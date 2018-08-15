@@ -46,6 +46,28 @@ public class POJO {
         this.b = b;
     }
 
+    @Override
+    public boolean equals(Object o) {
+        if (this == o) return true;
+        if (o == null || getClass() != o.getClass()) return false;
+
+        POJO pojo = (POJO) o;
+
+        if (gethMap() != null ? !gethMap().equals(pojo.gethMap()) : pojo.gethMap() != null) return false;
+        if (getAnotherPojo() != null ? !getAnotherPojo().equals(pojo.getAnotherPojo()) : pojo.getAnotherPojo() != null)
+            return false;
+        if (getA() != null ? !getA().equals(pojo.getA()) : pojo.getA() != null) return false;
+        return getB() != null ? getB().equals(pojo.getB()) : pojo.getB() == null;
+    }
+
+    @Override
+    public int hashCode() {
+        int result = gethMap() != null ? gethMap().hashCode() : 0;
+        result = 31 * result + (getAnotherPojo() != null ? getAnotherPojo().hashCode() : 0);
+        result = 31 * result + (getA() != null ? getA().hashCode() : 0);
+        result = 31 * result + (getB() != null ? getB().hashCode() : 0);
+        return result;
+    }
 
     @Override
     public String toString() {

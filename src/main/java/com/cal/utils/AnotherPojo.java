@@ -27,8 +27,25 @@ public class AnotherPojo {
          this.d = d;
      }
 
+    @Override
+    public boolean equals(Object o) {
+        if (this == o) return true;
+        if (o == null || getClass() != o.getClass()) return false;
 
-     @Override
+        AnotherPojo that = (AnotherPojo) o;
+
+        if (getC() != null ? !getC().equals(that.getC()) : that.getC() != null) return false;
+        return getD() != null ? getD().equals(that.getD()) : that.getD() == null;
+    }
+
+    @Override
+    public int hashCode() {
+        int result = getC() != null ? getC().hashCode() : 0;
+        result = 31 * result + (getD() != null ? getD().hashCode() : 0);
+        return result;
+    }
+
+    @Override
      public String toString() {
          return ToStringBuilder.reflectionToString(this);
      }

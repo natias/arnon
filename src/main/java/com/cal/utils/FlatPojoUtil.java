@@ -87,6 +87,8 @@ public class FlatPojoUtil {
         pojo.setAnotherPojo(anotherPojo);
         anotherPojo.setC("CC");
         anotherPojo.setD(122L);
+        anotherPojo2.setC("");
+        anotherPojo.setD(0L);
 
 
         System.out.println("original:\n"+ pojo);
@@ -94,7 +96,15 @@ public class FlatPojoUtil {
 
         FlatPojoUtil flatPojoUtil =new FlatPojoUtil();
 
-        System.out.println("to map and back to obj:\n" + flatPojoUtil.toObj(flatPojoUtil.toMap(pojo), pojo.getClass()));
+        POJO newj= (POJO) flatPojoUtil.toObj(flatPojoUtil.toMap(pojo), pojo.getClass());
+
+
+        System.out.println(flatPojoUtil.toMap(pojo));
+
+
+        System.out.println("to map and back to obj:\n" + newj);
+
+        System.out.println(newj.equals(pojo));
 
     }
 }
