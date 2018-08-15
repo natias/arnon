@@ -2,11 +2,8 @@
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.dataformat.javaprop.JavaPropsFactory;
 
-import java.io.ByteArrayOutputStream;
-import java.io.IOException;
-import java.io.OutputStreamWriter;
-import java.io.Writer;
-import java.util.Arrays;
+import java.io.*;
+import java.util.*;
 import java.util.stream.Collectors;
 
 public class M {
@@ -28,7 +25,7 @@ public class M {
         h.setD(122L);
 
 
-        System.out.println("j "+j);
+        System.out.println("j is "+j);
 
         ByteArrayOutputStream outputStream=new ByteArrayOutputStream();
         Writer writer=new OutputStreamWriter(outputStream);
@@ -37,10 +34,37 @@ public class M {
         objectMapper.writeValue(writer,j);
 
 
-        System.out.println("properties representation \n"+new String(outputStream.toByteArray()));
+        System.out.println("properties representation of j\n"+new String(outputStream.toByteArray()));
 
-        J newj=objectMapper.readValue(outputStream.toByteArray(),J.class);
 
-        System.out.println("newj "+newj);
+
+        Properties p=new Properties();
+        p.load(new ByteArrayInputStream(outputStream.toByteArray()));
+
+        Map<String, String> mapOfProperties = new LinkedHashMap(p);
+
+
+        System.out.println("j as map: "+mapOfProperties);
+
+
+        System.out.println("save map as properties");
+
+        ByteArrayOutputStream outputStream2=new ByteArrayOutputStream();
+        //Writer writer=new OutputStreamWriter(outputStream);
+
+        mapOfProperties.forEach((s, s2) ->
+                {
+                    try {
+                        outputStream2.write((s+"="+s2+"\n").getBytes());
+                    } catch (IOException e) {
+                        e.printStackTrace();
+                    }
+                }
+        );
+
+        System.out.println("load back from properties");
+        J newj=objectMapper.readValue(outputStream2.toByteArray(),J.class);
+
+        System.out.println("newj is "+newj);
     }
 }
