@@ -1,8 +1,10 @@
+package com.cal.utils;
+
 import org.apache.commons.lang3.builder.ToStringBuilder;
 
-public class H {
+public class AnotherPojo {
 
-     public H()
+     public AnotherPojo()
      {
 
      }
