@@ -22,7 +22,7 @@ public class M {
         H h2= new H();
 
         final int[] i = {0};
-        j.sethMap(Arrays.asList(h2,h).stream().collect(Collectors.toMap(o->""+ i[0]++, o->o)));
+        j.sethMap(Arrays.asList(h2,h).stream().collect(Collectors.toMap(o->"A"+ i[0]++, o->o)));
         j.setH(h);
         h.setC("CC");
         h.setD(122L);
@@ -39,8 +39,8 @@ public class M {
 
         System.out.println("properties representation \n"+new String(outputStream.toByteArray()));
 
-        //J newj=objectMapper.readValue(outputStream.toByteArray(),J.class);
+        J newj=objectMapper.readValue(outputStream.toByteArray(),J.class);
 
-        //System.out.println("newj "+newj);
+        System.out.println("newj "+newj);
     }
 }
