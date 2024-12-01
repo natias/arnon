@@ -18,6 +18,7 @@ $ wget http://yum.oracle.com/repo/OracleLinux/OL7/oracle/instantclient/x86_64/ge
 $ alien -i --scripts oracle-instantclient*.rpm
 $ sqlplus 'c##mdx/MDX@172.17.0.1:1521/free'
 $ cpan DBI
+$ cpan DBD:Oracle
 $ apt install vim
 $ vim demo.pl
 	use DBI;
