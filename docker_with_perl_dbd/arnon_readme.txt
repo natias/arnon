@@ -10,11 +10,9 @@ in docker
 
 $ apt update
 $ apt-get install -y libaio1 alien
-$ wget http://yum.oracle.com/repo/OracleLinux/OL7/oracle/instantclient/x86_64/getPackage/oracle-instantclient19.6-basic-19.6.0.0.0-1.x86_64.rpm
-$ alien -i --scripts oracle-instantclient19.6-basic-19.6.0.0.0-1.x86_64.rpm
-$ wget http://yum.oracle.com/repo/OracleLinux/OL7/oracle/instantclient/x86_64/getPackage/oracle-instantclient19.6-sdk-19.6.0.0.0-1.x86_64.rpm
-$ alien -i --scripts oracle-instantclient19.6-sdk-19.6.0.0.0-1.x86_64.rpm
-$ wget http://yum.oracle.com/repo/OracleLinux/OL7/oracle/instantclient/x86_64/getPackage/oracle-instantclient19.6-devel-19.6.0.0.0-1.x86_64.rpm
+$ wget https://download.oracle.com/otn_software/linux/instantclient/2360000/oracle-instantclient-basic-23.6.0.24.10-1.el9.x86_64.rpm
+$ wget https://download.oracle.com/otn_software/linux/instantclient/2360000/oracle-instantclient-devel-23.6.0.24.10-1.el9.x86_64.rpm
+$ wget https://download.oracle.com/otn_software/linux/instantclient/2360000/oracle-instantclient-sqlplus-23.6.0.24.10-1.el9.x86_64.rpm
 $ alien -i --scripts oracle-instantclient*.rpm
 $ sqlplus 'c##mdx/MDX@172.17.0.1:1521/free'
 $ cpan DBI
