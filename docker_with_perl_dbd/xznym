@@ -1,0 +1,1000 @@
+    if constexpr (__is_fixed_size_abi_v<_Abi> && _V::size() > 1)
+      {
+	return __fixed_size_apply<simd<_Tp, _Abi>>(
+	  [](auto __a, auto __b, auto __c) { return hypot(__a, __b, __c); },
+	  __x, __y, __z);
+      }
+    else
+      {
+	using namespace __float_bitwise_operators;
+	using namespace __proposed;
+	const _V __absx = abs(__x);                 // no error
+	const _V __absy = abs(__y);                 // no error
+	const _V __absz = abs(__z);                 // no error
+	_V __hi = max(max(__absx, __absy), __absz); // no error
+	_V __l0 = min(__absz, max(__absx, __absy)); // no error
+	_V __l1 = min(__absy, __absx);              // no error
+	if constexpr (__digits_v<_Tp> == 64 && __max_exponent_v<_Tp> == 0x4000
+		      && __min_exponent_v<_Tp> == -0x3FFD && _V::size() == 1)
+	  { // Seems like x87 fp80, where bit 63 is always 1 unless subnormal or
+	    // NaN. In this case the bit-tricks don't work, they require IEC559
+	    // binary32 or binary64 format.
+#ifdef __STDC_IEC_559__
+	    // fixup for Annex F requirements
+	    if (isinf(__absx[0]) || isinf(__absy[0]) || isinf(__absz[0]))
+	      return __infinity_v<_Tp>;
+	    else if (isunordered(__absx[0], __absy[0] + __absz[0]))
+	      return __quiet_NaN_v<_Tp>;
+	    else if (__l0[0] == 0 && __l1[0] == 0)
+	      return __hi;
+#endif
+	    _V __hi_exp = __hi;
+	    const _ULLong __tmp = 0x8000'0000'0000'0000ull;
+	    __builtin_memcpy(&__data(__hi_exp), &__tmp, 8);
+	    const _V __scale = 1 / __hi_exp;
+	    __hi *= __scale;
+	    __l0 *= __scale;
+	    __l1 *= __scale;
+	    return __hi_exp * sqrt((__l0 * __l0 + __l1 * __l1) + __hi * __hi);
+	  }
+	else
+	  {
+	    // round __hi down to the next power-of-2:
+	    _GLIBCXX_SIMD_USE_CONSTEXPR_API _V __inf(__infinity_v<_Tp>);
+
+#ifndef __FAST_MATH__
+	    if constexpr (_V::size() > 1 && __have_neon && !__have_neon_a32)
+	      { // With ARMv7 NEON, we have no subnormals and must use slightly
+		// different strategy
+		const _V __hi_exp = __hi & __inf;
+		_V __scale_back = __hi_exp;
+		// For large exponents (max & max/2) the inversion comes too
+		// close to subnormals. Subtract 3 from the exponent:
+		where(__hi_exp > 1, __scale_back) = __hi_exp * _Tp(0.125);
+		// Invert and adjust for the off-by-one error of inversion via
+		// xor:
+		const _V __scale = (__scale_back ^ __inf) * _Tp(.5);
+		const _V __h1 = __hi * __scale;
+		__l0 *= __scale;
+		__l1 *= __scale;
+		_V __lo = __l0 * __l0
+			  + __l1 * __l1; // add the two smaller values first
+		asm("" : "+m"(__lo));
+		_V __r = __scale_back * sqrt(__h1 * __h1 + __lo);
+		// Fix up hypot(0, 0, 0) to not be NaN:
+		where(__hi == 0, __r) = 0;
+		return __r;
+	      }
+#endif
+
+#ifdef __FAST_MATH__
+	    // With fast-math, ignore precision of subnormals and inputs from
+	    // __finite_max_v/2 to __finite_max_v. This removes all
+	    // branching/masking.
+	    if constexpr (true)
+#else
+	    if (_GLIBCXX_SIMD_IS_LIKELY(all_of(isnormal(__x))
+					&& all_of(isnormal(__y))
+					&& all_of(isnormal(__z))))
+#endif
+	      {
+		const _V __hi_exp = __hi & __inf;
+		//((__hi + __hi) & __inf) ^ __inf almost works for computing
+		//__scale, except when (__hi + __hi) & __inf == __inf, in which
+		// case __scale
+		// becomes 0 (should be min/2 instead) and thus loses the
+		// information from __lo.
+#ifdef __FAST_MATH__
+		using _Ip = __int_for_sizeof_t<_Tp>;
+		using _IV = rebind_simd_t<_Ip, _V>;
+		const auto __as_int = simd_bit_cast<_IV>(__hi_exp);
+		const _V __scale
+		  = simd_bit_cast<_V>(2 * simd_bit_cast<_Ip>(_Tp(1)) - __as_int);
+#else
+		const _V __scale = (__hi_exp ^ __inf) * _Tp(.5);
+#endif
+		constexpr _Tp __mant_mask
+		  = __norm_min_v<_Tp> - __denorm_min_v<_Tp>;
+		const _V __h1 = (__hi & _V(__mant_mask)) | _V(1);
+		__l0 *= __scale;
+		__l1 *= __scale;
+		const _V __lo
+		  = __l0 * __l0
+		    + __l1 * __l1; // add the two smaller values first
+		return __hi_exp * sqrt(__lo + __h1 * __h1);
+	      }
+	    else
+	      {
+		// slower path to support subnormals
+		// if __hi is subnormal, avoid scaling by inf & final mul by 0
+		// (which yields NaN) by using min()
+		_V __scale = _V(1 / __norm_min_v<_Tp>);
+		// invert exponent w/o error and w/o using the slow divider
+		// unit: xor inverts the exponent but off by 1. Multiplication
+		// with .5 adjusts for the discrepancy.
+		where(__hi >= __norm_min_v<_Tp>, __scale)
+		  = ((__hi & __inf) ^ __inf) * _Tp(.5);
+		// adjust final exponent for subnormal inputs
+		_V __hi_exp = __norm_min_v<_Tp>;
+		where(__hi >= __norm_min_v<_Tp>, __hi_exp)
+		  = __hi & __inf;         // no error
+		_V __h1 = __hi * __scale; // no error
+		__l0 *= __scale;          // no error
+		__l1 *= __scale;          // no error
+		_V __lo = __l0 * __l0
+			  + __l1 * __l1; // add the two smaller values first
+		_V __r = __hi_exp * sqrt(__lo + __h1 * __h1);
+#ifdef __STDC_IEC_559__
+		// fixup for Annex F requirements
+		_V __fixup = __hi; // __lo == 0
+		// where(__lo == 0, __fixup)                   = __hi;
+		where(isunordered(__x, __y + __z), __fixup)
+		  = __quiet_NaN_v<_Tp>;
+		where(isinf(__absx) || isinf(__absy) || isinf(__absz), __fixup)
+		  = __inf;
+		// Instead of __lo == 0, the following could depend on __h1² ==
+		// __h1² + __lo (i.e. __hi is so much larger than the other two
+		// inputs that the result is exactly __hi). While this may
+		// improve precision, it is likely to reduce efficiency if the
+		// ISA has FMAs (because __h1² + __lo is an FMA, but the
+		// intermediate
+		// __h1² must be kept)
+		where(!(__lo == 0 || isunordered(__x, __y + __z)
+			|| isinf(__absx) || isinf(__absy) || isinf(__absz)),
+		      __fixup)
+		  = __r;
+		__r = __fixup;
+#endif
+		return __r;
+	      }
+	  }
+      }
+  }
+
+  template <typename _Tp, typename _Abi>
+  _GLIBCXX_SIMD_INTRINSIC simd<_Tp, _Abi>
+  hypot(const simd<_Tp, _Abi>& __x, const simd<_Tp, _Abi>& __y,
+	const simd<_Tp, _Abi>& __z)
+  {
+    return __hypot<conditional_t<__is_fixed_size_abi_v<_Abi>,
+				 const simd<_Tp, _Abi>&, simd<_Tp, _Abi>>>(__x,
+									   __y,
+									   __z);
+  }
+
+_GLIBCXX_SIMD_CVTING3(hypot)
+
+_GLIBCXX_SIMD_MATH_CALL2_(pow, _Tp)
+
+_GLIBCXX_SIMD_MATH_CALL_(sqrt)
+_GLIBCXX_SIMD_MATH_CALL_(erf)
+_GLIBCXX_SIMD_MATH_CALL_(erfc)
+_GLIBCXX_SIMD_MATH_CALL_(lgamma)
+_GLIBCXX_SIMD_MATH_CALL_(tgamma)
+_GLIBCXX_SIMD_MATH_CALL_(ceil)
+_GLIBCXX_SIMD_MATH_CALL_(floor)
+_GLIBCXX_SIMD_MATH_CALL_(nearbyint)
+_GLIBCXX_SIMD_MATH_CALL_(rint)
+_GLIBCXX_SIMD_MATH_CALL_(lrint)
+_GLIBCXX_SIMD_MATH_CALL_(llrint)
+
+_GLIBCXX_SIMD_MATH_CALL_(round)
+_GLIBCXX_SIMD_MATH_CALL_(lround)
+_GLIBCXX_SIMD_MATH_CALL_(llround)
+
+_GLIBCXX_SIMD_MATH_CALL_(trunc)
+
+_GLIBCXX_SIMD_MATH_CALL2_(fmod, _Tp)
+_GLIBCXX_SIMD_MATH_CALL2_(remainder, _Tp)
+_GLIBCXX_SIMD_MATH_CALL3_(remquo, _Tp, int*)
+
+template <typename _Tp, typename _Abi, typename = __detail::__odr_helper>
+  enable_if_t<is_floating_point_v<_Tp>, simd<_Tp, _Abi>>
+  copysign(const simd<_Tp, _Abi>& __x, const simd<_Tp, _Abi>& __y)
+  {
+    if constexpr (simd_size_v<_Tp, _Abi> == 1)
+      return std::copysign(__x[0], __y[0]);
+    else if constexpr (__is_fixed_size_abi_v<_Abi>)
+      return {__private_init, _Abi::_SimdImpl::_S_copysign(__data(__x), __data(__y))};
+    else
+      {
+	using _V = simd<_Tp, _Abi>;
+	using namespace std::experimental::__float_bitwise_operators;
+	_GLIBCXX_SIMD_USE_CONSTEXPR_API auto __signmask = _V(1) ^ _V(-1);
+	return (__x & ~__signmask) | (__y & __signmask);
+      }
+  }
+
+_GLIBCXX_SIMD_MATH_CALL2_(nextafter, _Tp)
+// not covered in [parallel.simd.math]:
+// _GLIBCXX_SIMD_MATH_CALL2_(nexttoward, long double)
+_GLIBCXX_SIMD_MATH_CALL2_(fdim, _Tp)
+_GLIBCXX_SIMD_MATH_CALL2_(fmax, _Tp)
+_GLIBCXX_SIMD_MATH_CALL2_(fmin, _Tp)
+
+_GLIBCXX_SIMD_MATH_CALL3_(fma, _Tp, _Tp)
+_GLIBCXX_SIMD_MATH_CALL_(fpclassify)
+_GLIBCXX_SIMD_MATH_CALL_(isfinite)
+
+// isnan and isinf require special treatment because old glibc may declare
+// `int isinf(double)`.
+template <typename _Tp, typename _Abi, typename...,
+	  typename _R = _Math_return_type_t<bool, _Tp, _Abi>>
+  _GLIBCXX_SIMD_ALWAYS_INLINE
+  enable_if_t<is_floating_point_v<_Tp>, _R>
+  isinf(simd<_Tp, _Abi> __x)
+  { return {__private_init, _Abi::_SimdImpl::_S_isinf(__data(__x))}; }
+
+template <typename _Tp, typename _Abi, typename...,
+	  typename _R = _Math_return_type_t<bool, _Tp, _Abi>>
+  _GLIBCXX_SIMD_ALWAYS_INLINE
+  enable_if_t<is_floating_point_v<_Tp>, _R>
+  isnan(simd<_Tp, _Abi> __x)
+  { return {__private_init, _Abi::_SimdImpl::_S_isnan(__data(__x))}; }
+
+_GLIBCXX_SIMD_MATH_CALL_(isnormal)
+
+template <typename..., typename _Tp, typename _Abi>
+  _GLIBCXX_SIMD_ALWAYS_INLINE
+  simd_mask<_Tp, _Abi>
+  signbit(simd<_Tp, _Abi> __x)
+  {
+    if constexpr (is_integral_v<_Tp>)
+      {
+	if constexpr (is_unsigned_v<_Tp>)
+	  return simd_mask<_Tp, _Abi>{}; // false
+	else
+	  return __x < 0;
+      }
+    else
+      return {__private_init, _Abi::_SimdImpl::_S_signbit(__data(__x))};
+  }
+
+_GLIBCXX_SIMD_MATH_CALL2_(isgreater, _Tp)
+_GLIBCXX_SIMD_MATH_CALL2_(isgreaterequal, _Tp)
+_GLIBCXX_SIMD_MATH_CALL2_(isless, _Tp)
+_GLIBCXX_SIMD_MATH_CALL2_(islessequal, _Tp)
+_GLIBCXX_SIMD_MATH_CALL2_(islessgreater, _Tp)
+_GLIBCXX_SIMD_MATH_CALL2_(isunordered, _Tp)
+
+/* not covered in [parallel.simd.math]
+template <typename _Abi> __doublev<_Abi> nan(const char* tagp);
+template <typename _Abi> __floatv<_Abi> nanf(const char* tagp);
+template <typename _Abi> __ldoublev<_Abi> nanl(const char* tagp);
+
+template <typename _V> struct simd_div_t {
+    _V quot, rem;
+};
+
+template <typename _Abi>
+simd_div_t<_SCharv<_Abi>> div(_SCharv<_Abi> numer,
+					 _SCharv<_Abi> denom);
+template <typename _Abi>
+simd_div_t<__shortv<_Abi>> div(__shortv<_Abi> numer,
+					 __shortv<_Abi> denom);
+template <typename _Abi>
+simd_div_t<__intv<_Abi>> div(__intv<_Abi> numer, __intv<_Abi> denom);
+template <typename _Abi>
+simd_div_t<__longv<_Abi>> div(__longv<_Abi> numer,
+					__longv<_Abi> denom);
+template <typename _Abi>
+simd_div_t<__llongv<_Abi>> div(__llongv<_Abi> numer,
+					 __llongv<_Abi> denom);
+*/
+
+// special math {{{
+template <typename _Tp, typename _Abi, typename = __detail::__odr_helper>
+  enable_if_t<is_floating_point_v<_Tp>, simd<_Tp, _Abi>>
+  assoc_laguerre(const fixed_size_simd<unsigned, simd_size_v<_Tp, _Abi>>& __n,
+		 const fixed_size_simd<unsigned, simd_size_v<_Tp, _Abi>>& __m,
+		 const simd<_Tp, _Abi>& __x)
+  {
+    return simd<_Tp, _Abi>([&](auto __i) {
+      return std::assoc_laguerre(__n[__i], __m[__i], __x[__i]);
+    });
+  }
+
+template <typename _Tp, typename _Abi, typename = __detail::__odr_helper>
+  enable_if_t<is_floating_point_v<_Tp>, simd<_Tp, _Abi>>
+  assoc_legendre(const fixed_size_simd<unsigned, simd_size_v<_Tp, _Abi>>& __n,
+		 const fixed_size_simd<unsigned, simd_size_v<_Tp, _Abi>>& __m,
+		 const simd<_Tp, _Abi>& __x)
+  {
+    return simd<_Tp, _Abi>([&](auto __i) {
+      return std::assoc_legendre(__n[__i], __m[__i], __x[__i]);
+    });
+  }
+
+_GLIBCXX_SIMD_MATH_CALL2_(beta, _Tp)
+_GLIBCXX_SIMD_MATH_CALL_(comp_ellint_1)
+_GLIBCXX_SIMD_MATH_CALL_(comp_ellint_2)
+_GLIBCXX_SIMD_MATH_CALL2_(comp_ellint_3, _Tp)
+_GLIBCXX_SIMD_MATH_CALL2_(cyl_bessel_i, _Tp)
+_GLIBCXX_SIMD_MATH_CALL2_(cyl_bessel_j, _Tp)
+_GLIBCXX_SIMD_MATH_CALL2_(cyl_bessel_k, _Tp)
+_GLIBCXX_SIMD_MATH_CALL2_(cyl_neumann, _Tp)
+_GLIBCXX_SIMD_MATH_CALL2_(ellint_1, _Tp)
+_GLIBCXX_SIMD_MATH_CALL2_(ellint_2, _Tp)
+_GLIBCXX_SIMD_MATH_CALL3_(ellint_3, _Tp, _Tp)
+_GLIBCXX_SIMD_MATH_CALL_(expint)
+
+template <typename _Tp, typename _Abi, typename = __detail::__odr_helper>
+  enable_if_t<is_floating_point_v<_Tp>, simd<_Tp, _Abi>>
+  hermite(const fixed_size_simd<unsigned, simd_size_v<_Tp, _Abi>>& __n,
+	  const simd<_Tp, _Abi>& __x)
+  {
+    return simd<_Tp, _Abi>(
+      [&](auto __i) { return std::hermite(__n[__i], __x[__i]); });
+  }
+
+template <typename _Tp, typename _Abi, typename = __detail::__odr_helper>
+  enable_if_t<is_floating_point_v<_Tp>, simd<_Tp, _Abi>>
+  laguerre(const fixed_size_simd<unsigned, simd_size_v<_Tp, _Abi>>& __n,
+	   const simd<_Tp, _Abi>& __x)
+  {
+    return simd<_Tp, _Abi>(
+      [&](auto __i) { return std::laguerre(__n[__i], __x[__i]); });
+  }
+
+template <typename _Tp, typename _Abi, typename = __detail::__odr_helper>
+  enable_if_t<is_floating_point_v<_Tp>, simd<_Tp, _Abi>>
+  legendre(const fixed_size_simd<unsigned, simd_size_v<_Tp, _Abi>>& __n,
+	   const simd<_Tp, _Abi>& __x)
+  {
+    return simd<_Tp, _Abi>(
+      [&](auto __i) { return std::legendre(__n[__i], __x[__i]); });
+  }
+
+_GLIBCXX_SIMD_MATH_CALL_(riemann_zeta)
+
+template <typename _Tp, typename _Abi, typename = __detail::__odr_helper>
+  enable_if_t<is_floating_point_v<_Tp>, simd<_Tp, _Abi>>
+  sph_bessel(const fixed_size_simd<unsigned, simd_size_v<_Tp, _Abi>>& __n,
+	     const simd<_Tp, _Abi>& __x)
+  {
+    return simd<_Tp, _Abi>(
+      [&](auto __i) { return std::sph_bessel(__n[__i], __x[__i]); });
+  }
+
+template <typename _Tp, typename _Abi, typename = __detail::__odr_helper>
+  enable_if_t<is_floating_point_v<_Tp>, simd<_Tp, _Abi>>
+  sph_legendre(const fixed_size_simd<unsigned, simd_size_v<_Tp, _Abi>>& __l,
+	       const fixed_size_simd<unsigned, simd_size_v<_Tp, _Abi>>& __m,
+	       const simd<_Tp, _Abi>& theta)
+  {
+    return simd<_Tp, _Abi>([&](auto __i) {
+      return std::assoc_legendre(__l[__i], __m[__i], theta[__i]);
+    });
+  }
+
+template <typename _Tp, typename _Abi, typename = __detail::__odr_helper>
+  enable_if_t<is_floating_point_v<_Tp>, simd<_Tp, _Abi>>
+  sph_neumann(const fixed_size_simd<unsigned, simd_size_v<_Tp, _Abi>>& __n,
+	      const simd<_Tp, _Abi>& __x)
+  {
+    return simd<_Tp, _Abi>(
+      [&](auto __i) { return std::sph_neumann(__n[__i], __x[__i]); });
+  }
+// }}}
+
+#undef _GLIBCXX_SIMD_CVTING2
+#undef _GLIBCXX_SIMD_CVTING3
+#undef _GLIBCXX_SIMD_MATH_CALL_
+#undef _GLIBCXX_SIMD_MATH_CALL2_
+#undef _GLIBCXX_SIMD_MATH_CALL3_
+
+_GLIBCXX_SIMD_END_NAMESPACE
+
+#endif // __cplusplus >= 201703L
+#endif // _GLIBCXX_EXPERIMENTAL_SIMD_MATH_H_
+
+// vim: foldmethod=marker sw=2 ts=8 noet sts=2
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      usr/include/c++/12/experimental/bits/simd_neon.h                                                    0000644 0000000 0000000 00000036766 14356504412 020102  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        // Simd NEON specific implementations -*- C++ -*-
+
+// Copyright (C) 2020-2022 Free Software Foundation, Inc.
+//
+// This file is part of the GNU ISO C++ Library.  This library is free
+// software; you can redistribute it and/or modify it under the
+// terms of the GNU General Public License as published by the
+// Free Software Foundation; either version 3, or (at your option)
+// any later version.
+
+// This library is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+
+// Under Section 7 of GPL version 3, you are granted additional
+// permissions described in the GCC Runtime Library Exception, version
+// 3.1, as published by the Free Software Foundation.
+
+// You should have received a copy of the GNU General Public License and
+// a copy of the GCC Runtime Library Exception along with this program;
+// see the files COPYING3 and COPYING.RUNTIME respectively.  If not, see
+// <http://www.gnu.org/licenses/>.
+
+#ifndef _GLIBCXX_EXPERIMENTAL_SIMD_NEON_H_
+#define _GLIBCXX_EXPERIMENTAL_SIMD_NEON_H_
+
+#if __cplusplus >= 201703L
+
+#if !_GLIBCXX_SIMD_HAVE_NEON
+#error "simd_neon.h may only be included when NEON on ARM is available"
+#endif
+
+_GLIBCXX_SIMD_BEGIN_NAMESPACE
+
+// _CommonImplNeon {{{
+struct _CommonImplNeon : _CommonImplBuiltin
+{
+  // _S_store {{{
+  using _CommonImplBuiltin::_S_store;
+
+  // }}}
+};
+
+// }}}
+// _SimdImplNeon {{{
+template <typename _Abi, typename>
+  struct _SimdImplNeon : _SimdImplBuiltin<_Abi>
+  {
+    using _Base = _SimdImplBuiltin<_Abi>;
+
+    template <typename _Tp>
+      using _MaskMember = typename _Base::template _MaskMember<_Tp>;
+
+    template <typename _Tp>
+      static constexpr size_t _S_max_store_size = 16;
+
+    // _S_masked_load {{{
+    template <typename _Tp, size_t _Np, typename _Up>
+      static inline _SimdWrapper<_Tp, _Np>
+      _S_masked_load(_SimdWrapper<_Tp, _Np> __merge, _MaskMember<_Tp> __k,
+		     const _Up* __mem) noexcept
+      {
+	__execute_n_times<_Np>([&](auto __i) {
+	  if (__k[__i] != 0)
+	    __merge._M_set(__i, static_cast<_Tp>(__mem[__i]));
+	});
+	return __merge;
+      }
+
+    // }}}
+    // _S_masked_store_nocvt {{{
+    template <typename _Tp, size_t _Np>
+      _GLIBCXX_SIMD_INTRINSIC static void
+      _S_masked_store_nocvt(_SimdWrapper<_Tp, _Np> __v, _Tp* __mem,
+			    _MaskMember<_Tp> __k)
+      {
+	__execute_n_times<_Np>([&](auto __i) {
+	  if (__k[__i] != 0)
+	    __mem[__i] = __v[__i];
+	});
+      }
+
+    // }}}
+    // _S_reduce {{{
+    template <typename _Tp, typename _BinaryOperation>
+      _GLIBCXX_SIMD_INTRINSIC static _Tp
+      _S_reduce(simd<_Tp, _Abi> __x, _BinaryOperation&& __binary_op)
+      {
+	constexpr size_t _Np = __x.size();
+	if constexpr (sizeof(__x) == 16 && _Np >= 4
+		      && !_Abi::template _S_is_partial<_Tp>)
+	  {
+	    const auto __halves = split<simd<_Tp, simd_abi::_Neon<8>>>(__x);
+	    const auto __y = __binary_op(__halves[0], __halves[1]);
+	    return _SimdImplNeon<simd_abi::_Neon<8>>::_S_reduce(
+	      __y, static_cast<_BinaryOperation&&>(__binary_op));
+	  }
+	else if constexpr (_Np == 8)
+	  {
+	    __x = __binary_op(__x, _Base::template _M_make_simd<_Tp, _Np>(
+				     __vector_permute<1, 0, 3, 2, 5, 4, 7, 6>(
+				       __x._M_data)));
+	    __x = __binary_op(__x, _Base::template _M_make_simd<_Tp, _Np>(
+				     __vector_permute<3, 2, 1, 0, 7, 6, 5, 4>(
+				       __x._M_data)));
+	    __x = __binary_op(__x, _Base::template _M_make_simd<_Tp, _Np>(
+				     __vector_permute<7, 6, 5, 4, 3, 2, 1, 0>(
+				       __x._M_data)));
+	    return __x[0];
+	  }
+	else if constexpr (_Np == 4)
+	  {
+	    __x
+	      = __binary_op(__x, _Base::template _M_make_simd<_Tp, _Np>(
+				   __vector_permute<1, 0, 3, 2>(__x._M_data)));
+	    __x
+	      = __binary_op(__x, _Base::template _M_make_simd<_Tp, _Np>(
+				   __vector_permute<3, 2, 1, 0>(__x._M_data)));
+	    return __x[0];
+	  }
+	else if constexpr (_Np == 2)
+	  {
+	    __x = __binary_op(__x, _Base::template _M_make_simd<_Tp, _Np>(
+				     __vector_permute<1, 0>(__x._M_data)));
+	    return __x[0];
+	  }
+	else
+	  return _Base::_S_reduce(__x,
+				  static_cast<_BinaryOperation&&>(__binary_op));
+      }
+
+    // }}}
+    // math {{{
+    // _S_sqrt {{{
+    template <typename _Tp, typename _TVT = _VectorTraits<_Tp>>
+      _GLIBCXX_SIMD_INTRINSIC static _Tp _S_sqrt(_Tp __x)
+      {
+	if constexpr (__have_neon_a64)
+	  {
+	    const auto __intrin = __to_intrin(__x);
+	    if constexpr (_TVT::template _S_is<float, 2>)
+	      return vsqrt_f32(__intrin);
+	    else if constexpr (_TVT::template _S_is<float, 4>)
+	      return vsqrtq_f32(__intrin);
+	    else if constexpr (_TVT::template _S_is<double, 1>)
+	      return vsqrt_f64(__intrin);
+	    else if constexpr (_TVT::template _S_is<double, 2>)
+	      return vsqrtq_f64(__intrin);
+	    else
+	      __assert_unreachable<_Tp>();
+	  }
+	else
+	  return _Base::_S_sqrt(__x);
+      }
+
+    // }}}
+    // _S_trunc {{{
+    template <typename _TW, typename _TVT = _VectorTraits<_TW>>
+      _GLIBCXX_SIMD_INTRINSIC static _TW _S_trunc(_TW __x)
+      {
+	using _Tp = typename _TVT::value_type;
+	if constexpr (__have_neon_a32)
+	  {
+	    const auto __intrin = __to_intrin(__x);
+	    if constexpr (_TVT::template _S_is<float, 2>)
+	      return vrnd_f32(__intrin);
+	    else if constexpr (_TVT::template _S_is<float, 4>)
+	      return vrndq_f32(__intrin);
+	    else if constexpr (_TVT::template _S_is<double, 1>)
+	      return vrnd_f64(__intrin);
+	    else if constexpr (_TVT::template _S_is<double, 2>)
+	      return vrndq_f64(__intrin);
+	    else
+	      __assert_unreachable<_Tp>();
+	  }
+	else if constexpr (is_same_v<_Tp, float>)
+	  {
+	    auto __intrin = __to_intrin(__x);
+	    if constexpr (sizeof(__x) == 16)
+	      __intrin = vcvtq_f32_s32(vcvtq_s32_f32(__intrin));
+	    else
+	      __intrin = vcvt_f32_s32(vcvt_s32_f32(__intrin));
+	    return _Base::_S_abs(__x)._M_data < 0x1p23f
+		     ? __vector_bitcast<float>(__intrin)
+		     : __x._M_data;
+	  }
+	else
+	  return _Base::_S_trunc(__x);
+      }
+
+    // }}}
+    // _S_round {{{
+    template <typename _Tp, size_t _Np>
+      _GLIBCXX_SIMD_INTRINSIC static _SimdWrapper<_Tp, _Np>
+      _S_round(_SimdWrapper<_Tp, _Np> __x)
+      {
+	if constexpr (__have_neon_a32)
+	  {
+	    const auto __intrin = __to_intrin(__x);
+	    if constexpr (sizeof(_Tp) == 4 && sizeof(__x) == 8)
+	      return vrnda_f32(__intrin);
+	    else if constexpr (sizeof(_Tp) == 4 && sizeof(__x) == 16)
+	      return vrndaq_f32(__intrin);
+	    else if constexpr (sizeof(_Tp) == 8 && sizeof(__x) == 8)
+	      return vrnda_f64(__intrin);
+	    else if constexpr (sizeof(_Tp) == 8 && sizeof(__x) == 16)
+	      return vrndaq_f64(__intrin);
+	    else
+	      __assert_unreachable<_Tp>();
+	  }
+	else
+	  return _Base::_S_round(__x);
+      }
+
+    // }}}
+    // _S_floor {{{
+    template <typename _Tp, typename _TVT = _VectorTraits<_Tp>>
+      _GLIBCXX_SIMD_INTRINSIC static _Tp _S_floor(_Tp __x)
+      {
+	if constexpr (__have_neon_a32)
+	  {
+	    const auto __intrin = __to_intrin(__x);
+	    if constexpr (_TVT::template _S_is<float, 2>)
+	      return vrndm_f32(__intrin);
+	    else if constexpr (_TVT::template _S_is<float, 4>)
+	      return vrndmq_f32(__intrin);
+	    else if constexpr (_TVT::template _S_is<double, 1>)
+	      return vrndm_f64(__intrin);
+	    else if constexpr (_TVT::template _S_is<double, 2>)
+	      return vrndmq_f64(__intrin);
+	    else
+	      __assert_unreachable<_Tp>();
+	  }
+	else
+	  return _Base::_S_floor(__x);
+      }
+
+    // }}}
+    // _S_ceil {{{
+    template <typename _Tp, typename _TVT = _VectorTraits<_Tp>>
+      _GLIBCXX_SIMD_INTRINSIC static _Tp _S_ceil(_Tp __x)
+      {
+	if constexpr (__have_neon_a32)
+	  {
+	    const auto __intrin = __to_intrin(__x);
+	    if constexpr (_TVT::template _S_is<float, 2>)
+	      return vrndp_f32(__intrin);
+	    else if constexpr (_TVT::template _S_is<float, 4>)
+	      return vrndpq_f32(__intrin);
+	    else if constexpr (_TVT::template _S_is<double, 1>)
+	      return vrndp_f64(__intrin);
+	    else if constexpr (_TVT::template _S_is<double, 2>)
+	      return vrndpq_f64(__intrin);
+	    else
+	      __assert_unreachable<_Tp>();
+	  }
+	else
+	  return _Base::_S_ceil(__x);
+      }
+
+    //}}} }}}
+  }; // }}}
+// _MaskImplNeonMixin {{{
+struct _MaskImplNeonMixin
+{
+  using _Base = _MaskImplBuiltinMixin;
+
+  template <typename _Tp, size_t _Np>
+    _GLIBCXX_SIMD_INTRINSIC static constexpr _SanitizedBitMask<_Np>
+    _S_to_bits(_SimdWrapper<_Tp, _Np> __x)
+    {
+      if (__builtin_is_constant_evaluated())
+	return _Base::_S_to_bits(__x);
+
+      using _I = __int_for_sizeof_t<_Tp>;
+      if constexpr (sizeof(__x) == 16)
+	{
+	  auto __asint = __vector_bitcast<_I>(__x);
+#ifdef __aarch64__
+	  [[maybe_unused]] constexpr auto __zero = decltype(__asint)();
+#else
+	  [[maybe_unused]] constexpr auto __zero = decltype(__lo64(__asint))();
+#endif
+	  if constexpr (sizeof(_Tp) == 1)
+	    {
+	      constexpr auto __bitsel
+		= __generate_from_n_evaluations<16, __vector_type_t<_I, 16>>(
+		  [&](auto __i) {
+		    return static_cast<_I>(
+		      __i < _Np ? (__i < 8 ? 1 << __i : 1 << (__i - 8)) : 0);
+		  });
+	      __asint &= __bitsel;
+#ifdef __aarch64__
+	      return __vector_bitcast<_UShort>(
+		vpaddq_s8(vpaddq_s8(vpaddq_s8(__asint, __zero), __zero),
+			  __zero))[0];
+#else
+	      return __vector_bitcast<_UShort>(
+		vpadd_s8(vpadd_s8(vpadd_s8(__lo64(__asint), __hi64(__asint)),
+				  __zero),
+			 __zero))[0];
+#endif
+	    }
+	  else if constexpr (sizeof(_Tp) == 2)
+	    {
+	      constexpr auto __bitsel
+		= __generate_from_n_evaluations<8, __vector_type_t<_I, 8>>(
+		  [&](auto __i) {
+		    return static_cast<_I>(__i < _Np ? 1 << __i : 0);
+		  });
+	      __asint &= __bitsel;
+#ifdef __aarch64__
+	      return vaddvq_s16(__asint);
+#else
+	      return vpadd_s16(
+		vpadd_s16(vpadd_s16(__lo64(__asint), __hi64(__asint)), __zero),
+		__zero)[0];
+#endif
+	    }
+	  else if constexpr (sizeof(_Tp) == 4)
+	    {
+	      constexpr auto __bitsel
+		= __generate_from_n_evaluations<4, __vector_type_t<_I, 4>>(
+		  [&](auto __i) {
+		    return static_cast<_I>(__i < _Np ? 1 << __i : 0);
+		  });
+	      __asint &= __bitsel;
+#ifdef __aarch64__
+	      return vaddvq_s32(__asint);
+#else
+	      return vpadd_s32(vpadd_s32(__lo64(__asint), __hi64(__asint)),
+			       __zero)[0];
+#endif
+	    }
+	  else if constexpr (sizeof(_Tp) == 8)
+	    return (__asint[0] & 1) | (__asint[1] & 2);
+	  else
+	    __assert_unreachable<_Tp>();
+	}
+      else if constexpr (sizeof(__x) == 8)
+	{
+	  auto __asint = __vector_bitcast<_I>(__x);
+	  [[maybe_unused]] constexpr auto __zero = decltype(__asint)();
+	  if constexpr (sizeof(_Tp) == 1)
+	    {
+	      constexpr auto __bitsel
+		= __generate_from_n_evaluations<8, __vector_type_t<_I, 8>>(
+		  [&](auto __i) {
+		    return static_cast<_I>(__i < _Np ? 1 << __i : 0);
+		  });
+	      __asint &= __bitsel;
+#ifdef __aarch64__
+	      return vaddv_s8(__asint);
+#else
+	      return vpadd_s8(vpadd_s8(vpadd_s8(__asint, __zero), __zero),
+			      __zero)[0];
+#endif
+	    }
+	  else if constexpr (sizeof(_Tp) == 2)
+	    {
+	      constexpr auto __bitsel
+		= __generate_from_n_evaluations<4, __vector_type_t<_I, 4>>(
+		  [&](auto __i) {
+		    return static_cast<_I>(__i < _Np ? 1 << __i : 0);
+		  });
+	      __asint &= __bitsel;
+#ifdef __aarch64__
+	      return vaddv_s16(__asint);
+#else
+	      return vpadd_s16(vpadd_s16(__asint, __zero), __zero)[0];
+#endif
+	    }
+	  else if constexpr (sizeof(_Tp) == 4)
+	    {
+	      __asint &= __make_vector<_I>(0x1, 0x2);
+#ifdef __aarch64__
+	      return vaddv_s32(__asint);
+#else
+	      return vpadd_s32(__asint, __zero)[0];
+#endif
+	    }
+	  else
+	    __assert_unreachable<_Tp>();
+	}
+      else
+	return _Base::_S_to_bits(__x);
+    }
+};
+
+// }}}
+// _MaskImplNeon {{{
+template <typename _Abi, typename>
+  struct _MaskImplNeon : _MaskImplNeonMixin, _MaskImplBuiltin<_Abi>
+  {
+    using _MaskImplBuiltinMixin::_S_to_maskvector;
+    using _MaskImplNeonMixin::_S_to_bits;
+    using _Base = _MaskImplBuiltin<_Abi>;
+    using _Base::_S_convert;
+
+    // _S_all_of {{{
+    template <typename _Tp>
+      _GLIBCXX_SIMD_INTRINSIC static bool _S_all_of(simd_mask<_Tp, _Abi> __k)
+      {
+	const auto __kk
+	  = __vector_bitcast<char>(__k._M_data)
+	    | ~__vector_bitcast<char>(_Abi::template _S_implicit_mask<_Tp>());
+	if constexpr (sizeof(__k) == 16)
+	  {
+	    const auto __x = __vector_bitcast<long long>(__kk);
+	    return __x[0] + __x[1] == -2;
+	  }
+	else if constexpr (sizeof(__k) <= 8)
+	  return __bit_cast<__int_for_sizeof_t<decltype(__kk)>>(__kk) == -1;
+	else
+	  __assert_unreachable<_Tp>();
+      }
+
+    // }}}
+    // _S_any_of {{{
+    template <typename _Tp>
+      _GLIBCXX_SIMD_INTRINSIC static bool _S_any_of(simd_mask<_Tp, _Abi> __k)
+      {
+	const auto __kk
+	  = __vector_bitcast<char>(__k._M_data)
+	    | ~__vector_bitcast<char>(_Abi::template _S_implicit_mask<_Tp>());
+	if constexpr (sizeof(__k) == 16)
+	  {
+	    const auto __x = __vector_bitcast<long long>(__kk);
+	    return (__x[0] | __x[1]) != 0;
+	  }
+	else if constexpr (sizeof(__k) <= 8)
+	  return __bit_cast<__int_for_sizeof_t<decltype(__kk)>>(__kk) != 0;
+	else
+	  __assert_unreachable<_Tp>();
+      }
+
+    // }}}
+    // _S_none_of {{{
+    template <typename _Tp>
+      _GLIBCXX_SIMD_INTRINSIC static bool _S_none_of(simd_mask<_Tp, _Abi> __k)
+      {
+	const auto __kk = _Abi::_S_masked(__k._M_data);
+	if constexpr (sizeof(__k) == 16)
+	  {
+	    const auto __x = __vector_bitcast<long long>(__kk);
+	    return (__x[0] | __x[1]) == 0;
+	  }
+	else if constexpr (sizeof(__k) <= 8)
+	  return __bit_cast<__int_for_sizeof_t<decltype(__kk)>>(__kk) == 0;
+	else
+	  __assert_unreachable<_Tp>();
+      }
+
+    // }}}
+    // _S_some_of {{{
+    template <typename _Tp>
+      _GLIBCXX_SIMD_INTRINSIC static bool _S_some_of(simd_mask<_Tp, _Abi> __k)
+      {
+	if constexpr (sizeof(__k) <= 8)
+	  {
+	    const auto __kk = __vector_bitcast<char>(__k._M_data)
+			      | ~__vector_bitcast<char>(
+				_Abi::template _S_implicit_mask<_Tp>());
+	    using _Up = make_unsigned_t<__int_for_sizeof_t<decltype(__kk)>>;
+	    return __bit_cast<_Up>(__kk) + 1 > 1;
+	  }
+	else
+	  return _Base::_S_some_of(__k);
+      }
+
+    // }}}
+    // _S_popcount {{{
+    template <typename _Tp>
+      _GLIBCXX_SIMD_INTRINSIC static int _S_popcount(simd_mask<_Tp, _Abi> __k)
+      {
+	if constexpr (sizeof(_Tp) == 1)
+	  {
+	    const auto __s8 = __vector_bitcast<_SChar>(__k._M_data);
+	    int8x8_t __tmp = __lo64(__s8) + __hi64z(__s8);
+	    return -vpadd_s8(vpadd_s8(vpadd_s8(__tmp, int8x8_t()), int8x8_t()),
+			     int8x8_t())[0];
+	  }
+	else if constexpr (sizeof(_Tp) == 2)
+	  {
+	    const auto __s16 = __vector_bitcast<short>(__k._M_data);
+	    int16x4_t __tmp = __lo64(__s16) + __hi64z(__s16);
+	    return -vpadd_s16(vpadd_s16(__tmp, int16x4_t()), int16x4_t())[0];
+	  }
+	else if constexpr (sizeof(_Tp) == 4)
+	  {
+	    const auto __s32 = __vector_bitcast<int>(__k._M_data);
+	    int32x2_t __tmp = __lo64(__s32) + __hi64z(__s32);
+	    return -vpadd_s32(__tmp, int32x2_t())[0];
+	  }
+	else if constexpr (sizeof(_Tp) == 8)
+	  {
+	    static_assert(sizeof(__k) == 16);
+	    const auto __s64 = __vector_bitcast<long>(__k._M_data);
+	    return -(__s64[0] + __s64[1]);
+	  }
+      }
+
+    // }}}
+    // _S_find_first_set {{{
+    template <typename _Tp>
+      _GLIBCXX_SIMD_INTRINSIC static int
+      _S_find_first_set(simd_mask<_Tp, _Abi> __k)
+      {
+	// TODO: the _Base implementation is not optimal for NEON
+	return _Base::_S_find_first_set(__k);
+      }
+
+    // }}}
+    // _S_find_last_set {{{
+    template <typename _Tp>
+      _GLIBCXX_SIMD_INTRINSIC static int
+      _S_find_last_set(simd_mask<_Tp, _Abi> __k)
+      {
+	// TODO: the _Base implementation is not optimal for NEON
+	return _Base::_S_find_last_set(__k);
+      }
+
+    // }}}
+  }; // }}}
+
+_GLIBCXX_SIMD_END_NAMESPACE
+#endif // __cplusplus >= 201703L
+#endif // _GLIBCXX_EXPERIMENTAL_SIMD_NEON_H_
+// vim: foldmethod=marker sw=2 noet ts=8 sts=2 tw=80
+          usr/include/c++/12/experimental/bits/simd_ppc.h                                                     0000644 0000000 0000000 00000011370 14356504412 017705  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        // Simd PowerPC specific implementations -*- C++ -*-
+
+// Copyright (C) 2020-2022 Free Software Foundation, Inc.
+//
+// This file is part of the GNU ISO C++ Library.  This library is free
+// software; you can redistribute it and/or modify it under the
+// terms of the GNU General Public License as published by the
+// Free Software Foundation; either version 3, or (at your option)
+// any later version.
+
+// This library is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+
+// Under Section 7 of GPL version 3, you are granted additional
+// permissions described in the GCC Runtime Library Exception, version
+// 3.1, as published by the Free Software Foundation.
+
+// You should have received a copy of the GNU General Public License and
+// a copy of the GCC Runtime Library Exception along with this program;
+// see the files COPYING3 and COPYING.RUNTIME respectively.  If not, see
+// <http://www.gnu.org/licenses/>.
+
+#ifndef _GLIBCXX_EXPERIMENTAL_SIMD_PPC_H_
+#define _GLIBCXX_EXPERIMENTAL_SIMD_PPC_H_
+
+#if __cplusplus >= 201703L
+
+#ifndef __ALTIVEC__
+#error "simd_ppc.h may only be included when AltiVec/VMX is available"
+#endif
+#include <altivec.h>
+
+_GLIBCXX_SIMD_BEGIN_NAMESPACE
+
+// _SimdImplPpc {{{
+template <typename _Abi, typename>
+  struct _SimdImplPpc : _SimdImplBuiltin<_Abi>
+  {
+    using _Base = _SimdImplBuiltin<_Abi>;
+
+    // Byte and halfword shift instructions on PPC only consider the low 3 or 4
+    // bits of the RHS. Consequently, shifting by sizeof(_Tp)*CHAR_BIT (or more)
+    // is UB without extra measures. To match scalar behavior, byte and halfword
+    // shifts need an extra fixup step.
+
+    // _S_bit_shift_left {{{
+    template <typename _Tp, size_t _Np>
+      _GLIBCXX_SIMD_INTRINSIC static constexpr _SimdWrapper<_Tp, _Np>
+      _S_bit_shift_left(_SimdWrapper<_Tp, _Np> __x, _SimdWrapper<_Tp, _Np> __y)
+      {
+	__x = _Base::_S_bit_shift_left(__x, __y);
+	if constexpr (sizeof(_Tp) < sizeof(int))
+	  __x._M_data
+	    = (__y._M_data < sizeof(_Tp) * __CHAR_BIT__) & __x._M_data;
+	return __x;
+      }
+
+    template <typename _Tp, size_t _Np>
+      _GLIBCXX_SIMD_INTRINSIC static constexpr _SimdWrapper<_Tp, _Np>
+      _S_bit_shift_left(_SimdWrapper<_Tp, _Np> __x, int __y)
+      {
+	__x = _Base::_S_bit_shift_left(__x, __y);
+	if constexpr (sizeof(_Tp) < sizeof(int))
+	  {
+	    if (__y >= sizeof(_Tp) * __CHAR_BIT__)
+	      return {};
+	  }
+	return __x;
+      }
+
+    // }}}
+    // _S_bit_shift_right {{{
+    template <typename _Tp, size_t _Np>
+      _GLIBCXX_SIMD_INTRINSIC static constexpr _SimdWrapper<_Tp, _Np>
+      _S_bit_shift_right(_SimdWrapper<_Tp, _Np> __x, _SimdWrapper<_Tp, _Np> __y)
+      {
+	if constexpr (sizeof(_Tp) < sizeof(int))

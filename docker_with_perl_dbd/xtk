@@ -1,0 +1,1000 @@
+    return error.FilteredRepoLookupError(msg)
+
+
+def revsingle(repo, revspec, default=b'.', localalias=None):
+    if not revspec and revspec != 0:
+        return repo[default]
+
+    l = revrange(repo, [revspec], localalias=localalias)
+    if not l:
+        raise error.InputError(_(b'empty revision set'))
+    return repo[l.last()]
+
+
+def _pairspec(revspec):
+    tree = revsetlang.parse(revspec)
+    return tree and tree[0] in (
+        b'range',
+        b'rangepre',
+        b'rangepost',
+        b'rangeall',
+    )
+
+
+def revpair(repo, revs):
+    if not revs:
+        return repo[b'.'], repo[None]
+
+    l = revrange(repo, revs)
+
+    if not l:
+        raise error.InputError(_(b'empty revision range'))
+
+    first = l.first()
+    second = l.last()
+
+    if (
+        first == second
+        and len(revs) >= 2
+        and not all(revrange(repo, [r]) for r in revs)
+    ):
+        raise error.InputError(_(b'empty revision on one side of range'))
+
+    # if top-level is range expression, the result must always be a pair
+    if first == second and len(revs) == 1 and not _pairspec(revs[0]):
+        return repo[first], repo[None]
+
+    return repo[first], repo[second]
+
+
+def revrange(repo, specs, localalias=None):
+    """Execute 1 to many revsets and return the union.
+
+    This is the preferred mechanism for executing revsets using user-specified
+    config options, such as revset aliases.
+
+    The revsets specified by ``specs`` will be executed via a chained ``OR``
+    expression. If ``specs`` is empty, an empty result is returned.
+
+    ``specs`` can contain integers, in which case they are assumed to be
+    revision numbers.
+
+    It is assumed the revsets are already formatted. If you have arguments
+    that need to be expanded in the revset, call ``revsetlang.formatspec()``
+    and pass the result as an element of ``specs``.
+
+    Specifying a single revset is allowed.
+
+    Returns a ``smartset.abstractsmartset`` which is a list-like interface over
+    integer revisions.
+    """
+    allspecs = []
+    for spec in specs:
+        if isinstance(spec, int):
+            spec = revsetlang.formatspec(b'%d', spec)
+        allspecs.append(spec)
+    return repo.anyrevs(allspecs, user=True, localalias=localalias)
+
+
+def increasingwindows(windowsize=8, sizelimit=512):
+    while True:
+        yield windowsize
+        if windowsize < sizelimit:
+            windowsize *= 2
+
+
+def walkchangerevs(repo, revs, makefilematcher, prepare):
+    """Iterate over files and the revs in a "windowed" way.
+
+    Callers most commonly need to iterate backwards over the history
+    in which they are interested. Doing so has awful (quadratic-looking)
+    performance, so we use iterators in a "windowed" way.
+
+    We walk a window of revisions in the desired order.  Within the
+    window, we first walk forwards to gather data, then in the desired
+    order (usually backwards) to display it.
+
+    This function returns an iterator yielding contexts. Before
+    yielding each context, the iterator will first call the prepare
+    function on each context in the window in forward order."""
+
+    if not revs:
+        return []
+    change = repo.__getitem__
+
+    def iterate():
+        it = iter(revs)
+        stopiteration = False
+        for windowsize in increasingwindows():
+            nrevs = []
+            for i in range(windowsize):
+                rev = next(it, None)
+                if rev is None:
+                    stopiteration = True
+                    break
+                nrevs.append(rev)
+            for rev in sorted(nrevs):
+                ctx = change(rev)
+                prepare(ctx, makefilematcher(ctx))
+            for rev in nrevs:
+                yield change(rev)
+
+            if stopiteration:
+                break
+
+    return iterate()
+
+
+def meaningfulparents(repo, ctx):
+    """Return list of meaningful (or all if debug) parentrevs for rev.
+
+    For merges (two non-nullrev revisions) both parents are meaningful.
+    Otherwise the first parent revision is considered meaningful if it
+    is not the preceding revision.
+    """
+    parents = ctx.parents()
+    if len(parents) > 1:
+        return parents
+    if repo.ui.debugflag:
+        return [parents[0], repo[nullrev]]
+    if parents[0].rev() >= intrev(ctx) - 1:
+        return []
+    return parents
+
+
+def getuipathfn(repo, legacyrelativevalue=False, forcerelativevalue=None):
+    """Return a function that produced paths for presenting to the user.
+
+    The returned function takes a repo-relative path and produces a path
+    that can be presented in the UI.
+
+    Depending on the value of ui.relative-paths, either a repo-relative or
+    cwd-relative path will be produced.
+
+    legacyrelativevalue is the value to use if ui.relative-paths=legacy
+
+    If forcerelativevalue is not None, then that value will be used regardless
+    of what ui.relative-paths is set to.
+    """
+    if forcerelativevalue is not None:
+        relative = forcerelativevalue
+    else:
+        config = repo.ui.config(b'ui', b'relative-paths')
+        if config == b'legacy':
+            relative = legacyrelativevalue
+        else:
+            relative = stringutil.parsebool(config)
+            if relative is None:
+                raise error.ConfigError(
+                    _(b"ui.relative-paths is not a boolean ('%s')") % config
+                )
+
+    if relative:
+        cwd = repo.getcwd()
+        if cwd != b'':
+            # this branch would work even if cwd == b'' (ie cwd = repo
+            # root), but its generality makes the returned function slower
+            pathto = repo.pathto
+            return lambda f: pathto(f, cwd)
+    if repo.ui.configbool(b'ui', b'slash'):
+        return lambda f: f
+    else:
+        return util.localpath
+
+
+def subdiruipathfn(subpath, uipathfn):
+    '''Create a new uipathfn that treats the file as relative to subpath.'''
+    return lambda f: uipathfn(posixpath.join(subpath, f))
+
+
+def anypats(pats, opts):
+    """Checks if any patterns, including --include and --exclude were given.
+
+    Some commands (e.g. addremove) use this condition for deciding whether to
+    print absolute or relative paths.
+    """
+    return bool(pats or opts.get(b'include') or opts.get(b'exclude'))
+
+
+def expandpats(pats):
+    """Expand bare globs when running on windows.
+    On posix we assume it already has already been done by sh."""
+    if not util.expandglobs:
+        return list(pats)
+    ret = []
+    for kindpat in pats:
+        kind, pat = matchmod._patsplit(kindpat, None)
+        if kind is None:
+            try:
+                globbed = glob.glob(pat)
+            except re.error:
+                globbed = [pat]
+            if globbed:
+                ret.extend(globbed)
+                continue
+        ret.append(kindpat)
+    return ret
+
+
+def matchandpats(
+    ctx, pats=(), opts=None, globbed=False, default=b'relpath', badfn=None
+):
+    """Return a matcher and the patterns that were used.
+    The matcher will warn about bad matches, unless an alternate badfn callback
+    is provided."""
+    if opts is None:
+        opts = {}
+    if not globbed and default == b'relpath':
+        pats = expandpats(pats or [])
+
+    uipathfn = getuipathfn(ctx.repo(), legacyrelativevalue=True)
+
+    def bad(f, msg):
+        ctx.repo().ui.warn(b"%s: %s\n" % (uipathfn(f), msg))
+
+    if badfn is None:
+        badfn = bad
+
+    m = ctx.match(
+        pats,
+        opts.get(b'include'),
+        opts.get(b'exclude'),
+        default,
+        listsubrepos=opts.get(b'subrepos'),
+        badfn=badfn,
+    )
+
+    if m.always():
+        pats = []
+    return m, pats
+
+
+def match(
+    ctx, pats=(), opts=None, globbed=False, default=b'relpath', badfn=None
+):
+    '''Return a matcher that will warn about bad matches.'''
+    return matchandpats(ctx, pats, opts, globbed, default, badfn=badfn)[0]
+
+
+def matchall(repo):
+    '''Return a matcher that will efficiently match everything.'''
+    return matchmod.always()
+
+
+def matchfiles(repo, files, badfn=None):
+    '''Return a matcher that will efficiently match exactly these files.'''
+    return matchmod.exact(files, badfn=badfn)
+
+
+def parsefollowlinespattern(repo, rev, pat, msg):
+    """Return a file name from `pat` pattern suitable for usage in followlines
+    logic.
+    """
+    if not matchmod.patkind(pat):
+        return pathutil.canonpath(repo.root, repo.getcwd(), pat)
+    else:
+        ctx = repo[rev]
+        m = matchmod.match(repo.root, repo.getcwd(), [pat], ctx=ctx)
+        files = [f for f in ctx if m(f)]
+        if len(files) != 1:
+            raise error.ParseError(msg)
+        return files[0]
+
+
+def getorigvfs(ui, repo):
+    """return a vfs suitable to save 'orig' file
+
+    return None if no special directory is configured"""
+    origbackuppath = ui.config(b'ui', b'origbackuppath')
+    if not origbackuppath:
+        return None
+    return vfs.vfs(repo.wvfs.join(origbackuppath))
+
+
+def backuppath(ui, repo, filepath):
+    """customize where working copy backup files (.orig files) are created
+
+    Fetch user defined path from config file: [ui] origbackuppath = <path>
+    Fall back to default (filepath with .orig suffix) if not specified
+
+    filepath is repo-relative
+
+    Returns an absolute path
+    """
+    origvfs = getorigvfs(ui, repo)
+    if origvfs is None:
+        return repo.wjoin(filepath + b".orig")
+
+    origbackupdir = origvfs.dirname(filepath)
+    if not origvfs.isdir(origbackupdir) or origvfs.islink(origbackupdir):
+        ui.note(_(b'creating directory: %s\n') % origvfs.join(origbackupdir))
+
+        # Remove any files that conflict with the backup file's path
+        for f in reversed(list(pathutil.finddirs(filepath))):
+            if origvfs.isfileorlink(f):
+                ui.note(_(b'removing conflicting file: %s\n') % origvfs.join(f))
+                origvfs.unlink(f)
+                break
+
+        origvfs.makedirs(origbackupdir)
+
+    if origvfs.isdir(filepath) and not origvfs.islink(filepath):
+        ui.note(
+            _(b'removing conflicting directory: %s\n') % origvfs.join(filepath)
+        )
+        origvfs.rmtree(filepath, forcibly=True)
+
+    return origvfs.join(filepath)
+
+
+class _containsnode:
+    """proxy __contains__(node) to container.__contains__ which accepts revs"""
+
+    def __init__(self, repo, revcontainer):
+        self._torev = repo.changelog.rev
+        self._revcontains = revcontainer.__contains__
+
+    def __contains__(self, node):
+        return self._revcontains(self._torev(node))
+
+
+def cleanupnodes(
+    repo,
+    replacements,
+    operation,
+    moves=None,
+    metadata=None,
+    fixphase=False,
+    targetphase=None,
+    backup=True,
+):
+    """do common cleanups when old nodes are replaced by new nodes
+
+    That includes writing obsmarkers or stripping nodes, and moving bookmarks.
+    (we might also want to move working directory parent in the future)
+
+    By default, bookmark moves are calculated automatically from 'replacements',
+    but 'moves' can be used to override that. Also, 'moves' may include
+    additional bookmark moves that should not have associated obsmarkers.
+
+    replacements is {oldnode: [newnode]} or a iterable of nodes if they do not
+    have replacements. operation is a string, like "rebase".
+
+    metadata is dictionary containing metadata to be stored in obsmarker if
+    obsolescence is enabled.
+    """
+    assert fixphase or targetphase is None
+    if not replacements and not moves:
+        return
+
+    # translate mapping's other forms
+    if not util.safehasattr(replacements, b'items'):
+        replacements = {(n,): () for n in replacements}
+    else:
+        # upgrading non tuple "source" to tuple ones for BC
+        repls = {}
+        for key, value in replacements.items():
+            if not isinstance(key, tuple):
+                key = (key,)
+            repls[key] = value
+        replacements = repls
+
+    # Unfiltered repo is needed since nodes in replacements might be hidden.
+    unfi = repo.unfiltered()
+
+    # Calculate bookmark movements
+    if moves is None:
+        moves = {}
+        for oldnodes, newnodes in replacements.items():
+            for oldnode in oldnodes:
+                if oldnode in moves:
+                    continue
+                if len(newnodes) > 1:
+                    # usually a split, take the one with biggest rev number
+                    newnode = next(unfi.set(b'max(%ln)', newnodes)).node()
+                elif len(newnodes) == 0:
+                    # move bookmark backwards
+                    allreplaced = []
+                    for rep in replacements:
+                        allreplaced.extend(rep)
+                    roots = list(
+                        unfi.set(b'max((::%n) - %ln)', oldnode, allreplaced)
+                    )
+                    if roots:
+                        newnode = roots[0].node()
+                    else:
+                        newnode = repo.nullid
+                else:
+                    newnode = newnodes[0]
+                moves[oldnode] = newnode
+
+    allnewnodes = [n for ns in replacements.values() for n in ns]
+    toretract = {}
+    toadvance = {}
+    if fixphase:
+        precursors = {}
+        for oldnodes, newnodes in replacements.items():
+            for oldnode in oldnodes:
+                for newnode in newnodes:
+                    precursors.setdefault(newnode, []).append(oldnode)
+
+        allnewnodes.sort(key=lambda n: unfi[n].rev())
+        newphases = {}
+
+        def phase(ctx):
+            return newphases.get(ctx.node(), ctx.phase())
+
+        for newnode in allnewnodes:
+            ctx = unfi[newnode]
+            parentphase = max(phase(p) for p in ctx.parents())
+            if targetphase is None:
+                oldphase = max(
+                    unfi[oldnode].phase() for oldnode in precursors[newnode]
+                )
+                newphase = max(oldphase, parentphase)
+            else:
+                newphase = max(targetphase, parentphase)
+            newphases[newnode] = newphase
+            if newphase > ctx.phase():
+                toretract.setdefault(newphase, []).append(newnode)
+            elif newphase < ctx.phase():
+                toadvance.setdefault(newphase, []).append(newnode)
+
+    with repo.transaction(b'cleanup') as tr:
+        # Move bookmarks
+        bmarks = repo._bookmarks
+        bmarkchanges = []
+        for oldnode, newnode in moves.items():
+            oldbmarks = repo.nodebookmarks(oldnode)
+            if not oldbmarks:
+                continue
+            from . import bookmarks  # avoid import cycle
+
+            repo.ui.debug(
+                b'moving bookmarks %r from %s to %s\n'
+                % (
+                    pycompat.rapply(pycompat.maybebytestr, oldbmarks),
+                    hex(oldnode),
+                    hex(newnode),
+                )
+            )
+            # Delete divergent bookmarks being parents of related newnodes
+            deleterevs = repo.revs(
+                b'parents(roots(%ln & (::%n))) - parents(%n)',
+                allnewnodes,
+                newnode,
+                oldnode,
+            )
+            deletenodes = _containsnode(repo, deleterevs)
+            for name in oldbmarks:
+                bmarkchanges.append((name, newnode))
+                for b in bookmarks.divergent2delete(repo, deletenodes, name):
+                    bmarkchanges.append((b, None))
+
+        if bmarkchanges:
+            bmarks.applychanges(repo, tr, bmarkchanges)
+
+        for phase, nodes in toretract.items():
+            phases.retractboundary(repo, tr, phase, nodes)
+        for phase, nodes in toadvance.items():
+            phases.advanceboundary(repo, tr, phase, nodes)
+
+        mayusearchived = repo.ui.config(b'experimental', b'cleanup-as-archived')
+        # Obsolete or strip nodes
+        if obsolete.isenabled(repo, obsolete.createmarkersopt):
+            # If a node is already obsoleted, and we want to obsolete it
+            # without a successor, skip that obssolete request since it's
+            # unnecessary. That's the "if s or not isobs(n)" check below.
+            # Also sort the node in topology order, that might be useful for
+            # some obsstore logic.
+            # NOTE: the sorting might belong to createmarkers.
+            torev = unfi.changelog.rev
+            sortfunc = lambda ns: torev(ns[0][0])
+            rels = []
+            for ns, s in sorted(replacements.items(), key=sortfunc):
+                rel = (tuple(unfi[n] for n in ns), tuple(unfi[m] for m in s))
+                rels.append(rel)
+            if rels:
+                obsolete.createmarkers(
+                    repo, rels, operation=operation, metadata=metadata
+                )
+        elif phases.supportarchived(repo) and mayusearchived:
+            # this assume we do not have "unstable" nodes above the cleaned ones
+            allreplaced = set()
+            for ns in replacements.keys():
+                allreplaced.update(ns)
+            if backup:
+                from . import repair  # avoid import cycle
+
+                node = min(allreplaced, key=repo.changelog.rev)
+                repair.backupbundle(
+                    repo, allreplaced, allreplaced, node, operation
+                )
+            phases.retractboundary(repo, tr, phases.archived, allreplaced)
+        else:
+            from . import repair  # avoid import cycle
+
+            tostrip = list(n for ns in replacements for n in ns)
+            if tostrip:
+                repair.delayedstrip(
+                    repo.ui, repo, tostrip, operation, backup=backup
+                )
+
+
+def addremove(repo, matcher, prefix, uipathfn, opts=None):
+    if opts is None:
+        opts = {}
+    m = matcher
+    dry_run = opts.get(b'dry_run')
+    try:
+        similarity = float(opts.get(b'similarity') or 0)
+    except ValueError:
+        raise error.InputError(_(b'similarity must be a number'))
+    if similarity < 0 or similarity > 100:
+        raise error.InputError(_(b'similarity must be between 0 and 100'))
+    similarity /= 100.0
+
+    ret = 0
+
+    wctx = repo[None]
+    for subpath in sorted(wctx.substate):
+        submatch = matchmod.subdirmatcher(subpath, m)
+        if opts.get(b'subrepos') or m.exact(subpath) or any(submatch.files()):
+            sub = wctx.sub(subpath)
+            subprefix = repo.wvfs.reljoin(prefix, subpath)
+            subuipathfn = subdiruipathfn(subpath, uipathfn)
+            try:
+                if sub.addremove(submatch, subprefix, subuipathfn, opts):
+                    ret = 1
+            except error.LookupError:
+                repo.ui.status(
+                    _(b"skipping missing subrepository: %s\n")
+                    % uipathfn(subpath)
+                )
+
+    rejected = []
+
+    def badfn(f, msg):
+        if f in m.files():
+            m.bad(f, msg)
+        rejected.append(f)
+
+    badmatch = matchmod.badmatch(m, badfn)
+    added, unknown, deleted, removed, forgotten = _interestingfiles(
+        repo, badmatch
+    )
+
+    unknownset = set(unknown + forgotten)
+    toprint = unknownset.copy()
+    toprint.update(deleted)
+    for abs in sorted(toprint):
+        if repo.ui.verbose or not m.exact(abs):
+            if abs in unknownset:
+                status = _(b'adding %s\n') % uipathfn(abs)
+                label = b'ui.addremove.added'
+            else:
+                status = _(b'removing %s\n') % uipathfn(abs)
+                label = b'ui.addremove.removed'
+            repo.ui.status(status, label=label)
+
+    renames = _findrenames(
+        repo, m, added + unknown, removed + deleted, similarity, uipathfn
+    )
+
+    if not dry_run:
+        _markchanges(repo, unknown + forgotten, deleted, renames)
+
+    for f in rejected:
+        if f in m.files():
+            return 1
+    return ret
+
+
+def marktouched(repo, files, similarity=0.0):
+    """Assert that files have somehow been operated upon. files are relative to
+    the repo root."""
+    m = matchfiles(repo, files, badfn=lambda x, y: rejected.append(x))
+    rejected = []
+
+    added, unknown, deleted, removed, forgotten = _interestingfiles(repo, m)
+
+    if repo.ui.verbose:
+        unknownset = set(unknown + forgotten)
+        toprint = unknownset.copy()
+        toprint.update(deleted)
+        for abs in sorted(toprint):
+            if abs in unknownset:
+                status = _(b'adding %s\n') % abs
+            else:
+                status = _(b'removing %s\n') % abs
+            repo.ui.status(status)
+
+    # TODO: We should probably have the caller pass in uipathfn and apply it to
+    # the messages above too. legacyrelativevalue=True is consistent with how
+    # it used to work.
+    uipathfn = getuipathfn(repo, legacyrelativevalue=True)
+    renames = _findrenames(
+        repo, m, added + unknown, removed + deleted, similarity, uipathfn
+    )
+
+    _markchanges(repo, unknown + forgotten, deleted, renames)
+
+    for f in rejected:
+        if f in m.files():
+            return 1
+    return 0
+
+
+def _interestingfiles(repo, matcher):
+    """Walk dirstate with matcher, looking for files that addremove would care
+    about.
+
+    This is different from dirstate.status because it doesn't care about
+    whether files are modified or clean."""
+    added, unknown, deleted, removed, forgotten = [], [], [], [], []
+    audit_path = pathutil.pathauditor(repo.root, cached=True)
+
+    ctx = repo[None]
+    dirstate = repo.dirstate
+    matcher = repo.narrowmatch(matcher, includeexact=True)
+    walkresults = dirstate.walk(
+        matcher,
+        subrepos=sorted(ctx.substate),
+        unknown=True,
+        ignored=False,
+        full=False,
+    )
+    for abs, st in walkresults.items():
+        entry = dirstate.get_entry(abs)
+        if (not entry.any_tracked) and audit_path.check(abs):
+            unknown.append(abs)
+        elif (not entry.removed) and not st:
+            deleted.append(abs)
+        elif entry.removed and st:
+            forgotten.append(abs)
+        # for finding renames
+        elif entry.removed and not st:
+            removed.append(abs)
+        elif entry.added:
+            added.append(abs)
+
+    return added, unknown, deleted, removed, forgotten
+
+
+def _findrenames(repo, matcher, added, removed, similarity, uipathfn):
+    '''Find renames from removed files to added ones.'''
+    renames = {}
+    if similarity > 0:
+        for old, new, score in similar.findrenames(
+            repo, added, removed, similarity
+        ):
+            if (
+                repo.ui.verbose
+                or not matcher.exact(old)
+                or not matcher.exact(new)
+            ):
+                repo.ui.status(
+                    _(
+                        b'recording removal of %s as rename to %s '
+                        b'(%d%% similar)\n'
+                    )
+                    % (uipathfn(old), uipathfn(new), score * 100)
+                )
+            renames[new] = old
+    return renames
+
+
+def _markchanges(repo, unknown, deleted, renames):
+    """Marks the files in unknown as added, the files in deleted as removed,
+    and the files in renames as copied."""
+    wctx = repo[None]
+    with repo.wlock():
+        wctx.forget(deleted)
+        wctx.add(unknown)
+        for new, old in renames.items():
+            wctx.copy(old, new)
+
+
+def getrenamedfn(repo, endrev=None):
+    if copiesmod.usechangesetcentricalgo(repo):
+
+        def getrenamed(fn, rev):
+            ctx = repo[rev]
+            p1copies = ctx.p1copies()
+            if fn in p1copies:
+                return p1copies[fn]
+            p2copies = ctx.p2copies()
+            if fn in p2copies:
+                return p2copies[fn]
+            return None
+
+        return getrenamed
+
+    rcache = {}
+    if endrev is None:
+        endrev = len(repo)
+
+    def getrenamed(fn, rev):
+        """looks up all renames for a file (up to endrev) the first
+        time the file is given. It indexes on the changerev and only
+        parses the manifest if linkrev != changerev.
+        Returns rename info for fn at changerev rev."""
+        if fn not in rcache:
+            rcache[fn] = {}
+            fl = repo.file(fn)
+            for i in fl:
+                lr = fl.linkrev(i)
+                renamed = fl.renamed(fl.node(i))
+                rcache[fn][lr] = renamed and renamed[0]
+                if lr >= endrev:
+                    break
+        if rev in rcache[fn]:
+            return rcache[fn][rev]
+
+        # If linkrev != rev (i.e. rev not found in rcache) fallback to
+        # filectx logic.
+        try:
+            return repo[rev][fn].copysource()
+        except error.LookupError:
+            return None
+
+    return getrenamed
+
+
+def getcopiesfn(repo, endrev=None):
+    if copiesmod.usechangesetcentricalgo(repo):
+
+        def copiesfn(ctx):
+            if ctx.p2copies():
+                allcopies = ctx.p1copies().copy()
+                # There should be no overlap
+                allcopies.update(ctx.p2copies())
+                return sorted(allcopies.items())
+            else:
+                return sorted(ctx.p1copies().items())
+
+    else:
+        getrenamed = getrenamedfn(repo, endrev)
+
+        def copiesfn(ctx):
+            copies = []
+            for fn in ctx.files():
+                rename = getrenamed(fn, ctx.rev())
+                if rename:
+                    copies.append((fn, rename))
+            return copies
+
+    return copiesfn
+
+
+def dirstatecopy(ui, repo, wctx, src, dst, dryrun=False, cwd=None):
+    """Update the dirstate to reflect the intent of copying src to dst. For
+    different reasons it might not end with dst being marked as copied from src.
+    """
+    origsrc = repo.dirstate.copied(src) or src
+    if dst == origsrc:  # copying back a copy?
+        entry = repo.dirstate.get_entry(dst)
+        if (entry.added or not entry.tracked) and not dryrun:
+            repo.dirstate.set_tracked(dst)
+    else:
+        if repo.dirstate.get_entry(origsrc).added and origsrc == src:
+            if not ui.quiet:
+                ui.warn(
+                    _(
+                        b"%s has not been committed yet, so no copy "
+                        b"data will be stored for %s.\n"
+                    )
+                    % (repo.pathto(origsrc, cwd), repo.pathto(dst, cwd))
+                )
+            if not repo.dirstate.get_entry(dst).tracked and not dryrun:
+                wctx.add([dst])
+        elif not dryrun:
+            wctx.copy(origsrc, dst)
+
+
+def movedirstate(repo, newctx, match=None):
+    """Move the dirstate to newctx and adjust it as necessary.
+
+    A matcher can be provided as an optimization. It is probably a bug to pass
+    a matcher that doesn't match all the differences between the parent of the
+    working copy and newctx.
+    """
+    oldctx = repo[b'.']
+    ds = repo.dirstate
+    copies = dict(ds.copies())
+    ds.setparents(newctx.node(), repo.nullid)
+    s = newctx.status(oldctx, match=match)
+
+    for f in s.modified:
+        ds.update_file_p1(f, p1_tracked=True)
+
+    for f in s.added:
+        ds.update_file_p1(f, p1_tracked=False)
+
+    for f in s.removed:
+        ds.update_file_p1(f, p1_tracked=True)
+
+    # Merge old parent and old working dir copies
+    oldcopies = copiesmod.pathcopies(newctx, oldctx, match)
+    oldcopies.update(copies)
+    copies = {dst: oldcopies.get(src, src) for dst, src in oldcopies.items()}
+    # Adjust the dirstate copies
+    for dst, src in copies.items():
+        if src not in newctx or dst in newctx or not ds.get_entry(dst).added:
+            src = None
+        ds.copy(src, dst)
+    repo._quick_access_changeid_invalidate()
+
+
+def filterrequirements(requirements):
+    """filters the requirements into two sets:
+
+    wcreq: requirements which should be written in .hg/requires
+    storereq: which should be written in .hg/store/requires
+
+    Returns (wcreq, storereq)
+    """
+    if requirementsmod.SHARESAFE_REQUIREMENT in requirements:
+        wc, store = set(), set()
+        for r in requirements:
+            if r in requirementsmod.WORKING_DIR_REQUIREMENTS:
+                wc.add(r)
+            else:
+                store.add(r)
+        return wc, store
+    return requirements, None
+
+
+def istreemanifest(repo):
+    """returns whether the repository is using treemanifest or not"""
+    return requirementsmod.TREEMANIFEST_REQUIREMENT in repo.requirements
+
+
+def writereporequirements(repo, requirements=None):
+    """writes requirements for the repo
+
+    Requirements are written to .hg/requires and .hg/store/requires based
+    on whether share-safe mode is enabled and which requirements are wdir
+    requirements and which are store requirements
+    """
+    if requirements:
+        repo.requirements = requirements
+    wcreq, storereq = filterrequirements(repo.requirements)
+    if wcreq is not None:
+        writerequires(repo.vfs, wcreq)
+    if storereq is not None:
+        writerequires(repo.svfs, storereq)
+    elif repo.ui.configbool(b'format', b'usestore'):
+        # only remove store requires if we are using store
+        repo.svfs.tryunlink(b'requires')
+
+
+def writerequires(opener, requirements):
+    with opener(b'requires', b'w', atomictemp=True) as fp:
+        for r in sorted(requirements):
+            fp.write(b"%s\n" % r)
+
+
+class filecachesubentry:
+    def __init__(self, path, stat):
+        self.path = path
+        self.cachestat = None
+        self._cacheable = None
+
+        if stat:
+            self.cachestat = filecachesubentry.stat(self.path)
+
+            if self.cachestat:
+                self._cacheable = self.cachestat.cacheable()
+            else:
+                # None means we don't know yet
+                self._cacheable = None
+
+    def refresh(self):
+        if self.cacheable():
+            self.cachestat = filecachesubentry.stat(self.path)
+
+    def cacheable(self):
+        if self._cacheable is not None:
+            return self._cacheable
+
+        # we don't know yet, assume it is for now
+        return True
+
+    def changed(self):
+        # no point in going further if we can't cache it
+        if not self.cacheable():
+            return True
+
+        newstat = filecachesubentry.stat(self.path)
+
+        # we may not know if it's cacheable yet, check again now
+        if newstat and self._cacheable is None:
+            self._cacheable = newstat.cacheable()
+
+            # check again
+            if not self._cacheable:
+                return True
+
+        if self.cachestat != newstat:
+            self.cachestat = newstat
+            return True
+        else:
+            return False
+
+    @staticmethod
+    def stat(path):
+        try:
+            return util.cachestat(path)
+        except FileNotFoundError:
+            pass
+
+
+class filecacheentry:
+    def __init__(self, paths, stat=True):
+        self._entries = []
+        for path in paths:
+            self._entries.append(filecachesubentry(path, stat))
+
+    def changed(self):
+        '''true if any entry has changed'''
+        for entry in self._entries:
+            if entry.changed():
+                return True
+        return False
+
+    def refresh(self):
+        for entry in self._entries:
+            entry.refresh()
+
+
+class filecache:
+    """A property like decorator that tracks files under .hg/ for updates.
+
+    On first access, the files defined as arguments are stat()ed and the
+    results cached. The decorated function is called. The results are stashed
+    away in a ``_filecache`` dict on the object whose method is decorated.
+
+    On subsequent access, the cached result is used as it is set to the
+    instance dictionary.
+
+    On external property set/delete operations, the caller must update the
+    corresponding _filecache entry appropriately. Use __class__.<attr>.set()
+    instead of directly setting <attr>.
+
+    When using the property API, the cached data is always used if available.
+    No stat() is performed to check if the file has changed.
+
+    Others can muck about with the state of the ``_filecache`` dict. e.g. they
+    can populate an entry before the property's getter is called. In this case,
+    entries in ``_filecache`` will be used during property operations,
+    if available. If the underlying file changes, it is up to external callers
+    to reflect this by e.g. calling ``delattr(obj, attr)`` to remove the cached
+    method result as well as possibly calling ``del obj._filecache[attr]`` to
+    remove the ``filecacheentry``.
+    """
+
+    def __init__(self, *paths):
+        self.paths = paths
+
+    def tracked_paths(self, obj):
+        return [self.join(obj, path) for path in self.paths]
+
+    def join(self, obj, fname):
+        """Used to compute the runtime path of a cached file.
+
+        Users should subclass filecache and provide their own version of this
+        function to call the appropriate join function on 'obj' (an instance
+        of the class that its member function was decorated).
+        """
+        raise NotImplementedError
+
+    def __call__(self, func):
+        self.func = func
+        self.sname = func.__name__
+        self.name = pycompat.sysbytes(self.sname)
+        return self
+
+    def __get__(self, obj, type=None):
+        # if accessed on the class, return the descriptor itself.
+        if obj is None:

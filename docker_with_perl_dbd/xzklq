@@ -1,0 +1,1000 @@
+	    $text[-1] =~ s/ ;$/;/;
+	}
+	else {
+	    # my sub foo;
+	    push @text, ";\n";
+	}
+	return $pragmata . join "", @text;
+    }
+
+    my $gv = $cv->GV;
+    $name //= $self->gv_name($gv);
+    if ($is_form) {
+	return $pragmata . $self->keyword("format") . " $name =\n"
+	    . $self->deparse_format($cv). "\n";
+    } else {
+	my $use_dec;
+	if ($name eq "BEGIN") {
+	    $use_dec = $self->begin_is_use($cv);
+	    if (defined ($use_dec) and $self->{'expand'} < 5) {
+		return $pragmata if 0 == length($use_dec);
+
+                #  XXX bit of a hack: Test::More's use_ok() method
+                #  builds a fake use statement which deparses as, e.g.
+                #      use Net::Ping (@{$args[0];});
+                #  As well as being superfluous (the use_ok() is deparsed
+                #  too) and ugly, it fails under use strict and otherwise
+                #  makes use of a lexical var that's not in scope.
+                #  So strip it out.
+                return $pragmata
+                        if $use_dec =~
+                            m/
+                                \A
+                                use \s \S+ \s \(\@\{
+                                (
+                                    \s*\#line\ \d+\ \".*"\s*
+                                )?
+                                \$args\[0\];\}\);
+                                \n
+                                \Z
+                            /x;
+
+		$use_dec =~ s/^(use|no)\b/$self->keyword($1)/e;
+	    }
+	}
+	my $l = '';
+	if ($self->{'linenums'}) {
+	    my $line = $gv->LINE;
+	    my $file = $gv->FILE;
+	    $l = "\n\f#line $line \"$file\"\n";
+	}
+	my $p = '';
+	my $stash;
+	if (class($cv->STASH) ne "SPECIAL") {
+	    $stash = $cv->STASH->NAME;
+	    if ($stash ne $self->{'curstash'}) {
+		$p = $self->keyword("package") . " $stash;\n";
+		$name = "$self->{'curstash'}::$name" unless $name =~ /::/;
+		$self->{'curstash'} = $stash;
+	    }
+	}
+	if ($use_dec) {
+	    return "$pragmata$p$l$use_dec";
+	}
+        if ( $name !~ /::/ and $self->lex_in_scope("&$name")
+                            || $self->lex_in_scope("&$name", 1) )
+        {
+            $name = "$self->{'curstash'}::$name";
+        } elsif (defined $stash) {
+            $name =~ s/^\Q$stash\E::(?!\z|.*::)//;
+        }
+	my $ret = "$pragmata${p}${l}" . $self->keyword("sub") . " $name "
+	      . $self->deparse_sub($cv);
+	$self->{'subs_declared'}{$name} = 1;
+	return $ret;
+    }
+}
+
+
+# Return a "use" declaration for this BEGIN block, if appropriate
+sub begin_is_use {
+    my ($self, $cv) = @_;
+    my $root = $cv->ROOT;
+    local @$self{qw'curcv curcvlex'} = ($cv);
+    local $B::overlay = {};
+    $self->pessimise($root, $cv->START);
+#require B::Debug;
+#B::walkoptree($cv->ROOT, "debug");
+    my $lineseq = $root->first;
+    return if $lineseq->name ne "lineseq";
+
+    my $req_op = $lineseq->first->sibling;
+    return if $req_op->name ne "require";
+
+    # maybe it's C<require expr> rather than C<require 'foo'>
+    return if ($req_op->first->name ne 'const');
+
+    my $module;
+    if ($req_op->first->private & OPpCONST_BARE) {
+	# Actually it should always be a bareword
+	$module = $self->const_sv($req_op->first)->PV;
+	$module =~ s[/][::]g;
+	$module =~ s/.pm$//;
+    }
+    else {
+	$module = $self->const($self->const_sv($req_op->first), 6);
+    }
+
+    my $version;
+    my $version_op = $req_op->sibling;
+    return if class($version_op) eq "NULL";
+    if ($version_op->name eq "lineseq") {
+	# We have a version parameter; skip nextstate & pushmark
+	my $constop = $version_op->first->next->next;
+
+	return unless $self->const_sv($constop)->PV eq $module;
+	$constop = $constop->sibling;
+	$version = $self->const_sv($constop);
+	if (class($version) eq "IV") {
+	    $version = $version->int_value;
+	} elsif (class($version) eq "NV") {
+	    $version = $version->NV;
+	} elsif (class($version) ne "PVMG") {
+	    # Includes PVIV and PVNV
+	    $version = $version->PV;
+	} else {
+	    # version specified as a v-string
+	    $version = 'v'.join '.', map ord, split //, $version->PV;
+	}
+	$constop = $constop->sibling;
+	return if $constop->name ne "method_named";
+	return if $self->meth_sv($constop)->PV ne "VERSION";
+    }
+
+    $lineseq = $version_op->sibling;
+    return if $lineseq->name ne "lineseq";
+    my $entersub = $lineseq->first->sibling;
+    if ($entersub->name eq "stub") {
+	return "use $module $version ();\n" if defined $version;
+	return "use $module ();\n";
+    }
+    return if $entersub->name ne "entersub";
+
+    # See if there are import arguments
+    my $args = '';
+
+    my $svop = $entersub->first->sibling; # Skip over pushmark
+    return unless $self->const_sv($svop)->PV eq $module;
+
+    # Pull out the arguments
+    for ($svop=$svop->sibling; index($svop->name, "method_") != 0;
+		$svop = $svop->sibling) {
+	$args .= ", " if length($args);
+	$args .= $self->deparse($svop, 6);
+    }
+
+    my $use = 'use';
+    my $method_named = $svop;
+    return if $method_named->name ne "method_named";
+    my $method_name = $self->meth_sv($method_named)->PV;
+
+    if ($method_name eq "unimport") {
+	$use = 'no';
+    }
+
+    # Certain pragmas are dealt with using hint bits,
+    # so we ignore them here
+    if ($module eq 'strict' || $module eq 'integer'
+	|| $module eq 'bytes' || $module eq 'warnings'
+	|| $module eq 'feature') {
+	return "";
+    }
+
+    if (defined $version && length $args) {
+	return "$use $module $version ($args);\n";
+    } elsif (defined $version) {
+	return "$use $module $version;\n";
+    } elsif (length $args) {
+	return "$use $module ($args);\n";
+    } else {
+	return "$use $module;\n";
+    }
+}
+
+sub stash_subs {
+    my ($self, $pack, $seen) = @_;
+    my (@ret, $stash);
+    if (!defined $pack) {
+	$pack = '';
+	$stash = \%::;
+    }
+    else {
+	$pack =~ s/(::)?$/::/;
+	no strict 'refs';
+	$stash = \%{"main::$pack"};
+    }
+    return
+	if ($seen ||= {})->{
+	    $INC{"overload.pm"} ? overload::StrVal($stash) : $stash
+	   }++;
+    my $stashobj = svref_2object($stash);
+    my %stash = $stashobj->ARRAY;
+    while (my ($key, $val) = each %stash) {
+	my $flags = $val->FLAGS;
+	if ($flags & SVf_ROK) {
+	    # A reference.  Dump this if it is a reference to a CV.  If it
+	    # is a constant acting as a proxy for a full subroutine, then
+	    # we may or may not have to dump it.  If some form of perl-
+	    # space visible code must have created it, be it a use
+	    # statement, or some direct symbol-table manipulation code that
+	    # we will deparse, then we don’t want to dump it.  If it is the
+	    # result of a declaration like sub f () { 42 } then we *do*
+	    # want to dump it.  The only way to distinguish these seems
+	    # to be the SVs_PADTMP flag on the constant, which is admit-
+	    # tedly a hack.
+	    my $class = class(my $referent = $val->RV);
+	    if ($class eq "CV") {
+		$self->todo($referent, 0);
+	    } elsif (
+		$class !~ /^(AV|HV|CV|FM|IO|SPECIAL)\z/
+		# A more robust way to write that would be this, but B does
+		# not provide the SVt_ constants:
+		# ($referent->FLAGS & B::SVTYPEMASK) < B::SVt_PVAV
+		and $referent->FLAGS & SVs_PADTMP
+	    ) {
+		push @{$self->{'protos_todo'}}, [$pack . $key, $val];
+	    }
+	} elsif ($flags & (SVf_POK|SVf_IOK)) {
+	    # Just a prototype. As an ugly but fairly effective way
+	    # to find out if it belongs here is to see if the AUTOLOAD
+	    # (if any) for the stash was defined in one of our files.
+	    my $A = $stash{"AUTOLOAD"};
+	    if (defined ($A) && class($A) eq "GV" && defined($A->CV)
+		&& class($A->CV) eq "CV") {
+		my $AF = $A->FILE;
+		next unless $AF eq $0 || exists $self->{'files'}{$AF};
+	    }
+	    push @{$self->{'protos_todo'}},
+		 [$pack . $key, $flags & SVf_POK ? $val->PV: undef];
+	} elsif (class($val) eq "GV") {
+	    if (class(my $cv = $val->CV) ne "SPECIAL") {
+		next if $self->{'subs_done'}{$$val}++;
+
+                # Ignore imposters (aliases etc)
+                my $name = $cv->NAME_HEK;
+                if(defined $name) {
+                    # avoid using $cv->GV here because if the $val GV is
+                    # an alias, CvGV() could upgrade the real stash entry
+                    # from an RV to a GV
+                    next unless $name eq $key;
+                    next unless $$stashobj == ${$cv->STASH};
+                }
+                else {
+                   next if $$val != ${$cv->GV};
+                }
+
+		$self->todo($cv, 0);
+	    }
+	    if (class(my $cv = $val->FORM) ne "SPECIAL") {
+		next if $self->{'forms_done'}{$$val}++;
+		next if $$val != ${$cv->GV};   # Ignore imposters
+		$self->todo($cv, 1);
+	    }
+	    if (class($val->HV) ne "SPECIAL" && $key =~ /::$/) {
+		$self->stash_subs($pack . $key, $seen);
+	    }
+	}
+    }
+}
+
+sub print_protos {
+    my $self = shift;
+    my $ar;
+    my @ret;
+    foreach $ar (@{$self->{'protos_todo'}}) {
+	if (ref $ar->[1]) {
+	    # Only print a constant if it occurs in the same package as a
+	    # dumped sub.  This is not perfect, but a heuristic that will
+	    # hopefully work most of the time.  Ideally we would use
+	    # CvFILE, but a constant stub has no CvFILE.
+	    my $pack = ($ar->[0] =~ /(.*)::/)[0];
+	    next if $pack and !$self->{packs}{$pack}
+	}
+	my $body = defined $ar->[1]
+		? ref $ar->[1]
+		    ? " () {\n    " . $self->const($ar->[1]->RV,0) . ";\n}"
+		    : " (". $ar->[1] . ");"
+		: ";";
+	push @ret, "sub " . $ar->[0] .  "$body\n";
+    }
+    delete $self->{'protos_todo'};
+    return @ret;
+}
+
+sub style_opts {
+    my $self = shift;
+    my $opts = shift;
+    my $opt;
+    while (length($opt = substr($opts, 0, 1))) {
+	if ($opt eq "C") {
+	    $self->{'cuddle'} = " ";
+	    $opts = substr($opts, 1);
+	} elsif ($opt eq "i") {
+	    $opts =~ s/^i(\d+)//;
+	    $self->{'indent_size'} = $1;
+	} elsif ($opt eq "T") {
+	    $self->{'use_tabs'} = 1;
+	    $opts = substr($opts, 1);
+	} elsif ($opt eq "v") {
+	    $opts =~ s/^v([^.]*)(.|$)//;
+	    $self->{'ex_const'} = $1;
+	}
+    }
+}
+
+sub new {
+    my $class = shift;
+    my $self = bless {}, $class;
+    $self->{'cuddle'} = "\n";
+    $self->{'curcop'} = undef;
+    $self->{'curstash'} = "main";
+    $self->{'ex_const'} = "'???'";
+    $self->{'expand'} = 0;
+    $self->{'files'} = {};
+    $self->{'packs'} = {};
+    $self->{'indent_size'} = 4;
+    $self->{'linenums'} = 0;
+    $self->{'parens'} = 0;
+    $self->{'subs_todo'} = [];
+    $self->{'unquote'} = 0;
+    $self->{'use_dumper'} = 0;
+    $self->{'use_tabs'} = 0;
+
+    $self->{'ambient_warnings'} = undef; # Assume no lexical warnings
+    $self->{'ambient_hints'} = 0;
+    $self->{'ambient_hinthash'} = undef;
+    $self->init();
+
+    while (my $arg = shift @_) {
+	if ($arg eq "-d") {
+	    $self->{'use_dumper'} = 1;
+	    require Data::Dumper;
+	} elsif ($arg =~ /^-f(.*)/) {
+	    $self->{'files'}{$1} = 1;
+	} elsif ($arg eq "-l") {
+	    $self->{'linenums'} = 1;
+	} elsif ($arg eq "-p") {
+	    $self->{'parens'} = 1;
+	} elsif ($arg eq "-P") {
+	    $self->{'noproto'} = 1;
+	} elsif ($arg eq "-q") {
+	    $self->{'unquote'} = 1;
+	} elsif (substr($arg, 0, 2) eq "-s") {
+	    $self->style_opts(substr $arg, 2);
+	} elsif ($arg =~ /^-x(\d)$/) {
+	    $self->{'expand'} = $1;
+	}
+    }
+    return $self;
+}
+
+
+# Initialise the contextual information, either from
+# defaults provided with the ambient_pragmas method,
+# or from perl's own defaults otherwise.
+sub init {
+    my $self = shift;
+
+    $self->{'warnings'} = $self->{'ambient_warnings'};
+    $self->{'hints'}    = $self->{'ambient_hints'};
+    $self->{'hinthash'} = $self->{'ambient_hinthash'};
+
+    # also a convenient place to clear out subs_declared
+    delete $self->{'subs_declared'};
+}
+
+sub compile {
+    my(@args) = @_;
+    return sub {
+	my $self = B::Deparse->new(@args);
+	# First deparse command-line args
+	if (defined $^I) { # deparse -i
+	    print q(BEGIN { $^I = ).perlstring($^I).qq(; }\n);
+	}
+	if ($^W) { # deparse -w
+	    print qq(BEGIN { \$^W = $^W; }\n);
+	}
+	if ($/ ne "\n" or defined $O::savebackslash) { # deparse -l and -0
+	    my $fs = perlstring($/) || 'undef';
+	    my $bs = perlstring($O::savebackslash) || 'undef';
+	    print qq(BEGIN { \$/ = $fs; \$\\ = $bs; }\n);
+	}
+	my @BEGINs  = B::begin_av->isa("B::AV") ? B::begin_av->ARRAY : ();
+	my @UNITCHECKs = B::unitcheck_av->isa("B::AV")
+	    ? B::unitcheck_av->ARRAY
+	    : ();
+	my @CHECKs  = B::check_av->isa("B::AV") ? B::check_av->ARRAY : ();
+	my @INITs   = B::init_av->isa("B::AV") ? B::init_av->ARRAY : ();
+	my @ENDs    = B::end_av->isa("B::AV") ? B::end_av->ARRAY : ();
+	my @names = qw(BEGIN UNITCHECK CHECK INIT END);
+	my @blocks = \(@BEGINs, @UNITCHECKs, @CHECKs, @INITs, @ENDs);
+	while (@names) {
+	    my ($name, $blocks) = (shift @names, shift @blocks);
+	    for my $block (@$blocks) {
+		$self->todo($block, 0, $name);
+	    }
+	}
+	$self->stash_subs();
+	local($SIG{"__DIE__"}) =
+	  sub {
+	      if ($self->{'curcop'}) {
+		  my $cop = $self->{'curcop'};
+		  my($line, $file) = ($cop->line, $cop->file);
+		  print STDERR "While deparsing $file near line $line,\n";
+	      }
+	    };
+	$self->{'curcv'} = main_cv;
+	$self->{'curcvlex'} = undef;
+	print $self->print_protos;
+	@{$self->{'subs_todo'}} =
+	  sort {$a->[0] <=> $b->[0]} @{$self->{'subs_todo'}};
+	my $root = main_root;
+	local $B::overlay = {};
+	unless (null $root) {
+	    $self->pad_subs($self->{'curcv'});
+	    # Check for a stub-followed-by-ex-cop, resulting from a program
+	    # consisting solely of sub declarations.  For backward-compati-
+	    # bility (and sane output) we don’t want to emit the stub.
+	    #   leave
+	    #     enter
+	    #     stub
+	    #     ex-nextstate (or ex-dbstate)
+	    my $kid;
+	    if ( $root->name eq 'leave'
+	     and ($kid = $root->first)->name eq 'enter'
+	     and !null($kid = $kid->sibling) and $kid->name eq 'stub'
+	     and !null($kid = $kid->sibling) and $kid->name eq 'null'
+	     and class($kid) eq 'COP' and null $kid->sibling )
+	    {
+		# ignore
+	    } else {
+		$self->pessimise($root, main_start);
+		print $self->indent($self->deparse_root($root)), "\n";
+	    }
+	}
+	my @text;
+	while (scalar(@{$self->{'subs_todo'}})) {
+	    push @text, $self->next_todo;
+	}
+	print $self->indent(join("", @text)), "\n" if @text;
+
+	# Print __DATA__ section, if necessary
+	no strict 'refs';
+	my $laststash = defined $self->{'curcop'}
+	    ? $self->{'curcop'}->stash->NAME : $self->{'curstash'};
+	if (defined *{$laststash."::DATA"}{IO}) {
+	    print $self->keyword("package") . " $laststash;\n"
+		unless $laststash eq $self->{'curstash'};
+	    print $self->keyword("__DATA__") . "\n";
+	    print readline(*{$laststash."::DATA"});
+	}
+    }
+}
+
+sub coderef2text {
+    my $self = shift;
+    my $sub = shift;
+    croak "Usage: ->coderef2text(CODEREF)" unless UNIVERSAL::isa($sub, "CODE");
+
+    $self->init();
+    local $self->{in_coderef2text} = 1;
+    return $self->indent($self->deparse_sub(svref_2object($sub)));
+}
+
+my %strict_bits = do {
+    local $^H;
+    map +($_ => strict::bits($_)), qw/refs subs vars/
+};
+
+sub ambient_pragmas {
+    my $self = shift;
+    my ($hint_bits, $warning_bits, $hinthash) = (0);
+
+    while (@_ > 1) {
+	my $name = shift();
+	my $val  = shift();
+
+	if ($name eq 'strict') {
+	    require strict;
+
+	    if ($val eq 'none') {
+		$hint_bits &= $strict_bits{$_} for qw/refs subs vars/;
+		next();
+	    }
+
+	    my @names;
+	    if ($val eq "all") {
+		@names = qw/refs subs vars/;
+	    }
+	    elsif (ref $val) {
+		@names = @$val;
+	    }
+	    else {
+		@names = split' ', $val;
+	    }
+	    $hint_bits |= $strict_bits{$_} for @names;
+	}
+
+	elsif ($name eq 'integer'
+	    || $name eq 'bytes'
+	    || $name eq 'utf8') {
+	    require "$name.pm";
+	    if ($val) {
+		$hint_bits |= ${$::{"${name}::"}{"hint_bits"}};
+	    }
+	    else {
+		$hint_bits &= ~${$::{"${name}::"}{"hint_bits"}};
+	    }
+	}
+
+	elsif ($name eq 're') {
+	    require re;
+	    if ($val eq 'none') {
+		$hint_bits &= ~re::bits(qw/taint eval/);
+		next();
+	    }
+
+	    my @names;
+	    if ($val eq 'all') {
+		@names = qw/taint eval/;
+	    }
+	    elsif (ref $val) {
+		@names = @$val;
+	    }
+	    else {
+		@names = split' ',$val;
+	    }
+	    $hint_bits |= re::bits(@names);
+	}
+
+	elsif ($name eq 'warnings') {
+	    if ($val eq 'none') {
+		$warning_bits = $warnings::NONE;
+		next();
+	    }
+
+	    my @names;
+	    if (ref $val) {
+		@names = @$val;
+	    }
+	    else {
+		@names = split/\s+/, $val;
+	    }
+
+	    $warning_bits = $warnings::NONE if !defined ($warning_bits);
+	    $warning_bits |= warnings::bits(@names);
+	}
+
+	elsif ($name eq 'warning_bits') {
+	    $warning_bits = $val;
+	}
+
+	elsif ($name eq 'hint_bits') {
+	    $hint_bits = $val;
+	}
+
+	elsif ($name eq '%^H') {
+	    $hinthash = $val;
+	}
+
+	else {
+	    croak "Unknown pragma type: $name";
+	}
+    }
+    if (@_) {
+	croak "The ambient_pragmas method expects an even number of args";
+    }
+
+    $self->{'ambient_warnings'} = $warning_bits;
+    $self->{'ambient_hints'} = $hint_bits;
+    $self->{'ambient_hinthash'} = $hinthash;
+}
+
+# This method is the inner loop, so try to keep it simple
+sub deparse {
+    my $self = shift;
+    my($op, $cx) = @_;
+
+    Carp::confess("Null op in deparse") if !defined($op)
+					|| class($op) eq "NULL";
+    my $meth = "pp_" . $op->name;
+    return $self->$meth($op, $cx);
+}
+
+sub indent {
+    my $self = shift;
+    my $txt = shift;
+    # \cK also swallows a preceding line break when followed by a
+    # semicolon.
+    $txt =~ s/\n\cK;//g;
+    my @lines = split(/\n/, $txt);
+    my $leader = "";
+    my $level = 0;
+    my $line;
+    for $line (@lines) {
+	my $cmd = substr($line, 0, 1);
+	if ($cmd eq "\t" or $cmd eq "\b") {
+	    $level += ($cmd eq "\t" ? 1 : -1) * $self->{'indent_size'};
+	    if ($self->{'use_tabs'}) {
+		$leader = "\t" x ($level / 8) . " " x ($level % 8);
+	    } else {
+		$leader = " " x $level;
+	    }
+	    $line = substr($line, 1);
+	}
+	if (index($line, "\f") > 0) {
+		$line =~ s/\f/\n/;
+	}
+	if (substr($line, 0, 1) eq "\f") {
+	    $line = substr($line, 1); # no indent
+	} else {
+	    $line = $leader . $line;
+	}
+	$line =~ s/\cK;?//g;
+    }
+    return join("\n", @lines);
+}
+
+sub pad_subs {
+    my ($self, $cv) = @_;
+    my $padlist = $cv->PADLIST;
+    my @names = $padlist->ARRAYelt(0)->ARRAY;
+    my @values = $padlist->ARRAYelt(1)->ARRAY;
+    my @todo;
+  PADENTRY:
+    for my $ix (0.. $#names) { for $_ ($names[$ix]) {
+	next if class($_) eq "SPECIAL";
+	my $name = $_->PVX;
+	if (defined $name && $name =~ /^&./) {
+	    my $low = $_->COP_SEQ_RANGE_LOW;
+	    my $flags = $_->FLAGS;
+	    my $outer = $flags & PADNAMEf_OUTER;
+	    if ($flags & PADNAMEf_OUR) {
+		push @todo, [$low, undef, 0, $_]
+		          # [seq, no cv, not format, padname]
+		    unless $outer;
+		next;
+	    }
+	    my $protocv = $flags & SVpad_STATE
+		? $values[$ix]
+		: $_->PROTOCV;
+	    if (class ($protocv) ne 'CV') {
+		my $flags = $flags;
+		my $cv = $cv;
+		my $name = $_;
+		while ($flags & PADNAMEf_OUTER && class ($protocv) ne 'CV')
+		{
+		    $cv = $cv->OUTSIDE;
+		    next PADENTRY if class($cv) eq 'SPECIAL'; # XXX freed?
+		    my $padlist = $cv->PADLIST;
+		    my $ix = $name->PARENT_PAD_INDEX;
+		    $name = $padlist->NAMES->ARRAYelt($ix);
+		    $flags = $name->FLAGS;
+		    $protocv = $flags & SVpad_STATE
+			? $padlist->ARRAYelt(1)->ARRAYelt($ix)
+			: $name->PROTOCV;
+		}
+	    }
+	    my $defined_in_this_sub = ${$protocv->OUTSIDE} == $$cv || do {
+		my $other = $protocv->PADLIST;
+		$$other && $other->outid == $padlist->id;
+	    };
+	    if ($flags & PADNAMEf_OUTER) {
+		next unless $defined_in_this_sub;
+		push @todo, [$protocv->OUTSIDE_SEQ, $protocv, 0, $_];
+		next;
+	    }
+	    my $outseq = $protocv->OUTSIDE_SEQ;
+	    if ($outseq <= $low) {
+		# defined before its name is visible, so it’s gotta be
+		# declared and defined at once: my sub foo { ... }
+		push @todo, [$low, $protocv, 0, $_];
+	    }
+	    else {
+		# declared and defined separately: my sub f; sub f { ... }
+		push @todo, [$low, undef, 0, $_];
+		push @todo, [$outseq, $protocv, 0, $_]
+		    if $defined_in_this_sub;
+	    }
+	}
+    }}
+    @{$self->{'subs_todo'}} =
+	sort {$a->[0] <=> $b->[0]} @{$self->{'subs_todo'}}, @todo
+}
+
+
+# deparse_argops(): deparse, if possible, a sequence of argcheck + argelem
+# ops into a subroutine signature. If successful, return the first op
+# following the signature ops plus the signature string; else return the
+# empty list.
+#
+# Normally a bunch of argelem ops will have been generated by the
+# signature parsing, but it's possible that ops have been added manually
+# or altered. In this case we return "()" and fall back to general
+# deparsing of the individual sigelems as 'my $x = $_[N]' etc.
+#
+# We're only called if the top is an ex-argcheck, which is a placeholder
+# indicating a signature subtree.
+#
+# Return a signature string, or an empty list if no deparseable as a
+# signature
+
+sub deparse_argops {
+    my ($self, $topop, $cv) = @_;
+
+    my @sig;
+
+
+    $topop = $topop->first;
+    return unless $$topop and $topop->name eq 'lineseq';
+
+
+    # last op should be nextstate
+    my $last = $topop->last;
+    return unless $$last
+                    and (   _op_is_or_was($last, OP_NEXTSTATE)
+                         or _op_is_or_was($last, OP_DBSTATE));
+
+    # first OP_NEXTSTATE
+
+    my $o = $topop->first;
+    return unless $$o;
+    return if $o->label;
+
+    # OP_ARGCHECK
+
+    $o = $o->sibling;
+    return unless $$o and $o->name eq 'argcheck';
+
+    my ($params, $opt_params, $slurpy) = $o->aux_list($cv);
+    my $mandatory = $params - $opt_params;
+    my $seen_slurpy = 0;
+    my $last_ix = -1;
+
+    # keep looking for valid nextstate + argelem pairs, terminated
+    # by a final nextstate
+
+    while (1) {
+        $o = $o->sibling;
+        return unless $$o;
+
+        # skip trailing nextstate
+        last if $$o == $$last;
+
+        # OP_NEXTSTATE
+        return unless $o->name =~ /^(next|db)state$/;
+        return if $o->label;
+
+        # OP_ARGELEM
+        $o = $o->sibling;
+        last unless $$o;
+
+        if ($o->name eq 'argelem') {
+            my $ix  = $o->string($cv);
+            while (++$last_ix < $ix) {
+                push @sig, $last_ix <  $mandatory ? '$' : '$=';
+            }
+            my $var = $self->padname($o->targ);
+            if ($var =~ /^[@%]/) {
+                return if $seen_slurpy;
+                $seen_slurpy = 1;
+                return if $ix != $params or !$slurpy
+                            or substr($var,0,1) ne $slurpy;
+            }
+            else {
+                return if $ix >= $params;
+            }
+            if ($o->flags & OPf_KIDS) {
+                my $kid = $o->first;
+                return unless $$kid and $kid->name eq 'argdefelem';
+                my $def = $self->deparse($kid->first, 7);
+                $def = "($def)" if $kid->first->flags & OPf_PARENS;
+                my $assign = "=";
+                $assign = "//=" if $kid->private & OPpARG_IF_UNDEF;
+                $assign = "||=" if $kid->private & OPpARG_IF_FALSE;
+                $var .= " $assign $def";
+            }
+            push @sig, $var;
+        }
+        elsif ($o->name eq 'null'
+               and ($o->flags & OPf_KIDS)
+               and $o->first->name eq 'argdefelem')
+        {
+            # special case - a void context default expression: $ = expr
+
+            my $defop = $o->first;
+            my $ix = $defop->targ;
+            while (++$last_ix < $ix) {
+                push @sig, $last_ix <  $mandatory ? '$' : '$=';
+            }
+            return if $last_ix >= $params
+                    or $last_ix < $mandatory;
+            my $def = $self->deparse($defop->first, 7);
+            $def = "($def)" if $defop->first->flags & OPf_PARENS;
+            push @sig, '$ = ' . $def;
+        }
+        else {
+            return;
+        }
+
+    }
+
+    while (++$last_ix < $params) {
+        push @sig, $last_ix <  $mandatory ? '$' : '$=';
+    }
+    push @sig, $slurpy if $slurpy and !$seen_slurpy;
+
+    return (join(', ', @sig));
+}
+
+
+# Deparse a sub. Returns everything except the 'sub foo',
+# e.g.  ($$) : method { ...; }
+# or    : prototype($$) lvalue ($a, $b) { ...; };
+
+sub deparse_sub {
+    my $self = shift;
+    my $cv = shift;
+    my @attrs;
+    my $proto;
+    my $sig;
+
+Carp::confess("NULL in deparse_sub") if !defined($cv) || $cv->isa("B::NULL");
+Carp::confess("SPECIAL in deparse_sub") if $cv->isa("B::SPECIAL");
+    local $self->{'curcop'} = $self->{'curcop'};
+
+    my $has_sig = $self->feature_enabled('signatures');
+    if ($cv->FLAGS & SVf_POK) {
+	my $myproto = $cv->PV;
+	if ($has_sig) {
+            push @attrs, "prototype($myproto)";
+        }
+        else {
+            $proto = $myproto;
+        }
+    }
+    if ($cv->CvFLAGS & (CVf_NOWARN_AMBIGUOUS|CVf_LOCKED|CVf_LVALUE|CVf_ANONCONST)) {
+        push @attrs, "lvalue" if $cv->CvFLAGS & CVf_LVALUE;
+        push @attrs, "method" if $cv->CvFLAGS & CVf_NOWARN_AMBIGUOUS;
+        push @attrs, "const"  if $cv->CvFLAGS & CVf_ANONCONST;
+    }
+
+    local($self->{'curcv'}) = $cv;
+    local($self->{'curcvlex'});
+    local(@$self{qw'curstash warnings hints hinthash'})
+		= @$self{qw'curstash warnings hints hinthash'};
+    my $body;
+    my $root = $cv->ROOT;
+    local $B::overlay = {};
+    if (not null $root) {
+	$self->pad_subs($cv);
+	$self->pessimise($root, $cv->START);
+	my $lineseq = $root->first;
+
+        # stub sub may have single op rather than list of ops
+        my $is_list = ($lineseq->name eq "lineseq");
+        my $firstop = $is_list ? $lineseq->first : $lineseq;
+
+        # Try to deparse first subtree as a signature if possible.
+        # Top of signature subtree has an ex-argcheck as a placeholder
+        if (    $has_sig
+            and $$firstop
+            and $firstop->name eq 'null'
+            and $firstop->targ == OP_ARGCHECK
+        ) {
+            my ($mysig) = $self->deparse_argops($firstop, $cv);
+            if (defined $mysig) {
+                $sig = $mysig;
+                $firstop = $is_list ? $firstop->sibling : undef;
+            }
+        }
+
+        if ($is_list && $firstop) {
+            my @ops;
+	    for (my $o = $firstop; $$o; $o=$o->sibling) {
+		push @ops, $o;
+	    }
+	    $body = $self->lineseq(undef, 0, @ops).";";
+            if (!$has_sig and $ops[-1]->name =~ /^(next|db)state$/) {
+                # this handles void context in
+                #   use feature signatures; sub ($=1) {}
+                $body .= "\n()";
+            }
+	    my $scope_en = $self->find_scope_en($lineseq);
+	    if (defined $scope_en) {
+		my $subs = join"", $self->seq_subs($scope_en);
+		$body .= ";\n$subs" if length($subs);
+	    }
+	}
+	elsif ($firstop) {
+	    $body = $self->deparse($root->first, 0);
+	}
+        else {
+            $body = ';'; # stub sub
+        }
+
+        my $l = '';
+        if ($self->{'linenums'}) {
+            # a glob's gp_line is set from the line containing a
+            # sub's closing '}' if the CV is the first use of the GV.
+            # So make sure the linenum is set correctly for '}'
+            my $gv = $cv->GV;
+            my $line = $gv->LINE;
+            my $file = $gv->FILE;
+            $l = "\f#line $line \"$file\"\n";
+        }
+        $body = "{\n\t$body\n$l\b}";
+    }
+    else {
+	my $sv = $cv->const_sv;
+	if ($$sv) {
+	    # uh-oh. inlinable sub... format it differently
+	    $body = "{ " . $self->const($sv, 0) . " }\n";
+	} else { # XSUB? (or just a declaration)
+	    $body = ';'
+	}
+    }
+    $proto = defined $proto ? "($proto) " : "";
+    $sig   = defined $sig   ? "($sig) "   : "";
+    my $attrs = '';
+    $attrs = ': ' . join('', map "$_ ", @attrs) if @attrs;
+    return "$proto$attrs$sig$body\n";
+}
+
+sub deparse_format {
+    my $self = shift;
+    my $form = shift;
+    my @text;
+    local($self->{'curcv'}) = $form;
+    local($self->{'curcvlex'});
+    local($self->{'in_format'}) = 1;
+    local(@$self{qw'curstash warnings hints hinthash'})
+		= @$self{qw'curstash warnings hints hinthash'};
+    my $op = $form->ROOT;
+    local $B::overlay = {};
+    $self->pessimise($op, $form->START);
+    my $kid;
+    return "\f." if $op->first->name eq 'stub'
+                || $op->first->name eq 'nextstate';
+    $op = $op->first->first; # skip leavewrite, lineseq
+    while (not null $op) {
+	$op = $op->sibling; # skip nextstate
+	my @exprs;
+	$kid = $op->first->sibling; # skip pushmark
+	push @text, "\f".$self->const_sv($kid)->PV;
+	$kid = $kid->sibling;
+	for (; not null $kid; $kid = $kid->sibling) {
+	    push @exprs, $self->deparse($kid, -1);
+	    $exprs[-1] =~ s/;\z//;
+	}
+	push @text, "\f".join(", ", @exprs)."\n" if @exprs;
+	$op = $op->sibling;
+    }
+    return join("", @text) . "\f.";
+}
+
+sub is_scope {
+    my $op = shift;
+    return $op->name eq "leave" || $op->name eq "scope"
+      || $op->name eq "lineseq"
+	|| ($op->name eq "null" && class($op) eq "UNOP"
+	    && (is_scope($op->first) || $op->first->name eq "enter"));
+}
+
+sub is_state {
+    my $name = $_[0]->name;
+    return $name eq "nextstate" || $name eq "dbstate" || $name eq "setstate";
+}
+
+sub is_miniwhile { # check for one-line loop ('foo() while $y--')
+    my $op = shift;
+    return (!null($op) and null($op->sibling)
+	    and $op->name eq "null" and class($op) eq "UNOP"
+	    and (($op->first->name =~ /^(and|or)$/
+		  and $op->first->first->sibling->name eq "lineseq")
+		 or ($op->first->name eq "lineseq"
+		     and not null $op->first->first->sibling
+		     and $op->first->first->sibling->name eq "unstack")
+		 ));
+}
+
+# Check if the op and its sibling are the initialization and the rest of a
+# for (..;..;..) { ... } loop
+sub is_for_loop {
+    my $op = shift;
+    # This OP might be almost anything, though it won't be a
+    # nextstate. (It's the initialization, so in the canonical case it
+    # will be an sassign.) The sibling is (old style) a lineseq whose
+    # first child is a nextstate and whose second is a leaveloop, or
+    # (new style) an unstack whose sibling is a leaveloop.
+    my $lseq = $op->sibling;

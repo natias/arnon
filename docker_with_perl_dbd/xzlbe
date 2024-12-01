@@ -1,0 +1,1000 @@
+        @typeahead = ( @$pretype, @typeahead );
+
+=head2 WHERE ARE WE?
+
+XXX Relocate this section?
+
+The debugger normally shows the line corresponding to the current line of
+execution. Sometimes, though, we want to see the next line, or to move elsewhere
+in the file. This is done via the C<$incr>, C<$start>, and C<$max> variables.
+
+C<$incr> controls by how many lines the I<current> line should move forward
+after a command is executed. If set to -1, this indicates that the I<current>
+line shouldn't change.
+
+C<$start> is the I<current> line. It is used for things like knowing where to
+move forwards or backwards from when doing an C<L> or C<-> command.
+
+C<$max> tells the debugger where the last line of the current file is. It's
+used to terminate loops most often.
+
+=head2 THE COMMAND LOOP
+
+Most of C<DB::DB> is actually a command parsing and dispatch loop. It comes
+in two parts:
+
+=over 4
+
+=item *
+
+The outer part of the loop, starting at the C<CMD> label. This loop
+reads a command and then executes it.
+
+=item *
+
+The inner part of the loop, starting at the C<PIPE> label. This part
+is wholly contained inside the C<CMD> block and only executes a command.
+Used to handle commands running inside a pager.
+
+=back
+
+So why have two labels to restart the loop? Because sometimes, it's easier to
+have a command I<generate> another command and then re-execute the loop to do
+the new command. This is faster, but perhaps a bit more convoluted.
+
+=cut
+
+        # The big command dispatch loop. It keeps running until the
+        # user yields up control again.
+        #
+        # If we have a terminal for input, and we get something back
+        # from readline(), keep on processing.
+
+      CMD:
+        while (_DB__read_next_cmd($tid))
+        {
+
+            share($cmd);
+            # ... try to execute the input as debugger commands.
+
+            # Don't stop running.
+            $single = 0;
+
+            # No signal is active.
+            $signal = 0;
+
+            # Handle continued commands (ending with \):
+            if ($cmd =~ s/\\\z/\n/) {
+                $cmd .= DB::readline("  cont: ");
+                redo CMD;
+            }
+
+=head4 The null command
+
+A newline entered by itself means I<re-execute the last command>. We grab the
+command out of C<$laststep> (where it was recorded previously), and copy it
+back into C<$cmd> to be executed below. If there wasn't any previous command,
+we'll do nothing below (no command will match). If there was, we also save it
+in the command history and fall through to allow the command parsing to pick
+it up.
+
+=cut
+
+            # Empty input means repeat the last command.
+            if ($cmd eq '') {
+                $cmd = $laststep;
+            }
+            chomp($cmd);    # get rid of the annoying extra newline
+            if (length($cmd) >= option_val('HistItemMinLength', 2)) {
+                push( @hist, $cmd );
+            }
+            push( @truehist, $cmd );
+            share(@hist);
+            share(@truehist);
+
+            # This is a restart point for commands that didn't arrive
+            # via direct user input. It allows us to 'redo PIPE' to
+            # re-execute command processing without reading a new command.
+          PIPE: {
+                _DB__trim_command_and_return_first_component($obj);
+
+=head3 COMMAND ALIASES
+
+The debugger can create aliases for commands (these are stored in the
+C<%alias> hash). Before a command is executed, the command loop looks it up
+in the alias hash and substitutes the contents of the alias for the command,
+completely replacing it.
+
+=cut
+
+                # See if there's an alias for the command, and set it up if so.
+                if ( $alias{$cmd_verb} ) {
+
+                    # Squelch signal handling; we want to keep control here
+                    # if something goes loco during the alias eval.
+                    local $SIG{__DIE__};
+                    local $SIG{__WARN__};
+
+                    # This is a command, so we eval it in the DEBUGGER's
+                    # scope! Otherwise, we can't see the special debugger
+                    # variables, or get to the debugger's subs. (Well, we
+                    # _could_, but why make it even more complicated?)
+                    eval "\$cmd =~ $alias{$cmd_verb}";
+                    if ($@) {
+                        local $\ = '';
+                        print $OUT "Couldn't evaluate '$cmd_verb' alias: $@";
+                        next CMD;
+                    }
+                    _DB__trim_command_and_return_first_component($obj);
+                } ## end if ($alias{$cmd_verb})
+
+=head3 MAIN-LINE COMMANDS
+
+All of these commands work up to and after the program being debugged has
+terminated.
+
+=head4 C<q> - quit
+
+Quit the debugger. This entails setting the C<$fall_off_end> flag, so we don't
+try to execute further, cleaning any restart-related stuff out of the
+environment, and executing with the last value of C<$?>.
+
+=cut
+
+                # All of these commands were remapped in perl 5.8.0;
+                # we send them off to the secondary dispatcher (see below).
+                $obj->_handle_special_char_cmd_wrapper_commands;
+                _DB__trim_command_and_return_first_component($obj);
+
+                if (my $cmd_rec = $cmd_lookup{$cmd_verb}) {
+                    my $type = $cmd_rec->{t};
+                    my $val = $cmd_rec->{v};
+                    if ($type eq 'm') {
+                        $obj->$val();
+                    }
+                    elsif ($type eq 's') {
+                        $val->($obj);
+                    }
+                }
+
+=head4 C<t> - trace [n]
+
+Turn tracing on or off. Inverts the appropriate bit in C<$trace> (q.v.).
+If level is specified, set C<$trace_to_depth>.
+
+=head4 C<S> - list subroutines matching/not matching a pattern
+
+Walks through C<%sub>, checking to see whether or not to print the name.
+
+=head4 C<X> - list variables in current package
+
+Since the C<V> command actually processes this, just change this to the
+appropriate C<V> command and fall through.
+
+=head4 C<V> - list variables
+
+Uses C<dumpvar.pl> to dump out the current values for selected variables.
+
+=head4 C<x> - evaluate and print an expression
+
+Hands the expression off to C<DB::eval>, setting it up to print the value
+via C<dumpvar.pl> instead of just printing it directly.
+
+=head4 C<m> - print methods
+
+Just uses C<DB::methods> to determine what methods are available.
+
+=head4 C<f> - switch files
+
+Switch to a different filename.
+
+=head4 C<.> - return to last-executed line
+
+We set C<$incr> to -1 to indicate that the debugger shouldn't move ahead,
+and then we look up the line in the magical C<%dbline> hash.
+
+=head4 C<-> - back one window
+
+We change C<$start> to be one window back; if we go back past the first line,
+we set it to be the first line. We set C<$incr> to put us back at the
+currently-executing line, and then put a S<C<l $start +>> (list one window from
+C<$start>) in C<$cmd> to be executed later.
+
+=head3 PRE-580 COMMANDS VS. NEW COMMANDS: C<a, A, b, B, h, l, L, M, o, O, P, v, w, W, E<lt>, E<lt>E<lt>, E<0x7B>, E<0x7B>E<0x7B>>
+
+In Perl 5.8.0, a realignment of the commands was done to fix up a number of
+problems, most notably that the default case of several commands destroying
+the user's work in setting watchpoints, actions, etc. We wanted, however, to
+retain the old commands for those who were used to using them or who preferred
+them. At this point, we check for the new commands and call C<cmd_wrapper> to
+deal with them instead of processing them in-line.
+
+=head4 C<y> - List lexicals in higher scope
+
+Uses C<PadWalker> to find the lexicals supplied as arguments in a scope
+above the current one and then displays them using F<dumpvar.pl>.
+
+=head3 COMMANDS NOT WORKING AFTER PROGRAM ENDS
+
+All of the commands below this point don't work after the program being
+debugged has ended. All of them check to see if the program has ended; this
+allows the commands to be relocated without worrying about a 'line of
+demarcation' above which commands can be entered anytime, and below which
+they can't.
+
+=head4 C<n> - single step, but don't trace down into subs
+
+Done by setting C<$single> to 2, which forces subs to execute straight through
+when entered (see C<DB::sub> in L</DEBUGGER INTERFACE VARIABLES>). We also
+save the C<n> command in C<$laststep>,
+
+so a null command knows what to re-execute.
+
+=head4 C<s> - single-step, entering subs
+
+Sets C<$single> to 1, which causes C<DB::sub> to continue tracing inside
+subs. Also saves C<s> as C<$lastcmd>.
+
+=head4 C<c> - run continuously, setting an optional breakpoint
+
+Most of the code for this command is taken up with locating the optional
+breakpoint, which is either a subroutine name or a line number. We set
+the appropriate one-time-break in C<@dbline> and then turn off single-stepping
+in this and all call levels above this one.
+
+=head4 C<r> - return from a subroutine
+
+For C<r> to work properly, the debugger has to stop execution again
+immediately after the return is executed. This is done by forcing
+single-stepping to be on in the call level above the current one. If
+we are printing return values when a C<r> is executed, set C<$doret>
+appropriately, and force us out of the command loop.
+
+=head4 C<T> - stack trace
+
+Just calls C<DB::print_trace>.
+
+=head4 C<w> - List window around current line
+
+Just calls C<DB::cmd_w>.
+
+=head4 C<W> - watch-expression processing
+
+Just calls C<DB::cmd_W>.
+
+=head4 C</> - search forward for a string in the source
+
+We take the argument and treat it as a pattern. If it turns out to be a
+bad one, we return the error we got from trying to C<eval> it and exit.
+If not, we create some code to do the search and C<eval> it so it can't
+mess us up.
+
+=cut
+
+                _DB__handle_forward_slash_command($obj);
+
+=head4 C<?> - search backward for a string in the source
+
+Same as for C</>, except the loop runs backwards.
+
+=cut
+
+                _DB__handle_question_mark_command($obj);
+
+=head4 C<$rc> - Recall command
+
+Manages the commands in C<@hist> (which is created if C<Term::ReadLine> reports
+that the terminal supports history). It finds the command required, puts it
+into C<$cmd>, and redoes the loop to execute it.
+
+=cut
+
+                # $rc - recall command.
+                $obj->_handle_rc_recall_command;
+
+=head4 C<$sh$sh> - C<system()> command
+
+Calls the C<_db_system()> to handle the command. This keeps the C<STDIN> and
+C<STDOUT> from getting messed up.
+
+=cut
+
+                $obj->_handle_sh_command;
+
+=head4 C<$rc I<pattern> $rc> - Search command history
+
+Another command to manipulate C<@hist>: this one searches it with a pattern.
+If a command is found, it is placed in C<$cmd> and executed via C<redo>.
+
+=cut
+
+                $obj->_handle_rc_search_history_command;
+
+=head4 C<$sh> - Invoke a shell
+
+Uses C<_db_system()> to invoke a shell.
+
+=cut
+
+=head4 C<$sh I<command>> - Force execution of a command in a shell
+
+Like the above, but the command is passed to the shell. Again, we use
+C<_db_system()> to avoid problems with C<STDIN> and C<STDOUT>.
+
+=head4 C<H> - display commands in history
+
+Prints the contents of C<@hist> (if any).
+
+=head4 C<man, doc, perldoc> - look up documentation
+
+Just calls C<runman()> to print the appropriate document.
+
+=cut
+
+                $obj->_handle_doc_command;
+
+=head4 C<p> - print
+
+Builds a C<print EXPR> expression in the C<$cmd>; this will get executed at
+the bottom of the loop.
+
+=head4 C<=> - define command alias
+
+Manipulates C<%alias> to add or list command aliases.
+
+=head4 C<source> - read commands from a file
+
+Opens a lexical filehandle and stacks it on C<@cmdfhs>; C<DB::readline> will
+pick it up.
+
+=head4 C<enable> C<disable> - enable or disable breakpoints
+
+This enables or disables breakpoints.
+
+=head4 C<save> - send current history to a file
+
+Takes the complete history, (not the shrunken version you see with C<H>),
+and saves it to the given filename, so it can be replayed using C<source>.
+
+Note that all C<^(save|source)>'s are commented out with a view to minimise recursion.
+
+=head4 C<R> - restart
+
+Restart the debugger session.
+
+=head4 C<rerun> - rerun the current session
+
+Return to any given position in the B<true>-history list
+
+=head4 C<|, ||> - pipe output through the pager
+
+For C<|>, we save C<OUT> (the debugger's output filehandle) and C<STDOUT>
+(the program's standard output). For C<||>, we only save C<OUT>. We open a
+pipe to the pager (restoring the output filehandles if this fails). If this
+is the C<|> command, we also set up a C<SIGPIPE> handler which will simply
+set C<$signal>, sending us back into the debugger.
+
+We then trim off the pipe symbols and C<redo> the command loop at the
+C<PIPE> label, causing us to evaluate the command in C<$cmd> without
+reading another.
+
+=cut
+
+                # || - run command in the pager, with output to DB::OUT.
+                _DB__handle_run_command_in_pager_command($obj);
+
+=head3 END OF COMMAND PARSING
+
+Anything left in C<$cmd> at this point is a Perl expression that we want to
+evaluate. We'll always evaluate in the user's context, and fully qualify
+any variables we might want to address in the C<DB> package.
+
+=cut
+
+            }    # PIPE:
+
+            # trace an expression
+            $cmd =~ s/^t\s/\$DB::trace |= 1;\n/;
+
+            # Make sure the flag that says "the debugger's running" is
+            # still on, to make sure we get control again.
+            $evalarg = "\$^D = \$^D | \$DB::db_stop;\n$cmd";
+
+            # Run *our* eval that executes in the caller's context.
+            # The &-call is here to ascertain the mutability of @_.
+            &DB::eval;
+
+            # Turn off the one-time-dump stuff now.
+            if ($onetimeDump) {
+                $onetimeDump      = undef;
+                $onetimedumpDepth = undef;
+            }
+            elsif ( $term_pid == $$ ) {
+                eval { # May run under miniperl, when not available...
+                    STDOUT->flush();
+                    STDERR->flush();
+                };
+
+                # XXX If this is the master pid, print a newline.
+                print {$OUT} "\n";
+            }
+        } ## end while (($term || &setterm...
+
+=head3 POST-COMMAND PROCESSING
+
+After each command, we check to see if the command output was piped anywhere.
+If so, we go through the necessary code to unhook the pipe and go back to
+our standard filehandles for input and output.
+
+=cut
+
+        continue {    # CMD:
+            _DB__at_end_of_every_command($obj);
+        }    # CMD:
+
+=head3 COMMAND LOOP TERMINATION
+
+When commands have finished executing, we come here. If the user closed the
+input filehandle, we turn on C<$fall_off_end> to emulate a C<q> command. We
+evaluate any post-prompt items. We restore C<$@>, C<$!>, C<$^E>, C<$,>, C<$/>,
+C<$\>, and C<$^W>, and return a null list as expected by the Perl interpreter.
+The interpreter will then execute the next line and then return control to us
+again.
+
+=cut
+
+        # No more commands? Quit.
+        unless (defined $cmd) {
+            DB::Obj::_do_quit();
+        }
+
+        # Evaluate post-prompt commands.
+        foreach $evalarg (@$post) {
+            # The &-call is here to ascertain the mutability of @_.
+            &DB::eval;
+        }
+    }    # if ($single || $signal)
+
+    # Put the user's globals back where you found them.
+    ( $@, $!, $^E, $,, $/, $\, $^W ) = @saved;
+    ();
+} ## end sub DB
+
+# Because DB::Obj is used above,
+#
+#   my $obj = DB::Obj->new(
+#
+# The following package declaration must come before that,
+# or else runtime errors will occur with
+#
+#   PERLDB_OPTS="autotrace nonstop"
+#
+# ( rt#116771 )
+BEGIN {
+
+package DB::Obj;
+
+sub new {
+    my $class = shift;
+
+    my $self = bless {}, $class;
+
+    $self->_init(@_);
+
+    return $self;
+}
+
+sub _init {
+    my ($self, $args) = @_;
+
+    %{$self} = (%$self, %$args);
+
+    return;
+}
+
+{
+    no strict 'refs';
+    foreach my $slot_name (qw(
+        after explicit_stop infix pat piped position prefix selected cmd_verb
+        cmd_args
+        )) {
+        my $slot = $slot_name;
+        *{$slot} = sub {
+            my $self = shift;
+
+            if (@_) {
+                ${ $self->{$slot} } = shift;
+            }
+
+            return ${ $self->{$slot} };
+        };
+
+        *{"append_to_$slot"} = sub {
+            my $self = shift;
+            my $s = shift;
+
+            return $self->$slot($self->$slot . $s);
+        };
+    }
+}
+
+sub _DB_on_init__initialize_globals
+{
+    my $self = shift;
+
+    # Check for whether we should be running continuously or not.
+    # _After_ the perl program is compiled, $single is set to 1:
+    if ( $single and not $second_time++ ) {
+
+        # Options say run non-stop. Run until we get an interrupt.
+        if ($runnonstop) {    # Disable until signal
+                # If there's any call stack in place, turn off single
+                # stepping into subs throughout the stack.
+            for my $i (0 .. $stack_depth) {
+                $stack[ $i ] &= ~1;
+            }
+
+            # And we are now no longer in single-step mode.
+            $single = 0;
+
+            # If we simply returned at this point, we wouldn't get
+            # the trace info. Fall on through.
+            # return;
+        } ## end if ($runnonstop)
+
+        elsif ($ImmediateStop) {
+
+            # We are supposed to stop here; XXX probably a break.
+            $ImmediateStop = 0;    # We've processed it; turn it off
+            $signal        = 1;    # Simulate an interrupt to force
+                                   # us into the command loop
+        }
+    } ## end if ($single and not $second_time...
+
+    # If we're in single-step mode, or an interrupt (real or fake)
+    # has occurred, turn off non-stop mode.
+    $runnonstop = 0 if $single or $signal;
+
+    return;
+}
+
+sub _my_print_lineinfo
+{
+    my ($self, $i, $incr_pos) = @_;
+
+    if ($frame) {
+        # Print it indented if tracing is on.
+        DB::print_lineinfo( ' ' x $stack_depth,
+            "$i:\t$DB::dbline[$i]" . $self->after );
+    }
+    else {
+        DB::depth_print_lineinfo($self->explicit_stop, $incr_pos);
+    }
+}
+
+sub _curr_line {
+    return $DB::dbline[$line];
+}
+
+sub _is_full {
+    my ($self, $letter) = @_;
+
+    return ($DB::cmd eq $letter);
+}
+
+sub _DB__grab_control
+{
+    my $self = shift;
+
+    # Yes, grab control.
+    if ($client_editor) {
+
+        # Tell the editor to update its position.
+        $self->position("$sub_twice${DB::filename}:$line:0\n");
+        DB::print_lineinfo($self->position());
+    }
+
+=pod
+
+Special check: if we're in package C<DB::fake>, we've gone through the
+C<END> block at least once. We set up everything so that we can continue
+to enter commands and have a valid context to be in.
+
+=cut
+
+    elsif ( $DB::package eq 'DB::fake' ) {
+
+        # Fallen off the end already.
+        if (!$DB::term) {
+            DB::setterm();
+        }
+
+        DB::print_help(<<EOP);
+Debugged program terminated.  Use B<q> to quit or B<R> to restart,
+use B<o> I<inhibit_exit> to avoid stopping after program termination,
+S<B<h q>>, S<B<h R>> or S<B<h o>> to get additional info.
+EOP
+
+        $DB::package     = 'main';
+        $DB::usercontext = DB::_calc_usercontext($DB::package);
+    } ## end elsif ($package eq 'DB::fake')
+
+=pod
+
+If the program hasn't finished executing, we scan forward to the
+next executable line, print that out, build the prompt from the file and line
+number information, and print that.
+
+=cut
+
+    else {
+
+
+        # Still somewhere in the midst of execution. Set up the
+        #  debugger prompt.
+        $DB::sub =~ s/\'/::/;    # Swap Perl 4 package separators (') to
+                             # Perl 5 ones (sorry, we don't print Klingon
+                             #module names)
+
+        $self->prefix($DB::sub =~ /::/ ? "" : ($DB::package . '::'));
+        $self->append_to_prefix( "$DB::sub(${DB::filename}:" );
+        $self->after( $self->_curr_line =~ /\n$/ ? '' : "\n" );
+
+        # Break up the prompt if it's really long.
+        if ( length($self->prefix()) > 30 ) {
+            $self->position($self->prefix . "$line):\n$line:\t" . $self->_curr_line . $self->after);
+            $self->prefix("");
+            $self->infix(":\t");
+        }
+        else {
+            $self->infix("):\t");
+            $self->position(
+                $self->prefix . $line. $self->infix
+                . $self->_curr_line . $self->after
+            );
+        }
+
+        # Print current line info, indenting if necessary.
+        $self->_my_print_lineinfo($line, $self->position);
+
+        my $i;
+        my $line_i = sub { return $DB::dbline[$i]; };
+
+        # Scan forward, stopping at either the end or the next
+        # unbreakable line.
+        for ( $i = $line + 1 ; $i <= $DB::max && $line_i->() == 0 ; ++$i )
+        {    #{ vi
+
+            # Drop out on null statements, block closers, and comments.
+            last if $line_i->() =~ /^\s*[\;\}\#\n]/;
+
+            # Drop out if the user interrupted us.
+            last if $signal;
+
+            # Append a newline if the line doesn't have one. Can happen
+            # in eval'ed text, for instance.
+            $self->after( $line_i->() =~ /\n$/ ? '' : "\n" );
+
+            # Next executable line.
+            my $incr_pos = $self->prefix . $i . $self->infix . $line_i->()
+                . $self->after;
+            $self->append_to_position($incr_pos);
+            $self->_my_print_lineinfo($i, $incr_pos);
+        } ## end for ($i = $line + 1 ; $i...
+    } ## end else [ if ($client_editor)
+
+    return;
+}
+
+sub _handle_t_command {
+    my $self = shift;
+
+    my $levels = $self->cmd_args();
+
+    if ((!length($levels)) or ($levels !~ /\D/)) {
+        $trace ^= 1;
+        local $\ = '';
+        $DB::trace_to_depth = $levels ? $stack_depth + $levels : 1E9;
+        print {$OUT} "Trace = "
+        . ( ( $trace & 1 )
+            ? ( $levels ? "on (to level $DB::trace_to_depth)" : "on" )
+            : "off" ) . "\n";
+        next CMD;
+    }
+
+    return;
+}
+
+
+sub _handle_S_command {
+    my $self = shift;
+
+    if (my ($print_all_subs, $should_reverse, $Spatt)
+        = $self->cmd_args =~ /\A((!)?(.+))?\z/) {
+        # $Spatt is the pattern (if any) to use.
+        # Reverse scan?
+        my $Srev     = defined $should_reverse;
+        # No args - print all subs.
+        my $Snocheck = !defined $print_all_subs;
+
+        # Need to make these sane here.
+        local $\ = '';
+        local $, = '';
+
+        # Search through the debugger's magical hash of subs.
+        # If $nocheck is true, just print the sub name.
+        # Otherwise, check it against the pattern. We then use
+        # the XOR trick to reverse the condition as required.
+        foreach $subname ( sort( keys %sub ) ) {
+            if ( $Snocheck or $Srev ^ ( $subname =~ /$Spatt/ ) ) {
+                print $OUT $subname, "\n";
+            }
+        }
+        next CMD;
+    }
+
+    return;
+}
+
+sub _handle_V_command_and_X_command {
+    my $self = shift;
+
+    $DB::cmd =~ s/^X\b/V $DB::package/;
+
+    # Bare V commands get the currently-being-debugged package
+    # added.
+    if ($self->_is_full('V')) {
+        $DB::cmd = "V $DB::package";
+    }
+
+    # V - show variables in package.
+    if (my ($new_packname, $new_vars_str) =
+        $DB::cmd =~ /\AV\b\s*(\S+)\s*(.*)/) {
+
+        # Save the currently selected filehandle and
+        # force output to debugger's filehandle (dumpvar
+        # just does "print" for output).
+        my $savout = select($OUT);
+
+        # Grab package name and variables to dump.
+        $packname = $new_packname;
+        my @vars     = split( ' ', $new_vars_str );
+
+        # If main::dumpvar isn't here, get it.
+        do 'dumpvar.pl' || die $@ unless defined &main::dumpvar;
+        if ( defined &main::dumpvar ) {
+
+            # We got it. Turn off subroutine entry/exit messages
+            # for the moment, along with return values.
+            local $frame = 0;
+            local $doret = -2;
+
+            # must detect sigpipe failures  - not catching
+            # then will cause the debugger to die.
+            eval {
+                main::dumpvar(
+                    $packname,
+                    defined $option{dumpDepth}
+                    ? $option{dumpDepth}
+                    : -1,    # assume -1 unless specified
+                    @vars
+                );
+            };
+
+            # The die doesn't need to include the $@, because
+            # it will automatically get propagated for us.
+            if ($@) {
+                die unless $@ =~ /dumpvar print failed/;
+            }
+        } ## end if (defined &main::dumpvar)
+        else {
+
+            # Couldn't load dumpvar.
+            print $OUT "dumpvar.pl not available.\n";
+        }
+
+        # Restore the output filehandle, and go round again.
+        select($savout);
+        next CMD;
+    }
+
+    return;
+}
+
+sub _handle_dash_command {
+    my $self = shift;
+
+    if ($self->_is_full('-')) {
+
+        # back up by a window; go to 1 if back too far.
+        $start -= $incr + $window + 1;
+        $start = 1 if $start <= 0;
+        $incr  = $window - 1;
+
+        # Generate and execute a "l +" command (handled below).
+        $DB::cmd = 'l ' . ($start) . '+';
+        redo CMD;
+    }
+    return;
+}
+
+sub _n_or_s_commands_generic {
+    my ($self, $new_val) = @_;
+    # n - next
+    next CMD if DB::_DB__is_finished();
+
+    # Single step, but don't enter subs.
+    $single = $new_val;
+
+    # Save for empty command (repeat last).
+    $laststep = $DB::cmd;
+    last CMD;
+}
+
+sub _n_or_s {
+    my ($self, $letter, $new_val) = @_;
+
+    if ($self->_is_full($letter)) {
+        $self->_n_or_s_commands_generic($new_val);
+    }
+    else {
+        $self->_n_or_s_and_arg_commands_generic($letter, $new_val);
+    }
+
+    return;
+}
+
+sub _handle_n_command {
+    my $self = shift;
+
+    return $self->_n_or_s('n', 2);
+}
+
+sub _handle_s_command {
+    my $self = shift;
+
+    return $self->_n_or_s('s', 1);
+}
+
+sub _handle_r_command {
+    my $self = shift;
+
+    # r - return from the current subroutine.
+    if ($self->_is_full('r')) {
+
+        # Can't do anything if the program's over.
+        next CMD if DB::_DB__is_finished();
+
+        # Turn on stack trace.
+        $stack[$stack_depth] |= 1;
+
+        # Print return value unless the stack is empty.
+        $doret = $option{PrintRet} ? $stack_depth - 1 : -2;
+        last CMD;
+    }
+
+    return;
+}
+
+sub _handle_T_command {
+    my $self = shift;
+
+    if ($self->_is_full('T')) {
+        DB::print_trace( $OUT, 1 );    # skip DB
+        next CMD;
+    }
+
+    return;
+}
+
+sub _handle_w_command {
+    my $self = shift;
+
+    DB::cmd_w( 'w', $self->cmd_args() );
+    next CMD;
+
+    return;
+}
+
+sub _handle_W_command {
+    my $self = shift;
+
+    if (my $arg = $self->cmd_args) {
+        DB::cmd_W( 'W', $arg );
+        next CMD;
+    }
+
+    return;
+}
+
+sub _handle_rc_recall_command {
+    my $self = shift;
+
+    # $rc - recall command.
+    if (my ($minus, $arg) = $DB::cmd =~ m#\A$rc+\s*(-)?(\d+)?\z#) {
+
+        # No arguments, take one thing off history.
+        pop(@hist) if length($DB::cmd) > 1;
+
+        # Relative (- found)?
+        #  Y - index back from most recent (by 1 if bare minus)
+        #  N - go to that particular command slot or the last
+        #      thing if nothing following.
+
+        $self->cmd_verb(
+            scalar($minus ? ( $#hist - ( $arg || 1 ) ) : ( $arg || $#hist ))
+        );
+
+        # Pick out the command desired.
+        $DB::cmd = $hist[$self->cmd_verb];
+
+        # Print the command to be executed and restart the loop
+        # with that command in the buffer.
+        print {$OUT} $DB::cmd, "\n";
+        redo CMD;
+    }
+
+    return;
+}
+
+sub _handle_rc_search_history_command {
+    my $self = shift;
+
+    # $rc pattern $rc - find a command in the history.
+    if (my ($arg) = $DB::cmd =~ /\A$rc([^$rc].*)\z/) {
+
+        # Create the pattern to use.
+        my $pat = "^$arg";
+        $self->pat($pat);
+
+        # Toss off last entry if length is >1 (and it always is).
+        pop(@hist) if length($DB::cmd) > 1;
+
+        my $i;
+
+        # Look backward through the history.
+        SEARCH_HIST:
+        for ( $i = $#hist ; $i ; --$i ) {
+            # Stop if we find it.
+            last SEARCH_HIST if $hist[$i] =~ /$pat/;
+        }
+
+        if ( !$i ) {
+
+            # Never found it.
+            print $OUT "No such command!\n\n";
+            next CMD;
+        }
+
+        # Found it. Put it in the buffer, print it, and process it.
+        $DB::cmd = $hist[$i];
+        print $OUT $DB::cmd, "\n";
+        redo CMD;
+    }
+
+    return;
+}
+
+sub _handle_H_command {
+    my $self = shift;
+
+    if ($self->cmd_args =~ m#\A\*#) {
+        @hist = @truehist = ();
+        print $OUT "History cleansed\n";
+        next CMD;
+    }
+
+    if (my ($num) = $self->cmd_args =~ /\A(?:-(\d+))?/) {
+
+        # Anything other than negative numbers is ignored by
+        # the (incorrect) pattern, so this test does nothing.
+        $end = $num ? ( $#hist - $num ) : 0;
+
+        # Set to the minimum if less than zero.
+        $hist = 0 if $hist < 0;
+
+        # Start at the end of the array.
+        # Stay in while we're still above the ending value.
+        # Tick back by one each time around the loop.
+        my $i;
+

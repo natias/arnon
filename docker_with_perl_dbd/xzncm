@@ -1,0 +1,1000 @@
+	$maint = $1;
+    } elsif (/^-e(.*)$/ or /^--(?:changed|release)-by=(.*)$/) {
+	$changedby = $1;
+    } elsif (/^-C(.*)$/) {
+	$desc = $1;
+    } elsif (m/^-[EW]$/) {
+	# Deprecated option
+	warning(g_('%s is deprecated; it is without effect'), $_);
+    } elsif (/^-R(.*)$/ or /^--rules-file=(.*)$/) {
+	my $arg = $1;
+	@debian_rules = split ' ', $arg;
+    } else {
+	usageerr(g_('unknown option or argument %s'), $_);
+    }
+}
+
+if (@call_target) {
+    my $targets = join ',', @call_target;
+    set_build_type_from_targets($targets, '--rules-target', nocheck => 1);
+}
+
+if (build_has_all(BUILD_BINARY)) {
+    $buildtarget = 'build';
+    $binarytarget = 'binary';
+} elsif (build_has_any(BUILD_ARCH_DEP)) {
+    $buildtarget = 'build-arch';
+    $binarytarget = 'binary-arch';
+} elsif (build_has_any(BUILD_ARCH_INDEP)) {
+    $buildtarget = 'build-indep';
+    $binarytarget = 'binary-indep';
+}
+
+if (not $preclean) {
+    # -nc without -b/-B/-A/-S/-F implies -b
+    set_build_type(BUILD_BINARY) if build_has_any(BUILD_DEFAULT);
+    # -nc with -S implies no dependency checks
+    $checkbuilddep = 0 if build_is(BUILD_SOURCE);
+}
+
+if ($call_target_as_root and @call_target == 0) {
+    error(g_('option %s is only meaningful with option %s'),
+          '--as-root', '--rules-target');
+}
+
+if ($check_command and not find_command($check_command)) {
+    error(g_("check-command '%s' not found"), $check_command);
+}
+
+if ($signcommand and not find_command($signcommand)) {
+    error(g_("sign-command '%s' not found"), $signcommand);
+}
+
+# Default to auto if none of parallel=N, -J or -j have been specified.
+if (not defined $parallel and not $build_opts->has('parallel')) {
+    $parallel = 'auto';
+}
+
+if (defined $parallel) {
+    if ($parallel eq 'auto') {
+        # Most Unices.
+        $parallel = qx(getconf _NPROCESSORS_ONLN 2>/dev/null);
+        # Fallback for at least Irix.
+        $parallel = qx(getconf _NPROC_ONLN 2>/dev/null) if $?;
+        # Fallback to serial execution if cannot infer the number of online
+        # processors.
+        $parallel = '1' if $?;
+        chomp $parallel;
+    }
+    if ($parallel_force) {
+        $ENV{MAKEFLAGS} //= '';
+        $ENV{MAKEFLAGS} .= " -j$parallel";
+    }
+    $build_opts->set('parallel', $parallel);
+    $build_opts->export();
+}
+
+if ($build_opts->has('terse')) {
+    $ENV{MAKEFLAGS} //= '';
+    $ENV{MAKEFLAGS} .= ' --no-print-directory';
+}
+
+set_build_profiles(@build_profiles) if @build_profiles;
+
+my $changelog = changelog_parse();
+my $ctrl = Dpkg::Control::Info->new();
+
+# Check whether we are doing some kind of rootless build, and sanity check
+# the fields values.
+my %rules_requires_root = parse_rules_requires_root($ctrl->get_source());
+
+my $pkg = mustsetvar($changelog->{source}, g_('source package'));
+my $version = mustsetvar($changelog->{version}, g_('source version'));
+my $v = Dpkg::Version->new($version);
+my ($ok, $error) = version_check($v);
+error($error) unless $ok;
+
+my $sversion = $v->as_string(omit_epoch => 1);
+my $uversion = $v->version();
+
+my $distribution = mustsetvar($changelog->{distribution}, g_('source distribution'));
+
+my $maintainer;
+if ($changedby) {
+    $maintainer = $changedby;
+} elsif ($maint) {
+    $maintainer = $maint;
+} else {
+    $maintainer = mustsetvar($changelog->{maintainer}, g_('source changed by'));
+}
+
+# <https://reproducible-builds.org/specs/source-date-epoch/>
+$ENV{SOURCE_DATE_EPOCH} ||= $changelog->{timestamp} || time;
+
+my @arch_opts;
+push @arch_opts, ('--host-arch', $host_arch) if $host_arch;
+push @arch_opts, ('--host-type', $host_type) if $host_type;
+push @arch_opts, ('--target-arch', $target_arch) if $target_arch;
+push @arch_opts, ('--target-type', $target_type) if $target_type;
+
+open my $arch_env, '-|', 'dpkg-architecture', '-f', @arch_opts
+    or subprocerr('dpkg-architecture');
+while (<$arch_env>) {
+    chomp;
+    my ($key, $value) = split /=/, $_, 2;
+    $ENV{$key} = $value;
+}
+close $arch_env or subprocerr('dpkg-architecture');
+
+my $arch;
+if (build_has_any(BUILD_ARCH_DEP)) {
+    $arch = mustsetvar($ENV{DEB_HOST_ARCH}, g_('host architecture'));
+} elsif (build_has_any(BUILD_ARCH_INDEP)) {
+    $arch = 'all';
+} elsif (build_has_any(BUILD_SOURCE)) {
+    $arch = 'source';
+}
+
+my $pv = "${pkg}_$sversion";
+my $pva = "${pkg}_${sversion}_$arch";
+
+my $signkeytype;
+my $signkeyhandle;
+if (defined $signkeyfile) {
+    $signkeytype = 'keyfile';
+    $signkeyhandle = bsd_glob($signkeyfile, GLOB_TILDE | GLOB_NOCHECK);
+} elsif (defined $signkeyid) {
+    $signkeytype = 'autoid';
+    $signkeyhandle = $signkeyid;
+} else {
+    $signkeytype = 'userid';
+    $signkeyhandle = $maintainer;
+}
+my $signkey = Dpkg::OpenPGP::KeyHandle->new(
+    type => $signkeytype,
+    handle => $signkeyhandle,
+);
+signkey_validate();
+
+my $openpgp = Dpkg::OpenPGP->new(
+    backend => $signbackend // 'auto',
+    cmd => $signcommand // 'auto',
+    needs => {
+        keystore => $signkey->needs_keystore(),
+    },
+);
+
+if (not $openpgp->can_use_secrets($signkey)) {
+    $signsource = 0;
+    $signbuildinfo = 0;
+    $signchanges = 0;
+} elsif ($signforce) {
+    $signsource = 1;
+    $signbuildinfo = 1;
+    $signchanges = 1;
+} elsif (($signsource or $signbuildinfo or $signchanges) and
+         $distribution eq 'UNRELEASED') {
+    $signreleased = 0;
+    $signsource = 0;
+    $signbuildinfo = 0;
+    $signchanges = 0;
+}
+
+if ($signsource && build_has_none(BUILD_SOURCE)) {
+    $signsource = 0;
+}
+
+# Sanitize build environment.
+if ($sanitize_env) {
+    run_vendor_hook('sanitize-environment');
+}
+
+#
+# Preparation of environment stops here
+#
+
+run_hook('init', 1);
+
+if (not -x 'debian/rules') {
+    warning(g_('debian/rules is not executable; fixing that'));
+    chmod(0755, 'debian/rules'); # No checks of failures, non fatal
+}
+
+if (scalar @call_target == 0) {
+    run_cmd('dpkg-source', @source_opts, '--before-build', '.');
+}
+
+if ($checkbuilddep) {
+    my @checkbuilddep_opts;
+
+    push @checkbuilddep_opts, '-A' if build_has_none(BUILD_ARCH_DEP);
+    push @checkbuilddep_opts, '-B' if build_has_none(BUILD_ARCH_INDEP);
+    push @checkbuilddep_opts, '-I' if not $check_builtin_builddep;
+    push @checkbuilddep_opts, "--admindir=$admindir" if $admindir;
+
+    system('dpkg-checkbuilddeps', @checkbuilddep_opts);
+    if (not WIFEXITED($?)) {
+        subprocerr('dpkg-checkbuilddeps');
+    } elsif (WEXITSTATUS($?)) {
+	warning(g_('build dependencies/conflicts unsatisfied; aborting'));
+	warning(g_('(Use -d flag to override.)'));
+	exit 3;
+    }
+}
+
+foreach my $call_target (@call_target) {
+    run_rules_cond_root($call_target);
+}
+exit 0 if scalar @call_target;
+
+run_hook('preclean', $preclean);
+
+if ($preclean) {
+    run_rules_cond_root('clean');
+}
+
+run_hook('source', build_has_any(BUILD_SOURCE));
+
+if (build_has_any(BUILD_SOURCE)) {
+    warning(g_('building a source package without cleaning up as you asked; ' .
+               'it might contain undesired files')) if not $preclean;
+    run_cmd('dpkg-source', @source_opts, '-b', '.');
+}
+
+run_hook('build', build_has_any(BUILD_BINARY));
+
+my $build_types = get_build_options_from_type();
+
+if (build_has_any(BUILD_BINARY)) {
+    # XXX Use some heuristics to decide whether to use build-{arch,indep}
+    # targets. This is a temporary measure to not break too many packages
+    # on a flag day.
+    build_target_fallback($ctrl);
+
+    # If we are building rootless, there is no need to call the build target
+    # independently as non-root.
+    run_cmd(@debian_rules, $buildtarget) if rules_requires_root($binarytarget);
+    run_hook('binary', 1);
+    run_rules_cond_root($binarytarget);
+}
+
+run_hook('buildinfo', 1);
+
+$buildinfo_file //= "../$pva.buildinfo";
+
+push @buildinfo_opts, "--build=$build_types" if build_has_none(BUILD_DEFAULT);
+push @buildinfo_opts, "--admindir=$admindir" if $admindir;
+push @buildinfo_opts, "-O$buildinfo_file" if $buildinfo_file;
+
+run_cmd('dpkg-genbuildinfo', @buildinfo_opts);
+
+run_hook('changes', 1);
+
+$changes_file //= "../$pva.changes";
+
+push @changes_opts, "--build=$build_types" if build_has_none(BUILD_DEFAULT);
+push @changes_opts, "-m$maint" if defined $maint;
+push @changes_opts, "-e$changedby" if defined $changedby;
+push @changes_opts, "-v$since" if defined $since;
+push @changes_opts, "-C$desc" if defined $desc;
+push @changes_opts, "-O$changes_file";
+
+my $changes = Dpkg::Control->new(type => CTRL_FILE_CHANGES);
+
+run_cmd('dpkg-genchanges', @changes_opts);
+$changes->load($changes_file);
+
+run_hook('postclean', $postclean);
+
+if ($postclean) {
+    run_rules_cond_root('clean');
+}
+
+run_cmd('dpkg-source', @source_opts, '--after-build', '.');
+
+info(describe_build($changes->{'Files'}));
+
+run_hook('check', $check_command);
+
+if ($check_command) {
+    run_cmd($check_command, @check_opts, $changes_file);
+}
+
+if ($signpause && ($signsource || $signbuildinfo || $signchanges)) {
+    print g_("Press <enter> to start the signing process.\n");
+    getc();
+}
+
+run_hook('sign', $signsource || $signbuildinfo || $signchanges);
+
+if ($signsource) {
+    signfile("$pv.dsc");
+
+    # Recompute the checksums as the .dsc has changed now.
+    my $buildinfo = Dpkg::Control->new(type => CTRL_FILE_BUILDINFO);
+    $buildinfo->load($buildinfo_file);
+    my $checksums = Dpkg::Checksums->new();
+    $checksums->add_from_control($buildinfo);
+    $checksums->add_from_file("../$pv.dsc", update => 1, key => "$pv.dsc");
+    $checksums->export_to_control($buildinfo);
+    $buildinfo->save($buildinfo_file);
+}
+if ($signbuildinfo) {
+    signfile("$pva.buildinfo");
+}
+if ($signsource or $signbuildinfo) {
+    # Recompute the checksums as the .dsc and/or .buildinfo have changed.
+    my $checksums = Dpkg::Checksums->new();
+    $checksums->add_from_control($changes);
+    $checksums->add_from_file("../$pv.dsc", update => 1, key => "$pv.dsc")
+        if $signsource;
+    $checksums->add_from_file($buildinfo_file, update => 1, key => "$pva.buildinfo");
+    $checksums->export_to_control($changes);
+    delete $changes->{'Checksums-Md5'};
+    update_files_field($changes, $checksums, "$pv.dsc")
+        if $signsource;
+    update_files_field($changes, $checksums, "$pva.buildinfo");
+    $changes->save($changes_file);
+}
+if ($signchanges) {
+    signfile("$pva.changes");
+}
+
+if (not $signreleased) {
+    warning(g_('not signing UNRELEASED build; use --force-sign to override'));
+}
+
+run_hook('done', 1);
+
+sub mustsetvar {
+    my ($var, $text) = @_;
+
+    error(g_('unable to determine %s'), $text)
+	unless defined($var);
+
+    info("$text $var");
+    return $var;
+}
+
+sub setup_rootcommand {
+    if ($< == 0) {
+        warning(g_('using a gain-root-command while being root')) if @rootcommand;
+    } else {
+        push @rootcommand, 'fakeroot' unless @rootcommand;
+    }
+
+    if (@rootcommand and not find_command($rootcommand[0])) {
+        if ($rootcommand[0] eq 'fakeroot' and $< != 0) {
+            error(g_("fakeroot not found, either install the fakeroot\n" .
+                     'package, specify a command with the -r option, ' .
+                     'or run this as root'));
+        } else {
+            error(g_("gain-root-command '%s' not found"), $rootcommand[0]);
+        }
+    }
+}
+
+sub parse_rules_requires_root {
+    my $ctrl = shift;
+
+    my %rrr;
+    my $rrr;
+    my $keywords_base;
+    my $keywords_impl;
+
+    $rrr = $rrr_override // $ctrl->{'Rules-Requires-Root'} // 'binary-targets';
+
+    foreach my $keyword (split ' ', $rrr) {
+        if ($keyword =~ m{/}) {
+            if ($keyword =~ m{^dpkg/target/(.*)$}p and $target_official{$1}) {
+                error(g_('disallowed target in %s field keyword "%s"'),
+                      'Rules-Requires-Root', $keyword);
+            } elsif ($keyword ne 'dpkg/target-subcommand') {
+                error(g_('%s field keyword "%s" is unknown in dpkg namespace'),
+                      'Rules-Requires-Root', $keyword);
+            }
+            $keywords_impl++;
+        } else {
+            if ($keyword ne lc $keyword and
+                (lc $keyword eq 'no' or lc $keyword eq 'binary-targets')) {
+                error(g_('%s field keyword "%s" is uppercase; use "%s" instead'),
+                      'Rules-Requires-Root', $keyword, lc $keyword);
+            } elsif (lc $keyword eq 'yes') {
+                error(g_('%s field keyword "%s" is invalid; use "%s" instead'),
+                      'Rules-Requires-Root', $keyword, 'binary-targets');
+            } elsif ($keyword ne 'no' and $keyword ne 'binary-targets') {
+                warning(g_('%s field keyword "%s" is unknown'),
+                        'Rules-Requires-Root', $keyword);
+            }
+            $keywords_base++;
+        }
+
+        if ($rrr{$keyword}++) {
+            error(g_('field %s contains duplicate keyword "%s"'),
+                        'Rules-Requires-Root', $keyword);
+        }
+    }
+
+    if ($call_target_as_root or not exists $rrr{no}) {
+        setup_rootcommand();
+    }
+
+    # Notify the children we do support R³.
+    $ENV{DEB_RULES_REQUIRES_ROOT} = join ' ', sort keys %rrr;
+
+    if ($keywords_base > 1 or $keywords_base and $keywords_impl) {
+        error(g_('%s field contains both global and implementation specific keywords'),
+              'Rules-Requires-Root');
+    } elsif ($keywords_impl) {
+        # Set only on <implementations-keywords>.
+        $ENV{DEB_GAIN_ROOT_CMD} = join ' ', @rootcommand;
+    } else {
+        # We should not provide the variable otherwise.
+        delete $ENV{DEB_GAIN_ROOT_CMD};
+    }
+
+    return %rrr;
+}
+
+sub run_cmd {
+    printcmd(@_);
+    system @_ and subprocerr("@_");
+}
+
+sub rules_requires_root {
+    my $target = shift;
+
+    return 1 if $call_target_as_root;
+    return 1 if $rules_requires_root{"dpkg/target/$target"};
+    return 1 if $rules_requires_root{'binary-targets'} and $target_legacy_root{$target};
+    return 0;
+}
+
+sub run_rules_cond_root {
+    my $target = shift;
+
+    my @cmd;
+    push @cmd, @rootcommand if rules_requires_root($target);
+    push @cmd, @debian_rules, $target;
+
+    run_cmd(@cmd);
+}
+
+sub run_hook {
+    my ($name, $enabled) = @_;
+    my $cmd = $hook{$name};
+
+    return if not $cmd;
+
+    info("running hook $name");
+
+    my %hook_vars = (
+        '%' => '%',
+        'a' => $enabled ? 1 : 0,
+        'p' => $pkg,
+        'v' => $version,
+        's' => $sversion,
+        'u' => $uversion,
+    );
+
+    my $subst_hook_var = sub {
+        my $var = shift;
+
+        if (exists $hook_vars{$var}) {
+            return $hook_vars{$var};
+        } else {
+            warning(g_('unknown %% substitution in hook: %%%s'), $var);
+            return "\%$var";
+        }
+    };
+
+    $cmd =~ s/\%(.)/$subst_hook_var->($1)/eg;
+
+    run_cmd($cmd);
+}
+
+sub update_files_field {
+    my ($ctrl, $checksums, $filename) = @_;
+
+    my $md5sum_regex = checksums_get_property('md5', 'regex');
+    my $md5sum = $checksums->get_checksum($filename, 'md5');
+    my $size = $checksums->get_size($filename);
+    my $file_regex = qr/$md5sum_regex\s+\d+\s+(\S+\s+\S+\s+\Q$filename\E)/;
+
+    $ctrl->{'Files'} =~ s/^$file_regex$/$md5sum $size $1/m;
+}
+
+sub signkey_validate {
+    return unless $signkey->type eq 'keyid';
+
+    if (length $signkey->handle <= 8) {
+        error(g_('short OpenPGP key IDs are broken; ' .
+                 'please use key fingerprints in %s or %s instead'),
+              '-k', 'DEB_SIGN_KEYID');
+    } elsif (length $signkey->handle <= 16) {
+        warning(g_('long OpenPGP key IDs are strongly discouraged; ' .
+                   'please use key fingerprints in %s or %s instead'),
+                '-k', 'DEB_SIGN_KEYID');
+    }
+}
+
+sub signfile {
+    my $file = shift;
+
+    printcmd("signfile $file");
+
+    my $signdir = tempdir('dpkg-sign.XXXXXXXX', CLEANUP => 1);
+    my $signfile = "$signdir/$file";
+
+    # Make sure the file to sign ends with a newline.
+    copy("../$file", $signfile);
+    open my $signfh, '>>', $signfile or syserr(g_('cannot open %s'), $signfile);
+    print { $signfh } "\n";
+    close $signfh or syserr(g_('cannot close %s'), $signfile);
+
+    my $status = $openpgp->inline_sign($signfile, "$signfile.asc", $signkey);
+    if ($status == OPENPGP_OK) {
+        move("$signfile.asc", "../$file")
+            or syserror(g_('cannot move %s to %s'), "$signfile.asc", "../$file");
+    } else {
+        error(g_('failed to sign %s file: %s'), $file,
+              openpgp_errorcode_to_string($status));
+    }
+
+    return $status
+}
+
+sub fileomitted {
+    my ($files, $regex) = @_;
+
+    return $files !~ m/$regex$/m
+}
+
+sub describe_build {
+    my $files = shift;
+    my $ext = compression_get_file_extension_regex();
+
+    if (fileomitted($files, qr/\.deb/)) {
+        # source-only upload
+        if (fileomitted($files, qr/\.diff\.$ext/) and
+            fileomitted($files, qr/\.debian\.tar\.$ext/)) {
+            return g_('source-only upload: Debian-native package');
+        } elsif (fileomitted($files, qr/\.orig\.tar\.$ext/)) {
+            return g_('source-only, diff-only upload (original source NOT included)');
+        } else {
+            return g_('source-only upload (original source is included)');
+        }
+    } elsif (fileomitted($files, qr/\.dsc/)) {
+        return g_('binary-only upload (no source included)');
+    } elsif (fileomitted($files, qr/\.diff\.$ext/) and
+             fileomitted($files, qr/\.debian\.tar\.$ext/)) {
+        return g_('full upload; Debian-native package (full source is included)');
+    } elsif (fileomitted($files, qr/\.orig\.tar\.$ext/)) {
+        return g_('binary and diff upload (original source NOT included)');
+    } else {
+        return g_('full upload (original source is included)');
+    }
+}
+
+sub build_target_fallback {
+    my $ctrl = shift;
+
+    # If we are building rootless, there is no need to call the build target
+    # independently as non-root.
+    return if not rules_requires_root($binarytarget);
+
+    return if $buildtarget eq 'build';
+    return if scalar @debian_rules != 1;
+
+    # Check if we are building both arch:all and arch:any packages, in which
+    # case we now require working build-indep and build-arch targets.
+    my $pkg_arch = 0;
+
+    foreach my $bin ($ctrl->get_packages()) {
+        if ($bin->{Architecture} eq 'all') {
+            $pkg_arch |= BUILD_ARCH_INDEP;
+        } else {
+            $pkg_arch |= BUILD_ARCH_DEP;
+        }
+    }
+
+    return if $pkg_arch == BUILD_BINARY;
+
+    # Check if the build-{arch,indep} targets are supported. If not, fallback
+    # to build.
+    my $pid = spawn(exec => [ $Dpkg::PROGMAKE, '-f', @debian_rules, '-qn', $buildtarget ],
+                    from_file => '/dev/null', to_file => '/dev/null',
+                    error_to_file => '/dev/null');
+    my $cmdline = "make -f @debian_rules -qn $buildtarget";
+    wait_child($pid, nocheck => 1, cmdline => $cmdline);
+    my $exitcode = WEXITSTATUS($?);
+    subprocerr($cmdline) unless WIFEXITED($?);
+    if ($exitcode == 2) {
+        warning(g_("%s must be updated to support the 'build-arch' and " .
+                   "'build-indep' targets (at least '%s' seems to be " .
+                   'missing)'), "@debian_rules", $buildtarget);
+        $buildtarget = 'build';
+    }
+}
+                                                                                                                                                                                                                                                                                                                                                                                               usr/bin/dpkg-checkbuilddeps                                                                         0000755 0000000 0000000 00000016710 14427046421 014460  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        #!/usr/bin/perl
+#
+# dpkg-checkbuilddeps
+#
+# Copyright © 2001 Joey Hess <joeyh@debian.org>
+# Copyright © 2006-2009, 2011-2015 Guillem Jover <guillem@debian.org>
+# Copyright © 2007-2011 Raphael Hertzog <hertzog@debian.org>
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 2 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+use strict;
+use warnings;
+
+use Getopt::Long qw(:config posix_default bundling_values no_ignorecase);
+
+use Dpkg ();
+use Dpkg::Gettext;
+use Dpkg::ErrorHandling;
+use Dpkg::Arch qw(get_host_arch);
+use Dpkg::Vendor qw(run_vendor_hook);
+use Dpkg::BuildProfiles qw(get_build_profiles set_build_profiles);
+use Dpkg::Deps;
+use Dpkg::Control::Info;
+
+textdomain('dpkg-dev');
+
+sub version()
+{
+    printf g_("Debian %s version %s.\n"), $Dpkg::PROGNAME, $Dpkg::PROGVERSION;
+}
+
+sub usage {
+    printf g_(
+'Usage: %s [<option>...] [<control-file>]')
+    . "\n\n" . g_(
+'Options:
+  -A             ignore Build-Depends-Arch and Build-Conflicts-Arch.
+  -B             ignore Build-Depends-Indep and Build-Conflicts-Indep.
+  -I             ignore built-in build dependencies and conflicts.
+  -d build-deps  use given string as build dependencies instead of
+                 retrieving them from control file
+  -c build-conf  use given string for build conflicts instead of
+                 retrieving them from control file
+  -a arch        assume given host architecture
+  -P profiles    assume given build profiles (comma-separated list)
+  --admindir=<directory>
+                 change the administrative directory.
+  -?, --help     show this help message.
+      --version  show the version.')
+    . "\n\n" . g_(
+'<control-file> is the control file to process (default: debian/control).')
+	. "\n", $Dpkg::PROGNAME;
+}
+
+my $ignore_bd_arch = 0;
+my $ignore_bd_indep = 0;
+my $ignore_bd_builtin = 0;
+my ($bd_value, $bc_value);
+my $bp_value;
+my $host_arch = get_host_arch();
+my $admindir = $Dpkg::ADMINDIR;
+my @options_spec = (
+    'help|?' => sub { usage(); exit(0); },
+    'version' => sub { version(); exit 0; },
+    'A' => \$ignore_bd_arch,
+    'B' => \$ignore_bd_indep,
+    'I' => \$ignore_bd_builtin,
+    'd=s' => \$bd_value,
+    'c=s' => \$bc_value,
+    'a=s' => \$host_arch,
+    'P=s' => \$bp_value,
+    'admindir=s' => \$admindir,
+);
+
+{
+    local $SIG{__WARN__} = sub { usageerr($_[0]) };
+    GetOptions(@options_spec);
+}
+
+# Update currently active build profiles.
+set_build_profiles(split(/,/, $bp_value)) if ($bp_value);
+my @build_profiles = get_build_profiles();
+
+my $controlfile = shift // 'debian/control';
+
+my $control = Dpkg::Control::Info->new($controlfile);
+my $fields = $control->get_source();
+
+my $facts = parse_status("$admindir/status");
+
+unless (defined($bd_value) or defined($bc_value)) {
+    my @bd_list;
+    push @bd_list, run_vendor_hook('builtin-build-depends')
+        if not $ignore_bd_builtin;
+    push @bd_list, $fields->{'Build-Depends'};
+    push @bd_list, $fields->{'Build-Depends-Arch'} if not $ignore_bd_arch;
+    push @bd_list, $fields->{'Build-Depends-Indep'} if not $ignore_bd_indep;
+    $bd_value = deps_concat(@bd_list);
+
+    my @bc_list;
+    push @bc_list, run_vendor_hook('builtin-build-conflicts')
+        if not $ignore_bd_builtin;
+    push @bc_list, $fields->{'Build-Conflicts'};
+    push @bc_list, $fields->{'Build-Conflicts-Arch'} if not $ignore_bd_arch;
+    push @bc_list, $fields->{'Build-Conflicts-Indep'} if not $ignore_bd_indep;
+    $bc_value = deps_concat(@bc_list);
+}
+my (@unmet, @conflicts);
+
+if ($bd_value) {
+    my $dep = deps_parse($bd_value, reduce_restrictions => 1,
+                         build_dep => 1, build_profiles => \@build_profiles,
+                         host_arch => $host_arch);
+    error(g_('cannot parse %s field'),
+          'Build-Depends/Build-Depends-Arch/Build-Depends-Indep')
+        unless defined $dep;
+    push @unmet, build_depends($dep, $facts);
+}
+if ($bc_value) {
+    my $dep = deps_parse($bc_value, reduce_restrictions => 1, union => 1,
+                         build_dep => 1, build_profiles => \@build_profiles,
+                         host_arch => $host_arch);
+    error(g_('cannot parse %s field'),
+          'Build-Conflicts/Build-Conflicts-Arch/Build-Conflicts-Indep')
+        unless defined $dep;
+    push @conflicts, build_conflicts($dep, $facts);
+}
+
+if (@unmet) {
+    errormsg(g_('Unmet build dependencies: %s'),
+             join(' ', map { $_->output() } @unmet));
+}
+if (@conflicts) {
+    errormsg(g_('Build conflicts: %s'),
+             join(' ', map { $_->output() } @conflicts));
+}
+exit 1 if @unmet || @conflicts;
+
+# Silly little status file parser that returns a Dpkg::Deps::KnownFacts
+sub parse_status {
+    my $status = shift;
+
+    my $facts = Dpkg::Deps::KnownFacts->new();
+    local $/ = '';
+    open(my $status_fh, '<', $status)
+        or syserr(g_('cannot open %s'), $status);
+    while (<$status_fh>) {
+        next unless /^Status: .*ok installed$/m;
+
+        my ($package) = /^Package: (.*)$/m;
+        my ($version) = /^Version: (.*)$/m;
+        my ($arch) = /^Architecture: (.*)$/m;
+        my ($multiarch) = /^Multi-Arch: (.*)$/m;
+        $facts->add_installed_package($package, $version, $arch, $multiarch);
+
+        if (/^Provides: (.*)$/m) {
+            my $provides = deps_parse($1, reduce_arch => 1, virtual => 1, union => 1);
+            next if not defined $provides;
+            foreach (grep { $_->isa('Dpkg::Deps::Simple') }
+                     $provides->get_deps())
+            {
+                $facts->add_provided_package($_->{package},
+                                             $_->{relation}, $_->{version},
+                                             $package);
+            }
+        }
+    }
+    close $status_fh;
+
+    return $facts;
+}
+
+# This function checks the build dependencies passed in as the first
+# parameter. If they are satisfied, returns false. If they are unsatisfied,
+# a list of the unsatisfied depends is returned.
+#
+# Additional parameters that must be passed:
+# * A reference to a hash of all "ok installed" the packages on the system,
+#   with the hash key being the package name, and the value being the
+#   installed version.
+# * A reference to a hash, where the keys are package names, and the
+#   value is a true value iff some package installed on the system provides
+#   that package (all installed packages provide themselves)
+#
+# Optionally, the architecture the package is to be built for can be passed
+# in as the 4th parameter. If not set, dpkg will be queried for the build
+# architecture.
+sub build_depends {
+    my ($dep_list, $facts) = @_;
+
+    $dep_list->simplify_deps($facts);
+    if ($dep_list->is_empty()) {
+        return ();
+    } else {
+        return $dep_list->get_deps();
+    }
+}
+
+# This function is exactly like build_depends(), except it
+# checks for build conflicts, and returns a list of the packages
+# that are installed and are conflicted with.
+sub build_conflicts {
+    my ($dep_list, $facts) = @_;
+
+    my @conflicts = ();
+    foreach my $dep ($dep_list->get_deps()) {
+        if ($dep->get_evaluation($facts)) {
+            push @conflicts, $dep;
+        }
+    }
+    return @conflicts;
+}
+                                                        usr/bin/dpkg-distaddfile                                                                            0000755 0000000 0000000 00000005337 14427046421 013766  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        #!/usr/bin/perl
+#
+# dpkg-distaddfile
+#
+# Copyright © 1996 Ian Jackson
+# Copyright © 2006-2008,2010,2012-2014 Guillem Jover <guillem@debian.org>
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 2 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+use strict;
+use warnings;
+
+use POSIX qw(:errno_h :fcntl_h);
+
+use Dpkg ();
+use Dpkg::Gettext;
+use Dpkg::ErrorHandling;
+use Dpkg::Lock;
+use Dpkg::Dist::Files;
+
+textdomain('dpkg-dev');
+
+my $fileslistfile = 'debian/files';
+
+
+sub version {
+    printf g_("Debian %s version %s.\n"), $Dpkg::PROGNAME, $Dpkg::PROGVERSION;
+
+    printf g_('
+This is free software; see the GNU General Public License version 2 or
+later for copying conditions. There is NO warranty.
+');
+}
+
+sub usage {
+    printf g_(
+'Usage: %s [<option>...] <filename> <section> <priority>
+
+Options:
+  -f<files-list-file>      write files here instead of debian/files.
+  -?, --help               show this help message.
+      --version            show the version.
+'), $Dpkg::PROGNAME;
+}
+
+while (@ARGV && $ARGV[0] =~ m/^-/) {
+    $_ = shift @ARGV;
+    if (m/^-f/p) {
+        $fileslistfile = ${^POSTMATCH};
+    } elsif (m/^-(?:\?|-help)$/) {
+        usage();
+        exit(0);
+    } elsif (m/^--version$/) {
+        version();
+        exit(0);
+    } elsif (m/^--$/) {
+        last;
+    } else {
+        usageerr(g_("unknown option '%s'"), $_);
+    }
+}
+usageerr(g_('need exactly a filename, section and priority')) if @ARGV != 3;
+
+my ($filename, $section, $priority) = @ARGV;
+
+($filename =~ m/\s/ || $section =~ m/\s/ || $priority =~ m/\s/) &&
+    error(g_('filename, section and priority may contain no whitespace'));
+
+# Obtain a lock on debian/control to avoid simultaneous updates
+# of debian/files when parallel building is in use
+my $lockfh;
+my $lockfile = 'debian/control';
+sysopen($lockfh, $lockfile, O_WRONLY)
+    or syserr(g_('cannot write %s'), $lockfile);
+file_lock($lockfh, $lockfile);
+
+my $dist = Dpkg::Dist::Files->new();
+$dist->load($fileslistfile) if -e $fileslistfile;
+$dist->add_file($filename, $section, $priority);
+$dist->save("$fileslistfile.new");
+
+rename("$fileslistfile.new", $fileslistfile)
+    or syserr(g_('install new files list file'));
+
+# Release the lock
+close($lockfh) or syserr(g_('cannot close %s'), $lockfile);
+                                                                                                                                                                                                                                                                                                 usr/bin/dpkg-genbuildinfo                                                                           0000755 0000000 0000000 00000044751 14427046421 014162  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        #!/usr/bin/perl
+#
+# dpkg-genbuildinfo
+#
+# Copyright © 1996 Ian Jackson
+# Copyright © 2000,2001 Wichert Akkerman
+# Copyright © 2003-2013 Yann Dirson <dirson@debian.org>
+# Copyright © 2006-2016 Guillem Jover <guillem@debian.org>
+# Copyright © 2014 Niko Tyni <ntyni@debian.org>
+# Copyright © 2014-2015 Jérémy Bobbio <lunar@debian.org>
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 2 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+use strict;
+use warnings;
+
+use List::Util qw(any);
+use Cwd;
+use File::Basename;
+use File::Temp;
+use POSIX qw(:fcntl_h :locale_h strftime);
+
+use Dpkg ();
+use Dpkg::Gettext;
+use Dpkg::Checksums;
+use Dpkg::ErrorHandling;
+use Dpkg::IPC;
+use Dpkg::Path qw(find_command);
+use Dpkg::Arch qw(
+    get_build_arch
+    get_host_arch
+    debarch_eq debarch_to_gnutriplet
+);
+use Dpkg::BuildTypes;
+use Dpkg::BuildOptions;
+use Dpkg::BuildFlags;
+use Dpkg::BuildProfiles qw(get_build_profiles);
+use Dpkg::BuildInfo qw(get_build_env_allowed);
+use Dpkg::Control::Info;
+use Dpkg::Control::Fields;
+use Dpkg::Control;
+use Dpkg::Changelog::Parse;
+use Dpkg::Deps;
+use Dpkg::Dist::Files;
+use Dpkg::Lock;
+use Dpkg::Version;
+use Dpkg::Vendor qw(get_current_vendor run_vendor_hook);
+
+textdomain('dpkg-dev');
+
+my $controlfile = 'debian/control';

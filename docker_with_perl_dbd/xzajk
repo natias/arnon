@@ -1,0 +1,1000 @@
+def create_dict_rule(src: str, pos: Pos, out: Output) -> tuple[Pos, Key]:
+    pos += 1  # Skip "["
+    pos = skip_chars(src, pos, TOML_WS)
+    pos, key = parse_key(src, pos)
+
+    if out.flags.is_(key, Flags.EXPLICIT_NEST) or out.flags.is_(key, Flags.FROZEN):
+        raise suffixed_err(src, pos, f"Cannot declare {key} twice")
+    out.flags.set(key, Flags.EXPLICIT_NEST, recursive=False)
+    try:
+        out.data.get_or_create_nest(key)
+    except KeyError:
+        raise suffixed_err(src, pos, "Cannot overwrite a value") from None
+
+    if not src.startswith("]", pos):
+        raise suffixed_err(src, pos, "Expected ']' at the end of a table declaration")
+    return pos + 1, key
+
+
+def create_list_rule(src: str, pos: Pos, out: Output) -> tuple[Pos, Key]:
+    pos += 2  # Skip "[["
+    pos = skip_chars(src, pos, TOML_WS)
+    pos, key = parse_key(src, pos)
+
+    if out.flags.is_(key, Flags.FROZEN):
+        raise suffixed_err(src, pos, f"Cannot mutate immutable namespace {key}")
+    # Free the namespace now that it points to another empty list item...
+    out.flags.unset_all(key)
+    # ...but this key precisely is still prohibited from table declaration
+    out.flags.set(key, Flags.EXPLICIT_NEST, recursive=False)
+    try:
+        out.data.append_nest_to_list(key)
+    except KeyError:
+        raise suffixed_err(src, pos, "Cannot overwrite a value") from None
+
+    if not src.startswith("]]", pos):
+        raise suffixed_err(src, pos, "Expected ']]' at the end of an array declaration")
+    return pos + 2, key
+
+
+def key_value_rule(
+    src: str, pos: Pos, out: Output, header: Key, parse_float: ParseFloat
+) -> Pos:
+    pos, key, value = parse_key_value_pair(src, pos, parse_float)
+    key_parent, key_stem = key[:-1], key[-1]
+    abs_key_parent = header + key_parent
+
+    relative_path_cont_keys = (header + key[:i] for i in range(1, len(key)))
+    for cont_key in relative_path_cont_keys:
+        # Check that dotted key syntax does not redefine an existing table
+        if out.flags.is_(cont_key, Flags.EXPLICIT_NEST):
+            raise suffixed_err(src, pos, f"Cannot redefine namespace {cont_key}")
+        # Containers in the relative path can't be opened with the table syntax or
+        # dotted key/value syntax in following table sections.
+        out.flags.add_pending(cont_key, Flags.EXPLICIT_NEST)
+
+    if out.flags.is_(abs_key_parent, Flags.FROZEN):
+        raise suffixed_err(
+            src, pos, f"Cannot mutate immutable namespace {abs_key_parent}"
+        )
+
+    try:
+        nest = out.data.get_or_create_nest(abs_key_parent)
+    except KeyError:
+        raise suffixed_err(src, pos, "Cannot overwrite a value") from None
+    if key_stem in nest:
+        raise suffixed_err(src, pos, "Cannot overwrite a value")
+    # Mark inline table and array namespaces recursively immutable
+    if isinstance(value, (dict, list)):
+        out.flags.set(header + key, Flags.FROZEN, recursive=True)
+    nest[key_stem] = value
+    return pos
+
+
+def parse_key_value_pair(
+    src: str, pos: Pos, parse_float: ParseFloat
+) -> tuple[Pos, Key, Any]:
+    pos, key = parse_key(src, pos)
+    try:
+        char: str | None = src[pos]
+    except IndexError:
+        char = None
+    if char != "=":
+        raise suffixed_err(src, pos, "Expected '=' after a key in a key/value pair")
+    pos += 1
+    pos = skip_chars(src, pos, TOML_WS)
+    pos, value = parse_value(src, pos, parse_float)
+    return pos, key, value
+
+
+def parse_key(src: str, pos: Pos) -> tuple[Pos, Key]:
+    pos, key_part = parse_key_part(src, pos)
+    key: Key = (key_part,)
+    pos = skip_chars(src, pos, TOML_WS)
+    while True:
+        try:
+            char: str | None = src[pos]
+        except IndexError:
+            char = None
+        if char != ".":
+            return pos, key
+        pos += 1
+        pos = skip_chars(src, pos, TOML_WS)
+        pos, key_part = parse_key_part(src, pos)
+        key += (key_part,)
+        pos = skip_chars(src, pos, TOML_WS)
+
+
+def parse_key_part(src: str, pos: Pos) -> tuple[Pos, str]:
+    try:
+        char: str | None = src[pos]
+    except IndexError:
+        char = None
+    if char in BARE_KEY_CHARS:
+        start_pos = pos
+        pos = skip_chars(src, pos, BARE_KEY_CHARS)
+        return pos, src[start_pos:pos]
+    if char == "'":
+        return parse_literal_str(src, pos)
+    if char == '"':
+        return parse_one_line_basic_str(src, pos)
+    raise suffixed_err(src, pos, "Invalid initial character for a key part")
+
+
+def parse_one_line_basic_str(src: str, pos: Pos) -> tuple[Pos, str]:
+    pos += 1
+    return parse_basic_str(src, pos, multiline=False)
+
+
+def parse_array(src: str, pos: Pos, parse_float: ParseFloat) -> tuple[Pos, list]:
+    pos += 1
+    array: list = []
+
+    pos = skip_comments_and_array_ws(src, pos)
+    if src.startswith("]", pos):
+        return pos + 1, array
+    while True:
+        pos, val = parse_value(src, pos, parse_float)
+        array.append(val)
+        pos = skip_comments_and_array_ws(src, pos)
+
+        c = src[pos : pos + 1]
+        if c == "]":
+            return pos + 1, array
+        if c != ",":
+            raise suffixed_err(src, pos, "Unclosed array")
+        pos += 1
+
+        pos = skip_comments_and_array_ws(src, pos)
+        if src.startswith("]", pos):
+            return pos + 1, array
+
+
+def parse_inline_table(src: str, pos: Pos, parse_float: ParseFloat) -> tuple[Pos, dict]:
+    pos += 1
+    nested_dict = NestedDict()
+    flags = Flags()
+
+    pos = skip_chars(src, pos, TOML_WS)
+    if src.startswith("}", pos):
+        return pos + 1, nested_dict.dict
+    while True:
+        pos, key, value = parse_key_value_pair(src, pos, parse_float)
+        key_parent, key_stem = key[:-1], key[-1]
+        if flags.is_(key, Flags.FROZEN):
+            raise suffixed_err(src, pos, f"Cannot mutate immutable namespace {key}")
+        try:
+            nest = nested_dict.get_or_create_nest(key_parent, access_lists=False)
+        except KeyError:
+            raise suffixed_err(src, pos, "Cannot overwrite a value") from None
+        if key_stem in nest:
+            raise suffixed_err(src, pos, f"Duplicate inline table key {key_stem!r}")
+        nest[key_stem] = value
+        pos = skip_chars(src, pos, TOML_WS)
+        c = src[pos : pos + 1]
+        if c == "}":
+            return pos + 1, nested_dict.dict
+        if c != ",":
+            raise suffixed_err(src, pos, "Unclosed inline table")
+        if isinstance(value, (dict, list)):
+            flags.set(key, Flags.FROZEN, recursive=True)
+        pos += 1
+        pos = skip_chars(src, pos, TOML_WS)
+
+
+def parse_basic_str_escape(
+    src: str, pos: Pos, *, multiline: bool = False
+) -> tuple[Pos, str]:
+    escape_id = src[pos : pos + 2]
+    pos += 2
+    if multiline and escape_id in {"\\ ", "\\\t", "\\\n"}:
+        # Skip whitespace until next non-whitespace character or end of
+        # the doc. Error if non-whitespace is found before newline.
+        if escape_id != "\\\n":
+            pos = skip_chars(src, pos, TOML_WS)
+            try:
+                char = src[pos]
+            except IndexError:
+                return pos, ""
+            if char != "\n":
+                raise suffixed_err(src, pos, "Unescaped '\\' in a string")
+            pos += 1
+        pos = skip_chars(src, pos, TOML_WS_AND_NEWLINE)
+        return pos, ""
+    if escape_id == "\\u":
+        return parse_hex_char(src, pos, 4)
+    if escape_id == "\\U":
+        return parse_hex_char(src, pos, 8)
+    try:
+        return pos, BASIC_STR_ESCAPE_REPLACEMENTS[escape_id]
+    except KeyError:
+        raise suffixed_err(src, pos, "Unescaped '\\' in a string") from None
+
+
+def parse_basic_str_escape_multiline(src: str, pos: Pos) -> tuple[Pos, str]:
+    return parse_basic_str_escape(src, pos, multiline=True)
+
+
+def parse_hex_char(src: str, pos: Pos, hex_len: int) -> tuple[Pos, str]:
+    hex_str = src[pos : pos + hex_len]
+    if len(hex_str) != hex_len or not HEXDIGIT_CHARS.issuperset(hex_str):
+        raise suffixed_err(src, pos, "Invalid hex value")
+    pos += hex_len
+    hex_int = int(hex_str, 16)
+    if not is_unicode_scalar_value(hex_int):
+        raise suffixed_err(src, pos, "Escaped character is not a Unicode scalar value")
+    return pos, chr(hex_int)
+
+
+def parse_literal_str(src: str, pos: Pos) -> tuple[Pos, str]:
+    pos += 1  # Skip starting apostrophe
+    start_pos = pos
+    pos = skip_until(
+        src, pos, "'", error_on=ILLEGAL_LITERAL_STR_CHARS, error_on_eof=True
+    )
+    return pos + 1, src[start_pos:pos]  # Skip ending apostrophe
+
+
+def parse_multiline_str(src: str, pos: Pos, *, literal: bool) -> tuple[Pos, str]:
+    pos += 3
+    if src.startswith("\n", pos):
+        pos += 1
+
+    if literal:
+        delim = "'"
+        end_pos = skip_until(
+            src,
+            pos,
+            "'''",
+            error_on=ILLEGAL_MULTILINE_LITERAL_STR_CHARS,
+            error_on_eof=True,
+        )
+        result = src[pos:end_pos]
+        pos = end_pos + 3
+    else:
+        delim = '"'
+        pos, result = parse_basic_str(src, pos, multiline=True)
+
+    # Add at maximum two extra apostrophes/quotes if the end sequence
+    # is 4 or 5 chars long instead of just 3.
+    if not src.startswith(delim, pos):
+        return pos, result
+    pos += 1
+    if not src.startswith(delim, pos):
+        return pos, result + delim
+    pos += 1
+    return pos, result + (delim * 2)
+
+
+def parse_basic_str(src: str, pos: Pos, *, multiline: bool) -> tuple[Pos, str]:
+    if multiline:
+        error_on = ILLEGAL_MULTILINE_BASIC_STR_CHARS
+        parse_escapes = parse_basic_str_escape_multiline
+    else:
+        error_on = ILLEGAL_BASIC_STR_CHARS
+        parse_escapes = parse_basic_str_escape
+    result = ""
+    start_pos = pos
+    while True:
+        try:
+            char = src[pos]
+        except IndexError:
+            raise suffixed_err(src, pos, "Unterminated string") from None
+        if char == '"':
+            if not multiline:
+                return pos + 1, result + src[start_pos:pos]
+            if src.startswith('"""', pos):
+                return pos + 3, result + src[start_pos:pos]
+            pos += 1
+            continue
+        if char == "\\":
+            result += src[start_pos:pos]
+            pos, parsed_escape = parse_escapes(src, pos)
+            result += parsed_escape
+            start_pos = pos
+            continue
+        if char in error_on:
+            raise suffixed_err(src, pos, f"Illegal character {char!r}")
+        pos += 1
+
+
+def parse_value(  # noqa: C901
+    src: str, pos: Pos, parse_float: ParseFloat
+) -> tuple[Pos, Any]:
+    try:
+        char: str | None = src[pos]
+    except IndexError:
+        char = None
+
+    # IMPORTANT: order conditions based on speed of checking and likelihood
+
+    # Basic strings
+    if char == '"':
+        if src.startswith('"""', pos):
+            return parse_multiline_str(src, pos, literal=False)
+        return parse_one_line_basic_str(src, pos)
+
+    # Literal strings
+    if char == "'":
+        if src.startswith("'''", pos):
+            return parse_multiline_str(src, pos, literal=True)
+        return parse_literal_str(src, pos)
+
+    # Booleans
+    if char == "t":
+        if src.startswith("true", pos):
+            return pos + 4, True
+    if char == "f":
+        if src.startswith("false", pos):
+            return pos + 5, False
+
+    # Arrays
+    if char == "[":
+        return parse_array(src, pos, parse_float)
+
+    # Inline tables
+    if char == "{":
+        return parse_inline_table(src, pos, parse_float)
+
+    # Dates and times
+    datetime_match = RE_DATETIME.match(src, pos)
+    if datetime_match:
+        try:
+            datetime_obj = match_to_datetime(datetime_match)
+        except ValueError as e:
+            raise suffixed_err(src, pos, "Invalid date or datetime") from e
+        return datetime_match.end(), datetime_obj
+    localtime_match = RE_LOCALTIME.match(src, pos)
+    if localtime_match:
+        return localtime_match.end(), match_to_localtime(localtime_match)
+
+    # Integers and "normal" floats.
+    # The regex will greedily match any type starting with a decimal
+    # char, so needs to be located after handling of dates and times.
+    number_match = RE_NUMBER.match(src, pos)
+    if number_match:
+        return number_match.end(), match_to_number(number_match, parse_float)
+
+    # Special floats
+    first_three = src[pos : pos + 3]
+    if first_three in {"inf", "nan"}:
+        return pos + 3, parse_float(first_three)
+    first_four = src[pos : pos + 4]
+    if first_four in {"-inf", "+inf", "-nan", "+nan"}:
+        return pos + 4, parse_float(first_four)
+
+    raise suffixed_err(src, pos, "Invalid value")
+
+
+def suffixed_err(src: str, pos: Pos, msg: str) -> TOMLDecodeError:
+    """Return a `TOMLDecodeError` where error message is suffixed with
+    coordinates in source."""
+
+    def coord_repr(src: str, pos: Pos) -> str:
+        if pos >= len(src):
+            return "end of document"
+        line = src.count("\n", 0, pos) + 1
+        if line == 1:
+            column = pos + 1
+        else:
+            column = pos - src.rindex("\n", 0, pos)
+        return f"line {line}, column {column}"
+
+    return TOMLDecodeError(f"{msg} (at {coord_repr(src, pos)})")
+
+
+def is_unicode_scalar_value(codepoint: int) -> bool:
+    return (0 <= codepoint <= 55295) or (57344 <= codepoint <= 1114111)
+
+
+def make_safe_parse_float(parse_float: ParseFloat) -> ParseFloat:
+    """A decorator to make `parse_float` safe.
+
+    `parse_float` must not return dicts or lists, because these types
+    would be mixed with parsed TOML tables and arrays, thus confusing
+    the parser. The returned decorated callable raises `ValueError`
+    instead of returning illegal types.
+    """
+    # The default `float` callable never returns illegal types. Optimize it.
+    if parse_float is float:  # type: ignore[comparison-overlap]
+        return float
+
+    def safe_parse_float(float_str: str) -> Any:
+        float_value = parse_float(float_str)
+        if isinstance(float_value, (dict, list)):
+            raise ValueError("parse_float must not return dicts or lists")
+        return float_value
+
+    return safe_parse_float
+                                                                                                                                                                                                                                                                                                                                                                                                                         usr/lib/python3.11/tomllib/_re.py                                                                   0000644 0000000 0000000 00000005577 14671176116 015260  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        # SPDX-License-Identifier: MIT
+# SPDX-FileCopyrightText: 2021 Taneli Hukkinen
+# Licensed to PSF under a Contributor Agreement.
+
+from __future__ import annotations
+
+from datetime import date, datetime, time, timedelta, timezone, tzinfo
+from functools import lru_cache
+import re
+from typing import Any
+
+from ._types import ParseFloat
+
+# E.g.
+# - 00:32:00.999999
+# - 00:32:00
+_TIME_RE_STR = r"([01][0-9]|2[0-3]):([0-5][0-9]):([0-5][0-9])(?:\.([0-9]{1,6})[0-9]*)?"
+
+RE_NUMBER = re.compile(
+    r"""
+0
+(?:
+    x[0-9A-Fa-f](?:_?[0-9A-Fa-f])*   # hex
+    |
+    b[01](?:_?[01])*                 # bin
+    |
+    o[0-7](?:_?[0-7])*               # oct
+)
+|
+[+-]?(?:0|[1-9](?:_?[0-9])*)         # dec, integer part
+(?P<floatpart>
+    (?:\.[0-9](?:_?[0-9])*)?         # optional fractional part
+    (?:[eE][+-]?[0-9](?:_?[0-9])*)?  # optional exponent part
+)
+""",
+    flags=re.VERBOSE,
+)
+RE_LOCALTIME = re.compile(_TIME_RE_STR)
+RE_DATETIME = re.compile(
+    rf"""
+([0-9]{{4}})-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])  # date, e.g. 1988-10-27
+(?:
+    [Tt ]
+    {_TIME_RE_STR}
+    (?:([Zz])|([+-])([01][0-9]|2[0-3]):([0-5][0-9]))?  # optional time offset
+)?
+""",
+    flags=re.VERBOSE,
+)
+
+
+def match_to_datetime(match: re.Match) -> datetime | date:
+    """Convert a `RE_DATETIME` match to `datetime.datetime` or `datetime.date`.
+
+    Raises ValueError if the match does not correspond to a valid date
+    or datetime.
+    """
+    (
+        year_str,
+        month_str,
+        day_str,
+        hour_str,
+        minute_str,
+        sec_str,
+        micros_str,
+        zulu_time,
+        offset_sign_str,
+        offset_hour_str,
+        offset_minute_str,
+    ) = match.groups()
+    year, month, day = int(year_str), int(month_str), int(day_str)
+    if hour_str is None:
+        return date(year, month, day)
+    hour, minute, sec = int(hour_str), int(minute_str), int(sec_str)
+    micros = int(micros_str.ljust(6, "0")) if micros_str else 0
+    if offset_sign_str:
+        tz: tzinfo | None = cached_tz(
+            offset_hour_str, offset_minute_str, offset_sign_str
+        )
+    elif zulu_time:
+        tz = timezone.utc
+    else:  # local date-time
+        tz = None
+    return datetime(year, month, day, hour, minute, sec, micros, tzinfo=tz)
+
+
+@lru_cache(maxsize=None)
+def cached_tz(hour_str: str, minute_str: str, sign_str: str) -> timezone:
+    sign = 1 if sign_str == "+" else -1
+    return timezone(
+        timedelta(
+            hours=sign * int(hour_str),
+            minutes=sign * int(minute_str),
+        )
+    )
+
+
+def match_to_localtime(match: re.Match) -> time:
+    hour_str, minute_str, sec_str, micros_str = match.groups()
+    micros = int(micros_str.ljust(6, "0")) if micros_str else 0
+    return time(int(hour_str), int(minute_str), int(sec_str), micros)
+
+
+def match_to_number(match: re.Match, parse_float: ParseFloat) -> Any:
+    if match.group("floatpart"):
+        return parse_float(match.group())
+    return int(match.group(), 0)
+                                                                                                                                 usr/lib/python3.11/tomllib/_types.py                                                                0000644 0000000 0000000 00000000376 14671176116 016006  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        # SPDX-License-Identifier: MIT
+# SPDX-FileCopyrightText: 2021 Taneli Hukkinen
+# Licensed to PSF under a Contributor Agreement.
+
+from typing import Any, Callable, Tuple
+
+# Type annotations
+ParseFloat = Callable[[str], Any]
+Key = Tuple[str, ...]
+Pos = int
+                                                                                                                                                                                                                                                                  usr/lib/python3.11/trace.py                                                                         0000755 0000000 0000000 00000071023 14671176116 014137  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        #!/usr/bin/env python3
+
+# portions copyright 2001, Autonomous Zones Industries, Inc., all rights...
+# err...  reserved and offered to the public under the terms of the
+# Python 2.2 license.
+# Author: Zooko O'Whielacronx
+# http://zooko.com/
+# mailto:zooko@zooko.com
+#
+# Copyright 2000, Mojam Media, Inc., all rights reserved.
+# Author: Skip Montanaro
+#
+# Copyright 1999, Bioreason, Inc., all rights reserved.
+# Author: Andrew Dalke
+#
+# Copyright 1995-1997, Automatrix, Inc., all rights reserved.
+# Author: Skip Montanaro
+#
+# Copyright 1991-1995, Stichting Mathematisch Centrum, all rights reserved.
+#
+#
+# Permission to use, copy, modify, and distribute this Python software and
+# its associated documentation for any purpose without fee is hereby
+# granted, provided that the above copyright notice appears in all copies,
+# and that both that copyright notice and this permission notice appear in
+# supporting documentation, and that the name of neither Automatrix,
+# Bioreason or Mojam Media be used in advertising or publicity pertaining to
+# distribution of the software without specific, written prior permission.
+#
+"""program/module to trace Python program or function execution
+
+Sample use, command line:
+  trace.py -c -f counts --ignore-dir '$prefix' spam.py eggs
+  trace.py -t --ignore-dir '$prefix' spam.py eggs
+  trace.py --trackcalls spam.py eggs
+
+Sample use, programmatically
+  import sys
+
+  # create a Trace object, telling it what to ignore, and whether to
+  # do tracing or line-counting or both.
+  tracer = trace.Trace(ignoredirs=[sys.base_prefix, sys.base_exec_prefix,],
+                       trace=0, count=1)
+  # run the new command using the given tracer
+  tracer.run('main()')
+  # make a report, placing output in /tmp
+  r = tracer.results()
+  r.write_results(show_missing=True, coverdir="/tmp")
+"""
+__all__ = ['Trace', 'CoverageResults']
+
+import linecache
+import os
+import sys
+import sysconfig
+import token
+import tokenize
+import inspect
+import gc
+import dis
+import pickle
+from time import monotonic as _time
+
+import threading
+
+PRAGMA_NOCOVER = "#pragma NO COVER"
+
+class _Ignore:
+    def __init__(self, modules=None, dirs=None):
+        self._mods = set() if not modules else set(modules)
+        self._dirs = [] if not dirs else [os.path.normpath(d)
+                                          for d in dirs]
+        self._ignore = { '<string>': 1 }
+
+    def names(self, filename, modulename):
+        if modulename in self._ignore:
+            return self._ignore[modulename]
+
+        # haven't seen this one before, so see if the module name is
+        # on the ignore list.
+        if modulename in self._mods:  # Identical names, so ignore
+            self._ignore[modulename] = 1
+            return 1
+
+        # check if the module is a proper submodule of something on
+        # the ignore list
+        for mod in self._mods:
+            # Need to take some care since ignoring
+            # "cmp" mustn't mean ignoring "cmpcache" but ignoring
+            # "Spam" must also mean ignoring "Spam.Eggs".
+            if modulename.startswith(mod + '.'):
+                self._ignore[modulename] = 1
+                return 1
+
+        # Now check that filename isn't in one of the directories
+        if filename is None:
+            # must be a built-in, so we must ignore
+            self._ignore[modulename] = 1
+            return 1
+
+        # Ignore a file when it contains one of the ignorable paths
+        for d in self._dirs:
+            # The '+ os.sep' is to ensure that d is a parent directory,
+            # as compared to cases like:
+            #  d = "/usr/local"
+            #  filename = "/usr/local.py"
+            # or
+            #  d = "/usr/local.py"
+            #  filename = "/usr/local.py"
+            if filename.startswith(d + os.sep):
+                self._ignore[modulename] = 1
+                return 1
+
+        # Tried the different ways, so we don't ignore this module
+        self._ignore[modulename] = 0
+        return 0
+
+def _modname(path):
+    """Return a plausible module name for the path."""
+
+    base = os.path.basename(path)
+    filename, ext = os.path.splitext(base)
+    return filename
+
+def _fullmodname(path):
+    """Return a plausible module name for the path."""
+
+    # If the file 'path' is part of a package, then the filename isn't
+    # enough to uniquely identify it.  Try to do the right thing by
+    # looking in sys.path for the longest matching prefix.  We'll
+    # assume that the rest is the package name.
+
+    comparepath = os.path.normcase(path)
+    longest = ""
+    for dir in sys.path:
+        dir = os.path.normcase(dir)
+        if comparepath.startswith(dir) and comparepath[len(dir)] == os.sep:
+            if len(dir) > len(longest):
+                longest = dir
+
+    if longest:
+        base = path[len(longest) + 1:]
+    else:
+        base = path
+    # the drive letter is never part of the module name
+    drive, base = os.path.splitdrive(base)
+    base = base.replace(os.sep, ".")
+    if os.altsep:
+        base = base.replace(os.altsep, ".")
+    filename, ext = os.path.splitext(base)
+    return filename.lstrip(".")
+
+class CoverageResults:
+    def __init__(self, counts=None, calledfuncs=None, infile=None,
+                 callers=None, outfile=None):
+        self.counts = counts
+        if self.counts is None:
+            self.counts = {}
+        self.counter = self.counts.copy() # map (filename, lineno) to count
+        self.calledfuncs = calledfuncs
+        if self.calledfuncs is None:
+            self.calledfuncs = {}
+        self.calledfuncs = self.calledfuncs.copy()
+        self.callers = callers
+        if self.callers is None:
+            self.callers = {}
+        self.callers = self.callers.copy()
+        self.infile = infile
+        self.outfile = outfile
+        if self.infile:
+            # Try to merge existing counts file.
+            try:
+                with open(self.infile, 'rb') as f:
+                    counts, calledfuncs, callers = pickle.load(f)
+                self.update(self.__class__(counts, calledfuncs, callers=callers))
+            except (OSError, EOFError, ValueError) as err:
+                print(("Skipping counts file %r: %s"
+                                      % (self.infile, err)), file=sys.stderr)
+
+    def is_ignored_filename(self, filename):
+        """Return True if the filename does not refer to a file
+        we want to have reported.
+        """
+        return filename.startswith('<') and filename.endswith('>')
+
+    def update(self, other):
+        """Merge in the data from another CoverageResults"""
+        counts = self.counts
+        calledfuncs = self.calledfuncs
+        callers = self.callers
+        other_counts = other.counts
+        other_calledfuncs = other.calledfuncs
+        other_callers = other.callers
+
+        for key in other_counts:
+            counts[key] = counts.get(key, 0) + other_counts[key]
+
+        for key in other_calledfuncs:
+            calledfuncs[key] = 1
+
+        for key in other_callers:
+            callers[key] = 1
+
+    def write_results(self, show_missing=True, summary=False, coverdir=None):
+        """
+        Write the coverage results.
+
+        :param show_missing: Show lines that had no hits.
+        :param summary: Include coverage summary per module.
+        :param coverdir: If None, the results of each module are placed in its
+                         directory, otherwise it is included in the directory
+                         specified.
+        """
+        if self.calledfuncs:
+            print()
+            print("functions called:")
+            calls = self.calledfuncs
+            for filename, modulename, funcname in sorted(calls):
+                print(("filename: %s, modulename: %s, funcname: %s"
+                       % (filename, modulename, funcname)))
+
+        if self.callers:
+            print()
+            print("calling relationships:")
+            lastfile = lastcfile = ""
+            for ((pfile, pmod, pfunc), (cfile, cmod, cfunc)) \
+                    in sorted(self.callers):
+                if pfile != lastfile:
+                    print()
+                    print("***", pfile, "***")
+                    lastfile = pfile
+                    lastcfile = ""
+                if cfile != pfile and lastcfile != cfile:
+                    print("  -->", cfile)
+                    lastcfile = cfile
+                print("    %s.%s -> %s.%s" % (pmod, pfunc, cmod, cfunc))
+
+        # turn the counts data ("(filename, lineno) = count") into something
+        # accessible on a per-file basis
+        per_file = {}
+        for filename, lineno in self.counts:
+            lines_hit = per_file[filename] = per_file.get(filename, {})
+            lines_hit[lineno] = self.counts[(filename, lineno)]
+
+        # accumulate summary info, if needed
+        sums = {}
+
+        for filename, count in per_file.items():
+            if self.is_ignored_filename(filename):
+                continue
+
+            if filename.endswith(".pyc"):
+                filename = filename[:-1]
+
+            if coverdir is None:
+                dir = os.path.dirname(os.path.abspath(filename))
+                modulename = _modname(filename)
+            else:
+                dir = coverdir
+                if not os.path.exists(dir):
+                    os.makedirs(dir)
+                modulename = _fullmodname(filename)
+
+            # If desired, get a list of the line numbers which represent
+            # executable content (returned as a dict for better lookup speed)
+            if show_missing:
+                lnotab = _find_executable_linenos(filename)
+            else:
+                lnotab = {}
+            source = linecache.getlines(filename)
+            coverpath = os.path.join(dir, modulename + ".cover")
+            with open(filename, 'rb') as fp:
+                encoding, _ = tokenize.detect_encoding(fp.readline)
+            n_hits, n_lines = self.write_results_file(coverpath, source,
+                                                      lnotab, count, encoding)
+            if summary and n_lines:
+                percent = int(100 * n_hits / n_lines)
+                sums[modulename] = n_lines, percent, modulename, filename
+
+
+        if summary and sums:
+            print("lines   cov%   module   (path)")
+            for m in sorted(sums):
+                n_lines, percent, modulename, filename = sums[m]
+                print("%5d   %3d%%   %s   (%s)" % sums[m])
+
+        if self.outfile:
+            # try and store counts and module info into self.outfile
+            try:
+                with open(self.outfile, 'wb') as f:
+                    pickle.dump((self.counts, self.calledfuncs, self.callers),
+                                f, 1)
+            except OSError as err:
+                print("Can't save counts files because %s" % err, file=sys.stderr)
+
+    def write_results_file(self, path, lines, lnotab, lines_hit, encoding=None):
+        """Return a coverage results file in path."""
+        # ``lnotab`` is a dict of executable lines, or a line number "table"
+
+        try:
+            outfile = open(path, "w", encoding=encoding)
+        except OSError as err:
+            print(("trace: Could not open %r for writing: %s "
+                                  "- skipping" % (path, err)), file=sys.stderr)
+            return 0, 0
+
+        n_lines = 0
+        n_hits = 0
+        with outfile:
+            for lineno, line in enumerate(lines, 1):
+                # do the blank/comment match to try to mark more lines
+                # (help the reader find stuff that hasn't been covered)
+                if lineno in lines_hit:
+                    outfile.write("%5d: " % lines_hit[lineno])
+                    n_hits += 1
+                    n_lines += 1
+                elif lineno in lnotab and not PRAGMA_NOCOVER in line:
+                    # Highlight never-executed lines, unless the line contains
+                    # #pragma: NO COVER
+                    outfile.write(">>>>>> ")
+                    n_lines += 1
+                else:
+                    outfile.write("       ")
+                outfile.write(line.expandtabs(8))
+
+        return n_hits, n_lines
+
+def _find_lines_from_code(code, strs):
+    """Return dict where keys are lines in the line number table."""
+    linenos = {}
+
+    for _, lineno in dis.findlinestarts(code):
+        if lineno not in strs:
+            linenos[lineno] = 1
+
+    return linenos
+
+def _find_lines(code, strs):
+    """Return lineno dict for all code objects reachable from code."""
+    # get all of the lineno information from the code of this scope level
+    linenos = _find_lines_from_code(code, strs)
+
+    # and check the constants for references to other code objects
+    for c in code.co_consts:
+        if inspect.iscode(c):
+            # find another code object, so recurse into it
+            linenos.update(_find_lines(c, strs))
+    return linenos
+
+def _find_strings(filename, encoding=None):
+    """Return a dict of possible docstring positions.
+
+    The dict maps line numbers to strings.  There is an entry for
+    line that contains only a string or a part of a triple-quoted
+    string.
+    """
+    d = {}
+    # If the first token is a string, then it's the module docstring.
+    # Add this special case so that the test in the loop passes.
+    prev_ttype = token.INDENT
+    with open(filename, encoding=encoding) as f:
+        tok = tokenize.generate_tokens(f.readline)
+        for ttype, tstr, start, end, line in tok:
+            if ttype == token.STRING:
+                if prev_ttype == token.INDENT:
+                    sline, scol = start
+                    eline, ecol = end
+                    for i in range(sline, eline + 1):
+                        d[i] = 1
+            prev_ttype = ttype
+    return d
+
+def _find_executable_linenos(filename):
+    """Return dict where keys are line numbers in the line number table."""
+    try:
+        with tokenize.open(filename) as f:
+            prog = f.read()
+            encoding = f.encoding
+    except OSError as err:
+        print(("Not printing coverage data for %r: %s"
+                              % (filename, err)), file=sys.stderr)
+        return {}
+    code = compile(prog, filename, "exec")
+    strs = _find_strings(filename, encoding)
+    return _find_lines(code, strs)
+
+class Trace:
+    def __init__(self, count=1, trace=1, countfuncs=0, countcallers=0,
+                 ignoremods=(), ignoredirs=(), infile=None, outfile=None,
+                 timing=False):
+        """
+        @param count true iff it should count number of times each
+                     line is executed
+        @param trace true iff it should print out each line that is
+                     being counted
+        @param countfuncs true iff it should just output a list of
+                     (filename, modulename, funcname,) for functions
+                     that were called at least once;  This overrides
+                     `count' and `trace'
+        @param ignoremods a list of the names of modules to ignore
+        @param ignoredirs a list of the names of directories to ignore
+                     all of the (recursive) contents of
+        @param infile file from which to read stored counts to be
+                     added into the results
+        @param outfile file in which to write the results
+        @param timing true iff timing information be displayed
+        """
+        self.infile = infile
+        self.outfile = outfile
+        self.ignore = _Ignore(ignoremods, ignoredirs)
+        self.counts = {}   # keys are (filename, linenumber)
+        self.pathtobasename = {} # for memoizing os.path.basename
+        self.donothing = 0
+        self.trace = trace
+        self._calledfuncs = {}
+        self._callers = {}
+        self._caller_cache = {}
+        self.start_time = None
+        if timing:
+            self.start_time = _time()
+        if countcallers:
+            self.globaltrace = self.globaltrace_trackcallers
+        elif countfuncs:
+            self.globaltrace = self.globaltrace_countfuncs
+        elif trace and count:
+            self.globaltrace = self.globaltrace_lt
+            self.localtrace = self.localtrace_trace_and_count
+        elif trace:
+            self.globaltrace = self.globaltrace_lt
+            self.localtrace = self.localtrace_trace
+        elif count:
+            self.globaltrace = self.globaltrace_lt
+            self.localtrace = self.localtrace_count
+        else:
+            # Ahem -- do nothing?  Okay.
+            self.donothing = 1
+
+    def run(self, cmd):
+        import __main__
+        dict = __main__.__dict__
+        self.runctx(cmd, dict, dict)
+
+    def runctx(self, cmd, globals=None, locals=None):
+        if globals is None: globals = {}
+        if locals is None: locals = {}
+        if not self.donothing:
+            threading.settrace(self.globaltrace)
+            sys.settrace(self.globaltrace)
+        try:
+            exec(cmd, globals, locals)
+        finally:
+            if not self.donothing:
+                sys.settrace(None)
+                threading.settrace(None)
+
+    def runfunc(self, func, /, *args, **kw):
+        result = None
+        if not self.donothing:
+            sys.settrace(self.globaltrace)
+        try:
+            result = func(*args, **kw)
+        finally:
+            if not self.donothing:
+                sys.settrace(None)
+        return result
+
+    def file_module_function_of(self, frame):
+        code = frame.f_code
+        filename = code.co_filename
+        if filename:
+            modulename = _modname(filename)
+        else:
+            modulename = None
+
+        funcname = code.co_name

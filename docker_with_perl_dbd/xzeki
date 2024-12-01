@@ -1,0 +1,1000 @@
+	if ( ! defined $lp || ! defined $ls ) {
+	    my $ti = $dbh->type_info($data_type);
+	    $lp = $prefixes->{$data_type} = $ti ? $ti->{LITERAL_PREFIX} || "" : "'";
+	    $ls = $suffixes->{$data_type} = $ti ? $ti->{LITERAL_SUFFIX} || "" : "'";
+	}
+	return $str unless $lp || $ls; # no quoting required
+
+	# XXX don't know what the standard says about escaping
+	# in the 'general case' (where $lp != "'").
+	# So we just do this and hope:
+	$str =~ s/$lp/$lp$lp/g
+		if $lp && $lp eq $ls && ($lp eq "'" || $lp eq '"');
+	return "$lp$str$ls";
+    }
+
+    sub rows { -1 }	# here so $DBI::rows 'works' after using $dbh
+
+    sub do {
+	my($dbh, $statement, $attr, @params) = @_;
+	my $sth = $dbh->prepare($statement, $attr) or return undef;
+	$sth->execute(@params) or return undef;
+	my $rows = $sth->rows;
+	($rows == 0) ? "0E0" : $rows;
+    }
+
+    sub _do_selectrow {
+	my ($method, $dbh, $stmt, $attr, @bind) = @_;
+	my $sth = ((ref $stmt) ? $stmt : $dbh->prepare($stmt, $attr))
+	    or return undef;
+	$sth->execute(@bind)
+	    or return undef;
+	my $row = $sth->$method()
+	    and $sth->finish;
+	return $row;
+    }
+
+    sub selectrow_hashref {  return _do_selectrow('fetchrow_hashref',  @_); }
+
+    # XXX selectrow_array/ref also have C implementations in Driver.xst
+    sub selectrow_arrayref { return _do_selectrow('fetchrow_arrayref', @_); }
+    sub selectrow_array {
+	my $row = _do_selectrow('fetchrow_arrayref', @_) or return;
+	return $row->[0] unless wantarray;
+	return @$row;
+    }
+
+    sub selectall_array {
+        return @{ shift->selectall_arrayref(@_) || [] };
+    }
+
+    # XXX selectall_arrayref also has C implementation in Driver.xst
+    # which fallsback to this if a slice is given
+    sub selectall_arrayref {
+	my ($dbh, $stmt, $attr, @bind) = @_;
+	my $sth = (ref $stmt) ? $stmt : $dbh->prepare($stmt, $attr)
+	    or return;
+	$sth->execute(@bind) || return;
+	my $slice = $attr->{Slice}; # typically undef, else hash or array ref
+	if (!$slice and $slice=$attr->{Columns}) {
+	    if (ref $slice eq 'ARRAY') { # map col idx to perl array idx
+		$slice = [ @{$attr->{Columns}} ];	# take a copy
+		for (@$slice) { $_-- }
+	    }
+	}
+	my $rows = $sth->fetchall_arrayref($slice, my $MaxRows = $attr->{MaxRows});
+	$sth->finish if defined $MaxRows;
+	return $rows;
+    }
+
+    sub selectall_hashref {
+	my ($dbh, $stmt, $key_field, $attr, @bind) = @_;
+	my $sth = (ref $stmt) ? $stmt : $dbh->prepare($stmt, $attr);
+	return unless $sth;
+	$sth->execute(@bind) || return;
+	return $sth->fetchall_hashref($key_field);
+    }
+
+    sub selectcol_arrayref {
+	my ($dbh, $stmt, $attr, @bind) = @_;
+	my $sth = (ref $stmt) ? $stmt : $dbh->prepare($stmt, $attr);
+	return unless $sth;
+	$sth->execute(@bind) || return;
+	my @columns = ($attr->{Columns}) ? @{$attr->{Columns}} : (1);
+	my @values  = (undef) x @columns;
+	my $idx = 0;
+	for (@columns) {
+	    $sth->bind_col($_, \$values[$idx++]) || return;
+	}
+	my @col;
+	if (my $max = $attr->{MaxRows}) {
+	    push @col, @values while 0 < $max-- && $sth->fetch;
+	}
+	else {
+	    push @col, @values while $sth->fetch;
+	}
+	return \@col;
+    }
+
+    sub prepare_cached {
+	my ($dbh, $statement, $attr, $if_active) = @_;
+
+	# Needs support at dbh level to clear cache before complaining about
+	# active children. The XS template code does this. Drivers not using
+	# the template must handle clearing the cache themselves.
+	my $cache = $dbh->{CachedKids} ||= {};
+	my $key = do { no warnings;
+	    join "!\001", $statement, DBI::_concat_hash_sorted($attr, "=\001", ",\001", 0, 0)
+	};
+	my $sth = $cache->{$key};
+
+	if ($sth) {
+	    return $sth unless $sth->FETCH('Active');
+	    Carp::carp("prepare_cached($statement) statement handle $sth still Active")
+		unless ($if_active ||= 0);
+	    $sth->finish if $if_active <= 1;
+	    return $sth  if $if_active <= 2;
+	}
+
+	$sth = $dbh->prepare($statement, $attr);
+	$cache->{$key} = $sth if $sth;
+
+	return $sth;
+    }
+
+    sub ping {
+	my $dbh = shift;
+	# "0 but true" is a special kind of true 0 that is used here so
+	# applications can check if the ping was a real ping or not
+	($dbh->FETCH('Active')) ?  "0 but true" : 0;
+    }
+
+    sub begin_work {
+	my $dbh = shift;
+	return $dbh->set_err($DBI::stderr, "Already in a transaction")
+		unless $dbh->FETCH('AutoCommit');
+	$dbh->STORE('AutoCommit', 0); # will croak if driver doesn't support it
+	$dbh->STORE('BegunWork',  1); # trigger post commit/rollback action
+	return 1;
+    }
+
+    sub primary_key {
+	my ($dbh, @args) = @_;
+	my $sth = $dbh->primary_key_info(@args) or return;
+	my ($row, @col);
+	push @col, $row->[3] while ($row = $sth->fetch);
+	Carp::croak("primary_key method not called in list context")
+		unless wantarray; # leave us some elbow room
+	return @col;
+    }
+
+    sub tables {
+	my ($dbh, @args) = @_;
+	my $sth    = $dbh->table_info(@args[0,1,2,3,4]) or return;
+	my $tables = $sth->fetchall_arrayref or return;
+	my @tables;
+	if (defined($args[3]) && $args[3] eq '%' # special case for tables('','','','%')
+	    && grep {defined($_) && $_ eq ''} @args[0,1,2]
+	) {
+	    @tables = map { $_->[3] } @$tables;
+	} elsif ($dbh->get_info(29)) { # SQL_IDENTIFIER_QUOTE_CHAR
+	    @tables = map { $dbh->quote_identifier( @{$_}[0,1,2] ) } @$tables;
+	}
+	else {		# temporary old style hack (yeach)
+	    @tables = map {
+		my $name = $_->[2];
+		if ($_->[1]) {
+		    my $schema = $_->[1];
+		    # a sad hack (mostly for Informix I recall)
+		    my $quote = ($schema eq uc($schema)) ? '' : '"';
+		    $name = "$quote$schema$quote.$name"
+		}
+		$name;
+	    } @$tables;
+	}
+	return @tables;
+    }
+
+    sub type_info {	# this should be sufficient for all drivers
+	my ($dbh, $data_type) = @_;
+	my $idx_hash;
+	my $tia = $dbh->{dbi_type_info_row_cache};
+	if ($tia) {
+	    $idx_hash = $dbh->{dbi_type_info_idx_cache};
+	}
+	else {
+	    my $temp = $dbh->type_info_all;
+	    return unless $temp && @$temp;
+	    # we cache here because type_info_all may be expensive to call
+	    # (and we take a copy so the following shift can't corrupt
+	    # the data that may be returned by future calls to type_info_all)
+	    $tia      = $dbh->{dbi_type_info_row_cache} = [ @$temp ];
+	    $idx_hash = $dbh->{dbi_type_info_idx_cache} = shift @$tia;
+	}
+
+	my $dt_idx   = $idx_hash->{DATA_TYPE} || $idx_hash->{data_type};
+	Carp::croak("type_info_all returned non-standard DATA_TYPE index value ($dt_idx != 1)")
+	    if $dt_idx && $dt_idx != 1;
+
+	# --- simple DATA_TYPE match filter
+	my @ti;
+	my @data_type_list = (ref $data_type) ? @$data_type : ($data_type);
+	foreach $data_type (@data_type_list) {
+	    if (defined($data_type) && $data_type != DBI::SQL_ALL_TYPES()) {
+		push @ti, grep { $_->[$dt_idx] == $data_type } @$tia;
+	    }
+	    else {	# SQL_ALL_TYPES
+		push @ti, @$tia;
+	    }
+	    last if @ti;	# found at least one match
+	}
+
+	# --- format results into list of hash refs
+	my $idx_fields = keys %$idx_hash;
+	my @idx_names  = map { uc($_) } keys %$idx_hash;
+	my @idx_values = values %$idx_hash;
+	Carp::croak "type_info_all result has $idx_fields keys but ".(@{$ti[0]})." fields"
+		if @ti && @{$ti[0]} != $idx_fields;
+	my @out = map {
+	    my %h; @h{@idx_names} = @{$_}[ @idx_values ]; \%h;
+	} @ti;
+	return $out[0] unless wantarray;
+	return @out;
+    }
+
+    sub data_sources {
+	my ($dbh, @other) = @_;
+	my $drh = $dbh->{Driver}; # XXX proxy issues?
+	return $drh->data_sources(@other);
+    }
+
+}
+
+
+{   package		# hide from PAUSE
+	DBD::_::st;	# ====== STATEMENT ======
+    our @ISA = qw(DBD::_::common);
+    use strict;
+
+    sub bind_param { Carp::croak("Can't bind_param, not implement by driver") }
+
+#
+# ********************************************************
+#
+#	BEGIN ARRAY BINDING
+#
+#	Array binding support for drivers which don't support
+#	array binding, but have sufficient interfaces to fake it.
+#	NOTE: mixing scalars and arrayrefs requires using bind_param_array
+#	for *all* params...unless we modify bind_param for the default
+#	case...
+#
+#	2002-Apr-10	D. Arnold
+
+    sub bind_param_array {
+	my $sth = shift;
+	my ($p_id, $value_array, $attr) = @_;
+
+	return $sth->set_err($DBI::stderr, "Value for parameter $p_id must be a scalar or an arrayref, not a ".ref($value_array))
+	    if defined $value_array and ref $value_array and ref $value_array ne 'ARRAY';
+
+	return $sth->set_err($DBI::stderr, "Can't use named placeholder '$p_id' for non-driver supported bind_param_array")
+	    unless DBI::looks_like_number($p_id); # because we rely on execute(@ary) here
+
+	return $sth->set_err($DBI::stderr, "Placeholder '$p_id' is out of range")
+	    if $p_id <= 0; # can't easily/reliably test for too big
+
+	# get/create arrayref to hold params
+	my $hash_of_arrays = $sth->{ParamArrays} ||= { };
+
+	# If the bind has attribs then we rely on the driver conforming to
+	# the DBI spec in that a single bind_param() call with those attribs
+	# makes them 'sticky' and apply to all later execute(@values) calls.
+	# Since we only call bind_param() if we're given attribs then
+	# applications using drivers that don't support bind_param can still
+	# use bind_param_array() so long as they don't pass any attribs.
+
+	$$hash_of_arrays{$p_id} = $value_array;
+	return $sth->bind_param($p_id, undef, $attr)
+		if $attr;
+	1;
+    }
+
+    sub bind_param_inout_array {
+	my $sth = shift;
+	# XXX not supported so we just call bind_param_array instead
+	# and then return an error
+	my ($p_num, $value_array, $attr) = @_;
+	$sth->bind_param_array($p_num, $value_array, $attr);
+	return $sth->set_err($DBI::stderr, "bind_param_inout_array not supported");
+    }
+
+    sub bind_columns {
+	my $sth = shift;
+	my $fields = $sth->FETCH('NUM_OF_FIELDS') || 0;
+	if ($fields <= 0 && !$sth->{Active}) {
+	    return $sth->set_err($DBI::stderr, "Statement has no result columns to bind"
+		    ." (perhaps you need to successfully call execute first, or again)");
+	}
+	# Backwards compatibility for old-style call with attribute hash
+	# ref as first arg. Skip arg if undef or a hash ref.
+	my $attr;
+	$attr = shift if !defined $_[0] or ref($_[0]) eq 'HASH';
+
+	my $idx = 0;
+	$sth->bind_col(++$idx, shift, $attr) or return
+	    while (@_ and $idx < $fields);
+
+	return $sth->set_err($DBI::stderr, "bind_columns called with ".($idx+@_)." values but $fields are needed")
+	    if @_ or $idx != $fields;
+
+	return 1;
+    }
+
+    sub execute_array {
+	my $sth = shift;
+	my ($attr, @array_of_arrays) = @_;
+	my $NUM_OF_PARAMS = $sth->FETCH('NUM_OF_PARAMS'); # may be undef at this point
+
+	# get tuple status array or hash attribute
+	my $tuple_sts = $attr->{ArrayTupleStatus};
+	return $sth->set_err($DBI::stderr, "ArrayTupleStatus attribute must be an arrayref")
+		if $tuple_sts and ref $tuple_sts ne 'ARRAY';
+
+	# bind all supplied arrays
+	if (@array_of_arrays) {
+	    $sth->{ParamArrays} = { };	# clear out old params
+	    return $sth->set_err($DBI::stderr,
+		    @array_of_arrays." bind values supplied but $NUM_OF_PARAMS expected")
+		if defined ($NUM_OF_PARAMS) && @array_of_arrays != $NUM_OF_PARAMS;
+	    $sth->bind_param_array($_, $array_of_arrays[$_-1]) or return
+		foreach (1..@array_of_arrays);
+	}
+
+	my $fetch_tuple_sub;
+
+	if ($fetch_tuple_sub = $attr->{ArrayTupleFetch}) {	# fetch on demand
+
+	    return $sth->set_err($DBI::stderr,
+		    "Can't use both ArrayTupleFetch and explicit bind values")
+		if @array_of_arrays; # previous bind_param_array calls will simply be ignored
+
+	    if (UNIVERSAL::isa($fetch_tuple_sub,'DBI::st')) {
+		my $fetch_sth = $fetch_tuple_sub;
+		return $sth->set_err($DBI::stderr,
+			"ArrayTupleFetch sth is not Active, need to execute() it first")
+		    unless $fetch_sth->{Active};
+		# check column count match to give more friendly message
+		my $NUM_OF_FIELDS = $fetch_sth->{NUM_OF_FIELDS};
+		return $sth->set_err($DBI::stderr,
+			"$NUM_OF_FIELDS columns from ArrayTupleFetch sth but $NUM_OF_PARAMS expected")
+		    if defined($NUM_OF_FIELDS) && defined($NUM_OF_PARAMS)
+		    && $NUM_OF_FIELDS != $NUM_OF_PARAMS;
+		$fetch_tuple_sub = sub { $fetch_sth->fetchrow_arrayref };
+	    }
+	    elsif (!UNIVERSAL::isa($fetch_tuple_sub,'CODE')) {
+		return $sth->set_err($DBI::stderr, "ArrayTupleFetch '$fetch_tuple_sub' is not a code ref or statement handle");
+	    }
+
+	}
+	else {
+	    my $NUM_OF_PARAMS_given = keys %{ $sth->{ParamArrays} || {} };
+	    return $sth->set_err($DBI::stderr,
+		    "$NUM_OF_PARAMS_given bind values supplied but $NUM_OF_PARAMS expected")
+		if defined($NUM_OF_PARAMS) && $NUM_OF_PARAMS != $NUM_OF_PARAMS_given;
+
+	    # get the length of a bound array
+	    my $maxlen;
+	    my %hash_of_arrays = %{$sth->{ParamArrays}};
+	    foreach (keys(%hash_of_arrays)) {
+		my $ary = $hash_of_arrays{$_};
+		next unless ref $ary eq 'ARRAY';
+		$maxlen = @$ary if !$maxlen || @$ary > $maxlen;
+	    }
+	    # if there are no arrays then execute scalars once
+	    $maxlen = 1 unless defined $maxlen;
+	    my @bind_ids = 1..keys(%hash_of_arrays);
+
+	    my $tuple_idx = 0;
+	    $fetch_tuple_sub = sub {
+		return if $tuple_idx >= $maxlen;
+		my @tuple = map {
+		    my $a = $hash_of_arrays{$_};
+		    ref($a) ? $a->[$tuple_idx] : $a
+		} @bind_ids;
+		++$tuple_idx;
+		return \@tuple;
+	    };
+	}
+	# pass thru the callers scalar or list context
+	return $sth->execute_for_fetch($fetch_tuple_sub, $tuple_sts);
+    }
+
+    sub execute_for_fetch {
+	my ($sth, $fetch_tuple_sub, $tuple_status) = @_;
+	# start with empty status array
+	($tuple_status) ? @$tuple_status = () : $tuple_status = [];
+
+        my $rc_total = 0;
+	my $err_count;
+	while ( my $tuple = &$fetch_tuple_sub() ) {
+	    if ( my $rc = $sth->execute(@$tuple) ) {
+		push @$tuple_status, $rc;
+		$rc_total = ($rc >= 0 && $rc_total >= 0) ? $rc_total + $rc : -1;
+	    }
+	    else {
+		$err_count++;
+		push @$tuple_status, [ $sth->err, $sth->errstr, $sth->state ];
+                # XXX drivers implementing execute_for_fetch could opt to "last;" here
+                # if they know the error code means no further executes will work.
+	    }
+	}
+        my $tuples = @$tuple_status;
+        return $sth->set_err($DBI::stderr, "executing $tuples generated $err_count errors")
+            if $err_count;
+	$tuples ||= "0E0";
+	return $tuples unless wantarray;
+	return ($tuples, $rc_total);
+    }
+
+    sub last_insert_id {
+        return shift->{Database}->last_insert_id(@_);
+    }
+
+    sub fetchall_arrayref {	# ALSO IN Driver.xst
+	my ($sth, $slice, $max_rows) = @_;
+
+        # when batch fetching with $max_rows were very likely to try to
+        # fetch the 'next batch' after the previous batch returned
+        # <=$max_rows. So don't treat that as an error.
+        return undef if $max_rows and not $sth->FETCH('Active');
+
+	my $mode = ref($slice) || 'ARRAY';
+	my @rows;
+
+	if ($mode eq 'ARRAY') {
+	    my $row;
+	    # we copy the array here because fetch (currently) always
+	    # returns the same array ref. XXX
+	    if ($slice && @$slice) {
+                $max_rows = -1 unless defined $max_rows;
+		push @rows, [ @{$row}[ @$slice] ]
+		    while($max_rows-- and $row = $sth->fetch);
+	    }
+	    elsif (defined $max_rows) {
+		push @rows, [ @$row ]
+		    while($max_rows-- and $row = $sth->fetch);
+	    }
+	    else {
+		push @rows, [ @$row ] while($row = $sth->fetch);
+	    }
+	    return \@rows
+	}
+
+	my %row;
+	if ($mode eq 'REF' && ref($$slice) eq 'HASH') { # \{ $idx => $name }
+            keys %$$slice; # reset the iterator
+            while ( my ($idx, $name) = each %$$slice ) {
+                $sth->bind_col($idx+1, \$row{$name});
+            }
+	}
+	elsif ($mode eq 'HASH') {
+            if (keys %$slice) { # resets the iterator
+                my $name2idx = $sth->FETCH('NAME_lc_hash');
+                while ( my ($name, $unused) = each %$slice ) {
+                    my $idx = $name2idx->{lc $name};
+                    return $sth->set_err($DBI::stderr, "Invalid column name '$name' for slice")
+                        if not defined $idx;
+                    $sth->bind_col($idx+1, \$row{$name});
+                }
+	    }
+	    else {
+		my @column_names = @{ $sth->FETCH($sth->FETCH('FetchHashKeyName')) };
+		return [] if !@column_names;
+
+		$sth->bind_columns( \( @row{@column_names} ) );
+	    }
+	}
+	else {
+            return $sth->set_err($DBI::stderr, "fetchall_arrayref($mode) invalid");
+        }
+
+        if (not defined $max_rows) {
+            push @rows, { %row } while ($sth->fetch); # full speed ahead!
+        }
+        else {
+            push @rows, { %row } while ($max_rows-- and $sth->fetch);
+        }
+
+	return \@rows;
+    }
+
+    sub fetchall_hashref {
+	my ($sth, $key_field) = @_;
+
+        my $hash_key_name = $sth->{FetchHashKeyName} || 'NAME';
+        my $names_hash = $sth->FETCH("${hash_key_name}_hash");
+        my @key_fields = (ref $key_field) ? @$key_field : ($key_field);
+        my @key_indexes;
+        my $num_of_fields = $sth->FETCH('NUM_OF_FIELDS');
+        foreach (@key_fields) {
+           my $index = $names_hash->{$_};  # perl index not column
+           $index = $_ - 1 if !defined $index && DBI::looks_like_number($_) && $_>=1 && $_ <= $num_of_fields;
+           return $sth->set_err($DBI::stderr, "Field '$_' does not exist (not one of @{[keys %$names_hash]})")
+                unless defined $index;
+           push @key_indexes, $index;
+        }
+        my $rows = {};
+        my $NAME = $sth->FETCH($hash_key_name);
+        my @row = (undef) x $num_of_fields;
+        $sth->bind_columns(\(@row));
+        while ($sth->fetch) {
+            my $ref = $rows;
+            $ref = $ref->{$row[$_]} ||= {} for @key_indexes;
+            @{$ref}{@$NAME} = @row;
+        }
+        return $rows;
+    }
+
+    *dump_results = \&DBI::dump_results;
+
+    sub blob_copy_to_file {	# returns length or undef on error
+	my($self, $field, $filename_or_handleref, $blocksize) = @_;
+	my $fh = $filename_or_handleref;
+	my($len, $buf) = (0, "");
+	$blocksize ||= 512;	# not too ambitious
+	local(*FH);
+	unless(ref $fh) {
+	    open(FH, ">$fh") || return undef;
+	    $fh = \*FH;
+	}
+	while(defined($self->blob_read($field, $len, $blocksize, \$buf))) {
+	    print $fh $buf;
+	    $len += length $buf;
+	}
+	close(FH);
+	$len;
+    }
+
+    sub more_results {
+	shift->{syb_more_results};	# handy grandfathering
+    }
+
+}
+
+unless ($DBI::PurePerl) {   # See install_driver
+    { @DBD::_mem::dr::ISA = qw(DBD::_mem::common);	}
+    { @DBD::_mem::db::ISA = qw(DBD::_mem::common);	}
+    { @DBD::_mem::st::ISA = qw(DBD::_mem::common);	}
+    # DBD::_mem::common::DESTROY is implemented in DBI.xs
+}
+
+1;
+__END__
+
+=head1 DESCRIPTION
+
+The DBI is a database access module for the Perl programming language.  It defines
+a set of methods, variables, and conventions that provide a consistent
+database interface, independent of the actual database being used.
+
+It is important to remember that the DBI is just an interface.
+The DBI is a layer
+of "glue" between an application and one or more database I<driver>
+modules.  It is the driver modules which do most of the real work. The DBI
+provides a standard interface and framework for the drivers to operate
+within.
+
+This document often uses terms like I<references>, I<objects>,
+I<methods>.  If you're not familiar with those terms then it would
+be a good idea to read at least the following perl manuals first:
+L<perlreftut>, L<perldsc>, L<perllol>, and L<perlboot>.
+
+
+=head2 Architecture of a DBI Application
+
+             |<- Scope of DBI ->|
+                  .-.   .--------------.   .-------------.
+  .-------.       | |---| XYZ Driver   |---| XYZ Engine  |
+  | Perl  |       | |   `--------------'   `-------------'
+  | script|  |A|  |D|   .--------------.   .-------------.
+  | using |--|P|--|B|---|Oracle Driver |---|Oracle Engine|
+  | DBI   |  |I|  |I|   `--------------'   `-------------'
+  | API   |       | |...
+  |methods|       | |... Other drivers
+  `-------'       | |...
+                  `-'
+
+The API, or Application Programming Interface, defines the
+call interface and variables for Perl scripts to use. The API
+is implemented by the Perl DBI extension.
+
+The DBI "dispatches" the method calls to the appropriate driver for
+actual execution.  The DBI is also responsible for the dynamic loading
+of drivers, error checking and handling, providing default
+implementations for methods, and many other non-database specific duties.
+
+Each driver
+contains implementations of the DBI methods using the
+private interface functions of the corresponding database engine.  Only authors
+of sophisticated/multi-database applications or generic library
+functions need be concerned with drivers.
+
+=head2 Notation and Conventions
+
+The following conventions are used in this document:
+
+  $dbh    Database handle object
+  $sth    Statement handle object
+  $drh    Driver handle object (rarely seen or used in applications)
+  $h      Any of the handle types above ($dbh, $sth, or $drh)
+  $rc     General Return Code  (boolean: true=ok, false=error)
+  $rv     General Return Value (typically an integer)
+  @ary    List of values returned from the database, typically a row of data
+  $rows   Number of rows processed (if available, else -1)
+  $fh     A filehandle
+  undef   NULL values are represented by undefined values in Perl
+  \%attr  Reference to a hash of attribute values passed to methods
+
+Note that Perl will automatically destroy database and statement handle objects
+if all references to them are deleted.
+
+
+=head2 Outline Usage
+
+To use DBI,
+first you need to load the DBI module:
+
+  use DBI;
+  use strict;
+
+(The C<use strict;> isn't required but is strongly recommended.)
+
+Then you need to L</connect> to your data source and get a I<handle> for that
+connection:
+
+  $dbh = DBI->connect($dsn, $user, $password,
+                      { RaiseError => 1, AutoCommit => 0 });
+
+Since connecting can be expensive, you generally just connect at the
+start of your program and disconnect at the end.
+
+Explicitly defining the required C<AutoCommit> behaviour is strongly
+recommended and may become mandatory in a later version.  This
+determines whether changes are automatically committed to the
+database when executed, or need to be explicitly committed later.
+
+The DBI allows an application to "prepare" statements for later
+execution.  A prepared statement is identified by a statement handle
+held in a Perl variable.
+We'll call the Perl variable C<$sth> in our examples.
+
+The typical method call sequence for a C<SELECT> statement is:
+
+  prepare,
+    execute, fetch, fetch, ...
+    execute, fetch, fetch, ...
+    execute, fetch, fetch, ...
+
+for example:
+
+  $sth = $dbh->prepare("SELECT foo, bar FROM table WHERE baz=?");
+
+  $sth->execute( $baz );
+
+  while ( @row = $sth->fetchrow_array ) {
+    print "@row\n";
+  }
+
+For queries that are not executed many times at once, it is often cleaner
+to use the higher level select wrappers:
+
+  $row_hashref = $dbh->selectrow_hashref("SELECT foo, bar FROM table WHERE baz=?", undef, $baz);
+
+  $arrayref_of_row_hashrefs = $dbh->selectall_arrayref(
+    "SELECT foo, bar FROM table WHERE baz BETWEEN ? AND ?",
+    { Slice => {} }, $baz_min, $baz_max);
+
+The typical method call sequence for a I<non>-C<SELECT> statement is:
+
+  prepare,
+    execute,
+    execute,
+    execute.
+
+for example:
+
+  $sth = $dbh->prepare("INSERT INTO table(foo,bar,baz) VALUES (?,?,?)");
+
+  while(<CSV>) {
+    chomp;
+    my ($foo,$bar,$baz) = split /,/;
+	$sth->execute( $foo, $bar, $baz );
+  }
+
+The C<do()> method is a wrapper of prepare and execute that can be simpler
+for non repeated I<non>-C<SELECT> statements (or with drivers that don't
+support placeholders):
+
+  $rows_affected = $dbh->do("UPDATE your_table SET foo = foo + 1");
+
+  $rows_affected = $dbh->do("DELETE FROM table WHERE foo = ?", undef, $foo);
+
+To commit your changes to the database (when L</AutoCommit> is off):
+
+  $dbh->commit;  # or call $dbh->rollback; to undo changes
+
+Finally, when you have finished working with the data source, you should
+L</disconnect> from it:
+
+  $dbh->disconnect;
+
+
+=head2 General Interface Rules & Caveats
+
+The DBI does not have a concept of a "current session". Every session
+has a handle object (i.e., a C<$dbh>) returned from the C<connect> method.
+That handle object is used to invoke database related methods.
+
+Most data is returned to the Perl script as strings. (Null values are
+returned as C<undef>.)  This allows arbitrary precision numeric data to be
+handled without loss of accuracy.  Beware that Perl may not preserve
+the same accuracy when the string is used as a number.
+
+Dates and times are returned as character strings in the current
+default format of the corresponding database engine.  Time zone effects
+are database/driver dependent.
+
+Perl supports binary data in Perl strings, and the DBI will pass binary
+data to and from the driver without change. It is up to the driver
+implementors to decide how they wish to handle such binary data.
+
+Perl supports two kinds of strings: Unicode (utf8 internally) and non-Unicode
+(defaults to iso-8859-1 if forced to assume an encoding).  Drivers should
+accept both kinds of strings and, if required, convert them to the character
+set of the database being used. Similarly, when fetching from the database
+character data that isn't iso-8859-1 the driver should convert it into utf8.
+
+Multiple SQL statements may not be combined in a single statement
+handle (C<$sth>), although some databases and drivers do support this
+(notably Sybase and SQL Server).
+
+Non-sequential record reads are not supported in this version of the DBI.
+In other words, records can only be fetched in the order that the
+database returned them, and once fetched they are forgotten.
+
+Positioned updates and deletes are not directly supported by the DBI.
+See the description of the C<CursorName> attribute for an alternative.
+
+Individual driver implementors are free to provide any private
+functions and/or handle attributes that they feel are useful.
+Private driver functions can be invoked using the DBI C<func()> method.
+Private driver attributes are accessed just like standard attributes.
+
+Many methods have an optional C<\%attr> parameter which can be used to
+pass information to the driver implementing the method. Except where
+specifically documented, the C<\%attr> parameter can only be used to pass
+driver specific hints. In general, you can ignore C<\%attr> parameters
+or pass it as C<undef>.
+
+
+=head2 Naming Conventions and Name Space
+
+The DBI package and all packages below it (C<DBI::*>) are reserved for
+use by the DBI. Extensions and related modules use the C<DBIx::>
+namespace (see L<http://www.perl.com/CPAN/modules/by-module/DBIx/>).
+Package names beginning with C<DBD::> are reserved for use
+by DBI database drivers.  All environment variables used by the DBI
+or by individual DBDs begin with "C<DBI_>" or "C<DBD_>".
+
+The letter case used for attribute names is significant and plays an
+important part in the portability of DBI scripts.  The case of the
+attribute name is used to signify who defined the meaning of that name
+and its values.
+
+  Case of name  Has a meaning defined by
+  ------------  ------------------------
+  UPPER_CASE    Standards, e.g.,  X/Open, ISO SQL92 etc (portable)
+  MixedCase     DBI API (portable), underscores are not used.
+  lower_case    Driver or database engine specific (non-portable)
+
+It is of the utmost importance that Driver developers only use
+lowercase attribute names when defining private attributes. Private
+attribute names must be prefixed with the driver name or suitable
+abbreviation (e.g., "C<ora_>" for Oracle, "C<ing_>" for Ingres, etc).
+
+
+=head2 SQL - A Query Language
+
+Most DBI drivers require applications to use a dialect of SQL
+(Structured Query Language) to interact with the database engine.
+The L</"Standards Reference Information"> section provides links
+to useful information about SQL.
+
+The DBI itself does not mandate or require any particular language to
+be used; it is language independent. In ODBC terms, the DBI is in
+"pass-thru" mode, although individual drivers might not be. The only requirement
+is that queries and other statements must be expressed as a single
+string of characters passed as the first argument to the L</prepare> or
+L</do> methods.
+
+For an interesting diversion on the I<real> history of RDBMS and SQL,
+from the people who made it happen, see:
+
+  http://www.mcjones.org/System_R/SQL_Reunion_95/sqlr95.html
+
+Follow the "Full Contents" then "Intergalactic dataspeak" links for the
+SQL history.
+
+=head2 Placeholders and Bind Values
+
+Some drivers support placeholders and bind values.
+I<Placeholders>, also called parameter markers, are used to indicate
+values in a database statement that will be supplied later,
+before the prepared statement is executed.  For example, an application
+might use the following to insert a row of data into the SALES table:
+
+  INSERT INTO sales (product_code, qty, price) VALUES (?, ?, ?)
+
+or the following, to select the description for a product:
+
+  SELECT description FROM products WHERE product_code = ?
+
+The C<?> characters are the placeholders.  The association of actual
+values with placeholders is known as I<binding>, and the values are
+referred to as I<bind values>.
+Note that the C<?> is not enclosed in quotation marks, even when the
+placeholder represents a string.
+
+Some drivers also allow placeholders like C<:>I<name> and C<:>I<N> (e.g.,
+C<:1>, C<:2>, and so on) in addition to C<?>, but their use is not portable.
+
+If the C<:>I<N> form of placeholder is supported by the driver you're using,
+then you should be able to use either L</bind_param> or L</execute> to bind
+values. Check your driver documentation.
+
+Some drivers allow you to prevent the recognition of a placeholder by placing a
+single backslash character (C<\>) immediately before it. The driver will remove
+the backslash character and ignore the placeholder, passing it unchanged to the
+backend. If the driver supports this then L</get_info>(9000) will return true.
+
+With most drivers, placeholders can't be used for any element of a
+statement that would prevent the database server from validating the
+statement and creating a query execution plan for it. For example:
+
+  "SELECT name, age FROM ?"         # wrong (will probably fail)
+  "SELECT name, ?   FROM people"    # wrong (but may not 'fail')
+
+Also, placeholders can only represent single scalar values.
+For example, the following
+statement won't work as expected for more than one value:
+
+  "SELECT name, age FROM people WHERE name IN (?)"    # wrong
+  "SELECT name, age FROM people WHERE name IN (?,?)"  # two names
+
+When using placeholders with the SQL C<LIKE> qualifier, you must
+remember that the placeholder substitutes for the whole string.
+So you should use "C<... LIKE ? ...>" and include any wildcard
+characters in the value that you bind to the placeholder.
+
+B<NULL Values>
+
+Undefined values, or C<undef>, are used to indicate NULL values.
+You can insert and update columns with a NULL value as you would a
+non-NULL value.  These examples insert and update the column
+C<age> with a NULL value:
+
+  $sth = $dbh->prepare(qq{
+    INSERT INTO people (fullname, age) VALUES (?, ?)
+  });
+  $sth->execute("Joe Bloggs", undef);
+
+  $sth = $dbh->prepare(qq{
+    UPDATE people SET age = ? WHERE fullname = ?
+  });
+  $sth->execute(undef, "Joe Bloggs");
+
+However, care must be taken when trying to use NULL values in a
+C<WHERE> clause.  Consider:
+
+  SELECT fullname FROM people WHERE age = ?
+
+Binding an C<undef> (NULL) to the placeholder will I<not> select rows
+which have a NULL C<age>!  At least for database engines that
+conform to the SQL standard.  Refer to the SQL manual for your database
+engine or any SQL book for the reasons for this.  To explicitly select
+NULLs you have to say "C<WHERE age IS NULL>".
+
+A common issue is to have a code fragment handle a value that could be
+either C<defined> or C<undef> (non-NULL or NULL) at runtime.
+A simple technique is to prepare the appropriate statement as needed,
+and substitute the placeholder for non-NULL cases:
+
+  $sql_clause = defined $age? "age = ?" : "age IS NULL";
+  $sth = $dbh->prepare(qq{
+    SELECT fullname FROM people WHERE $sql_clause
+  });
+  $sth->execute(defined $age ? $age : ());
+
+The following technique illustrates qualifying a C<WHERE> clause with
+several columns, whose associated values (C<defined> or C<undef>) are
+in a hash %h:
+
+  for my $col ("age", "phone", "email") {
+    if (defined $h{$col}) {
+      push @sql_qual, "$col = ?";
+      push @sql_bind, $h{$col};
+    }
+    else {
+      push @sql_qual, "$col IS NULL";
+    }
+  }
+  $sql_clause = join(" AND ", @sql_qual);
+  $sth = $dbh->prepare(qq{
+      SELECT fullname FROM people WHERE $sql_clause
+  });
+  $sth->execute(@sql_bind);
+
+The techniques above call prepare for the SQL statement with each call to
+execute.  Because calls to prepare() can be expensive, performance
+can suffer when an application iterates many times over statements
+like the above.
+
+A better solution is a single C<WHERE> clause that supports both
+NULL and non-NULL comparisons.  Its SQL statement would need to be
+prepared only once for all cases, thus improving performance.
+Several examples of C<WHERE> clauses that support this are presented
+below.  But each example lacks portability, robustness, or simplicity.
+Whether an example is supported on your database engine depends on
+what SQL extensions it provides, and where it supports the C<?>
+placeholder in a statement.
+
+  0)  age = ?
+  1)  NVL(age, xx) = NVL(?, xx)
+  2)  ISNULL(age, xx) = ISNULL(?, xx)
+  3)  DECODE(age, ?, 1, 0) = 1
+  4)  age = ? OR (age IS NULL AND ? IS NULL)
+  5)  age = ? OR (age IS NULL AND SP_ISNULL(?) = 1)
+  6)  age = ? OR (age IS NULL AND ? = 1)
+
+Statements formed with the above C<WHERE> clauses require execute
+statements as follows.  The arguments are required, whether their
+values are C<defined> or C<undef>.
+
+  0,1,2,3)  $sth->execute($age);
+  4,5)      $sth->execute($age, $age);
+  6)        $sth->execute($age, defined($age) ? 0 : 1);
+
+Example 0 should not work (as mentioned earlier), but may work on
+a few database engines anyway (e.g. Sybase).  Example 0 is part
+of examples 4, 5, and 6, so if example 0 works, these other
+examples may work, even if the engine does not properly support
+the right hand side of the C<OR> expression.
+
+Examples 1 and 2 are not robust: they require that you provide a
+valid column value xx (e.g. '~') which is not present in any row.
+That means you must have some notion of what data won't be stored
+in the column, and expect clients to adhere to that.
+
+Example 5 requires that you provide a stored procedure (SP_ISNULL
+in this example) that acts as a function: it checks whether a value
+is null, and returns 1 if it is, or 0 if not.
+
+Example 6, the least simple, is probably the most portable, i.e., it
+should work with most, if not all, database engines.
+
+Here is a table that indicates which examples above are known to
+work on various database engines:
+
+                   -----Examples------
+                   0  1  2  3  4  5  6
+                   -  -  -  -  -  -  -
+  Oracle 9         N  Y  N  Y  Y  ?  Y
+  Informix IDS 9   N  N  N  Y  N  Y  Y
+  MS SQL           N  N  Y  N  Y  ?  Y
+  Sybase           Y  N  N  N  N  N  Y
+  AnyData,DBM,CSV  Y  N  N  N  Y  Y* Y
+  SQLite 3.3       N  N  N  N  Y  N  N
+  MSAccess         N  N  N  N  Y  N  Y
+
+* Works only because Example 0 works.
+
+DBI provides a sample perl script that will test the examples above
+on your database engine and tell you which ones work.  It is located
+in the F<ex/> subdirectory of the DBI source distribution, or here:
+L<https://github.com/perl5-dbi/dbi/blob/master/ex/perl_dbi_nulls_test.pl>
+Please use the script to help us fill-in and maintain this table.
+
+B<Performance>
+
+Without using placeholders, the insert statement shown previously would have to
+contain the literal values to be inserted and would have to be
+re-prepared and re-executed for each row. With placeholders, the insert
+statement only needs to be prepared once. The bind values for each row
+can be given to the C<execute> method each time it's called. By avoiding
+the need to re-prepare the statement for each row, the application
+typically runs many times faster. Here's an example:
+
+  my $sth = $dbh->prepare(q{
+    INSERT INTO sales (product_code, qty, price) VALUES (?, ?, ?)
+  }) or die $dbh->errstr;

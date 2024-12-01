@@ -1,0 +1,1000 @@
+# fonts may be set by the user.  Sets the internal hash key FONTS which is
+# used to map our internal font escapes to actual *roff sequences later.
+sub init_fonts {
+    my ($self) = @_;
+
+    # Figure out the fixed-width font.  If user-supplied, make sure that they
+    # are the right length.
+    for (qw(fixed fixedbold fixeditalic fixedbolditalic)) {
+        my $font = $self->{"opt_$_"};
+        if (defined($font) && (length($font) < 1 || length($font) > 2)) {
+            croak(qq(roff font should be 1 or 2 chars, not "$font"));
+        }
+    }
+
+    # Set the default fonts.  We can't be sure portably across different
+    # implementations what fixed bold-italic may be called (if it's even
+    # available), so default to just bold.
+    #<<<
+    $self->{opt_fixed}           ||= 'CW';
+    $self->{opt_fixedbold}       ||= 'CB';
+    $self->{opt_fixeditalic}     ||= 'CI';
+    $self->{opt_fixedbolditalic} ||= 'CB';
+    #>>>
+
+    # Set up a table of font escapes.  First number is fixed-width, second is
+    # bold, third is italic.
+    $self->{FONTS} = {
+        '000' => '\fR',
+        '001' => '\fI',
+        '010' => '\fB',
+        '011' => '\f(BI',
+        '100' => toescape($self->{opt_fixed}),
+        '101' => toescape($self->{opt_fixeditalic}),
+        '110' => toescape($self->{opt_fixedbold}),
+        '111' => toescape($self->{opt_fixedbolditalic}),
+    };
+
+    # Precalculate a regex that matches all fixed-width fonts, which will be
+    # used later by switchquotes.
+    my @fixedpat = map { quotemeta($self->{FONTS}{$_}) } qw(100 101 110 111);
+    my $fixedpat = join('|', @fixedpat);
+    $self->{FIXEDPAT} = qr{ $fixedpat }xms;
+}
+
+# Initialize the quotes that we'll be using for C<> text.  This requires some
+# special handling, both to parse the user parameters if given and to make
+# sure that the quotes will be safe against *roff.  Sets the internal hash
+# keys LQUOTE and RQUOTE.
+sub init_quotes {
+    my ($self) = (@_);
+
+    # Handle the quotes option first, which sets both quotes at once.
+    $self->{opt_quotes} ||= '"';
+    if ($self->{opt_quotes} eq 'none') {
+        $$self{LQUOTE} = $$self{RQUOTE} = '';
+    } elsif (length ($self->{opt_quotes}) == 1) {
+        $$self{LQUOTE} = $$self{RQUOTE} = $self->{opt_quotes};
+    } elsif (length ($self->{opt_quotes}) % 2 == 0) {
+        my $length = length ($self->{opt_quotes}) / 2;
+        $$self{LQUOTE} = substr ($self->{opt_quotes}, 0, $length);
+        $$self{RQUOTE} = substr ($self->{opt_quotes}, $length);
+    } else {
+        croak(qq(Invalid quote specification "$self->{opt_quotes}"))
+    }
+
+    # Now handle the lquote and rquote options.
+    if (defined($self->{opt_lquote})) {
+        $self->{opt_lquote} = q{} if $self->{opt_lquote} eq 'none';
+        $$self{LQUOTE} = $self->{opt_lquote};
+    }
+    if (defined $self->{opt_rquote}) {
+        $self->{opt_rquote} = q{} if $self->{opt_rquote} eq 'none';
+        $$self{RQUOTE} = $self->{opt_rquote};
+    }
+}
+
+# Initialize the page title information and indentation from our arguments.
+sub init_page {
+    my ($self) = @_;
+
+    # Get the version from the running Perl.
+    my @version = ($] =~ /^(\d+)\.(\d{3})(\d+)$/);
+    for (@version) { $_ += 0 }
+    my $version = join ('.', @version);
+
+    # Set the defaults for page titles and indentation if the user didn't
+    # override anything.
+    $self->{opt_center}  //= 'User Contributed Perl Documentation';
+    $self->{opt_release} //= 'perl v' . $version;
+    $self->{opt_indent}  //= 4;
+}
+
+##############################################################################
+# Core parsing
+##############################################################################
+
+# This is the glue that connects the code below with Pod::Simple itself.  The
+# goal is to convert the event stream coming from the POD parser into method
+# calls to handlers once the complete content of a tag has been seen.  Each
+# paragraph or POD command will have textual content associated with it, and
+# as soon as all of a paragraph or POD command has been seen, that content
+# will be passed in to the corresponding method for handling that type of
+# object.  The exceptions are handlers for lists, which have opening tag
+# handlers and closing tag handlers that will be called right away.
+#
+# The internal hash key PENDING is used to store the contents of a tag until
+# all of it has been seen.  It holds a stack of open tags, each one
+# represented by a tuple of the attributes hash for the tag, formatting
+# options for the tag (which are inherited), and the contents of the tag.
+
+# Add a block of text to the contents of the current node, formatting it
+# according to the current formatting instructions as we do.
+sub _handle_text {
+    my ($self, $text) = @_;
+    my $tag = $$self{PENDING}[-1];
+    $$tag[2] .= $self->format_text ($$tag[1], $text);
+}
+
+# Given an element name, get the corresponding method name.
+sub method_for_element {
+    my ($self, $element) = @_;
+    $element =~ tr/A-Z-/a-z_/;
+    $element =~ tr/_a-z0-9//cd;
+    return $element;
+}
+
+# Handle the start of a new element.  If cmd_element is defined, assume that
+# we need to collect the entire tree for this element before passing it to the
+# element method, and create a new tree into which we'll collect blocks of
+# text and nested elements.  Otherwise, if start_element is defined, call it.
+sub _handle_element_start {
+    my ($self, $element, $attrs) = @_;
+    my $method = $self->method_for_element ($element);
+
+    # If we have a command handler, we need to accumulate the contents of the
+    # tag before calling it.  Turn off IN_NAME for any command other than
+    # <Para> and the formatting codes so that IN_NAME isn't still set for the
+    # first heading after the NAME heading.
+    if ($self->can ("cmd_$method")) {
+        $$self{IN_NAME} = 0 if ($element ne 'Para' && length ($element) > 1);
+
+        # How we're going to format embedded text blocks depends on the tag
+        # and also depends on our parent tags.  Thankfully, inside tags that
+        # turn off guesswork and reformatting, nothing else can turn it back
+        # on, so this can be strictly inherited.
+        my $formatting = {
+            %{ $$self{PENDING}[-1][1] || $FORMATTING{DEFAULT} },
+            %{ $FORMATTING{$element} || {} },
+        };
+        push (@{ $$self{PENDING} }, [ $attrs, $formatting, '' ]);
+    } elsif (my $start_method = $self->can ("start_$method")) {
+        $self->$start_method ($attrs, '');
+    }
+}
+
+# Handle the end of an element.  If we had a cmd_ method for this element,
+# this is where we pass along the tree that we built.  Otherwise, if we have
+# an end_ method for the element, call that.
+sub _handle_element_end {
+    my ($self, $element) = @_;
+    my $method = $self->method_for_element ($element);
+
+    # If we have a command handler, pull off the pending text and pass it to
+    # the handler along with the saved attribute hash.
+    if (my $cmd_method = $self->can ("cmd_$method")) {
+        my $tag = pop @{ $$self{PENDING} };
+        my $text = $self->$cmd_method ($$tag[0], $$tag[2]);
+        if (defined $text) {
+            if (@{ $$self{PENDING} } > 1) {
+                $$self{PENDING}[-1][2] .= $text;
+            } else {
+                $self->output ($text);
+            }
+        }
+    } elsif (my $end_method = $self->can ("end_$method")) {
+        $self->$end_method ();
+    }
+}
+
+##############################################################################
+# General formatting
+##############################################################################
+
+# Format a text block.  Takes a hash of formatting options and the text to
+# format.  Currently, the only formatting options are guesswork, cleanup, and
+# convert, all of which are boolean.
+sub format_text {
+    my ($self, $options, $text) = @_;
+    my $guesswork = $$options{guesswork} && !$$self{IN_NAME};
+    my $cleanup = $$options{cleanup};
+    my $convert = $$options{convert};
+    my $literal = $$options{literal};
+
+    # Cleanup just tidies up a few things, telling *roff that the hyphens are
+    # hard, putting a bit of space between consecutive underscores, escaping
+    # backslashes, and converting zero-width spaces to zero-width break
+    # points.
+    if ($cleanup) {
+        $text =~ s/\\/\\e/g;
+        $text =~ s/-/\\-/g;
+        $text =~ s/_(?=_)/_\\|/g;
+        $text =~ s/\x{200B}/\\:/g;
+    }
+
+    # Except in <Data> blocks, if groff or roff encoding is requested and
+    # we're in an ASCII environment, do the encoding.  For EBCDIC, we just
+    # write what we get and hope for the best.  Leave non-breaking spaces and
+    # soft hyphens alone; we'll convert those at the last minute.
+    if ($convert) {
+        if (ASCII) {
+            if ($$self{ENCODING} eq 'groff') {
+                $text =~ s{ ([^\x00-\x7F\xA0\xAD]) }{
+                    '\\[u' . sprintf('%04X', ord($1)) . ']'
+                }xmsge;
+            } elsif ($$self{ENCODING} eq 'roff') {
+                $text =~ s/([^\x00-\x7F\xA0\xAD])/$ESCAPES{ord ($1)} || "X"/eg;
+            }
+        }
+    }
+
+    # Ensure that *roff doesn't convert literal quotes to UTF-8 single quotes,
+    # but don't mess up accent escapes.
+    if ($literal) {
+        $text =~ s/(?<!\\\*)\'/\\*\(Aq/g;
+        $text =~ s/(?<!\\\*)\`/\\\`/g;
+    }
+
+    # If guesswork is is viable for this block, do that.
+    if ($guesswork) {
+        $text = $self->guesswork ($text);
+    }
+
+    return $text;
+}
+
+# Handles C<> text, deciding whether to put \*C` around it or not.  This is a
+# whole bunch of messy heuristics to try to avoid overquoting, originally from
+# Barrie Slaymaker.  This largely duplicates similar code in Pod::Text.
+sub quote_literal {
+    my $self = shift;
+    local $_ = shift;
+
+    # If in NAME section, just return an ASCII quoted string to avoid
+    # confusing tools like whatis.
+    if ($$self{IN_NAME}) {
+        return $self->{LQUOTE} . $_ . $self->{RQUOTE};
+    }
+
+    # A regex that matches the portion of a variable reference that's the
+    # array or hash index, separated out just because we want to use it in
+    # several places in the following regex.
+    my $index = '(?: \[[^]]+\] | \{[^}]+\} )?';
+
+    # Check for things that we don't want to quote, and if we find any of
+    # them, return the string with just a font change and no quoting.
+    #
+    # Traditionally, Pod::Man has not quoted Perl variables, functions,
+    # numbers, or hex constants, but this is not always desirable.  Make this
+    # optional on the quoting guesswork flag.
+    my $extra = qr{(?!)}xms;    # never matches
+    if ($$self{GUESSWORK}{quoting}) {
+        $extra = qr{
+             \$+ [\#^]? \S $index                    # special ($^F, $")
+           | [\$\@%&*]+ \#? [:\'\w]+ $index          # plain var or func
+           | [\$\@%&*]* [:\'\w]+
+             (?: \\-> )? \(\s*[^\s,\)]*\s*\)         # 0/1-arg func call
+           | (?: [+] || \\- )? ( \d[\d.]* | \.\d+ )
+             (?: [eE] (?: [+] || \\- )? \d+ )?       # a number
+           | 0x [a-fA-F\d]+                          # a hex constant
+         }xms;
+    }
+    m{
+      ^\s*
+      (?:
+         ( [\'\"] ) .* \1                    # already quoted
+       | \\\*\(Aq .* \\\*\(Aq                # quoted and escaped
+       | \\?\` .* ( \' | \\?\` | \\\*\(Aq )  # `quoted' or `quoted`
+       | $extra
+      )
+      \s*\z
+     }xms and return '\f(FS' . $_ . '\f(FE';
+
+    # If we didn't return, go ahead and quote the text.
+    return '\f(FS\*(C`' . $_ . "\\*(C'\\f(FE";
+}
+
+# Takes a text block to perform guesswork on.  Returns the text block with
+# formatting codes added.  This is the code that marks up various Perl
+# constructs and things commonly used in man pages without requiring the user
+# to add any explicit markup, and is applied to all non-literal text.  Note
+# that the inserted font sequences must be treated later with mapfonts.
+#
+# This method is very fragile, both in the regular expressions it uses and in
+# the ordering of those modifications.  Care and testing is required when
+# modifying it.
+sub guesswork {
+    my $self = shift;
+    local $_ = shift;
+
+    # By the time we reach this point, all hyphens will be escaped by adding a
+    # backslash.  We want to undo that escaping if they're part of regular
+    # words and there's only a single dash, since that's a real hyphen that
+    # *roff gets to consider a possible break point.  Make sure that a dash
+    # after the first character of a word stays non-breaking, however.
+    #
+    # Note that this is not user-controllable; we pretty much have to do this
+    # transformation or *roff will mangle the output in unacceptable ways.
+    s{
+        ( (?:\G|^|\s|$NBSP) [\(\"]* [a-zA-Z] ) ( \\- )?
+        ( (?: [a-zA-Z\']+ \\-)+ )
+        ( [a-zA-Z\']+ ) (?= [\)\".?!,;:]* (?:\s|$NBSP|\Z|\\\ ) )
+        \b
+    } {
+        my ($prefix, $hyphen, $main, $suffix) = ($1, $2, $3, $4);
+        $hyphen ||= '';
+        $main =~ s/\\-/-/g;
+        $prefix . $hyphen . $main . $suffix;
+    }egx;
+
+    # Embolden functions in the form func(), including functions that are in
+    # all capitals, but don't embolden if there's anything inside the parens.
+    # The function must start with an alphabetic character or underscore and
+    # then consist of word characters or colons.
+    if ($$self{GUESSWORK}{functions}) {
+        s{
+            (?<! \\ )
+            \b
+            ( [A-Za-z_] [:\w]+ \(\) )
+        } {
+            '\f(BS' . $1 . '\f(BE'
+        }egx;
+    }
+
+    # Change references to manual pages to put the page name in bold but
+    # the number in the regular font, with a thin space between the name and
+    # the number.  Only recognize func(n) where func starts with an alphabetic
+    # character or underscore and contains only word characters, periods (for
+    # configuration file man pages), or colons, and n is a single digit,
+    # optionally followed by some number of lowercase letters.  Note that this
+    # does not recognize man page references like perl(l) or socket(3SOCKET).
+    if ($$self{GUESSWORK}{manref}) {
+        s{
+            \b
+            (?<! \\ )                                   # rule out \e0(1)
+            ( [A-Za-z_] (?:[.:\w] | \\-)+ )
+            ( \( \d [a-z]* \) )
+        } {
+            '\f(BS' . $1 . '\f(BE\|' . $2
+        }egx;
+    }
+
+    # Convert simple Perl variable references to a fixed-width font.  Be
+    # careful not to convert functions, though; there are too many subtleties
+    # with them to want to perform this transformation.
+    if ($$self{GUESSWORK}{variables}) {
+        s{
+           ( ^ | \s+ )
+           ( [\$\@%] [\w:]+ )
+           (?! \( )
+        } {
+            $1 . '\f(FS' . $2 . '\f(FE'
+        }egx;
+    }
+
+    # Done.
+    return $_;
+}
+
+##############################################################################
+# Output
+##############################################################################
+
+# When building up the *roff code, we don't use real *roff fonts.  Instead, we
+# embed font codes of the form \f(<font>[SE] where <font> is one of B, I, or
+# F, S stands for start, and E stands for end.  This method turns these into
+# the right start and end codes.
+#
+# We add this level of complexity because the old pod2man didn't get code like
+# B<< someI<thing> else>> right.  After I<> it switched back to normal text
+# rather than bold.  We take care of this by using variables that state
+# whether bold, italic, or fixed are turned on as a combined pointer to our
+# current font sequence, and set each to the number of current nestings of
+# start tags for that font.
+#
+# The base font must be either \fP or \fR.  \fP changes to the previous font,
+# but only one previous font is kept.  Unfortunately, there is a bug in
+# Solaris 2.6 nroff (not present in GNU groff) where the sequence
+# \fB\fP\f(CW\fP leaves the font set to B rather than R, presumably because
+# \f(CW doesn't actually do a font change.  Because of this, we prefer to use
+# \fR where possible.
+#
+# Unfortunately, this isn't possible for arguments to heading macros, since
+# there we don't know what the outside level font is.  In that case, arrange
+# things so that the outside font is always the "previous" font and end with
+# \fP instead of \fR.  Idea from Zack Weinberg.
+#
+# This function used to be much simpler outside of macro arguments because it
+# went directly from \fB to \f(CW and relied on \f(CW clearing bold since it
+# wasn't \f(CB.  Unfortunately, while this works for mandoc, this is not how
+# groff works; \fBfoo\f(CWbar still prints bar in bold.  Therefore, we force
+# the font back to the base font before each font change.
+sub mapfonts {
+    my ($self, $text, $base) = @_;
+
+    # The closure used to process each font escape, expected to be called from
+    # the right-hand side of an s/// expression.
+    my ($fixed, $bold, $italic) = (0, 0, 0);
+    my %magic = (F => \$fixed, B => \$bold, I => \$italic);
+    my $last = '\fR';
+    my $process = sub {
+        my ($style, $start_stop) = @_;
+        my $sequence = ($last ne '\fR') ? $base : q{};
+        ${ $magic{$style} } += ($start_stop eq 'S') ? 1 : -1;
+        my $f = $self->{FONTS}{($fixed && 1) . ($bold && 1) . ($italic && 1)};
+        return q{} if ($f eq $last);
+        if ($f ne '\fR') {
+            $sequence .= $f;
+        }
+        $last = $f;
+        return $sequence;
+    };
+
+    # Now, do the actual work.
+    $text =~ s{ \\f\((.)(.) }{$process->($1, $2)}xmsge;
+
+    # We can do a bit of cleanup by collapsing sequences like \fR\fB\fR\fI
+    # into just \fI.
+    $text =~ s{ (?: \\fR )? (?: \\f (.|\(..) \\fR )+ }{\\fR}xms;
+
+    return $text;
+}
+
+# Given a command and a single argument that may or may not contain double
+# quotes and fixed-width text, handle double-quote formatting for it.  If
+# there is no fixed-width text, just return the command followed by the
+# argument with proper quoting.  If there is fixed-width text, work around a
+# Solaris nroff bug with fixed-width fonts by converting fixed-width to
+# regular fonts (nroff sees no difference).
+sub switchquotes {
+    my ($self, $command, $text, $extra) = @_;
+
+    # Separate troff from nroff if there are any fixed-width fonts in use to
+    # work around problems with Solaris nroff.
+    if ($text =~ $self->{FIXEDPAT}) {
+        my $nroff = $text;
+        my $troff = $text;
+
+        # Work around the Solaris nroff bug where \f(CW\fP leaves the font set
+        # to Roman rather than the actual previous font when used in headings.
+        # troff output may still be broken, but at least we can fix nroff by
+        # just switching the font changes to the non-fixed versions.
+        my $font_end = qr{ (?: \\f[PR] | \Q$self->{FONTS}{100}\E ) }xms;
+        $nroff =~ s{\Q$self->{FONTS}{100}\E(.*?)\\f([PR])}{$1}xmsg;
+        $nroff =~ s{\Q$self->{FONTS}{101}\E}{\\fI}xmsg;
+        $nroff =~ s{\Q$self->{FONTS}{110}\E}{\\fB}xmsg;
+        $nroff =~ s{\Q$self->{FONTS}{111}\E}{\\f\(BI}xmsg;
+
+        # We have to deal with \*C` and \*C', which are used to add the quotes
+        # around C<> text, since they may expand to " and if they do this
+        # confuses the .SH macros and the like no end.  Expand them ourselves.
+        my $c_is_quote = index("$self->{LQUOTE}$self->{RQUOTE}", qq(\")) != -1;
+        if ($c_is_quote && $text =~ m{ \\[*]\(C[\'\`] }xms) {
+            $nroff =~ s{ \\[*]\(C\` }{$self->{LQUOTE}}xmsg;
+            $nroff =~ s{ \\[*]\(C\' }{$self->{RQUOTE}}xmsg;
+            $troff =~ s{ \\[*]\(C[\'\`] }{}xmsg;
+        }
+
+        # Now finally output the command.  Bother with .ie only if the nroff
+        # and troff output aren't the same.
+        $nroff = _quote_macro_argument($nroff) . ($extra ? " $extra" : '');
+        $troff = _quote_macro_argument($troff) . ($extra ? " $extra" : '');
+        if ($nroff ne $troff) {
+            return ".ie n $command $nroff\n.el $command $troff\n";
+        } else {
+            return "$command $nroff\n";
+        }
+    } else {
+        $text = _quote_macro_argument($text) . ($extra ? " $extra" : '');
+        return "$command $text\n";
+    }
+}
+
+# Protect leading quotes and periods against interpretation as commands.  Also
+# protect anything starting with a backslash, since it could expand or hide
+# something that *roff would interpret as a command.  This is overkill, but
+# it's much simpler than trying to parse *roff here.
+sub protect {
+    my ($self, $text) = @_;
+    $text =~ s/^([.\'\\])/\\&$1/mg;
+    return $text;
+}
+
+# Make vertical whitespace if NEEDSPACE is set, appropriate to the indentation
+# level the situation.  This function is needed since in *roff one has to
+# create vertical whitespace after paragraphs and between some things, but
+# other macros create their own whitespace.  Also close out a sequence of
+# repeated =items, since calling makespace means we're about to begin the item
+# body.
+sub makespace {
+    my ($self) = @_;
+    $self->output (".PD\n") if $$self{ITEMS} > 1;
+    $$self{ITEMS} = 0;
+    $self->output ($$self{INDENT} > 0 ? ".Sp\n" : ".PP\n")
+        if $$self{NEEDSPACE};
+}
+
+# Output any pending index entries, and optionally an index entry given as an
+# argument.  Support multiple index entries in X<> separated by slashes, and
+# strip special escapes from index entries.
+sub outindex {
+    my ($self, $section, $index) = @_;
+    my @entries = map { split m%\s*/\s*% } @{ $$self{INDEX} };
+    return unless ($section || @entries);
+
+    # We're about to output all pending entries, so clear our pending queue.
+    $$self{INDEX} = [];
+
+    # Build the output.  Regular index entries are marked Xref, and headings
+    # pass in their own section.  Undo some *roff formatting on headings.
+    my @output;
+    if (@entries) {
+        push @output, [ 'Xref', join (' ', @entries) ];
+    }
+    if ($section) {
+        $index =~ s/\\-/-/g;
+        $index =~ s/\\(?:s-?\d|.\(..|.)//g;
+        push @output, [ $section, $index ];
+    }
+
+    # Print out the .IX commands.
+    for (@output) {
+        my ($type, $entry) = @$_;
+        $entry =~ s/\s+/ /g;
+        $entry =~ s/\"/\"\"/g;
+        $entry =~ s/\\/\\\\/g;
+        $self->output (".IX $type " . '"' . $entry . '"' . "\n");
+    }
+}
+
+# Output some text, without any additional changes.
+sub output {
+    my ($self, @text) = @_;
+    my $text = join('', @text);
+    $text =~ s{$NBSP}{\\ }g;
+    $text =~ s{$SHY}{\\%}g;
+
+    if ($$self{ENCODE} && _needs_encode($$self{ENCODING})) {
+        my $check = sub {
+            my ($char) = @_;
+            my $display = '"\x{' . hex($char) . '}"';
+            my $error = "$display does not map to $$self{ENCODING}";
+            $self->whine ($self->line_count(), $error);
+            return Encode::encode ($$self{ENCODING}, chr($char));
+        };
+        my $output = Encode::encode ($$self{ENCODING}, $text, $check);
+        print { $$self{output_fh} } $output;
+    } else {
+        print { $$self{output_fh} } $text;
+    }
+}
+
+##############################################################################
+# Document initialization
+##############################################################################
+
+# Handle the start of the document.  Here we handle empty documents, as well
+# as setting up our basic macros in a preamble and building the page title.
+sub start_document {
+    my ($self, $attrs) = @_;
+    if ($$attrs{contentless} && !$$self{ALWAYS_EMIT_SOMETHING}) {
+        $$self{CONTENTLESS} = 1;
+    } else {
+        delete $$self{CONTENTLESS};
+    }
+
+    # When an encoding is requested, check whether our output file handle
+    # already has a PerlIO encoding layer set.  If it does not, we'll need to
+    # encode our output before printing it (handled in the output() sub).
+    # Wrap the check in an eval to handle versions of Perl without PerlIO.
+    #
+    # PerlIO::get_layers still requires its argument be a glob, so coerce the
+    # file handle to a glob.
+    $$self{ENCODE} = 0;
+    if ($$self{ENCODING}) {
+        $$self{ENCODE} = 1;
+        eval {
+            require PerlIO;
+            my @options = (output => 1, details => 1);
+            my @layers = PerlIO::get_layers (*{$$self{output_fh}}, @options);
+            if ($layers[-1] && ($layers[-1] & PerlIO::F_UTF8 ())) {
+                $$self{ENCODE} = 0;
+            }
+        }
+    }
+
+    # Determine information for the preamble and then output it unless the
+    # document was content-free.
+    if (!$$self{CONTENTLESS}) {
+        my ($name, $section);
+        if (defined $self->{opt_name}) {
+            $name = $self->{opt_name};
+            $section = $self->{opt_section} || 1;
+        } else {
+            ($name, $section) = $self->devise_title;
+        }
+        my $date = $self->{opt_date} // $self->devise_date();
+        $self->preamble ($name, $section, $date)
+            unless $self->bare_output;
+    }
+
+    # Initialize a few per-document variables.
+    $$self{INDENT}    = 0;      # Current indentation level.
+    $$self{INDENTS}   = [];     # Stack of indentations.
+    $$self{INDEX}     = [];     # Index keys waiting to be printed.
+    $$self{IN_NAME}   = 0;      # Whether processing the NAME section.
+    $$self{ITEMS}     = 0;      # The number of consecutive =items.
+    $$self{ITEMTYPES} = [];     # Stack of =item types, one per list.
+    $$self{SHIFTWAIT} = 0;      # Whether there is a shift waiting.
+    $$self{SHIFTS}    = [];     # Stack of .RS shifts.
+    $$self{PENDING}   = [[]];   # Pending output.
+}
+
+# Handle the end of the document.  This handles dying on POD errors, since
+# Pod::Parser currently doesn't.  Otherwise, does nothing but print out a
+# final comment at the end of the document under debugging.
+sub end_document {
+    my ($self) = @_;
+    if ($$self{complain_die} && $self->errors_seen) {
+        croak ("POD document had syntax errors");
+    }
+    return if $self->bare_output;
+    return if ($$self{CONTENTLESS} && !$$self{ALWAYS_EMIT_SOMETHING});
+}
+
+# Try to figure out the name and section from the file name and return them as
+# a list, returning an empty name and section 1 if we can't find any better
+# information.  Uses File::Basename and File::Spec as necessary.
+sub devise_title {
+    my ($self) = @_;
+    my $name = $self->source_filename || '';
+    my $section = $self->{opt_section} || 1;
+    $section = 3 if (!$self->{opt_section} && $name =~ /\.pm\z/i);
+    $name =~ s/\.p(od|[lm])\z//i;
+
+    # If Pod::Parser gave us an IO::File reference as the source file name,
+    # convert that to the empty string as well.  Then, if we don't have a
+    # valid name, convert it to STDIN.
+    #
+    # In podlators 4.00 through 4.07, this also produced a warning, but that
+    # was surprising to a lot of programs that had expected to be able to pipe
+    # POD through pod2man without specifying the name.  In the name of
+    # backward compatibility, just quietly set STDIN as the page title.
+    if ($name =~ /^IO::File(?:=\w+)\(0x[\da-f]+\)$/i) {
+        $name = '';
+    }
+    if ($name eq '') {
+        $name = 'STDIN';
+    }
+
+    # If the section isn't 3, then the name defaults to just the basename of
+    # the file.
+    if ($section !~ /^3/) {
+        require File::Basename;
+        $name = uc File::Basename::basename ($name);
+    } else {
+        require File::Spec;
+        my ($volume, $dirs, $file) = File::Spec->splitpath ($name);
+
+        # Otherwise, assume we're dealing with a module.  We want to figure
+        # out the full module name from the path to the file, but we don't
+        # want to include too much of the path into the module name.  Lose
+        # anything up to the first of:
+        #
+        #     */lib/*perl*/         standard or site_perl module
+        #     */*perl*/lib/         from -Dprefix=/opt/perl
+        #     */*perl*/             random module hierarchy
+        #
+        # Also strip off a leading site, site_perl, or vendor_perl component,
+        # any OS-specific component, and any version number component, and
+        # strip off an initial component of "lib" or "blib/lib" since that's
+        # what ExtUtils::MakeMaker creates.
+        #
+        # splitdir requires at least File::Spec 0.8.
+        my @dirs = File::Spec->splitdir ($dirs);
+        if (@dirs) {
+            my $cut = 0;
+            my $i;
+            for ($i = 0; $i < @dirs; $i++) {
+                if ($dirs[$i] =~ /perl/) {
+                    $cut = $i + 1;
+                    $cut++ if ($dirs[$i + 1] && $dirs[$i + 1] eq 'lib');
+                    last;
+                }
+            }
+            if ($cut > 0) {
+                splice (@dirs, 0, $cut);
+                shift @dirs if ($dirs[0] =~ /^(site|vendor)(_perl)?$/);
+                shift @dirs if ($dirs[0] =~ /^[\d.]+$/);
+                shift @dirs if ($dirs[0] =~ /^(.*-$^O|$^O-.*|$^O)$/);
+            }
+            shift @dirs if $dirs[0] eq 'lib';
+            splice (@dirs, 0, 2) if ($dirs[0] eq 'blib' && $dirs[1] eq 'lib');
+        }
+
+        # Remove empty directories when building the module name; they
+        # occur too easily on Unix by doubling slashes.
+        $name = join ('::', (grep { $_ ? $_ : () } @dirs), $file);
+    }
+    return ($name, $section);
+}
+
+# Determine the modification date and return that, properly formatted in ISO
+# format.
+#
+# If POD_MAN_DATE is set, that overrides anything else.  This can be used for
+# reproducible generation of the same file even if the input file timestamps
+# are unpredictable or the POD comes from standard input.
+#
+# Otherwise, if SOURCE_DATE_EPOCH is set and can be parsed as seconds since
+# the UNIX epoch, base the timestamp on that.  See
+# <https://reproducible-builds.org/specs/source-date-epoch/>
+#
+# Otherwise, use the modification date of the input if we can stat it.  Be
+# aware that Pod::Simple returns the stringification of the file handle as
+# source_filename for input from a file handle, so we'll stat some random ref
+# string in that case.  If that fails, instead use the current time.
+#
+# $self - Pod::Man object, used to get the source file
+#
+# Returns: YYYY-MM-DD date suitable for the left-hand footer
+sub devise_date {
+    my ($self) = @_;
+
+    # If POD_MAN_DATE is set, always use it.
+    if (defined($ENV{POD_MAN_DATE})) {
+        return $ENV{POD_MAN_DATE};
+    }
+
+    # If SOURCE_DATE_EPOCH is set and can be parsed, use that.
+    my $time;
+    if (defined($ENV{SOURCE_DATE_EPOCH}) && $ENV{SOURCE_DATE_EPOCH} !~ /\D/) {
+        $time = $ENV{SOURCE_DATE_EPOCH};
+    }
+
+    # Otherwise, get the input filename and try to stat it.  If that fails,
+    # use the current time.
+    if (!defined $time) {
+        my $input = $self->source_filename;
+        if ($input) {
+            $time = (stat($input))[9] || time();
+        } else {
+            $time = time();
+        }
+    }
+
+    # Can't use POSIX::strftime(), which uses Fcntl, because MakeMaker uses
+    # this and it has to work in the core which can't load dynamic libraries.
+    # Use gmtime instead of localtime so that the generated man page does not
+    # depend on the local time zone setting and is more reproducible
+    my ($year, $month, $day) = (gmtime($time))[5,4,3];
+    return sprintf("%04d-%02d-%02d", $year + 1900, $month + 1, $day);
+}
+
+# Print out the preamble and the title.  The meaning of the arguments to .TH
+# unfortunately vary by system; some systems consider the fourth argument to
+# be a "source" and others use it as a version number.  Generally it's just
+# presented as the left-side footer, though, so it doesn't matter too much if
+# a particular system gives it another interpretation.
+#
+# The order of date and release used to be reversed in older versions of this
+# module, but this order is correct for both Solaris and Linux.
+sub preamble {
+    my ($self, $name, $section, $date) = @_;
+    my $preamble = $self->preamble_template();
+
+    # groff's preconv script will use this line to correctly determine the
+    # input encoding if the encoding is one of the ones it recognizes.  It
+    # must be the first or second line.
+    #
+    # If the output encoding is some version of Unicode, we could also add a
+    # Unicode Byte Order Mark to the start of the file, but the BOM is now
+    # deprecated and I am concerned that may break a *roff implementation that
+    # might otherwise cope with Unicode.  Revisit this if someone files a bug
+    # report about it.
+    if (_needs_encode($$self{ENCODING})) {
+        my $normalized = lc($$self{ENCODING});
+        $normalized =~ s{-}{}g;
+        my $coding = $ENCODINGS{$normalized} || lc($$self{ENCODING});
+        if ($coding ne 'us-ascii') {
+            $self->output(qq{.\\\" -*- mode: troff; coding: $coding -*-\n});
+        }
+    }
+
+    # Substitute into the preamble the configuration options.  Because it's
+    # used as the argument to defining a string, any leading double quote (but
+    # no other double quotes) in LQUOTE and RQUOTE has to be doubled.
+    $preamble =~ s{ [@] CFONT [@] }{$self->{opt_fixed}}xms;
+    my $lquote = $self->{LQUOTE};
+    my $rquote = $self->{RQUOTE};
+    $lquote =~ s{ \A \" }{""}xms;
+    $rquote =~ s{ \A \" }{""}xms;
+    $preamble =~ s{ [@] LQUOTE [@] }{$lquote}xms;
+    $preamble =~ s{ [@] RQUOTE [@] }{$rquote}xms;
+    chomp($preamble);
+
+    # Get the version information.
+    my $version = $self->version_report();
+
+    # Build the index line and make sure that it will be syntactically valid.
+    my $index = _quote_macro_argument("$name $section");
+
+    # Quote the arguments to the .TH macro.  (Section should never require
+    # this, but we may as well be cautious.)
+    $name = _quote_macro_argument($name);
+    $section = _quote_macro_argument($section);
+    $date = _quote_macro_argument($date);
+    my $center = _quote_macro_argument($self->{opt_center});
+    my $release = _quote_macro_argument($self->{opt_release});
+
+    # Output the majority of the preamble.
+    $self->output (<<"----END OF HEADER----");
+.\\" Automatically generated by $version
+.\\"
+.\\" Standard preamble:
+.\\" ========================================================================
+$preamble
+.\\" ========================================================================
+.\\"
+.IX Title $index
+.TH $name $section $date $release $center
+.\\" For nroff, turn off justification.  Always turn off hyphenation; it makes
+.\\" way too many mistakes in technical documents.
+.if n .ad l
+.nh
+----END OF HEADER----
+
+    # If the language was specified, output the language configuration.
+    if ($self->{opt_language}) {
+        $self->output(".mso $self->{opt_language}.tmac\n");
+        $self->output(".hla $self->{opt_language}\n");
+    }
+}
+
+##############################################################################
+# Text blocks
+##############################################################################
+
+# Handle a basic block of text.  The only tricky part of this is if this is
+# the first paragraph of text after an =over, in which case we have to change
+# indentations for *roff.
+sub cmd_para {
+    my ($self, $attrs, $text) = @_;
+    my $line = $$attrs{start_line};
+
+    # Output the paragraph.  We also have to handle =over without =item.  If
+    # there's an =over without =item, SHIFTWAIT will be set, and we need to
+    # handle creation of the indent here.  Add the shift to SHIFTS so that it
+    # will be cleaned up on =back.
+    $self->makespace;
+    if ($$self{SHIFTWAIT}) {
+        $self->output (".RS $$self{INDENT}\n");
+        push (@{ $$self{SHIFTS} }, $$self{INDENT});
+        $$self{SHIFTWAIT} = 0;
+    }
+
+    # Force exactly one newline at the end and strip unwanted trailing
+    # whitespace at the end, but leave "\ " backslashed space from an S< > at
+    # the end of a line.  Reverse the text first, to avoid having to scan the
+    # entire paragraph.
+    $text = reverse $text;
+    $text =~ s/\A\s*?(?= \\|\S|\z)/\n/;
+    $text = reverse $text;
+
+    # Output the paragraph.
+    $self->output($self->protect($self->mapfonts($text, '\fR')));
+    $self->outindex();
+    $$self{NEEDSPACE} = 1;
+    return '';
+}
+
+# Handle a verbatim paragraph.  Put a null token at the beginning of each line
+# to protect against commands and wrap in .Vb/.Ve (which we define in our
+# prelude).
+sub cmd_verbatim {
+    my ($self, $attrs, $text) = @_;
+
+    # Ignore an empty verbatim paragraph.
+    return if $text !~ m{ \S }xms;
+
+    # Force exactly one newline at the end and strip unwanted trailing
+    # whitespace at the end.
+    $text =~ s{ \s* \z }{\n}xms;
+
+    # Get a count of the number of lines before the first blank line, which
+    # we'll pass to .Vb as its parameter.  This tells *roff to keep that many
+    # lines together.  We don't want to tell *roff to keep huge blocks
+    # together.
+    my @lines = split (m{ \n }xms, $text);
+    my $unbroken = 0;
+    for my $line (@lines) {
+        last if $line =~ m{ \A \s* \z }xms;
+        $unbroken++;
+    }
+    if ($unbroken > 12) {
+        $unbroken = 10;
+    }
+
+    # Prepend a null token to each line to preserve indentation.
+    $text =~ s{ ^ }{\\&}xmsg;
+
+    # Output the results.
+    $self->makespace();
+    $self->output(".Vb $unbroken\n$text.Ve\n");
+    $$self{NEEDSPACE} = 1;
+    return q{};
+}
+
+# Handle literal text (produced by =for and similar constructs).  Just output
+# it with the minimum of changes.
+sub cmd_data {
+    my ($self, $attrs, $text) = @_;
+    $text =~ s{ \A \n+ }{}xms;
+    $text =~ s{ \n{0,2} \z }{\n}xms;
+    $self->output($text);
+    return q{};
+}
+
+##############################################################################
+# Headings
+##############################################################################
+
+# Common code for all headings.  This is called before the actual heading is
+# output.  It returns the cleaned up heading text (putting the heading all on
+# one line) and may do other things, like closing bad =item blocks.
+sub heading_common {
+    my ($self, $text, $line) = @_;
+    $text =~ s/\s+$//;
+    $text =~ s/\s*\n\s*/ /g;
+
+    # This should never happen; it means that we have a heading after =item
+    # without an intervening =back.  But just in case, handle it anyway.
+    if ($$self{ITEMS} > 1) {
+        $$self{ITEMS} = 0;
+        $self->output (".PD\n");
+    }
+
+    return $text;
+}
+
+# First level heading.  We can't output .IX in the NAME section due to a bug
+# in some versions of catman, so don't output a .IX for that section.  .SH
+# already uses small caps, so remove \s0 and \s-1.  Maintain IN_NAME as
+# appropriate.
+sub cmd_head1 {
+    my ($self, $attrs, $text) = @_;
+    $text =~ s/\\s-?\d//g;
+    $text = $self->heading_common ($text, $$attrs{start_line});
+    my $isname = ($text eq 'NAME' || $text =~ /\(NAME\)/);
+    $self->output($self->switchquotes('.SH', $self->mapfonts($text, '\fP')));
+    $self->outindex ('Header', $text) unless $isname;
+    $$self{NEEDSPACE} = 0;
+    $$self{IN_NAME} = $isname;
+    return '';
+}
+
+# Second level heading.
+sub cmd_head2 {
+    my ($self, $attrs, $text) = @_;
+    $text = $self->heading_common ($text, $$attrs{start_line});
+    $self->output($self->switchquotes('.SS', $self->mapfonts($text, '\fP')));
+    $self->outindex ('Subsection', $text);
+    $$self{NEEDSPACE} = 0;
+    return '';
+}
+
+# Third level heading.  *roff doesn't have this concept, so just put the
+# heading in italics as a normal paragraph.
+sub cmd_head3 {
+    my ($self, $attrs, $text) = @_;
+    $text = $self->heading_common ($text, $$attrs{start_line});
+    $self->makespace;
+    $self->output($self->mapfonts('\f(IS' . $text . '\f(IE', '\fR') . "\n");
+    $self->outindex ('Subsection', $text);
+    $$self{NEEDSPACE} = 1;
+    return '';
+}
+
+# Fourth level heading.  *roff doesn't have this concept, so just put the
+# heading as a normal paragraph.
+sub cmd_head4 {
+    my ($self, $attrs, $text) = @_;
+    $text = $self->heading_common ($text, $$attrs{start_line});
+    $self->makespace;
+    $self->output($self->mapfonts($text, '\fR') . "\n");
+    $self->outindex ('Subsection', $text);
+    $$self{NEEDSPACE} = 1;
+    return '';
+}
+
+##############################################################################

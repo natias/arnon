@@ -1,0 +1,1000 @@
+        context = self.ensure_directories(env_dir)
+        # See issue 24875. We need system_site_packages to be False
+        # until after pip is installed.
+        true_system_site_packages = self.system_site_packages
+        self.system_site_packages = False
+        self.create_configuration(context)
+        self.setup_python(context)
+        if self.with_pip:
+            self._setup_pip(context)
+        if not self.upgrade:
+            self.setup_scripts(context)
+            self.post_setup(context)
+        if true_system_site_packages:
+            # We had set it to False before, now
+            # restore it and rewrite the configuration
+            self.system_site_packages = True
+            self.create_configuration(context)
+        if self.upgrade_deps:
+            self.upgrade_dependencies(context)
+
+    def clear_directory(self, path):
+        for fn in os.listdir(path):
+            fn = os.path.join(path, fn)
+            if os.path.islink(fn) or os.path.isfile(fn):
+                os.remove(fn)
+            elif os.path.isdir(fn):
+                shutil.rmtree(fn)
+
+    def _venv_path(self, env_dir, name):
+        vars = {
+            'base': env_dir,
+            'platbase': env_dir,
+            'installed_base': env_dir,
+            'installed_platbase': env_dir,
+        }
+        return sysconfig.get_path(name, scheme='venv', vars=vars)
+
+    def ensure_directories(self, env_dir):
+        """
+        Create the directories for the environment.
+
+        Returns a context object which holds paths in the environment,
+        for use by subsequent logic.
+        """
+
+        def create_if_needed(d):
+            if not os.path.exists(d):
+                os.makedirs(d)
+            elif os.path.islink(d) or os.path.isfile(d):
+                raise ValueError('Unable to create directory %r' % d)
+
+        if os.pathsep in os.fspath(env_dir):
+            raise ValueError(f'Refusing to create a venv in {env_dir} because '
+                             f'it contains the PATH separator {os.pathsep}.')
+        if os.path.exists(env_dir) and self.clear:
+            self.clear_directory(env_dir)
+        context = types.SimpleNamespace()
+        context.env_dir = env_dir
+        context.env_name = os.path.split(env_dir)[1]
+        prompt = self.prompt if self.prompt is not None else context.env_name
+        context.prompt = '(%s) ' % prompt
+        create_if_needed(env_dir)
+        executable = sys._base_executable
+        if not executable:  # see gh-96861
+            raise ValueError('Unable to determine path to the running '
+                             'Python interpreter. Provide an explicit path or '
+                             'check that your PATH environment variable is '
+                             'correctly set.')
+        dirname, exename = os.path.split(os.path.abspath(executable))
+        context.executable = executable
+        context.python_dir = dirname
+        context.python_exe = exename
+        binpath = self._venv_path(env_dir, 'scripts')
+        incpath = self._venv_path(env_dir, 'include')
+        libpath = self._venv_path(env_dir, 'purelib')
+
+        context.inc_path = incpath
+        create_if_needed(incpath)
+        create_if_needed(libpath)
+        # Issue 21197: create lib64 as a symlink to lib on 64-bit non-OS X POSIX
+        if ((sys.maxsize > 2**32) and (os.name == 'posix') and
+            (sys.platform != 'darwin')):
+            link_path = os.path.join(env_dir, 'lib64')
+            if not os.path.exists(link_path):   # Issue #21643
+                os.symlink('lib', link_path)
+        context.bin_path = binpath
+        context.bin_name = os.path.relpath(binpath, env_dir)
+        context.env_exe = os.path.join(binpath, exename)
+        create_if_needed(binpath)
+        # Assign and update the command to use when launching the newly created
+        # environment, in case it isn't simply the executable script (e.g. bpo-45337)
+        context.env_exec_cmd = context.env_exe
+        if sys.platform == 'win32':
+            # bpo-45337: Fix up env_exec_cmd to account for file system redirections.
+            # Some redirects only apply to CreateFile and not CreateProcess
+            real_env_exe = os.path.realpath(context.env_exe)
+            if os.path.normcase(real_env_exe) != os.path.normcase(context.env_exe):
+                logger.warning('Actual environment location may have moved due to '
+                               'redirects, links or junctions.\n'
+                               '  Requested location: "%s"\n'
+                               '  Actual location:    "%s"',
+                               context.env_exe, real_env_exe)
+                context.env_exec_cmd = real_env_exe
+        return context
+
+    def create_configuration(self, context):
+        """
+        Create a configuration file indicating where the environment's Python
+        was copied from, and whether the system site-packages should be made
+        available in the environment.
+
+        :param context: The information for the environment creation request
+                        being processed.
+        """
+        context.cfg_path = path = os.path.join(context.env_dir, 'pyvenv.cfg')
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write('home = %s\n' % context.python_dir)
+            if self.system_site_packages:
+                incl = 'true'
+            else:
+                incl = 'false'
+            f.write('include-system-site-packages = %s\n' % incl)
+            f.write('version = %d.%d.%d\n' % sys.version_info[:3])
+            if self.prompt is not None:
+                f.write(f'prompt = {self.prompt!r}\n')
+            f.write('executable = %s\n' % os.path.realpath(sys.executable))
+            args = []
+            nt = os.name == 'nt'
+            if nt and self.symlinks:
+                args.append('--symlinks')
+            if not nt and not self.symlinks:
+                args.append('--copies')
+            if not self.with_pip:
+                args.append('--without-pip')
+            if self.system_site_packages:
+                args.append('--system-site-packages')
+            if self.clear:
+                args.append('--clear')
+            if self.upgrade:
+                args.append('--upgrade')
+            if self.upgrade_deps:
+                args.append('--upgrade-deps')
+            if self.orig_prompt is not None:
+                args.append(f'--prompt="{self.orig_prompt}"')
+
+            args.append(context.env_dir)
+            args = ' '.join(args)
+            f.write(f'command = {sys.executable} -m venv {args}\n')
+
+    if os.name != 'nt':
+        def symlink_or_copy(self, src, dst, relative_symlinks_ok=False):
+            """
+            Try symlinking a file, and if that fails, fall back to copying.
+            """
+            force_copy = not self.symlinks
+            if not force_copy:
+                try:
+                    if not os.path.islink(dst): # can't link to itself!
+                        if relative_symlinks_ok:
+                            assert os.path.dirname(src) == os.path.dirname(dst)
+                            os.symlink(os.path.basename(src), dst)
+                        else:
+                            os.symlink(src, dst)
+                except Exception:   # may need to use a more specific exception
+                    logger.warning('Unable to symlink %r to %r', src, dst)
+                    force_copy = True
+            if force_copy:
+                shutil.copyfile(src, dst)
+    else:
+        def symlink_or_copy(self, src, dst, relative_symlinks_ok=False):
+            """
+            Try symlinking a file, and if that fails, fall back to copying.
+            """
+            bad_src = os.path.lexists(src) and not os.path.exists(src)
+            if self.symlinks and not bad_src and not os.path.islink(dst):
+                try:
+                    if relative_symlinks_ok:
+                        assert os.path.dirname(src) == os.path.dirname(dst)
+                        os.symlink(os.path.basename(src), dst)
+                    else:
+                        os.symlink(src, dst)
+                    return
+                except Exception:   # may need to use a more specific exception
+                    logger.warning('Unable to symlink %r to %r', src, dst)
+
+            # On Windows, we rewrite symlinks to our base python.exe into
+            # copies of venvlauncher.exe
+            basename, ext = os.path.splitext(os.path.basename(src))
+            srcfn = os.path.join(os.path.dirname(__file__),
+                                 "scripts",
+                                 "nt",
+                                 basename + ext)
+            # Builds or venv's from builds need to remap source file
+            # locations, as we do not put them into Lib/venv/scripts
+            if sysconfig.is_python_build() or not os.path.isfile(srcfn):
+                if basename.endswith('_d'):
+                    ext = '_d' + ext
+                    basename = basename[:-2]
+                if basename == 'python':
+                    basename = 'venvlauncher'
+                elif basename == 'pythonw':
+                    basename = 'venvwlauncher'
+                src = os.path.join(os.path.dirname(src), basename + ext)
+            else:
+                src = srcfn
+            if not os.path.exists(src):
+                if not bad_src:
+                    logger.warning('Unable to copy %r', src)
+                return
+
+            shutil.copyfile(src, dst)
+
+    def setup_python(self, context):
+        """
+        Set up a Python executable in the environment.
+
+        :param context: The information for the environment creation request
+                        being processed.
+        """
+        binpath = context.bin_path
+        path = context.env_exe
+        copier = self.symlink_or_copy
+        dirname = context.python_dir
+        if os.name != 'nt':
+            copier(context.executable, path)
+            if not os.path.islink(path):
+                os.chmod(path, 0o755)
+            for suffix in ('python', 'python3', f'python3.{sys.version_info[1]}'):
+                path = os.path.join(binpath, suffix)
+                if not os.path.exists(path):
+                    # Issue 18807: make copies if
+                    # symlinks are not wanted
+                    copier(context.env_exe, path, relative_symlinks_ok=True)
+                    if not os.path.islink(path):
+                        os.chmod(path, 0o755)
+        else:
+            if self.symlinks:
+                # For symlinking, we need a complete copy of the root directory
+                # If symlinks fail, you'll get unnecessary copies of files, but
+                # we assume that if you've opted into symlinks on Windows then
+                # you know what you're doing.
+                suffixes = [
+                    f for f in os.listdir(dirname) if
+                    os.path.normcase(os.path.splitext(f)[1]) in ('.exe', '.dll')
+                ]
+                if sysconfig.is_python_build():
+                    suffixes = [
+                        f for f in suffixes if
+                        os.path.normcase(f).startswith(('python', 'vcruntime'))
+                    ]
+            else:
+                suffixes = {'python.exe', 'python_d.exe', 'pythonw.exe', 'pythonw_d.exe'}
+                base_exe = os.path.basename(context.env_exe)
+                suffixes.add(base_exe)
+
+            for suffix in suffixes:
+                src = os.path.join(dirname, suffix)
+                if os.path.lexists(src):
+                    copier(src, os.path.join(binpath, suffix))
+
+            if sysconfig.is_python_build():
+                # copy init.tcl
+                for root, dirs, files in os.walk(context.python_dir):
+                    if 'init.tcl' in files:
+                        tcldir = os.path.basename(root)
+                        tcldir = os.path.join(context.env_dir, 'Lib', tcldir)
+                        if not os.path.exists(tcldir):
+                            os.makedirs(tcldir)
+                        src = os.path.join(root, 'init.tcl')
+                        dst = os.path.join(tcldir, 'init.tcl')
+                        shutil.copyfile(src, dst)
+                        break
+
+    def _call_new_python(self, context, *py_args, **kwargs):
+        """Executes the newly created Python using safe-ish options"""
+        # gh-98251: We do not want to just use '-I' because that masks
+        # legitimate user preferences (such as not writing bytecode). All we
+        # really need is to ensure that the path variables do not overrule
+        # normal venv handling.
+        args = [context.env_exec_cmd, *py_args]
+        kwargs['env'] = env = os.environ.copy()
+        env['VIRTUAL_ENV'] = context.env_dir
+        env.pop('PYTHONHOME', None)
+        env.pop('PYTHONPATH', None)
+        kwargs['cwd'] = context.env_dir
+        kwargs['executable'] = context.env_exec_cmd
+        subprocess.check_output(args, **kwargs)
+
+    def _setup_pip(self, context):
+        """Installs or upgrades pip in a virtual environment"""
+        try:
+            self._call_new_python(context, '-m', 'ensurepip', '--upgrade',
+                                  '--default-pip', stderr=subprocess.STDOUT)
+        except subprocess.CalledProcessError as err:
+            stdlib = sysconfig.get_path('stdlib')
+            if not os.path.exists(f'{stdlib}/ensurepip/__main__.py'):
+                print("""\
+The virtual environment was not created successfully because ensurepip is not
+available.  On Debian/Ubuntu systems, you need to install the python3-venv
+package using the following command.
+
+    apt install python{}-venv
+
+You may need to use sudo with that command.  After installing the python3-venv
+package, recreate your virtual environment.
+
+Failing command: {}
+""".format(sysconfig.get_python_version(), context.env_exec_cmd))
+                sys.exit(1)
+            raise
+
+    def setup_scripts(self, context):
+        """
+        Set up scripts into the created environment from a directory.
+
+        This method installs the default scripts into the environment
+        being created. You can prevent the default installation by overriding
+        this method if you really need to, or if you need to specify
+        a different location for the scripts to install. By default, the
+        'scripts' directory in the venv package is used as the source of
+        scripts to install.
+        """
+        path = os.path.abspath(os.path.dirname(__file__))
+        path = os.path.join(path, 'scripts')
+        self.install_scripts(context, path)
+
+    def post_setup(self, context):
+        """
+        Hook for post-setup modification of the venv. Subclasses may install
+        additional packages or scripts here, add activation shell scripts, etc.
+
+        :param context: The information for the environment creation request
+                        being processed.
+        """
+        pass
+
+    def replace_variables(self, text, context):
+        """
+        Replace variable placeholders in script text with context-specific
+        variables.
+
+        Return the text passed in , but with variables replaced.
+
+        :param text: The text in which to replace placeholder variables.
+        :param context: The information for the environment creation request
+                        being processed.
+        """
+        text = text.replace('__VENV_DIR__', context.env_dir)
+        text = text.replace('__VENV_NAME__', context.env_name)
+        text = text.replace('__VENV_PROMPT__', context.prompt)
+        text = text.replace('__VENV_BIN_NAME__', context.bin_name)
+        text = text.replace('__VENV_PYTHON__', context.env_exe)
+        return text
+
+    def install_scripts(self, context, path):
+        """
+        Install scripts into the created environment from a directory.
+
+        :param context: The information for the environment creation request
+                        being processed.
+        :param path:    Absolute pathname of a directory containing script.
+                        Scripts in the 'common' subdirectory of this directory,
+                        and those in the directory named for the platform
+                        being run on, are installed in the created environment.
+                        Placeholder variables are replaced with environment-
+                        specific values.
+        """
+        binpath = context.bin_path
+        plen = len(path)
+        for root, dirs, files in os.walk(path):
+            if root == path: # at top-level, remove irrelevant dirs
+                for d in dirs[:]:
+                    if d not in ('common', os.name):
+                        dirs.remove(d)
+                continue # ignore files in top level
+            for f in files:
+                if (os.name == 'nt' and f.startswith('python')
+                        and f.endswith(('.exe', '.pdb'))):
+                    continue
+                srcfile = os.path.join(root, f)
+                suffix = root[plen:].split(os.sep)[2:]
+                if not suffix:
+                    dstdir = binpath
+                else:
+                    dstdir = os.path.join(binpath, *suffix)
+                if not os.path.exists(dstdir):
+                    os.makedirs(dstdir)
+                dstfile = os.path.join(dstdir, f)
+                with open(srcfile, 'rb') as f:
+                    data = f.read()
+                if not srcfile.endswith(('.exe', '.pdb')):
+                    try:
+                        data = data.decode('utf-8')
+                        data = self.replace_variables(data, context)
+                        data = data.encode('utf-8')
+                    except UnicodeError as e:
+                        data = None
+                        logger.warning('unable to copy script %r, '
+                                       'may be binary: %s', srcfile, e)
+                if data is not None:
+                    with open(dstfile, 'wb') as f:
+                        f.write(data)
+                    shutil.copymode(srcfile, dstfile)
+
+    def upgrade_dependencies(self, context):
+        logger.debug(
+            f'Upgrading {CORE_VENV_DEPS} packages in {context.bin_path}'
+        )
+        self._call_new_python(context, '-m', 'pip', 'install', '--upgrade',
+                              *CORE_VENV_DEPS)
+
+
+def create(env_dir, system_site_packages=False, clear=False,
+           symlinks=False, with_pip=False, prompt=None, upgrade_deps=False):
+    """Create a virtual environment in a directory."""
+    builder = EnvBuilder(system_site_packages=system_site_packages,
+                         clear=clear, symlinks=symlinks, with_pip=with_pip,
+                         prompt=prompt, upgrade_deps=upgrade_deps)
+    builder.create(env_dir)
+
+def main(args=None):
+    compatible = True
+    if sys.version_info < (3, 3):
+        compatible = False
+    elif not hasattr(sys, 'base_prefix'):
+        compatible = False
+    if not compatible:
+        raise ValueError('This script is only for use with Python >= 3.3')
+    else:
+        import argparse
+
+        parser = argparse.ArgumentParser(prog=__name__,
+                                         description='Creates virtual Python '
+                                                     'environments in one or '
+                                                     'more target '
+                                                     'directories.',
+                                         epilog='Once an environment has been '
+                                                'created, you may wish to '
+                                                'activate it, e.g. by '
+                                                'sourcing an activate script '
+                                                'in its bin directory.')
+        parser.add_argument('dirs', metavar='ENV_DIR', nargs='+',
+                            help='A directory to create the environment in.')
+        parser.add_argument('--system-site-packages', default=False,
+                            action='store_true', dest='system_site',
+                            help='Give the virtual environment access to the '
+                                 'system site-packages dir.')
+        if os.name == 'nt':
+            use_symlinks = False
+        else:
+            use_symlinks = True
+        group = parser.add_mutually_exclusive_group()
+        group.add_argument('--symlinks', default=use_symlinks,
+                           action='store_true', dest='symlinks',
+                           help='Try to use symlinks rather than copies, '
+                                'when symlinks are not the default for '
+                                'the platform.')
+        group.add_argument('--copies', default=not use_symlinks,
+                           action='store_false', dest='symlinks',
+                           help='Try to use copies rather than symlinks, '
+                                'even when symlinks are the default for '
+                                'the platform.')
+        parser.add_argument('--clear', default=False, action='store_true',
+                            dest='clear', help='Delete the contents of the '
+                                               'environment directory if it '
+                                               'already exists, before '
+                                               'environment creation.')
+        parser.add_argument('--upgrade', default=False, action='store_true',
+                            dest='upgrade', help='Upgrade the environment '
+                                               'directory to use this version '
+                                               'of Python, assuming Python '
+                                               'has been upgraded in-place.')
+        parser.add_argument('--without-pip', dest='with_pip',
+                            default=True, action='store_false',
+                            help='Skips installing or upgrading pip in the '
+                                 'virtual environment (pip is bootstrapped '
+                                 'by default)')
+        parser.add_argument('--prompt',
+                            help='Provides an alternative prompt prefix for '
+                                 'this environment.')
+        parser.add_argument('--upgrade-deps', default=False, action='store_true',
+                            dest='upgrade_deps',
+                            help='Upgrade core dependencies: {} to the latest '
+                                 'version in PyPI'.format(
+                                 ' '.join(CORE_VENV_DEPS)))
+        options = parser.parse_args(args)
+        if options.upgrade and options.clear:
+            raise ValueError('you cannot supply --upgrade and --clear together.')
+        builder = EnvBuilder(system_site_packages=options.system_site,
+                             clear=options.clear,
+                             symlinks=options.symlinks,
+                             upgrade=options.upgrade,
+                             with_pip=options.with_pip,
+                             prompt=options.prompt,
+                             upgrade_deps=options.upgrade_deps)
+        for d in options.dirs:
+            builder.create(d)
+
+if __name__ == '__main__':
+    rc = 1
+    try:
+        main()
+        rc = 0
+    except Exception as e:
+        print('Error: %s' % e, file=sys.stderr)
+    sys.exit(rc)
+                                                                                                                                                                                                                                                                        usr/lib/python3.11/venv/__main__.py                                                                 0000644 0000000 0000000 00000000221 14671176116 015524  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        import sys
+from . import main
+
+rc = 1
+try:
+    main()
+    rc = 0
+except Exception as e:
+    print('Error: %s' % e, file=sys.stderr)
+sys.exit(rc)
+                                                                                                                                                                                                                                                                                                                                                                               usr/lib/python3.11/venv/__pycache__/                                                                0000755 0000000 0000000 00000000000 14714551121 015636  5                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        usr/lib/python3.11/venv/__pycache__/__init__.cpython-311.pyc                                        0000644 0000000 0000000 00000077077 14714551121 022121  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        §
+    Nüäfød  ã                   ó2  — d Z ddlZddlZddlZddlZddlZddlZddlZdZ ej	        e
+¦  «        Z G d„ d¦  «        Z	 	 dd„Zdd„Ze
+d	k    rId
+Z	  e¦   «          dZn'# e$ rZ edez  ej        ¬¦  «         Y dZ[ndZ[ww xY w ej        e¦  «         dS dS )z›
+Virtual environment (venv) package for Python. Based on PEP 405.
+
+Copyright (C) 2011-2014 Vinay Sajip.
+Licensed to the PSF under a contributor agreement.
+é    N)ÚpipÚ
+setuptoolsc                   ó–   — e Zd ZdZ	 	 	 dd„Zd„ Zd„ Zd„ Zd„ Zd	„ Z	e
+j        d
+k    rdd„Zndd„Zd„ Zd„ Zd„ Zd„ Zd„ Zd„ Zd„ Zd„ ZdS )Ú
+EnvBuilderaâ  
+    This class exists to allow virtual environment creation to be
+    customized. The constructor parameters determine the builder's
+    behaviour when called upon to create a virtual environment.
+
+    By default, the builder makes the system (global) site-packages dir
+    *un*available to the created environment.
+
+    If invoked using the Python -m option, the default is to use copying
+    on Windows platforms but symlinks elsewhere. If instantiated some
+    other way, the default is to *not* use symlinks.
+
+    :param system_site_packages: If True, the system (global) site-packages
+                                 dir is available to created environments.
+    :param clear: If True, delete the contents of the environment directory if
+                  it already exists, before environment creation.
+    :param symlinks: If True, attempt to symlink rather than copy files into
+                     virtual environment.
+    :param upgrade: If True, upgrade an existing virtual environment.
+    :param with_pip: If True, ensure pip is installed in the virtual
+                     environment
+    :param prompt: Alternative terminal prefix for the environment.
+    :param upgrade_deps: Update the base venv modules to the latest on PyPI
+    FNc                 óâ   — || _         || _        || _        || _        || _        || _        |dk    r0t          j                             t          j	        ¦   «         ¦  «        }|| _
+        || _        d S )Nú.)Úsystem_site_packagesÚclearÚsymlinksÚupgradeÚwith_pipÚorig_promptÚosÚpathÚbasenameÚgetcwdÚpromptÚupgrade_deps)Úselfr	   r
+   r   r   r   r   r   s           ú$/usr/lib/python3.11/venv/__init__.pyÚ__init__zEnvBuilder.__init__.   si   € ğ %9ˆÔ!ØˆŒ
+Ø ˆŒØˆŒØ ˆŒØ!ˆÔØSŠ=ˆ=İ”W×%Ò%¥b¤i¡k¤kÑ2Ô2ˆFØˆŒØ(ˆÔĞĞó    c                 óğ  — t           j                             |¦  «        }|                      |¦  «        }| j        }d| _        |                      |¦  «         |                      |¦  «         | j        r|                      |¦  «         | j	        s*|  
+                    |¦  «         |                      |¦  «         |rd| _        |                      |¦  «         | j        r|                      |¦  «         dS dS )zŠ
+        Create a virtual environment in a directory.
+
+        :param env_dir: The target directory to create an environment in.
+
+        FTN)r   r   ÚabspathÚensure_directoriesr	   Úcreate_configurationÚsetup_pythonr   Ú
+_setup_pipr   Úsetup_scriptsÚ
+post_setupr   Úupgrade_dependencies)r   Úenv_dirÚcontextÚtrue_system_site_packagess       r   ÚcreatezEnvBuilder.create<   s  € õ ”'—/’/ 'Ñ*Ô*ˆØ×)Ò)¨'Ñ2Ô2ˆğ %)Ô$=Ğ!Ø$)ˆÔ!Ø×!Ò! 'Ñ*Ô*Ğ*Ø×Ò˜'Ñ"Ô"Ğ"ØŒ=ğ 	%ØOŠO˜GÑ$Ô$Ğ$ØŒ|ğ 	%Ø×Ò˜wÑ'Ô'Ğ'ØOŠO˜GÑ$Ô$Ğ$Ø$ğ 	/ğ )-ˆDÔ%Ø×%Ò% gÑ.Ô.Ğ.ØÔğ 	/Ø×%Ò% gÑ.Ô.Ğ.Ğ.Ğ.ğ	/ğ 	/r   c                 ó€  — t          j        |¦  «        D ]¨}t           j                             ||¦  «        }t           j                             |¦  «        st           j                             |¦  «        rt          j        |¦  «         Œut           j                             |¦  «        rt          j	        |¦  «         Œ©d S ©N)
+r   Úlistdirr   ÚjoinÚislinkÚisfileÚremoveÚisdirÚshutilÚrmtree)r   r   Úfns      r   Úclear_directoryzEnvBuilder.clear_directoryX   s›   € İ”*˜TÑ"Ô"ğ 	"ğ 	"ˆBİ”—’˜d BÑ'Ô'ˆBİŒw~Š~˜bÑ!Ô!ğ "¥R¤W§^¢^°BÑ%7Ô%7ğ "İ”	˜"‘”İ”—’˜rÑ"Ô"ğ "İ”˜bÑ!Ô!Ğ!øğ	"ğ 	"r   c                 ó>   — ||||dœ}t          j        |d|¬¦  «        S )N)ÚbaseÚplatbaseÚinstalled_baseÚinstalled_platbaseÚvenv)ÚschemeÚvars)Ú	sysconfigÚget_path)r   r"   Únamer9   s       r   Ú
+_venv_pathzEnvBuilder._venv_path`   s4   € àØØ%Ø")ğ	
+ğ 
+ˆõ Ô! $¨v¸DĞAÑAÔAĞAr   c                 ó˜  — d„ }t           j        t          j        |¦  «        v r t          d|› dt           j        › d¦  «        ‚t           j                             |¦  «        r| j        r|                      |¦  «         t          j	        ¦   «         }||_
+        t           j                             |¦  «        d         |_        | j        | j        n|j        }d|z  |_         ||¦  «         t          j        }|st          d¦  «        ‚t           j                             t           j                             |¦  «        ¦  «        \  }}||_        ||_        ||_        |                      |d	¦  «        }|                      |d
+¦  «        }	|                      |d¦  «        }
+|	|_         ||	¦  «          ||
+¦  «         t          j        dk    rtt           j        dk    rdt          j        dk    rTt           j                             |d¦  «        }t           j                             |¦  «        st          j        d|¦  «         ||_        t           j                             ||¦  «        |_        t           j                             ||¦  «        |_         ||¦  «         |j        |_        t          j        dk    r‘t           j                              |j        ¦  «        }t           j         !                    |¦  «        t           j         !                    |j        ¦  «        k    r(tD           #                    d|j        |¦  «         ||_        |S )zª
+        Create the directories for the environment.
+
+        Returns a context object which holds paths in the environment,
+        for use by subsequent logic.
+        c                 ó  — t           j                             | ¦  «        st          j        | ¦  «         d S t           j                             | ¦  «        st           j                             | ¦  «        rt          d| z  ¦  «        ‚d S )NzUnable to create directory %r)r   r   ÚexistsÚmakedirsr*   r+   Ú
+ValueError)Úds    r   Úcreate_if_neededz7EnvBuilder.ensure_directories.<locals>.create_if_neededq   sw   € İ”7—>’> !Ñ$Ô$ğ Fİ”˜A‘”İ”—’ Ñ"Ô"ğ F¥b¤g§n¢n°QÑ&7Ô&7ğ Fİ Ğ!@À1Ñ!DÑEÔEĞEğFğ Fr   zRefusing to create a venv in z( because it contains the PATH separator r   é   Nz(%s) z“Unable to determine path to the running Python interpreter. Provide an explicit path or check that your PATH environment variable is correctly set.ÚscriptsÚincludeÚpurelibl        ÚposixÚdarwinÚlib64ÚlibÚwin32z†Actual environment location may have moved due to redirects, links or junctions.
+  Requested location: "%s"
+  Actual location:    "%s")$r   ÚpathsepÚfspathrB   r   r@   r
+   r1   ÚtypesÚSimpleNamespacer"   ÚsplitÚenv_namer   ÚsysÚ_base_executabler   Ú
+executableÚ
+python_dirÚ
+python_exer=   Úinc_pathÚmaxsizer<   Úplatformr)   ÚsymlinkÚbin_pathÚrelpathÚbin_nameÚenv_exeÚenv_exec_cmdÚrealpathÚnormcaseÚloggerÚwarning)r   r"   rD   r#   r   rV   ÚdirnameÚexenameÚbinpathÚincpathÚlibpathÚ	link_pathÚreal_env_exes                r   r   zEnvBuilder.ensure_directoriesi   s	  € ğ	Fğ 	Fğ 	Fõ Œ:œ 7Ñ+Ô+Ğ+Ğ+İğ M¸Wğ Mğ Mİ?A¼zğMğ Mğ Mñ Nô Nğ NåŒ7>Š>˜'Ñ"Ô"ğ 	* t¤zğ 	*Ø× Ò  Ñ)Ô)Ğ)İÔ'Ñ)Ô)ˆØ!ˆŒİœ7Ÿ=š=¨Ñ1Ô1°!Ô4ˆÔØ $¤Ğ 7”¸WÔ=MˆØ  6Ñ)ˆŒØĞ˜Ñ!Ô!Ğ!İÔ)ˆ
+Øğ 	/İğ .ñ /ô /ğ /õ œ7Ÿ=š=­¬¯ª¸Ñ)DÔ)DÑEÔEÑˆØ'ˆÔØ$ˆÔØ$ˆÔØ—/’/ '¨9Ñ5Ô5ˆØ—/’/ '¨9Ñ5Ô5ˆØ—/’/ '¨9Ñ5Ô5ˆà"ˆÔØĞ˜Ñ!Ô!Ğ!ØĞ˜Ñ!Ô!Ğ!åŒ[˜5Ò Ğ ¥r¤w°'Ò'9Ğ'9İŒ\˜XÒ%Ğ%İœŸš W¨gÑ6Ô6ˆIİ”7—>’> )Ñ,Ô,ğ -İ”
+˜5 )Ñ,Ô,Ğ,Ø"ˆÔİœ7Ÿ?š?¨7°GÑ<Ô<ˆÔİœ'Ÿ,š, w°Ñ8Ô8ˆŒØĞ˜Ñ!Ô!Ğ!ğ  'œˆÔİŒ<˜7Ò"Ğ"õ œ7×+Ò+¨G¬OÑ<Ô<ˆLİŒw×Ò Ñ-Ô-µ´×1AÒ1AÀ'Ä/Ñ1RÔ1RÒRĞRİ—’ğ  <ğ  'œ°ñ	>ô >ğ >ğ
+ (4Ô$Øˆr   c                 óú  — t           j                             |j        d¦  «        x|_        }t          |dd¬¦  «        5 }|                     d|j        z  ¦  «         | j        rd}nd}|                     d|z  ¦  «         |                     d	t          j
+        d
+d…         z  ¦  «         | j        |                     d| j        ›d¦  «         |                     dt           j                             t          j        ¦  «        z  ¦  «         g }t           j        dk    }|r| j        r|                     d¦  «         |s| j        s|                     d¦  «         | j        s|                     d¦  «         | j        r|                     d¦  «         | j        r|                     d¦  «         | j        r|                     d¦  «         | j        r|                     d¦  «         | j        |                     d| j        › d¦  «         |                     |j        ¦  «         d                     |¦  «        }|                     dt          j        › d|› d¦  «         d
+d
+d
+¦  «         d
+S # 1 swxY w Y   d
+S )aA  
+        Create a configuration file indicating where the environment's Python
+        was copied from, and whether the system site-packages should be made
+        available in the environment.
+
+        :param context: The information for the environment creation request
+                        being processed.
+        z
+pyvenv.cfgÚwúutf-8)Úencodingz
+home = %s
+ÚtrueÚfalsez"include-system-site-packages = %s
+zversion = %d.%d.%d
+Né   z	prompt = ú
+zexecutable = %s
+Úntú
+--symlinksú--copiesú--without-pipú--system-site-packagesú--clearú	--upgradeú--upgrade-depsz
+--prompt="ú"ú z
+command = z	 -m venv )r   r   r)   r"   Úcfg_pathÚopenÚwriterW   r	   rT   Úversion_infor   rb   rV   r<   r   Úappendr   r
+   r   r   r   )r   r#   r   ÚfÚinclÚargsru   s          r   r   zEnvBuilder.create_configuration­   sÇ  € õ #%¤'§,¢,¨w¬ÀÑ"MÔ"MĞMˆÔ˜4İ$˜ gĞ.Ñ.Ô.ğ  	D°!ØGŠGM GÔ$6Ñ6Ñ7Ô7Ğ7ØÔ(ğ ØàØGŠGĞ9¸DÑ@ÑAÔAĞAØGŠGĞ*­SÔ-=¸b¸q¸bÔ-AÑAÑBÔBĞBØŒ{Ğ&Ø—’Ğ5 D¤KĞ5Ğ5Ğ5Ñ6Ô6Ğ6ØGŠGĞ'­"¬'×*:Ò*:½3¼>Ñ*JÔ*JÑJÑKÔKĞKØˆDİ”˜D’ˆBØğ *d”mğ *Ø—’˜LÑ)Ô)Ğ)Øğ (˜dœmğ (Ø—’˜JÑ'Ô'Ğ'Ø”=ğ -Ø—’˜OÑ,Ô,Ğ,ØÔ(ğ 6Ø—’Ğ4Ñ5Ô5Ğ5ØŒzğ 'Ø—’˜IÑ&Ô&Ğ&ØŒ|ğ )Ø—’˜KÑ(Ô(Ğ(ØÔ ğ .Ø—’Ğ,Ñ-Ô-Ğ-ØÔĞ+Ø—’Ğ<¨Ô)9Ğ<Ğ<Ğ<Ñ=Ô=Ğ=àKŠK˜œÑ(Ô(Ğ(Ø—8’8˜D‘>”>ˆDØGŠGĞB¥¤ĞBĞB¸$ĞBĞBĞBÑCÔCĞCğA 	Dğ  	Dğ  	Dñ  	Dô  	Dğ  	Dğ  	Dğ  	Dğ  	Dğ  	Dğ  	Dğ  	Døøøğ  	Dğ  	Dğ  	Dğ  	Dğ  	Dğ  	Ds   ¿H$I0É0I4É7I4ru   c                 ó  — | j          }|sÛ	 t          j                             |¦  «        sŒ|rut          j                             |¦  «        t          j                             |¦  «        k    sJ ‚t          j        t          j                             |¦  «        |¦  «         nt          j        ||¦  «         n.# t          $ r! t           	                    d||¦  «         d}Y nw xY w|rt          j        ||¦  «         dS dS )úY
+            Try symlinking a file, and if that fails, fall back to copying.
+            úUnable to symlink %r to %rTN)r   r   r   r*   rf   r\   r   Ú	Exceptionrd   re   r.   Úcopyfile)r   ÚsrcÚdstÚrelative_symlinks_okÚ
+force_copys        r   Úsymlink_or_copyzEnvBuilder.symlink_or_copyÚ   s  € ğ "œ]Ğ*ˆJØğ 
+&ğ	&İœ7Ÿ>š>¨#Ñ.Ô.ğ 1Ø/ğ 1İ#%¤7§?¢?°3Ñ#7Ô#7½2¼7¿?º?È3Ñ;OÔ;OÒ#OĞ#OĞ#OĞ#OİœJ¥r¤w×'7Ò'7¸Ñ'<Ô'<¸cÑBÔBĞBĞBåœJ s¨CÑ0Ô0Ğ0øøİ ğ &ğ &ğ &İ—N’NĞ#?ÀÀcÑJÔJĞJØ!%JJJğ&øøøğ ğ *İ”  SÑ)Ô)Ğ)Ğ)Ğ)ğ*ğ *s   ŒB+B8 Â8(C#Ã"C#c                 óP  — t           j                             |¦  «        ot           j                             |¦  «         }| j        rÜ|sÚt           j                             |¦  «        s»	 |rut           j                             |¦  «        t           j                             |¦  «        k    sJ ‚t          j        t           j                             |¦  «        |¦  «         nt          j        ||¦  «         dS # t          $ r t                               d||¦  «         Y nw xY wt           j                             t           j                             |¦  «        ¦  «        \  }}t           j                             t           j                             t          ¦  «        dd||z   ¦  «        }t          j        ¦   «         st           j                             |¦  «        sv|                     d¦  «        rd|z   }|dd…         }|dk    rd}n|d	k    rd
+}t           j                             t           j                             |¦  «        ||z   ¦  «        }n|}t           j                             |¦  «        s|st                               d|¦  «         dS t'          j        ||¦  «         dS )rˆ   Nr‰   rF   ru   Ú_déşÿÿÿÚpythonÚvenvlauncherÚpythonwÚvenvwlauncherzUnable to copy %r)r   r   Úlexistsr@   r   r*   rf   r\   r   rŠ   rd   re   Úsplitextr)   Ú__file__r:   Úis_python_buildr+   Úendswithr.   r‹   )r   rŒ   r   r   Úbad_srcr   ÚextÚsrcfns           r   r   zEnvBuilder.symlink_or_copyí   sZ  € õ ”g—o’o cÑ*Ô*ĞFµ2´7·>²>À#Ñ3FÔ3FĞ/FˆGØŒ}ğ 	K Wğ 	KµR´W·^²^ÀCÑ5HÔ5Hğ 	KğKØ+ğ -İ!œwŸš¨sÑ3Ô3µr´w·²ÀsÑ7KÔ7KÒKĞKĞKĞKİœ
+¥2¤7×#3Ò#3°CÑ#8Ô#8¸#Ñ>Ô>Ğ>Ğ>åœ
+ 3¨Ñ,Ô,Ğ,ØFøİ ğ Kğ Kğ Kİ—N’NĞ#?ÀÀcÑJÔJĞJĞJĞJğKøøøõ
+ œG×,Ò,­R¬W×-=Ò-=¸cÑ-BÔ-BÑCÔC‰MˆHcİ”G—L’L¥¤§¢µÑ!:Ô!:Ø!*Ø!%Ø!)¨C¡ñ1ô 1ˆEõ Ô(Ñ*Ô*ğ 
+µ"´'·.².ÀÑ2GÔ2Gğ 
+Ø×$Ò$ TÑ*Ô*ğ -Ø ™*CØ'¨¨¨œ}HØ˜xÒ'Ğ'Ø-HHØ Ò*Ğ*Ø.Hİ”g—l’l¥2¤7§?¢?°3Ñ#7Ô#7¸ÀC¹ÑHÔHàİ”7—>’> #Ñ&Ô&ğ Øğ =İ—N’NĞ#6¸Ñ<Ô<Ğ<ØåŒO˜C Ñ%Ô%Ğ%Ğ%Ğ%s   Á)BC7 Ã7&D ÄD c                 ó   — |j         }|j        }| j        }|j        }t          j        dk    rè ||j        |¦  «         t          j                             |¦  «        st	          j	        |d¦  «         dddt          j        d         › fD ]ˆ}t          j                             ||¦  «        }t          j                             |¦  «        sG ||j        |d¬¦  «         t          j                             |¦  «        st	          j	        |d¦  «         Œ‰dS | j        r>d	„ t	          j        |¦  «        D ¦   «         }t!          j        ¦   «         rd
+„ |D ¦   «         }n=h d£}t          j                             |j        ¦  «        }|                     |¦  «         |D ]k}t          j                             ||¦  «        }	t          j                             |	¦  «        r* ||	t          j                             ||¦  «        ¦  «         Œlt!          j        ¦   «         rôt	          j        |j        ¦  «        D ]Ü\  }
+}}d|v rĞt          j                             |
+¦  «        }t          j                             |j        d|¦  «        }t          j                             |¦  «        st	          j        |¦  «         t          j                             |
+d¦  «        }	t          j                             |d¦  «        }t1          j        |	|¦  «          dS ŒÛdS dS )z·
+        Set up a Python executable in the environment.
+
+        :param context: The information for the environment creation request
+                        being processed.
+        ru   ií  r”   Úpython3zpython3.rE   T)r   c                 óš   — g | ]H}t           j                             t           j                             |¦  «        d          ¦  «        dv ¯F|‘ŒIS )rE   )ú.exez.dll)r   r   rc   r™   ©Ú.0r„   s     r   ú
+<listcomp>z+EnvBuilder.setup_python.<locals>.<listcomp>5  sS   € ğ ğ ğ Øİ”G×$Ò$¥R¤W×%5Ò%5°aÑ%8Ô%8¸Ô%;Ñ<Ô<Ğ@PĞPĞPğ ØPĞPĞPr   c                 óv   — g | ]6}t           j                             |¦  «                             d ¦  «        ¯4|‘Œ7S ))r”   Ú	vcruntime)r   r   rc   Ú
+startswithr¤   s     r   r¦   z+EnvBuilder.setup_python.<locals>.<listcomp>:  sM   € ğ  ğ  ğ  Øİœ×(Ò(¨Ñ+Ô+×6Ò6Ğ7NÑOÔOğ Øğ ğ  ğ  r   >   ú
+python.exeúpythonw.exeúpython_d.exeúpythonw_d.exezinit.tclÚLibN)r]   r`   r   rW   r   r<   rV   r   r*   ÚchmodrT   r‚   r)   r@   r   r(   r:   r›   r   Úaddr˜   Úwalkr"   rA   r.   r‹   )r   r#   rh   r   Úcopierrf   ÚsuffixÚsuffixesÚbase_exerŒ   ÚrootÚdirsÚfilesÚtcldirr   s                  r   r   zEnvBuilder.setup_python  sô  € ğ Ô"ˆØŒˆØÔ%ˆØÔ$ˆİŒ7dŠ?ˆ?ØˆF7Ô% tÑ,Ô,Ğ,İ”7—>’> $Ñ'Ô'ğ &İ”˜˜uÑ%Ô%Ğ%Ø# YĞ0P½3Ô;KÈAÔ;NĞ0PĞ0PĞQğ .ğ .İ”w—|’| G¨VÑ4Ô4İ”w—~’~ dÑ+Ô+ğ .ğ F˜7œ?¨DÀtĞLÑLÔLĞLİœ7Ÿ>š>¨$Ñ/Ô/ğ .İœ  uÑ-Ô-Ğ-øğ.ğ .ğ Œ}ğ 'ğ
+ğ İ!œz¨'Ñ2Ô2ğñ ô õ Ô,Ñ.Ô.ğ ğ ğ  Ø#+ğ ñ  ô  Høğ
+ ZĞYĞYİœ7×+Ò+¨G¬OÑ<Ô<Ø—’˜XÑ&Ô&Ğ&à"ğ ?ğ ?İ”g—l’l 7¨FÑ3Ô3İ”7—?’? 3Ñ'Ô'ğ ?ØF˜3¥¤§¢¨W°fÑ =Ô =Ñ>Ô>Ğ>øåÔ(Ñ*Ô*ğ å)+¬°Ô1CÑ)DÔ)Dğ 	ğ 	Ñ%D˜$ Ø! UĞ*Ğ*İ!#¤×!1Ò!1°$Ñ!7Ô!7˜İ!#¤§¢¨g¬o¸uÀfÑ!MÔ!M˜İ!œwŸ~š~¨fÑ5Ô5ğ 0İœK¨Ñ/Ô/Ğ/İ œgŸlšl¨4°Ñ<Ô<˜İ œgŸlšl¨6°:Ñ>Ô>˜İœ¨¨SÑ1Ô1Ğ1Ø˜˜ğ +ğğ ğ	ğ 	r   c                 ó  — |j         g|¢}t          j                             ¦   «         x|d<   }|j        |d<   |                     dd¦  «         |                     dd¦  «         |j        |d<   |j         |d<   t          j        |fi |¤ dS )z8Executes the newly created Python using safe-ish optionsÚenvÚVIRTUAL_ENVÚ
+PYTHONHOMENÚ
+PYTHONPATHÚcwdrV   )ra   r   ÚenvironÚcopyr"   ÚpopÚ
+subprocessÚcheck_output)r   r#   Úpy_argsÚkwargsr†   r»   s         r   Ú_call_new_pythonzEnvBuilder._call_new_pythonU  s™   € ğ Ô$Ğ/ wĞ/ˆİ œjŸošoÑ/Ô/Ğ/ˆˆu‰˜Ø$œ_ˆˆMÑØŠ˜dÑ#Ô#Ğ#ØŠ˜dÑ#Ô#Ğ#Øœˆˆu‰Ø&Ô3ˆˆ|ÑİÔ Ğ/Ğ/¨Ğ/Ğ/Ğ/Ğ/Ğ/r   c                 óˆ  — 	 |                       |ddddt          j        ¬¦  «         d
+S # t          j        $ r‰}t	          j        d¦  «        }t          j                             |› d¦  «        sMt          d 
+                    t	          j        ¦   «         |j        ¦  «        ¦  «         t          j        d	¦  «         ‚ d
+}~ww xY w)z1Installs or upgrades pip in a virtual environmentú-mÚ	ensurepipr{   z--default-pip)ÚstderrÚstdlibz/ensurepip/__main__.pyan  The virtual environment was not created successfully because ensurepip is not
+available.  On Debian/Ubuntu systems, you need to install the python3-venv
+package using the following command.
+
+    apt install python{}-venv
+
+You may need to use sudo with that command.  After installing the python3-venv
+package, recreate your virtual environment.
+
+Failing command: {}
+rE   N)rÇ   rÃ   ÚSTDOUTÚCalledProcessErrorr:   r;   r   r   r@   ÚprintÚformatÚget_python_versionra   rT   Úexit)r   r#   ÚerrrÌ   s       r   r   zEnvBuilder._setup_pipd  sİ   € ğ	Ø×!Ò! '¨4°¸kØ"1½*Ô:Kğ "ñ Mô Mğ Mğ Mğ MøåÔ,ğ 	ğ 	ğ 	İÔ'¨Ñ1Ô1ˆFİ”7—>’> VĞ"CĞ"CĞ"CÑDÔDğ İğ ÷ ‚F9Ô'Ñ)Ô)¨7Ô+?Ñ@Ô@ñBô Bğ Bõ ”˜‘”Øøøøøğ!	øøøs   ‚%) ©C¸BB<Â<Cc                 óô   — t           j                             t           j                             t          ¦  «        ¦  «        }t           j                             |d¦  «        }|                      ||¦  «         dS )a×  
+        Set up scripts into the created environment from a directory.
+
+        This method installs the default scripts into the environment
+        being created. You can prevent the default installation by overriding
+        this method if you really need to, or if you need to specify
+        a different location for the scripts to install. By default, the
+        'scripts' directory in the venv package is used as the source of
+        scripts to install.
+        rF   N)r   r   r   rf   rš   r)   Úinstall_scripts)r   r#   r   s      r   r   zEnvBuilder.setup_scripts{  sV   € õ ŒwŠrœwŸš­xÑ8Ô8Ñ9Ô9ˆİŒw|Š|˜D )Ñ,Ô,ˆØ×Ò˜W dÑ+Ô+Ğ+Ğ+Ğ+r   c                 ó   — dS )a  
+        Hook for post-setup modification of the venv. Subclasses may install
+        additional packages or scripts here, add activation shell scripts, etc.
+
+        :param context: The information for the environment creation request
+                        being processed.
+        N© ©r   r#   s     r   r    zEnvBuilder.post_setupŠ  s	   € ğ 	ˆr   c                 ó  — |                      d|j        ¦  «        }|                      d|j        ¦  «        }|                      d|j        ¦  «        }|                      d|j        ¦  «        }|                      d|j        ¦  «        }|S )ai  
+        Replace variable placeholders in script text with context-specific
+        variables.
+
+        Return the text passed in , but with variables replaced.
+
+        :param text: The text in which to replace placeholder variables.
+        :param context: The information for the environment creation request
+                        being processed.
+        Ú__VENV_DIR__Ú__VENV_NAME__Ú__VENV_PROMPT__Ú__VENV_BIN_NAME__Ú__VENV_PYTHON__)Úreplacer"   rS   r   r_   r`   )r   Útextr#   s      r   Úreplace_variableszEnvBuilder.replace_variables”  sw   € ğ |Š|˜N¨G¬OÑ<Ô<ˆØ|Š|˜O¨WÔ-=Ñ>Ô>ˆØ|Š|Ğ-¨w¬~Ñ>Ô>ˆØ|Š|Ğ/°Ô1AÑBÔBˆØ|Š|Ğ-¨w¬Ñ?Ô?ˆØˆr   c                 ó  — |j         }t          |¦  «        }t          j        |¦  «        D ]\\  }}}||k    r3|dd…         D ]'}|dt          j        fvr|                     |¦  «         Œ(Œ@|D ]}	t          j        dk    r+|	                     d¦  «        r|	                     d¦  «        rŒ>t          j         	                    ||	¦  «        }
+||d…          
+                    t          j        ¦  «        dd…         }|s|}nt          j        j	        |g|¢R  }t          j                             |¦  «        st          j        |¦  «         t          j         	                    ||	¦  «        }t          |
+d¦  «        5 }	|	                     ¦   «         }ddd¦  «         n# 1 swxY w Y   |
+                     d¦  «        sw	 |                     d¦  «        }|                      ||¦  «        }|                     d¦  «        }n5# t&          $ r(}d}t(                               d	|
+|¦  «         Y d}~nd}~ww xY w|Rt          |d
+¦  «        5 }	|	                     |¦  «         ddd¦  «         n# 1 swxY w Y   t/          j        |
+|¦  «         ŒŒ^dS )as  
+        Install scripts into the created environment from a directory.
+
+        :param context: The information for the environment creation request
+                        being processed.
+        :param path:    Absolute pathname of a directory containing script.
+                        Scripts in the 'common' subdirectory of this directory,
+                        and those in the directory named for the platform
+                        being run on, are installed in the created environment.
+                        Placeholder variables are replaced with environment-
+                        specific values.
+        NÚcommonru   r”   )r£   z.pdbé   Úrbro   z+unable to copy script %r, may be binary: %sÚwb)r]   Úlenr   r±   r<   r,   r©   rœ   r   r)   rR   Úsepr@   rA   r€   ÚreadÚdecoderá   ÚencodeÚUnicodeErrorrd   re   r   r.   Úcopymode)r   r#   r   rh   Úplenr¶   r·   r¸   rC   r„   Úsrcfiler³   ÚdstdirÚdstfileÚdataÚes                   r   rÕ   zEnvBuilder.install_scripts¦  s$  € ğ Ô"ˆİ4‰yŒyˆİ!#¤¨¡¤ğ !	6ñ !	6ÑˆD$˜ØtŠ|ˆ|Ø˜a˜a˜aœğ 'ğ 'AØ ­2¬7Ğ 3Ğ3Ğ3ØŸš A™œ˜øØØğ 6ñ 6İ”G˜t’OO¨¯ª°XÑ(>Ô(>OØŸJšJĞ'7Ñ8Ô8ğ $àİœ'Ÿ,š, t¨QÑ/Ô/Ø˜d˜e˜eœ×*Ò*­2¬6Ñ2Ô2°1°2°2Ô6Øğ <Ø$FFåœWœ\¨'Ğ;°FĞ;Ğ;Ğ;Fİ”w—~’~ fÑ-Ô-ğ (İ”K Ñ'Ô'Ğ'İœ'Ÿ,š, v¨qÑ1Ô1İ˜' 4Ñ(Ô(ğ $¨AØŸ6š6™8œ8Dğ$ğ $ğ $ñ $ô $ğ $ğ $ğ $ğ $ğ $ğ $øøøğ $ğ $ğ $ğ $à×'Ò'Ğ(8Ñ9Ô9ğ HğHØ#Ÿ{š{¨7Ñ3Ô3˜Ø#×5Ò5°d¸GÑDÔD˜Ø#Ÿ{š{¨7Ñ3Ô3˜˜øİ'ğ Hğ Hğ HØ#˜İŸšğ (;Ø<CÀQñHô Hğ Hğ Hğ Hğ Hğ Hğ HøøøøğHøøøğ Ğ#İ˜g tÑ,Ô,ğ &°ØŸš ™œ˜ğ&ğ &ğ &ñ &ô &ğ &ğ &ğ &ğ &ğ &ğ &øøøğ &ğ &ğ &ğ &å”O G¨WÑ5Ô5Ğ5ùñ76ğ!	6ğ !	6s=   Å9FÆFÆ!FÆ;A G<Ç<
+H.ÈH)È)H.ÉI%É%I)É,I)c                 óˆ   — t                                dt          › d|j        › ¦  «          | j        |ddddgt          ¢R   d S )Nz
+Upgrading z packages in rÉ   r   Úinstallr{   )rd   ÚdebugÚCORE_VENV_DEPSr]   rÇ   rØ   s     r   r!   zEnvBuilder.upgrade_dependenciesØ  sh   € İŠØHĞHĞH°gÔ6FĞHĞHñ	
+ô 	
+ğ 	
+ğ 	ˆÔ˜g t¨U°I¸{ğ 	/İ-ğ	/ğ 	/ğ 	/ğ 	/ğ 	/ğ 	/r   )FFFFFNF)F)Ú__name__Ú
+__module__Ú__qualname__Ú__doc__r   r%   r1   r=   r   r   r   r<   r   r   rÇ   r   r   r    rá   rÕ   r!   r×   r   r   r   r      sH  € € € € € ğğ ğ2 :?ØGKØ#ğ)ğ )ğ )ğ )ğ/ğ /ğ /ğ8"ğ "ğ "ğBğ Bğ BğBğ Bğ BğH*Dğ *Dğ *DğX 
+„w$‚€ğ	*ğ 	*ğ 	*ğ 	*ğ 	*ğ&)	&ğ )	&ğ )	&ğ )	&ğV;ğ ;ğ ;ğz0ğ 0ğ 0ğğ ğ ğ.,ğ ,ğ ,ğğ ğ ğğ ğ ğ$06ğ 06ğ 06ğd/ğ /ğ /ğ /ğ /r   r   Fc                 óZ   — t          ||||||¬¦  «        }|                     | ¦  «         dS )z,Create a virtual environment in a directory.)r	   r
+   r   r   r   r   N)r   r%   )r"   r	   r
+   r   r   r   r   Úbuilders           r   r%   r%   à  sD   € õ Ğ.BØ$¨xÀ(Ø &°\ğCñ Cô C€Gğ ‡N‚N7ÑÔĞĞĞr   c                 óL  — d}t           j        dk     rd}nt          t           d¦  «        sd}|st          d¦  «        ‚dd l}|                     t          dd¬	¦  «        }|                     d
+ddd¬¦  «         |                     ddddd¬¦  «         t          j	        dk    rd}nd}| 
+                    ¦   «         }|                     d|ddd¬¦  «         |                     d| ddd¬¦  «         |                     ddddd¬¦  «         |                     ddddd ¬¦  «         |                     d!d"ddd#¬$¦  «         |                     d%d&¬'¦  «         |                     d(ddd)d*                     d+                     t          ¦  «        ¦  «        ¬¦  «         |                     | ¦  «        }|j        r|j        rt          d,¦  «        ‚t#          |j        |j        |j        |j        |j        |j        |j        ¬-¦  «        }|j        D ]}|                     |¦  «         Œd S ).NT)rs   rs   FÚbase_prefixz.This script is only for use with Python >= 3.3r   zFCreates virtual Python environments in one or more target directories.z|Once an environment has been created, you may wish to activate it, e.g. by sourcing an activate script in its bin directory.)ÚprogÚdescriptionÚepilogr·   ÚENV_DIRú+z)A directory to create the environment in.)ÚmetavarÚnargsÚhelpry   Ú
+store_trueÚsystem_sitezDGive the virtual environment access to the system site-packages dir.)ÚdefaultÚactionÚdestr  ru   rv   r   z[Try to use symlinks rather than copies, when symlinks are not the default for the platform.rw   Ústore_falsez\Try to use copies rather than symlinks, even when symlinks are the default for the platform.rz   r
+   zcDelete the contents of the environment directory if it already exists, before environment creation.r{   r   zlUpgrade the environment directory to use this version of Python, assuming Python has been upgraded in-place.rx   r   z]Skips installing or upgrading pip in the virtual environment (pip is bootstrapped by default))r  r
+  r  r  z--promptz;Provides an alternative prompt prefix for this environment.)r  r|   r   z;Upgrade core dependencies: {} to the latest version in PyPIr~   z1you cannot supply --upgrade and --clear together.)r	   r
+   r   r   r   r   r   )rT   r‚   ÚhasattrrB   ÚargparseÚArgumentParserrø   Úadd_argumentr   r<   Úadd_mutually_exclusive_grouprĞ   r)   r÷   Ú
+parse_argsr   r
+   r   r	  r   r   r   r   r·   r%   )	r†   Ú
+compatibler  ÚparserÚuse_symlinksÚgroupÚoptionsrı   rC   s	            r   Úmainr  è  s  € Ø€Jİ
+Ô˜&Ò Ğ Øˆ
+ˆ
+İ•S˜-Ñ(Ô(ğ Øˆ
+Øğ FİĞIÑJÔJĞJàˆˆˆà×(Ò(­hğ6Dğ1Hğ )ñ 	Iô 	Iˆğ 	×Ò˜F¨I¸SØ!Lğ 	ñ 	Nô 	Nğ 	Nà×ÒĞ4¸eØ#/°mğ"=ğ 	ñ 	>ô 	>ğ 	>õ Œ7dŠ?ˆ?Ø ˆLˆLàˆLØ×3Ò3Ñ5Ô5ˆØ×Ò˜<°Ø".°Zğ!0ğ 	ñ 	1ô 	1ğ 	1ğ
+ 	×Ò˜:°<Ğ/?Ø"/°jğ!0ğ 	ñ 	1ô 	1ğ 	1ğ
+ 	×Ò˜I¨u¸\Ø!(ğ 0Gğ 	ñ 	Hô 	Hğ 	Hğ
+ 	×Ò˜K°¸|Ø!*ğ 2Mğ 	ñ 	Nô 	Nğ 	Nğ
+ 	×Ò˜O°*Ø$(°ğ"/ğ 	ñ 	0ô 	0ğ 	0ğ
+ 	×Ò˜Jğ"5ğ 	ñ 	6ô 	6ğ 	6ğ 	×ÒĞ,°eÀLØ!/ğ"3ß39²6Ø!$§¢­.Ñ!9Ô!9ñ4;ô 4;ğ 	ñ 	<ô 	<ğ 	<ğ
+ ×#Ò# DÑ)Ô)ˆØŒ?ğ 	R˜wœ}ğ 	RİĞPÑQÔQĞQİ°'Ô2EØ#*¤=Ø&-Ô&6Ø%,¤_Ø&-Ô&6Ø$+¤NØ*1Ô*>ğ@ñ @ô @ˆğ ”ğ 	ğ 	ˆAØNŠN˜1ÑÔĞĞğ	ğ 	r   Ú__main__rE   z	Error: %s)Úfile)FFFFNFr'   )rû   Úloggingr   r.   rÃ   rT   r:   rP   r÷   Ú	getLoggerrø   rd   r   r%   r  ÚrcrŠ   ró   rÏ   rË   rÒ   r×   r   r   ú<module>r     sb  ğğğ ğ €€€Ø 	€	€	€	Ø €€€Ø Ğ Ğ Ğ Ø 
+€
+€
+€
+Ø Ğ Ğ Ğ Ø €€€ğ '€Ø	ˆÔ	˜8Ñ	$Ô	$€ğI/ğ I/ğ I/ğ I/ğ I/ñ I/ô I/ğ I/ğX 7<ØEJğğ ğ ğ ğLğ Lğ Lğ Lğ\ ˆzÒĞØ	
+€Bğ0Øˆ‰ŒˆØˆˆøØğ 0ğ 0ğ 0Øˆˆk˜A‰o C¤JĞ/Ñ/Ô/Ğ/Ğ/Ğ/Ğ/Ğ/Ğ/øøøøğ0øøøà€C„HˆRL„L€L€L€Lğ Ğs   ÁA ÁBÁ#A=Á=B                                                                                                                                                                                                                                                                                                                                                                                                                                                                 usr/lib/python3.11/venv/__pycache__/__main__.cpython-311.pyc                                        0000644 0000000 0000000 00000001041 14714551121 022054  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        §
+    Nüäf‘   ã                   ó¨   — d dl Z ddlmZ dZ	  e¦   «          d Zn'# e$ rZ edez  e j        ¬¦  «         Y dZ[ndZ[ww xY w e j        e¦  «         dS )é    Né   )Úmainz	Error: %s)Úfile)	ÚsysÚ r   ÚrcÚ	ExceptionÚeÚprintÚstderrÚexit© ó    ú$/usr/lib/python3.11/venv/__main__.pyú<module>r      s˜   ğØ 
+€
+€
+€
+Ø Ğ Ğ Ğ Ğ Ğ à€ğ,Ø€DF„F€FØ	
+€B€BøØğ ,ğ ,ğ ,Ø	€Eˆ+˜‰/ ¤
+Ğ+Ñ+Ô+Ğ+Ğ+Ğ+Ğ+Ğ+Ğ+øøøøğ,øøøà €„ˆ„€€€s    ›? :º?                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               usr/lib/python3.11/venv/scripts/                                                                    0000755 0000000 0000000 00000000000 14714551117 015122  5                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        usr/lib/python3.11/venv/scripts/common/                                                             0000755 0000000 0000000 00000000000 14714551117 016412  5                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        usr/lib/python3.11/venv/scripts/common/Activate.ps1                                                 0000644 0000000 0000000 00000021511 14671176116 020603  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        <#
+.Synopsis
+Activate a Python virtual environment for the current PowerShell session.
+
+.Description
+Pushes the python executable for a virtual environment to the front of the
+$Env:PATH environment variable and sets the prompt to signify that you are
+in a Python virtual environment. Makes use of the command line switches as
+well as the `pyvenv.cfg` file values present in the virtual environment.
+
+.Parameter VenvDir
+Path to the directory that contains the virtual environment to activate. The
+default value for this is the parent of the directory that the Activate.ps1
+script is located within.
+
+.Parameter Prompt
+The prompt prefix to display when this virtual environment is activated. By
+default, this prompt is the name of the virtual environment folder (VenvDir)
+surrounded by parentheses and followed by a single space (ie. '(.venv) ').
+
+.Example
+Activate.ps1
+Activates the Python virtual environment that contains the Activate.ps1 script.
+
+.Example
+Activate.ps1 -Verbose
+Activates the Python virtual environment that contains the Activate.ps1 script,
+and shows extra information about the activation as it executes.
+
+.Example
+Activate.ps1 -VenvDir C:\Users\MyUser\Common\.venv
+Activates the Python virtual environment located in the specified location.
+
+.Example
+Activate.ps1 -Prompt "MyPython"
+Activates the Python virtual environment that contains the Activate.ps1 script,
+and prefixes the current prompt with the specified string (surrounded in
+parentheses) while the virtual environment is active.
+
+.Notes
+On Windows, it may be required to enable this Activate.ps1 script by setting the
+execution policy for the user. You can do this by issuing the following PowerShell
+command:
+
+PS C:\> Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
+
+For more information on Execution Policies: 
+https://go.microsoft.com/fwlink/?LinkID=135170
+
+#>
+Param(
+    [Parameter(Mandatory = $false)]
+    [String]
+    $VenvDir,
+    [Parameter(Mandatory = $false)]
+    [String]
+    $Prompt
+)
+
+<# Function declarations --------------------------------------------------- #>
+
+<#
+.Synopsis
+Remove all shell session elements added by the Activate script, including the
+addition of the virtual environment's Python executable from the beginning of
+the PATH variable.
+
+.Parameter NonDestructive
+If present, do not remove this function from the global namespace for the
+session.
+
+#>
+function global:deactivate ([switch]$NonDestructive) {
+    # Revert to original values
+
+    # The prior prompt:
+    if (Test-Path -Path Function:_OLD_VIRTUAL_PROMPT) {
+        Copy-Item -Path Function:_OLD_VIRTUAL_PROMPT -Destination Function:prompt
+        Remove-Item -Path Function:_OLD_VIRTUAL_PROMPT
+    }
+
+    # The prior PYTHONHOME:
+    if (Test-Path -Path Env:_OLD_VIRTUAL_PYTHONHOME) {
+        Copy-Item -Path Env:_OLD_VIRTUAL_PYTHONHOME -Destination Env:PYTHONHOME
+        Remove-Item -Path Env:_OLD_VIRTUAL_PYTHONHOME
+    }
+
+    # The prior PATH:
+    if (Test-Path -Path Env:_OLD_VIRTUAL_PATH) {
+        Copy-Item -Path Env:_OLD_VIRTUAL_PATH -Destination Env:PATH
+        Remove-Item -Path Env:_OLD_VIRTUAL_PATH
+    }
+
+    # Just remove the VIRTUAL_ENV altogether:
+    if (Test-Path -Path Env:VIRTUAL_ENV) {
+        Remove-Item -Path env:VIRTUAL_ENV
+    }
+
+    # Just remove VIRTUAL_ENV_PROMPT altogether.
+    if (Test-Path -Path Env:VIRTUAL_ENV_PROMPT) {
+        Remove-Item -Path env:VIRTUAL_ENV_PROMPT
+    }
+
+    # Just remove the _PYTHON_VENV_PROMPT_PREFIX altogether:
+    if (Get-Variable -Name "_PYTHON_VENV_PROMPT_PREFIX" -ErrorAction SilentlyContinue) {
+        Remove-Variable -Name _PYTHON_VENV_PROMPT_PREFIX -Scope Global -Force
+    }
+
+    # Leave deactivate function in the global namespace if requested:
+    if (-not $NonDestructive) {
+        Remove-Item -Path function:deactivate
+    }
+}
+
+<#
+.Description
+Get-PyVenvConfig parses the values from the pyvenv.cfg file located in the
+given folder, and returns them in a map.
+
+For each line in the pyvenv.cfg file, if that line can be parsed into exactly
+two strings separated by `=` (with any amount of whitespace surrounding the =)
+then it is considered a `key = value` line. The left hand string is the key,
+the right hand is the value.
+
+If the value starts with a `'` or a `"` then the first and last character is
+stripped from the value before being captured.
+
+.Parameter ConfigDir
+Path to the directory that contains the `pyvenv.cfg` file.
+#>
+function Get-PyVenvConfig(
+    [String]
+    $ConfigDir
+) {
+    Write-Verbose "Given ConfigDir=$ConfigDir, obtain values in pyvenv.cfg"
+
+    # Ensure the file exists, and issue a warning if it doesn't (but still allow the function to continue).
+    $pyvenvConfigPath = Join-Path -Resolve -Path $ConfigDir -ChildPath 'pyvenv.cfg' -ErrorAction Continue
+
+    # An empty map will be returned if no config file is found.
+    $pyvenvConfig = @{ }
+
+    if ($pyvenvConfigPath) {
+
+        Write-Verbose "File exists, parse `key = value` lines"
+        $pyvenvConfigContent = Get-Content -Path $pyvenvConfigPath
+
+        $pyvenvConfigContent | ForEach-Object {
+            $keyval = $PSItem -split "\s*=\s*", 2
+            if ($keyval[0] -and $keyval[1]) {
+                $val = $keyval[1]
+
+                # Remove extraneous quotations around a string value.
+                if ("'""".Contains($val.Substring(0, 1))) {
+                    $val = $val.Substring(1, $val.Length - 2)
+                }
+
+                $pyvenvConfig[$keyval[0]] = $val
+                Write-Verbose "Adding Key: '$($keyval[0])'='$val'"
+            }
+        }
+    }
+    return $pyvenvConfig
+}
+
+
+<# Begin Activate script --------------------------------------------------- #>
+
+# Determine the containing directory of this script
+$VenvExecPath = Split-Path -Parent $MyInvocation.MyCommand.Definition
+$VenvExecDir = Get-Item -Path $VenvExecPath
+
+Write-Verbose "Activation script is located in path: '$VenvExecPath'"
+Write-Verbose "VenvExecDir Fullname: '$($VenvExecDir.FullName)"
+Write-Verbose "VenvExecDir Name: '$($VenvExecDir.Name)"
+
+# Set values required in priority: CmdLine, ConfigFile, Default
+# First, get the location of the virtual environment, it might not be
+# VenvExecDir if specified on the command line.
+if ($VenvDir) {
+    Write-Verbose "VenvDir given as parameter, using '$VenvDir' to determine values"
+}
+else {
+    Write-Verbose "VenvDir not given as a parameter, using parent directory name as VenvDir."
+    $VenvDir = $VenvExecDir.Parent.FullName.TrimEnd("\\/")
+    Write-Verbose "VenvDir=$VenvDir"
+}
+
+# Next, read the `pyvenv.cfg` file to determine any required value such
+# as `prompt`.
+$pyvenvCfg = Get-PyVenvConfig -ConfigDir $VenvDir
+
+# Next, set the prompt from the command line, or the config file, or
+# just use the name of the virtual environment folder.
+if ($Prompt) {
+    Write-Verbose "Prompt specified as argument, using '$Prompt'"
+}
+else {
+    Write-Verbose "Prompt not specified as argument to script, checking pyvenv.cfg value"
+    if ($pyvenvCfg -and $pyvenvCfg['prompt']) {
+        Write-Verbose "  Setting based on value in pyvenv.cfg='$($pyvenvCfg['prompt'])'"
+        $Prompt = $pyvenvCfg['prompt'];
+    }
+    else {
+        Write-Verbose "  Setting prompt based on parent's directory's name. (Is the directory name passed to venv module when creating the virtual environment)"
+        Write-Verbose "  Got leaf-name of $VenvDir='$(Split-Path -Path $venvDir -Leaf)'"
+        $Prompt = Split-Path -Path $venvDir -Leaf
+    }
+}
+
+Write-Verbose "Prompt = '$Prompt'"
+Write-Verbose "VenvDir='$VenvDir'"
+
+# Deactivate any currently active virtual environment, but leave the
+# deactivate function in place.
+deactivate -nondestructive
+
+# Now set the environment variable VIRTUAL_ENV, used by many tools to determine
+# that there is an activated venv.
+$env:VIRTUAL_ENV = $VenvDir
+
+if (-not $Env:VIRTUAL_ENV_DISABLE_PROMPT) {
+
+    Write-Verbose "Setting prompt to '$Prompt'"
+
+    # Set the prompt to include the env name
+    # Make sure _OLD_VIRTUAL_PROMPT is global
+    function global:_OLD_VIRTUAL_PROMPT { "" }
+    Copy-Item -Path function:prompt -Destination function:_OLD_VIRTUAL_PROMPT
+    New-Variable -Name _PYTHON_VENV_PROMPT_PREFIX -Description "Python virtual environment prompt prefix" -Scope Global -Option ReadOnly -Visibility Public -Value $Prompt
+
+    function global:prompt {
+        Write-Host -NoNewline -ForegroundColor Green "($_PYTHON_VENV_PROMPT_PREFIX) "
+        _OLD_VIRTUAL_PROMPT
+    }
+    $env:VIRTUAL_ENV_PROMPT = $Prompt
+}
+
+# Clear PYTHONHOME
+if (Test-Path -Path Env:PYTHONHOME) {
+    Copy-Item -Path Env:PYTHONHOME -Destination Env:_OLD_VIRTUAL_PYTHONHOME
+    Remove-Item -Path Env:PYTHONHOME
+}
+
+# Add the venv to the PATH
+Copy-Item -Path Env:PATH -Destination Env:_OLD_VIRTUAL_PATH
+$Env:PATH = "$VenvExecDir$([System.IO.Path]::PathSeparator)$Env:PATH"
+                                                                                                                                                                                       usr/lib/python3.11/venv/scripts/common/activate                                                     0000644 0000000 0000000 00000003731 14671176116 020145  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        # This file must be used with "source bin/activate" *from bash*
+# you cannot run it directly
+
+deactivate () {
+    # reset old environment variables
+    if [ -n "${_OLD_VIRTUAL_PATH:-}" ] ; then
+        PATH="${_OLD_VIRTUAL_PATH:-}"
+        export PATH
+        unset _OLD_VIRTUAL_PATH
+    fi
+    if [ -n "${_OLD_VIRTUAL_PYTHONHOME:-}" ] ; then
+        PYTHONHOME="${_OLD_VIRTUAL_PYTHONHOME:-}"
+        export PYTHONHOME
+        unset _OLD_VIRTUAL_PYTHONHOME
+    fi
+
+    # This should detect bash and zsh, which have a hash command that must
+    # be called to get it to forget past commands.  Without forgetting
+    # past commands the $PATH changes we made may not be respected
+    if [ -n "${BASH:-}" -o -n "${ZSH_VERSION:-}" ] ; then

@@ -1,0 +1,1000 @@
+                raise error.Abort(b'unknown compression engine: %s' % engine)
+    else:
+        engines = []
+        for e in util.compengines:
+            engine = util.compengines[e]
+            try:
+                if engine.available():
+                    engine.revlogcompressor().compress(b'dummy')
+                    engines.append(e)
+            except NotImplementedError:
+                pass
+
+    revs = list(rl.revs(startrev, len(rl) - 1))
+
+    def rlfh(rl):
+        if rl._inline:
+            indexfile = getattr(rl, '_indexfile', None)
+            if indexfile is None:
+                # compatibility with <= hg-5.8
+                indexfile = getattr(rl, 'indexfile')
+            return getsvfs(repo)(indexfile)
+        else:
+            datafile = getattr(rl, 'datafile', getattr(rl, 'datafile'))
+            return getsvfs(repo)(datafile)
+
+    def doread():
+        rl.clearcaches()
+        for rev in revs:
+            segmentforrevs(rev, rev)
+
+    def doreadcachedfh():
+        rl.clearcaches()
+        fh = rlfh(rl)
+        for rev in revs:
+            segmentforrevs(rev, rev, df=fh)
+
+    def doreadbatch():
+        rl.clearcaches()
+        segmentforrevs(revs[0], revs[-1])
+
+    def doreadbatchcachedfh():
+        rl.clearcaches()
+        fh = rlfh(rl)
+        segmentforrevs(revs[0], revs[-1], df=fh)
+
+    def dochunk():
+        rl.clearcaches()
+        fh = rlfh(rl)
+        for rev in revs:
+            rl._chunk(rev, df=fh)
+
+    chunks = [None]
+
+    def dochunkbatch():
+        rl.clearcaches()
+        fh = rlfh(rl)
+        # Save chunks as a side-effect.
+        chunks[0] = rl._chunks(revs, df=fh)
+
+    def docompress(compressor):
+        rl.clearcaches()
+
+        try:
+            # Swap in the requested compression engine.
+            oldcompressor = rl._compressor
+            rl._compressor = compressor
+            for chunk in chunks[0]:
+                rl.compress(chunk)
+        finally:
+            rl._compressor = oldcompressor
+
+    benches = [
+        (lambda: doread(), b'read'),
+        (lambda: doreadcachedfh(), b'read w/ reused fd'),
+        (lambda: doreadbatch(), b'read batch'),
+        (lambda: doreadbatchcachedfh(), b'read batch w/ reused fd'),
+        (lambda: dochunk(), b'chunk'),
+        (lambda: dochunkbatch(), b'chunk batch'),
+    ]
+
+    for engine in sorted(engines):
+        compressor = util.compengines[engine].revlogcompressor()
+        benches.append(
+            (
+                functools.partial(docompress, compressor),
+                b'compress w/ %s' % engine,
+            )
+        )
+
+    for fn, title in benches:
+        timer, fm = gettimer(ui, opts)
+        timer(fn, title=title)
+        fm.end()
+
+
+@command(
+    b'perf::revlogrevision|perfrevlogrevision',
+    revlogopts
+    + formatteropts
+    + [(b'', b'cache', False, b'use caches instead of clearing')],
+    b'-c|-m|FILE REV',
+)
+def perfrevlogrevision(ui, repo, file_, rev=None, cache=None, **opts):
+    """Benchmark obtaining a revlog revision.
+
+    Obtaining a revlog revision consists of roughly the following steps:
+
+    1. Compute the delta chain
+    2. Slice the delta chain if applicable
+    3. Obtain the raw chunks for that delta chain
+    4. Decompress each raw chunk
+    5. Apply binary patches to obtain fulltext
+    6. Verify hash of fulltext
+
+    This command measures the time spent in each of these phases.
+    """
+    opts = _byteskwargs(opts)
+
+    if opts.get(b'changelog') or opts.get(b'manifest'):
+        file_, rev = None, file_
+    elif rev is None:
+        raise error.CommandError(b'perfrevlogrevision', b'invalid arguments')
+
+    r = cmdutil.openrevlog(repo, b'perfrevlogrevision', file_, opts)
+
+    # _chunkraw was renamed to _getsegmentforrevs.
+    try:
+        segmentforrevs = r._getsegmentforrevs
+    except AttributeError:
+        segmentforrevs = r._chunkraw
+
+    node = r.lookup(rev)
+    rev = r.rev(node)
+
+    def getrawchunks(data, chain):
+        start = r.start
+        length = r.length
+        inline = r._inline
+        try:
+            iosize = r.index.entry_size
+        except AttributeError:
+            iosize = r._io.size
+        buffer = util.buffer
+
+        chunks = []
+        ladd = chunks.append
+        for idx, item in enumerate(chain):
+            offset = start(item[0])
+            bits = data[idx]
+            for rev in item:
+                chunkstart = start(rev)
+                if inline:
+                    chunkstart += (rev + 1) * iosize
+                chunklength = length(rev)
+                ladd(buffer(bits, chunkstart - offset, chunklength))
+
+        return chunks
+
+    def dodeltachain(rev):
+        if not cache:
+            r.clearcaches()
+        r._deltachain(rev)
+
+    def doread(chain):
+        if not cache:
+            r.clearcaches()
+        for item in slicedchain:
+            segmentforrevs(item[0], item[-1])
+
+    def doslice(r, chain, size):
+        for s in slicechunk(r, chain, targetsize=size):
+            pass
+
+    def dorawchunks(data, chain):
+        if not cache:
+            r.clearcaches()
+        getrawchunks(data, chain)
+
+    def dodecompress(chunks):
+        decomp = r.decompress
+        for chunk in chunks:
+            decomp(chunk)
+
+    def dopatch(text, bins):
+        if not cache:
+            r.clearcaches()
+        mdiff.patches(text, bins)
+
+    def dohash(text):
+        if not cache:
+            r.clearcaches()
+        r.checkhash(text, node, rev=rev)
+
+    def dorevision():
+        if not cache:
+            r.clearcaches()
+        r.revision(node)
+
+    try:
+        from mercurial.revlogutils.deltas import slicechunk
+    except ImportError:
+        slicechunk = getattr(revlog, '_slicechunk', None)
+
+    size = r.length(rev)
+    chain = r._deltachain(rev)[0]
+    if not getattr(r, '_withsparseread', False):
+        slicedchain = (chain,)
+    else:
+        slicedchain = tuple(slicechunk(r, chain, targetsize=size))
+    data = [segmentforrevs(seg[0], seg[-1])[1] for seg in slicedchain]
+    rawchunks = getrawchunks(data, slicedchain)
+    bins = r._chunks(chain)
+    text = bytes(bins[0])
+    bins = bins[1:]
+    text = mdiff.patches(text, bins)
+
+    benches = [
+        (lambda: dorevision(), b'full'),
+        (lambda: dodeltachain(rev), b'deltachain'),
+        (lambda: doread(chain), b'read'),
+    ]
+
+    if getattr(r, '_withsparseread', False):
+        slicing = (lambda: doslice(r, chain, size), b'slice-sparse-chain')
+        benches.append(slicing)
+
+    benches.extend(
+        [
+            (lambda: dorawchunks(data, slicedchain), b'rawchunks'),
+            (lambda: dodecompress(rawchunks), b'decompress'),
+            (lambda: dopatch(text, bins), b'patch'),
+            (lambda: dohash(text), b'hash'),
+        ]
+    )
+
+    timer, fm = gettimer(ui, opts)
+    for fn, title in benches:
+        timer(fn, title=title)
+    fm.end()
+
+
+@command(
+    b'perf::revset|perfrevset',
+    [
+        (b'C', b'clear', False, b'clear volatile cache between each call.'),
+        (b'', b'contexts', False, b'obtain changectx for each revision'),
+    ]
+    + formatteropts,
+    b"REVSET",
+)
+def perfrevset(ui, repo, expr, clear=False, contexts=False, **opts):
+    """benchmark the execution time of a revset
+
+    Use the --clean option if need to evaluate the impact of build volatile
+    revisions set cache on the revset execution. Volatile cache hold filtered
+    and obsolete related cache."""
+    opts = _byteskwargs(opts)
+
+    timer, fm = gettimer(ui, opts)
+
+    def d():
+        if clear:
+            repo.invalidatevolatilesets()
+        if contexts:
+            for ctx in repo.set(expr):
+                pass
+        else:
+            for r in repo.revs(expr):
+                pass
+
+    timer(d)
+    fm.end()
+
+
+@command(
+    b'perf::volatilesets|perfvolatilesets',
+    [
+        (b'', b'clear-obsstore', False, b'drop obsstore between each call.'),
+    ]
+    + formatteropts,
+)
+def perfvolatilesets(ui, repo, *names, **opts):
+    """benchmark the computation of various volatile set
+
+    Volatile set computes element related to filtering and obsolescence."""
+    opts = _byteskwargs(opts)
+    timer, fm = gettimer(ui, opts)
+    repo = repo.unfiltered()
+
+    def getobs(name):
+        def d():
+            repo.invalidatevolatilesets()
+            if opts[b'clear_obsstore']:
+                clearfilecache(repo, b'obsstore')
+            obsolete.getrevs(repo, name)
+
+        return d
+
+    allobs = sorted(obsolete.cachefuncs)
+    if names:
+        allobs = [n for n in allobs if n in names]
+
+    for name in allobs:
+        timer(getobs(name), title=name)
+
+    def getfiltered(name):
+        def d():
+            repo.invalidatevolatilesets()
+            if opts[b'clear_obsstore']:
+                clearfilecache(repo, b'obsstore')
+            repoview.filterrevs(repo, name)
+
+        return d
+
+    allfilter = sorted(repoview.filtertable)
+    if names:
+        allfilter = [n for n in allfilter if n in names]
+
+    for name in allfilter:
+        timer(getfiltered(name), title=name)
+    fm.end()
+
+
+@command(
+    b'perf::branchmap|perfbranchmap',
+    [
+        (b'f', b'full', False, b'Includes build time of subset'),
+        (
+            b'',
+            b'clear-revbranch',
+            False,
+            b'purge the revbranch cache between computation',
+        ),
+    ]
+    + formatteropts,
+)
+def perfbranchmap(ui, repo, *filternames, **opts):
+    """benchmark the update of a branchmap
+
+    This benchmarks the full repo.branchmap() call with read and write disabled
+    """
+    opts = _byteskwargs(opts)
+    full = opts.get(b"full", False)
+    clear_revbranch = opts.get(b"clear_revbranch", False)
+    timer, fm = gettimer(ui, opts)
+
+    def getbranchmap(filtername):
+        """generate a benchmark function for the filtername"""
+        if filtername is None:
+            view = repo
+        else:
+            view = repo.filtered(filtername)
+        if util.safehasattr(view._branchcaches, '_per_filter'):
+            filtered = view._branchcaches._per_filter
+        else:
+            # older versions
+            filtered = view._branchcaches
+
+        def d():
+            if clear_revbranch:
+                repo.revbranchcache()._clear()
+            if full:
+                view._branchcaches.clear()
+            else:
+                filtered.pop(filtername, None)
+            view.branchmap()
+
+        return d
+
+    # add filter in smaller subset to bigger subset
+    possiblefilters = set(repoview.filtertable)
+    if filternames:
+        possiblefilters &= set(filternames)
+    subsettable = getbranchmapsubsettable()
+    allfilters = []
+    while possiblefilters:
+        for name in possiblefilters:
+            subset = subsettable.get(name)
+            if subset not in possiblefilters:
+                break
+        else:
+            assert False, b'subset cycle %s!' % possiblefilters
+        allfilters.append(name)
+        possiblefilters.remove(name)
+
+    # warm the cache
+    if not full:
+        for name in allfilters:
+            repo.filtered(name).branchmap()
+    if not filternames or b'unfiltered' in filternames:
+        # add unfiltered
+        allfilters.append(None)
+
+    if util.safehasattr(branchmap.branchcache, 'fromfile'):
+        branchcacheread = safeattrsetter(branchmap.branchcache, b'fromfile')
+        branchcacheread.set(classmethod(lambda *args: None))
+    else:
+        # older versions
+        branchcacheread = safeattrsetter(branchmap, b'read')
+        branchcacheread.set(lambda *args: None)
+    branchcachewrite = safeattrsetter(branchmap.branchcache, b'write')
+    branchcachewrite.set(lambda *args: None)
+    try:
+        for name in allfilters:
+            printname = name
+            if name is None:
+                printname = b'unfiltered'
+            timer(getbranchmap(name), title=printname)
+    finally:
+        branchcacheread.restore()
+        branchcachewrite.restore()
+    fm.end()
+
+
+@command(
+    b'perf::branchmapupdate|perfbranchmapupdate',
+    [
+        (b'', b'base', [], b'subset of revision to start from'),
+        (b'', b'target', [], b'subset of revision to end with'),
+        (b'', b'clear-caches', False, b'clear cache between each runs'),
+    ]
+    + formatteropts,
+)
+def perfbranchmapupdate(ui, repo, base=(), target=(), **opts):
+    """benchmark branchmap update from for <base> revs to <target> revs
+
+    If `--clear-caches` is passed, the following items will be reset before
+    each update:
+        * the changelog instance and associated indexes
+        * the rev-branch-cache instance
+
+    Examples:
+
+       # update for the one last revision
+       $ hg perfbranchmapupdate --base 'not tip' --target 'tip'
+
+       $ update for change coming with a new branch
+       $ hg perfbranchmapupdate --base 'stable' --target 'default'
+    """
+    from mercurial import branchmap
+    from mercurial import repoview
+
+    opts = _byteskwargs(opts)
+    timer, fm = gettimer(ui, opts)
+    clearcaches = opts[b'clear_caches']
+    unfi = repo.unfiltered()
+    x = [None]  # used to pass data between closure
+
+    # we use a `list` here to avoid possible side effect from smartset
+    baserevs = list(scmutil.revrange(repo, base))
+    targetrevs = list(scmutil.revrange(repo, target))
+    if not baserevs:
+        raise error.Abort(b'no revisions selected for --base')
+    if not targetrevs:
+        raise error.Abort(b'no revisions selected for --target')
+
+    # make sure the target branchmap also contains the one in the base
+    targetrevs = list(set(baserevs) | set(targetrevs))
+    targetrevs.sort()
+
+    cl = repo.changelog
+    allbaserevs = list(cl.ancestors(baserevs, inclusive=True))
+    allbaserevs.sort()
+    alltargetrevs = frozenset(cl.ancestors(targetrevs, inclusive=True))
+
+    newrevs = list(alltargetrevs.difference(allbaserevs))
+    newrevs.sort()
+
+    allrevs = frozenset(unfi.changelog.revs())
+    basefilterrevs = frozenset(allrevs.difference(allbaserevs))
+    targetfilterrevs = frozenset(allrevs.difference(alltargetrevs))
+
+    def basefilter(repo, visibilityexceptions=None):
+        return basefilterrevs
+
+    def targetfilter(repo, visibilityexceptions=None):
+        return targetfilterrevs
+
+    msg = b'benchmark of branchmap with %d revisions with %d new ones\n'
+    ui.status(msg % (len(allbaserevs), len(newrevs)))
+    if targetfilterrevs:
+        msg = b'(%d revisions still filtered)\n'
+        ui.status(msg % len(targetfilterrevs))
+
+    try:
+        repoview.filtertable[b'__perf_branchmap_update_base'] = basefilter
+        repoview.filtertable[b'__perf_branchmap_update_target'] = targetfilter
+
+        baserepo = repo.filtered(b'__perf_branchmap_update_base')
+        targetrepo = repo.filtered(b'__perf_branchmap_update_target')
+
+        # try to find an existing branchmap to reuse
+        subsettable = getbranchmapsubsettable()
+        candidatefilter = subsettable.get(None)
+        while candidatefilter is not None:
+            candidatebm = repo.filtered(candidatefilter).branchmap()
+            if candidatebm.validfor(baserepo):
+                filtered = repoview.filterrevs(repo, candidatefilter)
+                missing = [r for r in allbaserevs if r in filtered]
+                base = candidatebm.copy()
+                base.update(baserepo, missing)
+                break
+            candidatefilter = subsettable.get(candidatefilter)
+        else:
+            # no suitable subset where found
+            base = branchmap.branchcache()
+            base.update(baserepo, allbaserevs)
+
+        def setup():
+            x[0] = base.copy()
+            if clearcaches:
+                unfi._revbranchcache = None
+                clearchangelog(repo)
+
+        def bench():
+            x[0].update(targetrepo, newrevs)
+
+        timer(bench, setup=setup)
+        fm.end()
+    finally:
+        repoview.filtertable.pop(b'__perf_branchmap_update_base', None)
+        repoview.filtertable.pop(b'__perf_branchmap_update_target', None)
+
+
+@command(
+    b'perf::branchmapload|perfbranchmapload',
+    [
+        (b'f', b'filter', b'', b'Specify repoview filter'),
+        (b'', b'list', False, b'List brachmap filter caches'),
+        (b'', b'clear-revlogs', False, b'refresh changelog and manifest'),
+    ]
+    + formatteropts,
+)
+def perfbranchmapload(ui, repo, filter=b'', list=False, **opts):
+    """benchmark reading the branchmap"""
+    opts = _byteskwargs(opts)
+    clearrevlogs = opts[b'clear_revlogs']
+
+    if list:
+        for name, kind, st in repo.cachevfs.readdir(stat=True):
+            if name.startswith(b'branch2'):
+                filtername = name.partition(b'-')[2] or b'unfiltered'
+                ui.status(
+                    b'%s - %s\n' % (filtername, util.bytecount(st.st_size))
+                )
+        return
+    if not filter:
+        filter = None
+    subsettable = getbranchmapsubsettable()
+    if filter is None:
+        repo = repo.unfiltered()
+    else:
+        repo = repoview.repoview(repo, filter)
+
+    repo.branchmap()  # make sure we have a relevant, up to date branchmap
+
+    try:
+        fromfile = branchmap.branchcache.fromfile
+    except AttributeError:
+        # older versions
+        fromfile = branchmap.read
+
+    currentfilter = filter
+    # try once without timer, the filter may not be cached
+    while fromfile(repo) is None:
+        currentfilter = subsettable.get(currentfilter)
+        if currentfilter is None:
+            raise error.Abort(
+                b'No branchmap cached for %s repo' % (filter or b'unfiltered')
+            )
+        repo = repo.filtered(currentfilter)
+    timer, fm = gettimer(ui, opts)
+
+    def setup():
+        if clearrevlogs:
+            clearchangelog(repo)
+
+    def bench():
+        fromfile(repo)
+
+    timer(bench, setup=setup)
+    fm.end()
+
+
+@command(b'perf::loadmarkers|perfloadmarkers')
+def perfloadmarkers(ui, repo):
+    """benchmark the time to parse the on-disk markers for a repo
+
+    Result is the number of markers in the repo."""
+    timer, fm = gettimer(ui)
+    svfs = getsvfs(repo)
+    timer(lambda: len(obsolete.obsstore(repo, svfs)))
+    fm.end()
+
+
+@command(
+    b'perf::lrucachedict|perflrucachedict',
+    formatteropts
+    + [
+        (b'', b'costlimit', 0, b'maximum total cost of items in cache'),
+        (b'', b'mincost', 0, b'smallest cost of items in cache'),
+        (b'', b'maxcost', 100, b'maximum cost of items in cache'),
+        (b'', b'size', 4, b'size of cache'),
+        (b'', b'gets', 10000, b'number of key lookups'),
+        (b'', b'sets', 10000, b'number of key sets'),
+        (b'', b'mixed', 10000, b'number of mixed mode operations'),
+        (
+            b'',
+            b'mixedgetfreq',
+            50,
+            b'frequency of get vs set ops in mixed mode',
+        ),
+    ],
+    norepo=True,
+)
+def perflrucache(
+    ui,
+    mincost=0,
+    maxcost=100,
+    costlimit=0,
+    size=4,
+    gets=10000,
+    sets=10000,
+    mixed=10000,
+    mixedgetfreq=50,
+    **opts
+):
+    opts = _byteskwargs(opts)
+
+    def doinit():
+        for i in _xrange(10000):
+            util.lrucachedict(size)
+
+    costrange = list(range(mincost, maxcost + 1))
+
+    values = []
+    for i in _xrange(size):
+        values.append(random.randint(0, _maxint))
+
+    # Get mode fills the cache and tests raw lookup performance with no
+    # eviction.
+    getseq = []
+    for i in _xrange(gets):
+        getseq.append(random.choice(values))
+
+    def dogets():
+        d = util.lrucachedict(size)
+        for v in values:
+            d[v] = v
+        for key in getseq:
+            value = d[key]
+            value  # silence pyflakes warning
+
+    def dogetscost():
+        d = util.lrucachedict(size, maxcost=costlimit)
+        for i, v in enumerate(values):
+            d.insert(v, v, cost=costs[i])
+        for key in getseq:
+            try:
+                value = d[key]
+                value  # silence pyflakes warning
+            except KeyError:
+                pass
+
+    # Set mode tests insertion speed with cache eviction.
+    setseq = []
+    costs = []
+    for i in _xrange(sets):
+        setseq.append(random.randint(0, _maxint))
+        costs.append(random.choice(costrange))
+
+    def doinserts():
+        d = util.lrucachedict(size)
+        for v in setseq:
+            d.insert(v, v)
+
+    def doinsertscost():
+        d = util.lrucachedict(size, maxcost=costlimit)
+        for i, v in enumerate(setseq):
+            d.insert(v, v, cost=costs[i])
+
+    def dosets():
+        d = util.lrucachedict(size)
+        for v in setseq:
+            d[v] = v
+
+    # Mixed mode randomly performs gets and sets with eviction.
+    mixedops = []
+    for i in _xrange(mixed):
+        r = random.randint(0, 100)
+        if r < mixedgetfreq:
+            op = 0
+        else:
+            op = 1
+
+        mixedops.append(
+            (op, random.randint(0, size * 2), random.choice(costrange))
+        )
+
+    def domixed():
+        d = util.lrucachedict(size)
+
+        for op, v, cost in mixedops:
+            if op == 0:
+                try:
+                    d[v]
+                except KeyError:
+                    pass
+            else:
+                d[v] = v
+
+    def domixedcost():
+        d = util.lrucachedict(size, maxcost=costlimit)
+
+        for op, v, cost in mixedops:
+            if op == 0:
+                try:
+                    d[v]
+                except KeyError:
+                    pass
+            else:
+                d.insert(v, v, cost=cost)
+
+    benches = [
+        (doinit, b'init'),
+    ]
+
+    if costlimit:
+        benches.extend(
+            [
+                (dogetscost, b'gets w/ cost limit'),
+                (doinsertscost, b'inserts w/ cost limit'),
+                (domixedcost, b'mixed w/ cost limit'),
+            ]
+        )
+    else:
+        benches.extend(
+            [
+                (dogets, b'gets'),
+                (doinserts, b'inserts'),
+                (dosets, b'sets'),
+                (domixed, b'mixed'),
+            ]
+        )
+
+    for fn, title in benches:
+        timer, fm = gettimer(ui, opts)
+        timer(fn, title=title)
+        fm.end()
+
+
+@command(
+    b'perf::write|perfwrite',
+    formatteropts
+    + [
+        (b'', b'write-method', b'write', b'ui write method'),
+        (b'', b'nlines', 100, b'number of lines'),
+        (b'', b'nitems', 100, b'number of items (per line)'),
+        (b'', b'item', b'x', b'item that is written'),
+        (b'', b'batch-line', None, b'pass whole line to write method at once'),
+        (b'', b'flush-line', None, b'flush after each line'),
+    ],
+)
+def perfwrite(ui, repo, **opts):
+    """microbenchmark ui.write (and others)"""
+    opts = _byteskwargs(opts)
+
+    write = getattr(ui, _sysstr(opts[b'write_method']))
+    nlines = int(opts[b'nlines'])
+    nitems = int(opts[b'nitems'])
+    item = opts[b'item']
+    batch_line = opts.get(b'batch_line')
+    flush_line = opts.get(b'flush_line')
+
+    if batch_line:
+        line = item * nitems + b'\n'
+
+    def benchmark():
+        for i in pycompat.xrange(nlines):
+            if batch_line:
+                write(line)
+            else:
+                for i in pycompat.xrange(nitems):
+                    write(item)
+                write(b'\n')
+            if flush_line:
+                ui.flush()
+        ui.flush()
+
+    timer, fm = gettimer(ui, opts)
+    timer(benchmark)
+    fm.end()
+
+
+def uisetup(ui):
+    if util.safehasattr(cmdutil, b'openrevlog') and not util.safehasattr(
+        commands, b'debugrevlogopts'
+    ):
+        # for "historical portability":
+        # In this case, Mercurial should be 1.9 (or a79fea6b3e77) -
+        # 3.7 (or 5606f7d0d063). Therefore, '--dir' option for
+        # openrevlog() should cause failure, because it has been
+        # available since 3.5 (or 49c583ca48c4).
+        def openrevlog(orig, repo, cmd, file_, opts):
+            if opts.get(b'dir') and not util.safehasattr(repo, b'dirlog'):
+                raise error.Abort(
+                    b"This version doesn't support --dir option",
+                    hint=b"use 3.5 or later",
+                )
+            return orig(repo, cmd, file_, opts)
+
+        extensions.wrapfunction(cmdutil, b'openrevlog', openrevlog)
+
+
+@command(
+    b'perf::progress|perfprogress',
+    formatteropts
+    + [
+        (b'', b'topic', b'topic', b'topic for progress messages'),
+        (b'c', b'total', 1000000, b'total value we are progressing to'),
+    ],
+    norepo=True,
+)
+def perfprogress(ui, topic=None, total=None, **opts):
+    """printing of progress bars"""
+    opts = _byteskwargs(opts)
+
+    timer, fm = gettimer(ui, opts)
+
+    def doprogress():
+        with ui.makeprogress(topic, total=total) as progress:
+            for i in _xrange(total):
+                progress.increment()
+
+    timer(doprogress)
+    fm.end()
+                                                    usr/share/doc/mercurial-common/examples/python-hook-examples.py                                     0000644 0000000 0000000 00000001122 14355257011 023457  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        '''
+Examples of useful python hooks for Mercurial.
+'''
+from mercurial import (
+    patch,
+    util,
+)
+
+
+def diffstat(ui, repo, **kwargs):
+    """Example usage:
+
+    [hooks]
+    commit.diffstat = python:/path/to/this/file.py:diffstat
+    changegroup.diffstat = python:/path/to/this/file.py:diffstat
+    """
+    if kwargs.get('parent2'):
+        return
+    node = kwargs['node']
+    first = repo[node].p1().node()
+    if 'url' in kwargs:
+        last = repo.changelog.tip()
+    else:
+        last = node
+    diff = patch.diff(repo, first, last)
+    ui.write(patch.diffstat(util.iterlines(diff)))
+                                                                                                                                                                                                                                                                                                                                                                                                                                              usr/share/doc/mercurial-common/examples/simplemerge                                                 0000644 0000000 0000000 00000007647 14355257011 021270  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        #!/usr/bin/env python3
+
+import getopt
+import sys
+
+import hgdemandimport
+
+hgdemandimport.enable()
+
+from mercurial.i18n import _
+from mercurial import (
+    context,
+    error,
+    fancyopts,
+    simplemerge,
+    ui as uimod,
+    util,
+)
+from mercurial.utils import procutil, stringutil
+
+options = [
+    (b'L', b'label', [], _(b'labels to use on conflict markers')),
+    (b'a', b'text', None, _(b'treat all files as text')),
+    (b'p', b'print', None, _(b'print results instead of overwriting LOCAL')),
+    (b'', b'no-minimal', None, _(b'no effect (DEPRECATED)')),
+    (b'h', b'help', None, _(b'display help and exit')),
+    (b'q', b'quiet', None, _(b'suppress output')),
+]
+
+usage = _(
+    b'''simplemerge [OPTS] LOCAL BASE OTHER
+
+    Simple three-way file merge utility with a minimal feature set.
+
+    Apply to LOCAL the changes necessary to go from BASE to OTHER.
+
+    By default, LOCAL is overwritten with the results of this operation.
+'''
+)
+
+
+class ParseError(Exception):
+    """Exception raised on errors in parsing the command line."""
+
+
+def showhelp():
+    procutil.stdout.write(usage)
+    procutil.stdout.write(b'\noptions:\n')
+
+    out_opts = []
+    for shortopt, longopt, default, desc in options:
+        out_opts.append(
+            (
+                b'%2s%s'
+                % (
+                    shortopt and b'-%s' % shortopt,
+                    longopt and b' --%s' % longopt,
+                ),
+                b'%s' % desc,
+            )
+        )
+    opts_len = max([len(opt[0]) for opt in out_opts])
+    for first, second in out_opts:
+        procutil.stdout.write(b' %-*s  %s\n' % (opts_len, first, second))
+
+
+def _verifytext(input, ui, quiet=False, allow_binary=False):
+    """verifies that text is non-binary (unless opts[text] is passed,
+    then we just warn)"""
+    if stringutil.binary(input.text()):
+        msg = _(b"%s looks like a binary file.") % input.fctx.path()
+        if not quiet:
+            ui.warn(_(b'warning: %s\n') % msg)
+        if not allow_binary:
+            sys.exit(1)
+
+
+try:
+    for fp in (sys.stdin, procutil.stdout, sys.stderr):
+        procutil.setbinary(fp)
+
+    opts = {}
+    try:
+        bargv = [a.encode('utf8') for a in sys.argv[1:]]
+        args = fancyopts.fancyopts(bargv, options, opts)
+    except getopt.GetoptError as e:
+        raise ParseError(e)
+    if opts[b'help']:
+        showhelp()
+        sys.exit(0)
+    if len(args) != 3:
+        raise ParseError(_(b'wrong number of arguments').decode('utf8'))
+    mode = b'merge'
+    if len(opts[b'label']) > 2:
+        mode = b'merge3'
+    local, base, other = args
+    overrides = opts[b'label']
+    if len(overrides) > 3:
+        raise error.InputError(b'can only specify three labels.')
+    labels = [local, other, base]
+    labels[: len(overrides)] = overrides
+    local_input = simplemerge.MergeInput(
+        context.arbitraryfilectx(local), labels[0]
+    )
+    other_input = simplemerge.MergeInput(
+        context.arbitraryfilectx(other), labels[1]
+    )
+    base_input = simplemerge.MergeInput(
+        context.arbitraryfilectx(base), labels[2]
+    )
+
+    quiet = opts.get(b'quiet')
+    allow_binary = opts.get(b'text')
+    ui = uimod.ui.load()
+    _verifytext(local_input, ui, quiet=quiet, allow_binary=allow_binary)
+    _verifytext(base_input, ui, quiet=quiet, allow_binary=allow_binary)
+    _verifytext(other_input, ui, quiet=quiet, allow_binary=allow_binary)
+
+    merged_text, conflicts = simplemerge.simplemerge(
+        local_input,
+        base_input,
+        other_input,
+        mode,
+        allow_binary=allow_binary,
+    )
+    if opts.get(b'print'):
+        ui.fout.write(merged_text)
+    else:
+        util.writefile(local, merged_text)
+    sys.exit(1 if conflicts else 0)
+except ParseError as e:
+    e = stringutil.forcebytestr(e)
+    procutil.stdout.write(b"%s: %s\n" % (sys.argv[0].encode('utf8'), e))
+    showhelp()
+    sys.exit(1)
+except error.Abort as e:
+    procutil.stderr.write(b"abort: %s\n" % e)
+    sys.exit(255)

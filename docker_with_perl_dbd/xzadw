@@ -1,0 +1,1000 @@
+        once per request).
+
+        """
+        # add cookies in order of most specific (ie. longest) path first
+        cookies.sort(key=lambda a: len(a.path), reverse=True)
+
+        version_set = False
+
+        attrs = []
+        for cookie in cookies:
+            # set version of Cookie header
+            # XXX
+            # What should it be if multiple matching Set-Cookie headers have
+            #  different versions themselves?
+            # Answer: there is no answer; was supposed to be settled by
+            #  RFC 2965 errata, but that may never appear...
+            version = cookie.version
+            if not version_set:
+                version_set = True
+                if version > 0:
+                    attrs.append("$Version=%s" % version)
+
+            # quote cookie value if necessary
+            # (not for Netscape protocol, which already has any quotes
+            #  intact, due to the poorly-specified Netscape Cookie: syntax)
+            if ((cookie.value is not None) and
+                self.non_word_re.search(cookie.value) and version > 0):
+                value = self.quote_re.sub(r"\\\1", cookie.value)
+            else:
+                value = cookie.value
+
+            # add cookie-attributes to be returned in Cookie header
+            if cookie.value is None:
+                attrs.append(cookie.name)
+            else:
+                attrs.append("%s=%s" % (cookie.name, value))
+            if version > 0:
+                if cookie.path_specified:
+                    attrs.append('$Path="%s"' % cookie.path)
+                if cookie.domain.startswith("."):
+                    domain = cookie.domain
+                    if (not cookie.domain_initial_dot and
+                        domain.startswith(".")):
+                        domain = domain[1:]
+                    attrs.append('$Domain="%s"' % domain)
+                if cookie.port is not None:
+                    p = "$Port"
+                    if cookie.port_specified:
+                        p = p + ('="%s"' % cookie.port)
+                    attrs.append(p)
+
+        return attrs
+
+    def add_cookie_header(self, request):
+        """Add correct Cookie: header to request (urllib.request.Request object).
+
+        The Cookie2 header is also added unless policy.hide_cookie2 is true.
+
+        """
+        _debug("add_cookie_header")
+        self._cookies_lock.acquire()
+        try:
+
+            self._policy._now = self._now = int(time.time())
+
+            cookies = self._cookies_for_request(request)
+
+            attrs = self._cookie_attrs(cookies)
+            if attrs:
+                if not request.has_header("Cookie"):
+                    request.add_unredirected_header(
+                        "Cookie", "; ".join(attrs))
+
+            # if necessary, advertise that we know RFC 2965
+            if (self._policy.rfc2965 and not self._policy.hide_cookie2 and
+                not request.has_header("Cookie2")):
+                for cookie in cookies:
+                    if cookie.version != 1:
+                        request.add_unredirected_header("Cookie2", '$Version="1"')
+                        break
+
+        finally:
+            self._cookies_lock.release()
+
+        self.clear_expired_cookies()
+
+    def _normalized_cookie_tuples(self, attrs_set):
+        """Return list of tuples containing normalised cookie information.
+
+        attrs_set is the list of lists of key,value pairs extracted from
+        the Set-Cookie or Set-Cookie2 headers.
+
+        Tuples are name, value, standard, rest, where name and value are the
+        cookie name and value, standard is a dictionary containing the standard
+        cookie-attributes (discard, secure, version, expires or max-age,
+        domain, path and port) and rest is a dictionary containing the rest of
+        the cookie-attributes.
+
+        """
+        cookie_tuples = []
+
+        boolean_attrs = "discard", "secure"
+        value_attrs = ("version",
+                       "expires", "max-age",
+                       "domain", "path", "port",
+                       "comment", "commenturl")
+
+        for cookie_attrs in attrs_set:
+            name, value = cookie_attrs[0]
+
+            # Build dictionary of standard cookie-attributes (standard) and
+            # dictionary of other cookie-attributes (rest).
+
+            # Note: expiry time is normalised to seconds since epoch.  V0
+            # cookies should have the Expires cookie-attribute, and V1 cookies
+            # should have Max-Age, but since V1 includes RFC 2109 cookies (and
+            # since V0 cookies may be a mish-mash of Netscape and RFC 2109), we
+            # accept either (but prefer Max-Age).
+            max_age_set = False
+
+            bad_cookie = False
+
+            standard = {}
+            rest = {}
+            for k, v in cookie_attrs[1:]:
+                lc = k.lower()
+                # don't lose case distinction for unknown fields
+                if lc in value_attrs or lc in boolean_attrs:
+                    k = lc
+                if k in boolean_attrs and v is None:
+                    # boolean cookie-attribute is present, but has no value
+                    # (like "discard", rather than "port=80")
+                    v = True
+                if k in standard:
+                    # only first value is significant
+                    continue
+                if k == "domain":
+                    if v is None:
+                        _debug("   missing value for domain attribute")
+                        bad_cookie = True
+                        break
+                    # RFC 2965 section 3.3.3
+                    v = v.lower()
+                if k == "expires":
+                    if max_age_set:
+                        # Prefer max-age to expires (like Mozilla)
+                        continue
+                    if v is None:
+                        _debug("   missing or invalid value for expires "
+                              "attribute: treating as session cookie")
+                        continue
+                if k == "max-age":
+                    max_age_set = True
+                    try:
+                        v = int(v)
+                    except ValueError:
+                        _debug("   missing or invalid (non-numeric) value for "
+                              "max-age attribute")
+                        bad_cookie = True
+                        break
+                    # convert RFC 2965 Max-Age to seconds since epoch
+                    # XXX Strictly you're supposed to follow RFC 2616
+                    #   age-calculation rules.  Remember that zero Max-Age
+                    #   is a request to discard (old and new) cookie, though.
+                    k = "expires"
+                    v = self._now + v
+                if (k in value_attrs) or (k in boolean_attrs):
+                    if (v is None and
+                        k not in ("port", "comment", "commenturl")):
+                        _debug("   missing value for %s attribute" % k)
+                        bad_cookie = True
+                        break
+                    standard[k] = v
+                else:
+                    rest[k] = v
+
+            if bad_cookie:
+                continue
+
+            cookie_tuples.append((name, value, standard, rest))
+
+        return cookie_tuples
+
+    def _cookie_from_cookie_tuple(self, tup, request):
+        # standard is dict of standard cookie-attributes, rest is dict of the
+        # rest of them
+        name, value, standard, rest = tup
+
+        domain = standard.get("domain", Absent)
+        path = standard.get("path", Absent)
+        port = standard.get("port", Absent)
+        expires = standard.get("expires", Absent)
+
+        # set the easy defaults
+        version = standard.get("version", None)
+        if version is not None:
+            try:
+                version = int(version)
+            except ValueError:
+                return None  # invalid version, ignore cookie
+        secure = standard.get("secure", False)
+        # (discard is also set if expires is Absent)
+        discard = standard.get("discard", False)
+        comment = standard.get("comment", None)
+        comment_url = standard.get("commenturl", None)
+
+        # set default path
+        if path is not Absent and path != "":
+            path_specified = True
+            path = escape_path(path)
+        else:
+            path_specified = False
+            path = request_path(request)
+            i = path.rfind("/")
+            if i != -1:
+                if version == 0:
+                    # Netscape spec parts company from reality here
+                    path = path[:i]
+                else:
+                    path = path[:i+1]
+            if len(path) == 0: path = "/"
+
+        # set default domain
+        domain_specified = domain is not Absent
+        # but first we have to remember whether it starts with a dot
+        domain_initial_dot = False
+        if domain_specified:
+            domain_initial_dot = bool(domain.startswith("."))
+        if domain is Absent:
+            req_host, erhn = eff_request_host(request)
+            domain = erhn
+        elif not domain.startswith("."):
+            domain = "."+domain
+
+        # set default port
+        port_specified = False
+        if port is not Absent:
+            if port is None:
+                # Port attr present, but has no value: default to request port.
+                # Cookie should then only be sent back on that port.
+                port = request_port(request)
+            else:
+                port_specified = True
+                port = re.sub(r"\s+", "", port)
+        else:
+            # No port attr present.  Cookie can be sent back on any port.
+            port = None
+
+        # set default expires and discard
+        if expires is Absent:
+            expires = None
+            discard = True
+        elif expires <= self._now:
+            # Expiry date in past is request to delete cookie.  This can't be
+            # in DefaultCookiePolicy, because can't delete cookies there.
+            try:
+                self.clear(domain, path, name)
+            except KeyError:
+                pass
+            _debug("Expiring cookie, domain='%s', path='%s', name='%s'",
+                   domain, path, name)
+            return None
+
+        return Cookie(version,
+                      name, value,
+                      port, port_specified,
+                      domain, domain_specified, domain_initial_dot,
+                      path, path_specified,
+                      secure,
+                      expires,
+                      discard,
+                      comment,
+                      comment_url,
+                      rest)
+
+    def _cookies_from_attrs_set(self, attrs_set, request):
+        cookie_tuples = self._normalized_cookie_tuples(attrs_set)
+
+        cookies = []
+        for tup in cookie_tuples:
+            cookie = self._cookie_from_cookie_tuple(tup, request)
+            if cookie: cookies.append(cookie)
+        return cookies
+
+    def _process_rfc2109_cookies(self, cookies):
+        rfc2109_as_ns = getattr(self._policy, 'rfc2109_as_netscape', None)
+        if rfc2109_as_ns is None:
+            rfc2109_as_ns = not self._policy.rfc2965
+        for cookie in cookies:
+            if cookie.version == 1:
+                cookie.rfc2109 = True
+                if rfc2109_as_ns:
+                    # treat 2109 cookies as Netscape cookies rather than
+                    # as RFC2965 cookies
+                    cookie.version = 0
+
+    def make_cookies(self, response, request):
+        """Return sequence of Cookie objects extracted from response object."""
+        # get cookie-attributes for RFC 2965 and Netscape protocols
+        headers = response.info()
+        rfc2965_hdrs = headers.get_all("Set-Cookie2", [])
+        ns_hdrs = headers.get_all("Set-Cookie", [])
+        self._policy._now = self._now = int(time.time())
+
+        rfc2965 = self._policy.rfc2965
+        netscape = self._policy.netscape
+
+        if ((not rfc2965_hdrs and not ns_hdrs) or
+            (not ns_hdrs and not rfc2965) or
+            (not rfc2965_hdrs and not netscape) or
+            (not netscape and not rfc2965)):
+            return []  # no relevant cookie headers: quick exit
+
+        try:
+            cookies = self._cookies_from_attrs_set(
+                split_header_words(rfc2965_hdrs), request)
+        except Exception:
+            _warn_unhandled_exception()
+            cookies = []
+
+        if ns_hdrs and netscape:
+            try:
+                # RFC 2109 and Netscape cookies
+                ns_cookies = self._cookies_from_attrs_set(
+                    parse_ns_headers(ns_hdrs), request)
+            except Exception:
+                _warn_unhandled_exception()
+                ns_cookies = []
+            self._process_rfc2109_cookies(ns_cookies)
+
+            # Look for Netscape cookies (from Set-Cookie headers) that match
+            # corresponding RFC 2965 cookies (from Set-Cookie2 headers).
+            # For each match, keep the RFC 2965 cookie and ignore the Netscape
+            # cookie (RFC 2965 section 9.1).  Actually, RFC 2109 cookies are
+            # bundled in with the Netscape cookies for this purpose, which is
+            # reasonable behaviour.
+            if rfc2965:
+                lookup = {}
+                for cookie in cookies:
+                    lookup[(cookie.domain, cookie.path, cookie.name)] = None
+
+                def no_matching_rfc2965(ns_cookie, lookup=lookup):
+                    key = ns_cookie.domain, ns_cookie.path, ns_cookie.name
+                    return key not in lookup
+                ns_cookies = filter(no_matching_rfc2965, ns_cookies)
+
+            if ns_cookies:
+                cookies.extend(ns_cookies)
+
+        return cookies
+
+    def set_cookie_if_ok(self, cookie, request):
+        """Set a cookie if policy says it's OK to do so."""
+        self._cookies_lock.acquire()
+        try:
+            self._policy._now = self._now = int(time.time())
+
+            if self._policy.set_ok(cookie, request):
+                self.set_cookie(cookie)
+
+
+        finally:
+            self._cookies_lock.release()
+
+    def set_cookie(self, cookie):
+        """Set a cookie, without checking whether or not it should be set."""
+        c = self._cookies
+        self._cookies_lock.acquire()
+        try:
+            if cookie.domain not in c: c[cookie.domain] = {}
+            c2 = c[cookie.domain]
+            if cookie.path not in c2: c2[cookie.path] = {}
+            c3 = c2[cookie.path]
+            c3[cookie.name] = cookie
+        finally:
+            self._cookies_lock.release()
+
+    def extract_cookies(self, response, request):
+        """Extract cookies from response, where allowable given the request."""
+        _debug("extract_cookies: %s", response.info())
+        self._cookies_lock.acquire()
+        try:
+            for cookie in self.make_cookies(response, request):
+                if self._policy.set_ok(cookie, request):
+                    _debug(" setting cookie: %s", cookie)
+                    self.set_cookie(cookie)
+        finally:
+            self._cookies_lock.release()
+
+    def clear(self, domain=None, path=None, name=None):
+        """Clear some cookies.
+
+        Invoking this method without arguments will clear all cookies.  If
+        given a single argument, only cookies belonging to that domain will be
+        removed.  If given two arguments, cookies belonging to the specified
+        path within that domain are removed.  If given three arguments, then
+        the cookie with the specified name, path and domain is removed.
+
+        Raises KeyError if no matching cookie exists.
+
+        """
+        if name is not None:
+            if (domain is None) or (path is None):
+                raise ValueError(
+                    "domain and path must be given to remove a cookie by name")
+            del self._cookies[domain][path][name]
+        elif path is not None:
+            if domain is None:
+                raise ValueError(
+                    "domain must be given to remove cookies by path")
+            del self._cookies[domain][path]
+        elif domain is not None:
+            del self._cookies[domain]
+        else:
+            self._cookies = {}
+
+    def clear_session_cookies(self):
+        """Discard all session cookies.
+
+        Note that the .save() method won't save session cookies anyway, unless
+        you ask otherwise by passing a true ignore_discard argument.
+
+        """
+        self._cookies_lock.acquire()
+        try:
+            for cookie in self:
+                if cookie.discard:
+                    self.clear(cookie.domain, cookie.path, cookie.name)
+        finally:
+            self._cookies_lock.release()
+
+    def clear_expired_cookies(self):
+        """Discard all expired cookies.
+
+        You probably don't need to call this method: expired cookies are never
+        sent back to the server (provided you're using DefaultCookiePolicy),
+        this method is called by CookieJar itself every so often, and the
+        .save() method won't save expired cookies anyway (unless you ask
+        otherwise by passing a true ignore_expires argument).
+
+        """
+        self._cookies_lock.acquire()
+        try:
+            now = time.time()
+            for cookie in self:
+                if cookie.is_expired(now):
+                    self.clear(cookie.domain, cookie.path, cookie.name)
+        finally:
+            self._cookies_lock.release()
+
+    def __iter__(self):
+        return deepvalues(self._cookies)
+
+    def __len__(self):
+        """Return number of contained cookies."""
+        i = 0
+        for cookie in self: i = i + 1
+        return i
+
+    def __repr__(self):
+        r = []
+        for cookie in self: r.append(repr(cookie))
+        return "<%s[%s]>" % (self.__class__.__name__, ", ".join(r))
+
+    def __str__(self):
+        r = []
+        for cookie in self: r.append(str(cookie))
+        return "<%s[%s]>" % (self.__class__.__name__, ", ".join(r))
+
+
+# derives from OSError for backwards-compatibility with Python 2.4.0
+class LoadError(OSError): pass
+
+class FileCookieJar(CookieJar):
+    """CookieJar that can be loaded from and saved to a file."""
+
+    def __init__(self, filename=None, delayload=False, policy=None):
+        """
+        Cookies are NOT loaded from the named file until either the .load() or
+        .revert() method is called.
+
+        """
+        CookieJar.__init__(self, policy)
+        if filename is not None:
+            filename = os.fspath(filename)
+        self.filename = filename
+        self.delayload = bool(delayload)
+
+    def save(self, filename=None, ignore_discard=False, ignore_expires=False):
+        """Save cookies to a file."""
+        raise NotImplementedError()
+
+    def load(self, filename=None, ignore_discard=False, ignore_expires=False):
+        """Load cookies from a file."""
+        if filename is None:
+            if self.filename is not None: filename = self.filename
+            else: raise ValueError(MISSING_FILENAME_TEXT)
+
+        with open(filename) as f:
+            self._really_load(f, filename, ignore_discard, ignore_expires)
+
+    def revert(self, filename=None,
+               ignore_discard=False, ignore_expires=False):
+        """Clear all cookies and reload cookies from a saved file.
+
+        Raises LoadError (or OSError) if reversion is not successful; the
+        object's state will not be altered if this happens.
+
+        """
+        if filename is None:
+            if self.filename is not None: filename = self.filename
+            else: raise ValueError(MISSING_FILENAME_TEXT)
+
+        self._cookies_lock.acquire()
+        try:
+
+            old_state = copy.deepcopy(self._cookies)
+            self._cookies = {}
+            try:
+                self.load(filename, ignore_discard, ignore_expires)
+            except OSError:
+                self._cookies = old_state
+                raise
+
+        finally:
+            self._cookies_lock.release()
+
+
+def lwp_cookie_str(cookie):
+    """Return string representation of Cookie in the LWP cookie file format.
+
+    Actually, the format is extended a bit -- see module docstring.
+
+    """
+    h = [(cookie.name, cookie.value),
+         ("path", cookie.path),
+         ("domain", cookie.domain)]
+    if cookie.port is not None: h.append(("port", cookie.port))
+    if cookie.path_specified: h.append(("path_spec", None))
+    if cookie.port_specified: h.append(("port_spec", None))
+    if cookie.domain_initial_dot: h.append(("domain_dot", None))
+    if cookie.secure: h.append(("secure", None))
+    if cookie.expires: h.append(("expires",
+                               time2isoz(float(cookie.expires))))
+    if cookie.discard: h.append(("discard", None))
+    if cookie.comment: h.append(("comment", cookie.comment))
+    if cookie.comment_url: h.append(("commenturl", cookie.comment_url))
+
+    keys = sorted(cookie._rest.keys())
+    for k in keys:
+        h.append((k, str(cookie._rest[k])))
+
+    h.append(("version", str(cookie.version)))
+
+    return join_header_words([h])
+
+class LWPCookieJar(FileCookieJar):
+    """
+    The LWPCookieJar saves a sequence of "Set-Cookie3" lines.
+    "Set-Cookie3" is the format used by the libwww-perl library, not known
+    to be compatible with any browser, but which is easy to read and
+    doesn't lose information about RFC 2965 cookies.
+
+    Additional methods
+
+    as_lwp_str(ignore_discard=True, ignore_expired=True)
+
+    """
+
+    def as_lwp_str(self, ignore_discard=True, ignore_expires=True):
+        """Return cookies as a string of "\\n"-separated "Set-Cookie3" headers.
+
+        ignore_discard and ignore_expires: see docstring for FileCookieJar.save
+
+        """
+        now = time.time()
+        r = []
+        for cookie in self:
+            if not ignore_discard and cookie.discard:
+                continue
+            if not ignore_expires and cookie.is_expired(now):
+                continue
+            r.append("Set-Cookie3: %s" % lwp_cookie_str(cookie))
+        return "\n".join(r+[""])
+
+    def save(self, filename=None, ignore_discard=False, ignore_expires=False):
+        if filename is None:
+            if self.filename is not None: filename = self.filename
+            else: raise ValueError(MISSING_FILENAME_TEXT)
+
+        with os.fdopen(
+            os.open(filename, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600),
+            'w',
+        ) as f:
+            # There really isn't an LWP Cookies 2.0 format, but this indicates
+            # that there is extra information in here (domain_dot and
+            # port_spec) while still being compatible with libwww-perl, I hope.
+            f.write("#LWP-Cookies-2.0\n")
+            f.write(self.as_lwp_str(ignore_discard, ignore_expires))
+
+    def _really_load(self, f, filename, ignore_discard, ignore_expires):
+        magic = f.readline()
+        if not self.magic_re.search(magic):
+            msg = ("%r does not look like a Set-Cookie3 (LWP) format "
+                   "file" % filename)
+            raise LoadError(msg)
+
+        now = time.time()
+
+        header = "Set-Cookie3:"
+        boolean_attrs = ("port_spec", "path_spec", "domain_dot",
+                         "secure", "discard")
+        value_attrs = ("version",
+                       "port", "path", "domain",
+                       "expires",
+                       "comment", "commenturl")
+
+        try:
+            while 1:
+                line = f.readline()
+                if line == "": break
+                if not line.startswith(header):
+                    continue
+                line = line[len(header):].strip()
+
+                for data in split_header_words([line]):
+                    name, value = data[0]
+                    standard = {}
+                    rest = {}
+                    for k in boolean_attrs:
+                        standard[k] = False
+                    for k, v in data[1:]:
+                        if k is not None:
+                            lc = k.lower()
+                        else:
+                            lc = None
+                        # don't lose case distinction for unknown fields
+                        if (lc in value_attrs) or (lc in boolean_attrs):
+                            k = lc
+                        if k in boolean_attrs:
+                            if v is None: v = True
+                            standard[k] = v
+                        elif k in value_attrs:
+                            standard[k] = v
+                        else:
+                            rest[k] = v
+
+                    h = standard.get
+                    expires = h("expires")
+                    discard = h("discard")
+                    if expires is not None:
+                        expires = iso2time(expires)
+                    if expires is None:
+                        discard = True
+                    domain = h("domain")
+                    domain_specified = domain.startswith(".")
+                    c = Cookie(h("version"), name, value,
+                               h("port"), h("port_spec"),
+                               domain, domain_specified, h("domain_dot"),
+                               h("path"), h("path_spec"),
+                               h("secure"),
+                               expires,
+                               discard,
+                               h("comment"),
+                               h("commenturl"),
+                               rest)
+                    if not ignore_discard and c.discard:
+                        continue
+                    if not ignore_expires and c.is_expired(now):
+                        continue
+                    self.set_cookie(c)
+        except OSError:
+            raise
+        except Exception:
+            _warn_unhandled_exception()
+            raise LoadError("invalid Set-Cookie3 format file %r: %r" %
+                            (filename, line))
+
+
+class MozillaCookieJar(FileCookieJar):
+    """
+
+    WARNING: you may want to backup your browser's cookies file if you use
+    this class to save cookies.  I *think* it works, but there have been
+    bugs in the past!
+
+    This class differs from CookieJar only in the format it uses to save and
+    load cookies to and from a file.  This class uses the Mozilla/Netscape
+    `cookies.txt' format.  curl and lynx use this file format, too.
+
+    Don't expect cookies saved while the browser is running to be noticed by
+    the browser (in fact, Mozilla on unix will overwrite your saved cookies if
+    you change them on disk while it's running; on Windows, you probably can't
+    save at all while the browser is running).
+
+    Note that the Mozilla/Netscape format will downgrade RFC2965 cookies to
+    Netscape cookies on saving.
+
+    In particular, the cookie version and port number information is lost,
+    together with information about whether or not Path, Port and Discard were
+    specified by the Set-Cookie2 (or Set-Cookie) header, and whether or not the
+    domain as set in the HTTP header started with a dot (yes, I'm aware some
+    domains in Netscape files start with a dot and some don't -- trust me, you
+    really don't want to know any more about this).
+
+    Note that though Mozilla and Netscape use the same format, they use
+    slightly different headers.  The class saves cookies using the Netscape
+    header by default (Mozilla can cope with that).
+
+    """
+
+    def _really_load(self, f, filename, ignore_discard, ignore_expires):
+        now = time.time()
+
+        if not NETSCAPE_MAGIC_RGX.match(f.readline()):
+            raise LoadError(
+                "%r does not look like a Netscape format cookies file" %
+                filename)
+
+        try:
+            while 1:
+                line = f.readline()
+                rest = {}
+
+                if line == "": break
+
+                # httponly is a cookie flag as defined in rfc6265
+                # when encoded in a netscape cookie file,
+                # the line is prepended with "#HttpOnly_"
+                if line.startswith(HTTPONLY_PREFIX):
+                    rest[HTTPONLY_ATTR] = ""
+                    line = line[len(HTTPONLY_PREFIX):]
+
+                # last field may be absent, so keep any trailing tab
+                if line.endswith("\n"): line = line[:-1]
+
+                # skip comments and blank lines XXX what is $ for?
+                if (line.strip().startswith(("#", "$")) or
+                    line.strip() == ""):
+                    continue
+
+                domain, domain_specified, path, secure, expires, name, value = \
+                        line.split("\t")
+                secure = (secure == "TRUE")
+                domain_specified = (domain_specified == "TRUE")
+                if name == "":
+                    # cookies.txt regards 'Set-Cookie: foo' as a cookie
+                    # with no name, whereas http.cookiejar regards it as a
+                    # cookie with no value.
+                    name = value
+                    value = None
+
+                initial_dot = domain.startswith(".")
+                assert domain_specified == initial_dot
+
+                discard = False
+                if expires == "":
+                    expires = None
+                    discard = True
+
+                # assume path_specified is false
+                c = Cookie(0, name, value,
+                           None, False,
+                           domain, domain_specified, initial_dot,
+                           path, False,
+                           secure,
+                           expires,
+                           discard,
+                           None,
+                           None,
+                           rest)
+                if not ignore_discard and c.discard:
+                    continue
+                if not ignore_expires and c.is_expired(now):
+                    continue
+                self.set_cookie(c)
+
+        except OSError:
+            raise
+        except Exception:
+            _warn_unhandled_exception()
+            raise LoadError("invalid Netscape format cookies file %r: %r" %
+                            (filename, line))
+
+    def save(self, filename=None, ignore_discard=False, ignore_expires=False):
+        if filename is None:
+            if self.filename is not None: filename = self.filename
+            else: raise ValueError(MISSING_FILENAME_TEXT)
+
+        with os.fdopen(
+            os.open(filename, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600),
+            'w',
+        ) as f:
+            f.write(NETSCAPE_HEADER_TEXT)
+            now = time.time()
+            for cookie in self:
+                domain = cookie.domain
+                if not ignore_discard and cookie.discard:
+                    continue
+                if not ignore_expires and cookie.is_expired(now):
+                    continue
+                if cookie.secure: secure = "TRUE"
+                else: secure = "FALSE"
+                if domain.startswith("."): initial_dot = "TRUE"
+                else: initial_dot = "FALSE"
+                if cookie.expires is not None:
+                    expires = str(cookie.expires)
+                else:
+                    expires = ""
+                if cookie.value is None:
+                    # cookies.txt regards 'Set-Cookie: foo' as a cookie
+                    # with no name, whereas http.cookiejar regards it as a
+                    # cookie with no value.
+                    name = ""
+                    value = cookie.name
+                else:
+                    name = cookie.name
+                    value = cookie.value
+                if cookie.has_nonstandard_attr(HTTPONLY_ATTR):
+                    domain = HTTPONLY_PREFIX + domain
+                f.write(
+                    "\t".join([domain, initial_dot, cookie.path,
+                               secure, expires, name, value])+
+                    "\n")
+                                                                                                                                                                                                                                                                                                                   usr/lib/python3.11/http/cookies.py                                                                  0000644 0000000 0000000 00000050002 14671176116 015443  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        ####
+# Copyright 2000 by Timothy O'Malley <timo@alum.mit.edu>
+#
+#                All Rights Reserved
+#
+# Permission to use, copy, modify, and distribute this software
+# and its documentation for any purpose and without fee is hereby
+# granted, provided that the above copyright notice appear in all
+# copies and that both that copyright notice and this permission
+# notice appear in supporting documentation, and that the name of
+# Timothy O'Malley  not be used in advertising or publicity
+# pertaining to distribution of the software without specific, written
+# prior permission.
+#
+# Timothy O'Malley DISCLAIMS ALL WARRANTIES WITH REGARD TO THIS
+# SOFTWARE, INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY
+# AND FITNESS, IN NO EVENT SHALL Timothy O'Malley BE LIABLE FOR
+# ANY SPECIAL, INDIRECT OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+# WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS,
+# WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS
+# ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR
+# PERFORMANCE OF THIS SOFTWARE.
+#
+####
+#
+# Id: Cookie.py,v 2.29 2000/08/23 05:28:49 timo Exp
+#   by Timothy O'Malley <timo@alum.mit.edu>
+#
+#  Cookie.py is a Python module for the handling of HTTP
+#  cookies as a Python dictionary.  See RFC 2109 for more
+#  information on cookies.
+#
+#  The original idea to treat Cookies as a dictionary came from
+#  Dave Mitchell (davem@magnet.com) in 1995, when he released the
+#  first version of nscookie.py.
+#
+####
+
+r"""
+Here's a sample session to show how to use this module.
+At the moment, this is the only documentation.
+
+The Basics
+----------
+
+Importing is easy...
+
+   >>> from http import cookies
+
+Most of the time you start by creating a cookie.
+
+   >>> C = cookies.SimpleCookie()
+
+Once you've created your Cookie, you can add values just as if it were
+a dictionary.
+
+   >>> C = cookies.SimpleCookie()
+   >>> C["fig"] = "newton"
+   >>> C["sugar"] = "wafer"
+   >>> C.output()
+   'Set-Cookie: fig=newton\r\nSet-Cookie: sugar=wafer'
+
+Notice that the printable representation of a Cookie is the
+appropriate format for a Set-Cookie: header.  This is the
+default behavior.  You can change the header and printed
+attributes by using the .output() function
+
+   >>> C = cookies.SimpleCookie()
+   >>> C["rocky"] = "road"
+   >>> C["rocky"]["path"] = "/cookie"
+   >>> print(C.output(header="Cookie:"))
+   Cookie: rocky=road; Path=/cookie
+   >>> print(C.output(attrs=[], header="Cookie:"))
+   Cookie: rocky=road
+
+The load() method of a Cookie extracts cookies from a string.  In a
+CGI script, you would use this method to extract the cookies from the
+HTTP_COOKIE environment variable.
+
+   >>> C = cookies.SimpleCookie()
+   >>> C.load("chips=ahoy; vienna=finger")
+   >>> C.output()
+   'Set-Cookie: chips=ahoy\r\nSet-Cookie: vienna=finger'
+
+The load() method is darn-tootin smart about identifying cookies
+within a string.  Escaped quotation marks, nested semicolons, and other
+such trickeries do not confuse it.
+
+   >>> C = cookies.SimpleCookie()
+   >>> C.load('keebler="E=everybody; L=\\"Loves\\"; fudge=\\012;";')
+   >>> print(C)
+   Set-Cookie: keebler="E=everybody; L=\"Loves\"; fudge=\012;"
+
+Each element of the Cookie also supports all of the RFC 2109
+Cookie attributes.  Here's an example which sets the Path
+attribute.
+
+   >>> C = cookies.SimpleCookie()
+   >>> C["oreo"] = "doublestuff"
+   >>> C["oreo"]["path"] = "/"
+   >>> print(C)
+   Set-Cookie: oreo=doublestuff; Path=/
+
+Each dictionary element has a 'value' attribute, which gives you
+back the value associated with the key.
+
+   >>> C = cookies.SimpleCookie()
+   >>> C["twix"] = "none for you"
+   >>> C["twix"].value
+   'none for you'
+
+The SimpleCookie expects that all values should be standard strings.
+Just to be sure, SimpleCookie invokes the str() builtin to convert
+the value to a string, when the values are set dictionary-style.
+
+   >>> C = cookies.SimpleCookie()
+   >>> C["number"] = 7
+   >>> C["string"] = "seven"
+   >>> C["number"].value
+   '7'
+   >>> C["string"].value
+   'seven'
+   >>> C.output()
+   'Set-Cookie: number=7\r\nSet-Cookie: string=seven'
+
+Finis.
+"""
+
+#
+# Import our required modules
+#
+import re
+import string
+import types
+
+__all__ = ["CookieError", "BaseCookie", "SimpleCookie"]
+
+_nulljoin = ''.join
+_semispacejoin = '; '.join
+_spacejoin = ' '.join
+
+#
+# Define an exception visible to External modules
+#
+class CookieError(Exception):
+    pass
+
+
+# These quoting routines conform to the RFC2109 specification, which in
+# turn references the character definitions from RFC2068.  They provide
+# a two-way quoting algorithm.  Any non-text character is translated
+# into a 4 character sequence: a forward-slash followed by the
+# three-digit octal equivalent of the character.  Any '\' or '"' is
+# quoted with a preceding '\' slash.
+# Because of the way browsers really handle cookies (as opposed to what
+# the RFC says) we also encode "," and ";".
+#
+# These are taken from RFC2068 and RFC2109.
+#       _LegalChars       is the list of chars which don't require "'s
+#       _Translator       hash-table for fast quoting
+#
+_LegalChars = string.ascii_letters + string.digits + "!#$%&'*+-.^_`|~:"
+_UnescapedChars = _LegalChars + ' ()/<=>?@[]{}'
+
+_Translator = {n: '\\%03o' % n
+               for n in set(range(256)) - set(map(ord, _UnescapedChars))}
+_Translator.update({
+    ord('"'): '\\"',
+    ord('\\'): '\\\\',
+})
+
+_is_legal_key = re.compile('[%s]+' % re.escape(_LegalChars)).fullmatch
+
+def _quote(str):
+    r"""Quote a string for use in a cookie header.
+

@@ -1,0 +1,1000 @@
+	    foreach (keys(%hash_of_arrays)) {
+		my $ary = $hash_of_arrays{$_};
+		next unless ref $ary eq 'ARRAY';
+		$maxlen = @$ary if !$maxlen || @$ary > $maxlen;
+	    }
+	    # if there are no arrays then execute scalars once
+	    $maxlen = 1 unless defined $maxlen;
+	    my @bind_ids = 1..keys(%hash_of_arrays);
+
+	    my $tuple_idx = 0;
+	    $fetch_tuple_sub = sub {
+		return if $tuple_idx >= $maxlen;
+		my @tuple = map {
+		    my $a = $hash_of_arrays{$_};
+		    ref($a) ? $a->[$tuple_idx] : $a
+		} @bind_ids;
+		++$tuple_idx;
+		return \@tuple;
+	    };
+	}
+	# pass thru the callers scalar or list context
+	return $sth->execute_for_fetch($fetch_tuple_sub, $tuple_sts);
+    }
+
+    sub execute_for_fetch {
+	my ($sth, $fetch_tuple_sub, $tuple_status) = @_;
+	# start with empty status array
+	($tuple_status) ? @$tuple_status = () : $tuple_status = [];
+
+        my $rc_total = 0;
+	my $err_count;
+	while ( my $tuple = &$fetch_tuple_sub() ) {
+	    if ( my $rc = $sth->execute(@$tuple) ) {
+		push @$tuple_status, $rc;
+		$rc_total = ($rc >= 0 && $rc_total >= 0) ? $rc_total + $rc : -1;
+	    }
+	    else {
+		$err_count++;
+		push @$tuple_status, [ $sth->err, $sth->errstr, $sth->state ];
+                # XXX drivers implementing execute_for_fetch could opt to "last;" here
+                # if they know the error code means no further executes will work.
+	    }
+	}
+        my $tuples = @$tuple_status;
+        return $sth->set_err($DBI::stderr, "executing $tuples generated $err_count errors")
+            if $err_count;
+	$tuples ||= "0E0";
+	return $tuples unless wantarray;
+	return ($tuples, $rc_total);
+    }
+
+    sub last_insert_id {
+        return shift->{Database}->last_insert_id(@_);
+    }
+
+    sub fetchall_arrayref {	# ALSO IN Driver.xst
+	my ($sth, $slice, $max_rows) = @_;
+
+        # when batch fetching with $max_rows were very likely to try to
+        # fetch the 'next batch' after the previous batch returned
+        # <=$max_rows. So don't treat that as an error.
+        return undef if $max_rows and not $sth->FETCH('Active');
+
+	my $mode = ref($slice) || 'ARRAY';
+	my @rows;
+
+	if ($mode eq 'ARRAY') {
+	    my $row;
+	    # we copy the array here because fetch (currently) always
+	    # returns the same array ref. XXX
+	    if ($slice && @$slice) {
+                $max_rows = -1 unless defined $max_rows;
+		push @rows, [ @{$row}[ @$slice] ]
+		    while($max_rows-- and $row = $sth->fetch);
+	    }
+	    elsif (defined $max_rows) {
+		push @rows, [ @$row ]
+		    while($max_rows-- and $row = $sth->fetch);
+	    }
+	    else {
+		push @rows, [ @$row ] while($row = $sth->fetch);
+	    }
+	    return \@rows
+	}
+
+	my %row;
+	if ($mode eq 'REF' && ref($$slice) eq 'HASH') { # \{ $idx => $name }
+            keys %$$slice; # reset the iterator
+            while ( my ($idx, $name) = each %$$slice ) {
+                $sth->bind_col($idx+1, \$row{$name});
+            }
+	}
+	elsif ($mode eq 'HASH') {
+            if (keys %$slice) { # resets the iterator
+                my $name2idx = $sth->FETCH('NAME_lc_hash');
+                while ( my ($name, $unused) = each %$slice ) {
+                    my $idx = $name2idx->{lc $name};
+                    return $sth->set_err($DBI::stderr, "Invalid column name '$name' for slice")
+                        if not defined $idx;
+                    $sth->bind_col($idx+1, \$row{$name});
+                }
+	    }
+	    else {
+		my @column_names = @{ $sth->FETCH($sth->FETCH('FetchHashKeyName')) };
+		return [] if !@column_names;
+
+		$sth->bind_columns( \( @row{@column_names} ) );
+	    }
+	}
+	else {
+            return $sth->set_err($DBI::stderr, "fetchall_arrayref($mode) invalid");
+        }
+
+        if (not defined $max_rows) {
+            push @rows, { %row } while ($sth->fetch); # full speed ahead!
+        }
+        else {
+            push @rows, { %row } while ($max_rows-- and $sth->fetch);
+        }
+
+	return \@rows;
+    }
+
+    sub fetchall_hashref {
+	my ($sth, $key_field) = @_;
+
+        my $hash_key_name = $sth->{FetchHashKeyName} || 'NAME';
+        my $names_hash = $sth->FETCH("${hash_key_name}_hash");
+        my @key_fields = (ref $key_field) ? @$key_field : ($key_field);
+        my @key_indexes;
+        my $num_of_fields = $sth->FETCH('NUM_OF_FIELDS');
+        foreach (@key_fields) {
+           my $index = $names_hash->{$_};  # perl index not column
+           $index = $_ - 1 if !defined $index && DBI::looks_like_number($_) && $_>=1 && $_ <= $num_of_fields;
+           return $sth->set_err($DBI::stderr, "Field '$_' does not exist (not one of @{[keys %$names_hash]})")
+                unless defined $index;
+           push @key_indexes, $index;
+        }
+        my $rows = {};
+        my $NAME = $sth->FETCH($hash_key_name);
+        my @row = (undef) x $num_of_fields;
+        $sth->bind_columns(\(@row));
+        while ($sth->fetch) {
+            my $ref = $rows;
+            $ref = $ref->{$row[$_]} ||= {} for @key_indexes;
+            @{$ref}{@$NAME} = @row;
+        }
+        return $rows;
+    }
+
+    *dump_results = \&DBI::dump_results;
+
+    sub blob_copy_to_file {	# returns length or undef on error
+	my($self, $field, $filename_or_handleref, $blocksize) = @_;
+	my $fh = $filename_or_handleref;
+	my($len, $buf) = (0, "");
+	$blocksize ||= 512;	# not too ambitious
+	local(*FH);
+	unless(ref $fh) {
+	    open(FH, ">$fh") || return undef;
+	    $fh = \*FH;
+	}
+	while(defined($self->blob_read($field, $len, $blocksize, \$buf))) {
+	    print $fh $buf;
+	    $len += length $buf;
+	}
+	close(FH);
+	$len;
+    }
+
+    sub more_results {
+	shift->{syb_more_results};	# handy grandfathering
+    }
+
+}
+
+unless ($DBI::PurePerl) {   # See install_driver
+    { @DBD::_mem::dr::ISA = qw(DBD::_mem::common);	}
+    { @DBD::_mem::db::ISA = qw(DBD::_mem::common);	}
+    { @DBD::_mem::st::ISA = qw(DBD::_mem::common);	}
+    # DBD::_mem::common::DESTROY is implemented in DBI.xs
+}
+
+1;
+__END__
+
+=head1 DESCRIPTION
+
+The DBI is a database access module for the Perl programming language.  It defines
+a set of methods, variables, and conventions that provide a consistent
+database interface, independent of the actual database being used.
+
+It is important to remember that the DBI is just an interface.
+The DBI is a layer
+of "glue" between an application and one or more database I<driver>
+modules.  It is the driver modules which do most of the real work. The DBI
+provides a standard interface and framework for the drivers to operate
+within.
+
+This document often uses terms like I<references>, I<objects>,
+I<methods>.  If you're not familiar with those terms then it would
+be a good idea to read at least the following perl manuals first:
+L<perlreftut>, L<perldsc>, L<perllol>, and L<perlboot>.
+
+
+=head2 Architecture of a DBI Application
+
+             |<- Scope of DBI ->|
+                  .-.   .--------------.   .-------------.
+  .-------.       | |---| XYZ Driver   |---| XYZ Engine  |
+  | Perl  |       | |   `--------------'   `-------------'
+  | script|  |A|  |D|   .--------------.   .-------------.
+  | using |--|P|--|B|---|Oracle Driver |---|Oracle Engine|
+  | DBI   |  |I|  |I|   `--------------'   `-------------'
+  | API   |       | |...
+  |methods|       | |... Other drivers
+  `-------'       | |...
+                  `-'
+
+The API, or Application Programming Interface, defines the
+call interface and variables for Perl scripts to use. The API
+is implemented by the Perl DBI extension.
+
+The DBI "dispatches" the method calls to the appropriate driver for
+actual execution.  The DBI is also responsible for the dynamic loading
+of drivers, error checking and handling, providing default
+implementations for methods, and many other non-database specific duties.
+
+Each driver
+contains implementations of the DBI methods using the
+private interface functions of the corresponding database engine.  Only authors
+of sophisticated/multi-database applications or generic library
+functions need be concerned with drivers.
+
+=head2 Notation and Conventions
+
+The following conventions are used in this document:
+
+  $dbh    Database handle object
+  $sth    Statement handle object
+  $drh    Driver handle object (rarely seen or used in applications)
+  $h      Any of the handle types above ($dbh, $sth, or $drh)
+  $rc     General Return Code  (boolean: true=ok, false=error)
+  $rv     General Return Value (typically an integer)
+  @ary    List of values returned from the database, typically a row of data
+  $rows   Number of rows processed (if available, else -1)
+  $fh     A filehandle
+  undef   NULL values are represented by undefined values in Perl
+  \%attr  Reference to a hash of attribute values passed to methods
+
+Note that Perl will automatically destroy database and statement handle objects
+if all references to them are deleted.
+
+
+=head2 Outline Usage
+
+To use DBI,
+first you need to load the DBI module:
+
+  use DBI;
+  use strict;
+
+(The C<use strict;> isn't required but is strongly recommended.)
+
+Then you need to L</connect> to your data source and get a I<handle> for that
+connection:
+
+  $dbh = DBI->connect($dsn, $user, $password,
+                      { RaiseError => 1, AutoCommit => 0 });
+
+Since connecting can be expensive, you generally just connect at the
+start of your program and disconnect at the end.
+
+Explicitly defining the required C<AutoCommit> behaviour is strongly
+recommended and may become mandatory in a later version.  This
+determines whether changes are automatically committed to the
+database when executed, or need to be explicitly committed later.
+
+The DBI allows an application to "prepare" statements for later
+execution.  A prepared statement is identified by a statement handle
+held in a Perl variable.
+We'll call the Perl variable C<$sth> in our examples.
+
+The typical method call sequence for a C<SELECT> statement is:
+
+  prepare,
+    execute, fetch, fetch, ...
+    execute, fetch, fetch, ...
+    execute, fetch, fetch, ...
+
+for example:
+
+  $sth = $dbh->prepare("SELECT foo, bar FROM table WHERE baz=?");
+
+  $sth->execute( $baz );
+
+  while ( @row = $sth->fetchrow_array ) {
+    print "@row\n";
+  }
+
+For queries that are not executed many times at once, it is often cleaner
+to use the higher level select wrappers:
+
+  $row_hashref = $dbh->selectrow_hashref("SELECT foo, bar FROM table WHERE baz=?", undef, $baz);
+
+  $arrayref_of_row_hashrefs = $dbh->selectall_arrayref(
+    "SELECT foo, bar FROM table WHERE baz BETWEEN ? AND ?",
+    { Slice => {} }, $baz_min, $baz_max);
+
+The typical method call sequence for a I<non>-C<SELECT> statement is:
+
+  prepare,
+    execute,
+    execute,
+    execute.
+
+for example:
+
+  $sth = $dbh->prepare("INSERT INTO table(foo,bar,baz) VALUES (?,?,?)");
+
+  while(<CSV>) {
+    chomp;
+    my ($foo,$bar,$baz) = split /,/;
+	$sth->execute( $foo, $bar, $baz );
+  }
+
+The C<do()> method is a wrapper of prepare and execute that can be simpler
+for non repeated I<non>-C<SELECT> statements (or with drivers that don't
+support placeholders):
+
+  $rows_affected = $dbh->do("UPDATE your_table SET foo = foo + 1");
+
+  $rows_affected = $dbh->do("DELETE FROM table WHERE foo = ?", undef, $foo);
+
+To commit your changes to the database (when L</AutoCommit> is off):
+
+  $dbh->commit;  # or call $dbh->rollback; to undo changes
+
+Finally, when you have finished working with the data source, you should
+L</disconnect> from it:
+
+  $dbh->disconnect;
+
+
+=head2 General Interface Rules & Caveats
+
+The DBI does not have a concept of a "current session". Every session
+has a handle object (i.e., a C<$dbh>) returned from the C<connect> method.
+That handle object is used to invoke database related methods.
+
+Most data is returned to the Perl script as strings. (Null values are
+returned as C<undef>.)  This allows arbitrary precision numeric data to be
+handled without loss of accuracy.  Beware that Perl may not preserve
+the same accuracy when the string is used as a number.
+
+Dates and times are returned as character strings in the current
+default format of the corresponding database engine.  Time zone effects
+are database/driver dependent.
+
+Perl supports binary data in Perl strings, and the DBI will pass binary
+data to and from the driver without change. It is up to the driver
+implementors to decide how they wish to handle such binary data.
+
+Perl supports two kinds of strings: Unicode (utf8 internally) and non-Unicode
+(defaults to iso-8859-1 if forced to assume an encoding).  Drivers should
+accept both kinds of strings and, if required, convert them to the character
+set of the database being used. Similarly, when fetching from the database
+character data that isn't iso-8859-1 the driver should convert it into utf8.
+
+Multiple SQL statements may not be combined in a single statement
+handle (C<$sth>), although some databases and drivers do support this
+(notably Sybase and SQL Server).
+
+Non-sequential record reads are not supported in this version of the DBI.
+In other words, records can only be fetched in the order that the
+database returned them, and once fetched they are forgotten.
+
+Positioned updates and deletes are not directly supported by the DBI.
+See the description of the C<CursorName> attribute for an alternative.
+
+Individual driver implementors are free to provide any private
+functions and/or handle attributes that they feel are useful.
+Private driver functions can be invoked using the DBI C<func()> method.
+Private driver attributes are accessed just like standard attributes.
+
+Many methods have an optional C<\%attr> parameter which can be used to
+pass information to the driver implementing the method. Except where
+specifically documented, the C<\%attr> parameter can only be used to pass
+driver specific hints. In general, you can ignore C<\%attr> parameters
+or pass it as C<undef>.
+
+
+=head2 Naming Conventions and Name Space
+
+The DBI package and all packages below it (C<DBI::*>) are reserved for
+use by the DBI. Extensions and related modules use the C<DBIx::>
+namespace (see L<http://www.perl.com/CPAN/modules/by-module/DBIx/>).
+Package names beginning with C<DBD::> are reserved for use
+by DBI database drivers.  All environment variables used by the DBI
+or by individual DBDs begin with "C<DBI_>" or "C<DBD_>".
+
+The letter case used for attribute names is significant and plays an
+important part in the portability of DBI scripts.  The case of the
+attribute name is used to signify who defined the meaning of that name
+and its values.
+
+  Case of name  Has a meaning defined by
+  ------------  ------------------------
+  UPPER_CASE    Standards, e.g.,  X/Open, ISO SQL92 etc (portable)
+  MixedCase     DBI API (portable), underscores are not used.
+  lower_case    Driver or database engine specific (non-portable)
+
+It is of the utmost importance that Driver developers only use
+lowercase attribute names when defining private attributes. Private
+attribute names must be prefixed with the driver name or suitable
+abbreviation (e.g., "C<ora_>" for Oracle, "C<ing_>" for Ingres, etc).
+
+
+=head2 SQL - A Query Language
+
+Most DBI drivers require applications to use a dialect of SQL
+(Structured Query Language) to interact with the database engine.
+The L</"Standards Reference Information"> section provides links
+to useful information about SQL.
+
+The DBI itself does not mandate or require any particular language to
+be used; it is language independent. In ODBC terms, the DBI is in
+"pass-thru" mode, although individual drivers might not be. The only requirement
+is that queries and other statements must be expressed as a single
+string of characters passed as the first argument to the L</prepare> or
+L</do> methods.
+
+For an interesting diversion on the I<real> history of RDBMS and SQL,
+from the people who made it happen, see:
+
+  http://www.mcjones.org/System_R/SQL_Reunion_95/sqlr95.html
+
+Follow the "Full Contents" then "Intergalactic dataspeak" links for the
+SQL history.
+
+=head2 Placeholders and Bind Values
+
+Some drivers support placeholders and bind values.
+I<Placeholders>, also called parameter markers, are used to indicate
+values in a database statement that will be supplied later,
+before the prepared statement is executed.  For example, an application
+might use the following to insert a row of data into the SALES table:
+
+  INSERT INTO sales (product_code, qty, price) VALUES (?, ?, ?)
+
+or the following, to select the description for a product:
+
+  SELECT description FROM products WHERE product_code = ?
+
+The C<?> characters are the placeholders.  The association of actual
+values with placeholders is known as I<binding>, and the values are
+referred to as I<bind values>.
+Note that the C<?> is not enclosed in quotation marks, even when the
+placeholder represents a string.
+
+Some drivers also allow placeholders like C<:>I<name> and C<:>I<N> (e.g.,
+C<:1>, C<:2>, and so on) in addition to C<?>, but their use is not portable.
+
+If the C<:>I<N> form of placeholder is supported by the driver you're using,
+then you should be able to use either L</bind_param> or L</execute> to bind
+values. Check your driver documentation.
+
+Some drivers allow you to prevent the recognition of a placeholder by placing a
+single backslash character (C<\>) immediately before it. The driver will remove
+the backslash character and ignore the placeholder, passing it unchanged to the
+backend. If the driver supports this then L</get_info>(9000) will return true.
+
+With most drivers, placeholders can't be used for any element of a
+statement that would prevent the database server from validating the
+statement and creating a query execution plan for it. For example:
+
+  "SELECT name, age FROM ?"         # wrong (will probably fail)
+  "SELECT name, ?   FROM people"    # wrong (but may not 'fail')
+
+Also, placeholders can only represent single scalar values.
+For example, the following
+statement won't work as expected for more than one value:
+
+  "SELECT name, age FROM people WHERE name IN (?)"    # wrong
+  "SELECT name, age FROM people WHERE name IN (?,?)"  # two names
+
+When using placeholders with the SQL C<LIKE> qualifier, you must
+remember that the placeholder substitutes for the whole string.
+So you should use "C<... LIKE ? ...>" and include any wildcard
+characters in the value that you bind to the placeholder.
+
+B<NULL Values>
+
+Undefined values, or C<undef>, are used to indicate NULL values.
+You can insert and update columns with a NULL value as you would a
+non-NULL value.  These examples insert and update the column
+C<age> with a NULL value:
+
+  $sth = $dbh->prepare(qq{
+    INSERT INTO people (fullname, age) VALUES (?, ?)
+  });
+  $sth->execute("Joe Bloggs", undef);
+
+  $sth = $dbh->prepare(qq{
+    UPDATE people SET age = ? WHERE fullname = ?
+  });
+  $sth->execute(undef, "Joe Bloggs");
+
+However, care must be taken when trying to use NULL values in a
+C<WHERE> clause.  Consider:
+
+  SELECT fullname FROM people WHERE age = ?
+
+Binding an C<undef> (NULL) to the placeholder will I<not> select rows
+which have a NULL C<age>!  At least for database engines that
+conform to the SQL standard.  Refer to the SQL manual for your database
+engine or any SQL book for the reasons for this.  To explicitly select
+NULLs you have to say "C<WHERE age IS NULL>".
+
+A common issue is to have a code fragment handle a value that could be
+either C<defined> or C<undef> (non-NULL or NULL) at runtime.
+A simple technique is to prepare the appropriate statement as needed,
+and substitute the placeholder for non-NULL cases:
+
+  $sql_clause = defined $age? "age = ?" : "age IS NULL";
+  $sth = $dbh->prepare(qq{
+    SELECT fullname FROM people WHERE $sql_clause
+  });
+  $sth->execute(defined $age ? $age : ());
+
+The following technique illustrates qualifying a C<WHERE> clause with
+several columns, whose associated values (C<defined> or C<undef>) are
+in a hash %h:
+
+  for my $col ("age", "phone", "email") {
+    if (defined $h{$col}) {
+      push @sql_qual, "$col = ?";
+      push @sql_bind, $h{$col};
+    }
+    else {
+      push @sql_qual, "$col IS NULL";
+    }
+  }
+  $sql_clause = join(" AND ", @sql_qual);
+  $sth = $dbh->prepare(qq{
+      SELECT fullname FROM people WHERE $sql_clause
+  });
+  $sth->execute(@sql_bind);
+
+The techniques above call prepare for the SQL statement with each call to
+execute.  Because calls to prepare() can be expensive, performance
+can suffer when an application iterates many times over statements
+like the above.
+
+A better solution is a single C<WHERE> clause that supports both
+NULL and non-NULL comparisons.  Its SQL statement would need to be
+prepared only once for all cases, thus improving performance.
+Several examples of C<WHERE> clauses that support this are presented
+below.  But each example lacks portability, robustness, or simplicity.
+Whether an example is supported on your database engine depends on
+what SQL extensions it provides, and where it supports the C<?>
+placeholder in a statement.
+
+  0)  age = ?
+  1)  NVL(age, xx) = NVL(?, xx)
+  2)  ISNULL(age, xx) = ISNULL(?, xx)
+  3)  DECODE(age, ?, 1, 0) = 1
+  4)  age = ? OR (age IS NULL AND ? IS NULL)
+  5)  age = ? OR (age IS NULL AND SP_ISNULL(?) = 1)
+  6)  age = ? OR (age IS NULL AND ? = 1)
+
+Statements formed with the above C<WHERE> clauses require execute
+statements as follows.  The arguments are required, whether their
+values are C<defined> or C<undef>.
+
+  0,1,2,3)  $sth->execute($age);
+  4,5)      $sth->execute($age, $age);
+  6)        $sth->execute($age, defined($age) ? 0 : 1);
+
+Example 0 should not work (as mentioned earlier), but may work on
+a few database engines anyway (e.g. Sybase).  Example 0 is part
+of examples 4, 5, and 6, so if example 0 works, these other
+examples may work, even if the engine does not properly support
+the right hand side of the C<OR> expression.
+
+Examples 1 and 2 are not robust: they require that you provide a
+valid column value xx (e.g. '~') which is not present in any row.
+That means you must have some notion of what data won't be stored
+in the column, and expect clients to adhere to that.
+
+Example 5 requires that you provide a stored procedure (SP_ISNULL
+in this example) that acts as a function: it checks whether a value
+is null, and returns 1 if it is, or 0 if not.
+
+Example 6, the least simple, is probably the most portable, i.e., it
+should work with most, if not all, database engines.
+
+Here is a table that indicates which examples above are known to
+work on various database engines:
+
+                   -----Examples------
+                   0  1  2  3  4  5  6
+                   -  -  -  -  -  -  -
+  Oracle 9         N  Y  N  Y  Y  ?  Y
+  Informix IDS 9   N  N  N  Y  N  Y  Y
+  MS SQL           N  N  Y  N  Y  ?  Y
+  Sybase           Y  N  N  N  N  N  Y
+  AnyData,DBM,CSV  Y  N  N  N  Y  Y* Y
+  SQLite 3.3       N  N  N  N  Y  N  N
+  MSAccess         N  N  N  N  Y  N  Y
+
+* Works only because Example 0 works.
+
+DBI provides a sample perl script that will test the examples above
+on your database engine and tell you which ones work.  It is located
+in the F<ex/> subdirectory of the DBI source distribution, or here:
+L<https://github.com/perl5-dbi/dbi/blob/master/ex/perl_dbi_nulls_test.pl>
+Please use the script to help us fill-in and maintain this table.
+
+B<Performance>
+
+Without using placeholders, the insert statement shown previously would have to
+contain the literal values to be inserted and would have to be
+re-prepared and re-executed for each row. With placeholders, the insert
+statement only needs to be prepared once. The bind values for each row
+can be given to the C<execute> method each time it's called. By avoiding
+the need to re-prepare the statement for each row, the application
+typically runs many times faster. Here's an example:
+
+  my $sth = $dbh->prepare(q{
+    INSERT INTO sales (product_code, qty, price) VALUES (?, ?, ?)
+  }) or die $dbh->errstr;
+  while (<>) {
+      chomp;
+      my ($product_code, $qty, $price) = split /,/;
+      $sth->execute($product_code, $qty, $price) or die $dbh->errstr;
+  }
+  $dbh->commit or die $dbh->errstr;
+
+See L</execute> and L</bind_param> for more details.
+
+The C<q{...}> style quoting used in this example avoids clashing with
+quotes that may be used in the SQL statement. Use the double-quote like
+C<qq{...}> operator if you want to interpolate variables into the string.
+See L<perlop/"Quote and Quote-like Operators"> for more details.
+
+See also the L</bind_columns> method, which is used to associate Perl
+variables with the output columns of a C<SELECT> statement.
+
+=head1 THE DBI PACKAGE AND CLASS
+
+In this section, we cover the DBI class methods, utility functions,
+and the dynamic attributes associated with generic DBI handles.
+
+=head2 DBI Constants
+
+Constants representing the values of the SQL standard types can be
+imported individually by name, or all together by importing the
+special C<:sql_types> tag.
+
+The names and values of all the defined SQL standard types can be
+produced like this:
+
+  foreach (@{ $DBI::EXPORT_TAGS{sql_types} }) {
+    printf "%s=%d\n", $_, &{"DBI::$_"};
+  }
+
+These constants are defined by SQL/CLI, ODBC or both.
+C<SQL_BIGINT> has conflicting codes in SQL/CLI and ODBC,
+DBI uses the ODBC one.
+
+See the L</type_info>, L</type_info_all>, and L</bind_param> methods
+for possible uses.
+
+Note that just because the DBI defines a named constant for a given
+data type doesn't mean that drivers will support that data type.
+
+
+=head2 DBI Class Methods
+
+The following methods are provided by the DBI class:
+
+=head3 C<parse_dsn>
+
+  ($scheme, $driver, $attr_string, $attr_hash, $driver_dsn) = DBI->parse_dsn($dsn)
+      or die "Can't parse DBI DSN '$dsn'";
+
+Breaks apart a DBI Data Source Name (DSN) and returns the individual
+parts. If $dsn doesn't contain a valid DSN then parse_dsn() returns
+an empty list.
+
+$scheme is the first part of the DSN and is currently always 'dbi'.
+$driver is the driver name, possibly defaulted to $ENV{DBI_DRIVER},
+and may be undefined.  $attr_string is the contents of the optional attribute
+string, which may be undefined.  If $attr_string is not empty then $attr_hash
+is a reference to a hash containing the parsed attribute names and values.
+$driver_dsn is the last part of the DBI DSN string. For example:
+
+  ($scheme, $driver, $attr_string, $attr_hash, $driver_dsn)
+      = DBI->parse_dsn("dbi:MyDriver(RaiseError=>1):db=test;port=42");
+  $scheme      = 'dbi';
+  $driver      = 'MyDriver';
+  $attr_string = 'RaiseError=>1';
+  $attr_hash   = { 'RaiseError' => '1' };
+  $driver_dsn  = 'db=test;port=42';
+
+The parse_dsn() method was added in DBI 1.43.
+
+=head3 C<connect>
+
+  $dbh = DBI->connect($data_source, $username, $password)
+            or die $DBI::errstr;
+  $dbh = DBI->connect($data_source, $username, $password, \%attr)
+            or die $DBI::errstr;
+
+Establishes a database connection, or session, to the requested C<$data_source>.
+Returns a database handle object if the connection succeeds. Use
+C<$dbh-E<gt>disconnect> to terminate the connection.
+
+If the connect fails (see below), it returns C<undef> and sets both C<$DBI::err>
+and C<$DBI::errstr>. (It does I<not> explicitly set C<$!>.) You should generally
+test the return status of C<connect> and C<print $DBI::errstr> if it has failed.
+
+Multiple simultaneous connections to multiple databases through multiple
+drivers can be made via the DBI. Simply make one C<connect> call for each
+database and keep a copy of each returned database handle.
+
+The C<$data_source> value must begin with "C<dbi:>I<driver_name>C<:>".
+The I<driver_name> specifies the driver that will be used to make the
+connection. (Letter case is significant.)
+
+As a convenience, if the C<$data_source> parameter is undefined or empty,
+the DBI will substitute the value of the environment variable C<DBI_DSN>.
+If just the I<driver_name> part is empty (i.e., the C<$data_source>
+prefix is "C<dbi::>"), the environment variable C<DBI_DRIVER> is
+used. If neither variable is set, then C<connect> dies.
+
+Examples of C<$data_source> values are:
+
+  dbi:DriverName:database_name
+  dbi:DriverName:database_name@hostname:port
+  dbi:DriverName:database=database_name;host=hostname;port=port
+
+There is I<no standard> for the text following the driver name. Each
+driver is free to use whatever syntax it wants. The only requirement the
+DBI makes is that all the information is supplied in a single string.
+You must consult the documentation for the drivers you are using for a
+description of the syntax they require.
+
+It is recommended that drivers support the ODBC style, shown in the
+last example above. It is also recommended that they support the
+three common names 'C<host>', 'C<port>', and 'C<database>' (plus 'C<db>'
+as an alias for C<database>). This simplifies automatic construction
+of basic DSNs: C<"dbi:$driver:database=$db;host=$host;port=$port">.
+Drivers should aim to 'do something reasonable' when given a DSN
+in this form, but if any part is meaningless for that driver (such
+as 'port' for Informix) it should generate an error if that part
+is not empty.
+
+If the environment variable C<DBI_AUTOPROXY> is defined (and the
+driver in C<$data_source> is not "C<Proxy>") then the connect request
+will automatically be changed to:
+
+  $ENV{DBI_AUTOPROXY};dsn=$data_source
+
+C<DBI_AUTOPROXY> is typically set as "C<dbi:Proxy:hostname=...;port=...>".
+If $ENV{DBI_AUTOPROXY} doesn't begin with 'C<dbi:>' then "dbi:Proxy:"
+will be prepended to it first.  See the DBD::Proxy documentation
+for more details.
+
+If C<$username> or C<$password> are undefined (rather than just empty),
+then the DBI will substitute the values of the C<DBI_USER> and C<DBI_PASS>
+environment variables, respectively.  The DBI will warn if the
+environment variables are not defined.  However, the everyday use
+of these environment variables is not recommended for security
+reasons. The mechanism is primarily intended to simplify testing.
+See below for alternative way to specify the username and password.
+
+C<DBI-E<gt>connect> automatically installs the driver if it has not been
+installed yet. Driver installation either returns a valid driver
+handle, or it I<dies> with an error message that includes the string
+"C<install_driver>" and the underlying problem. So C<DBI-E<gt>connect>
+will die
+on a driver installation failure and will only return C<undef> on a
+connect failure, in which case C<$DBI::errstr> will hold the error message.
+Use C<eval> if you need to catch the "C<install_driver>" error.
+
+The C<$data_source> argument (with the "C<dbi:...:>" prefix removed) and the
+C<$username> and C<$password> arguments are then passed to the driver for
+processing. The DBI does not define any interpretation for the
+contents of these fields.  The driver is free to interpret the
+C<$data_source>, C<$username>, and C<$password> fields in any way, and supply
+whatever defaults are appropriate for the engine being accessed.
+(Oracle, for example, uses the ORACLE_SID and TWO_TASK environment
+variables if no C<$data_source> is specified.)
+
+The C<AutoCommit> and C<PrintError> attributes for each connection
+default to "on". (See L</AutoCommit> and L</PrintError> for more information.)
+However, it is strongly recommended that you explicitly define C<AutoCommit>
+rather than rely on the default. The C<PrintWarn> attribute defaults to true.
+The C<RaiseWarn> attribute defaults to false.
+
+The C<\%attr> parameter can be used to alter the default settings of
+C<PrintError>, C<RaiseError>, C<AutoCommit>, and other attributes. For example:
+
+  $dbh = DBI->connect($data_source, $user, $pass, {
+	PrintError => 0,
+	AutoCommit => 0
+  });
+
+The username and password can also be specified using the attributes
+C<Username> and C<Password>, in which case they take precedence
+over the C<$username> and C<$password> parameters.
+
+You can also define connection attribute values within the C<$data_source>
+parameter. For example:
+
+  dbi:DriverName(PrintWarn=>0,PrintError=>0,Taint=>1):...
+
+Individual attributes values specified in this way take precedence over
+any conflicting values specified via the C<\%attr> parameter to C<connect>.
+
+The C<dbi_connect_method> attribute can be used to specify which driver
+method should be called to establish the connection. The only useful
+values are 'connect', 'connect_cached', or some specialized case like
+'Apache::DBI::connect' (which is automatically the default when running
+within Apache).
+
+Where possible, each session (C<$dbh>) is independent from the transactions
+in other sessions. This is useful when you need to hold cursors open
+across transactions--for example, if you use one session for your long lifespan
+cursors (typically read-only) and another for your short update
+transactions.
+
+For compatibility with old DBI scripts, the driver can be specified by
+passing its name as the fourth argument to C<connect> (instead of C<\%attr>):
+
+  $dbh = DBI->connect($data_source, $user, $pass, $driver);
+
+In this "old-style" form of C<connect>, the C<$data_source> should not start
+with "C<dbi:driver_name:>". (If it does, the embedded driver_name
+will be ignored). Also note that in this older form of C<connect>,
+the C<$dbh-E<gt>{AutoCommit}> attribute is I<undefined>, the
+C<$dbh-E<gt>{PrintError}> attribute is off, and the old C<DBI_DBNAME>
+environment variable is
+checked if C<DBI_DSN> is not defined. Beware that this "old-style"
+C<connect> will soon be withdrawn in a future version of DBI.
+
+=head3 C<connect_cached>
+
+  $dbh = DBI->connect_cached($data_source, $username, $password)
+            or die $DBI::errstr;
+  $dbh = DBI->connect_cached($data_source, $username, $password, \%attr)
+            or die $DBI::errstr;
+
+C<connect_cached> is like L</connect>, except that the database handle
+returned is also
+stored in a hash associated with the given parameters. If another call
+is made to C<connect_cached> with the same parameter values, then the
+corresponding cached C<$dbh> will be returned if it is still valid.
+The cached database handle is replaced with a new connection if it
+has been disconnected or if the C<ping> method fails.
+
+Note that the behaviour of this method differs in several respects from the
+behaviour of persistent connections implemented by Apache::DBI.
+However, if Apache::DBI is loaded then C<connect_cached> will use it.
+
+Caching connections can be useful in some applications, but it can
+also cause problems, such as too many connections, and so should
+be used with care. In particular, avoid changing the attributes of
+a database handle created via connect_cached() because it will affect
+other code that may be using the same handle. When connect_cached()
+returns a handle the attributes will be reset to their initial values.
+This can cause problems, especially with the C<AutoCommit> attribute.
+
+Also, to ensure that the attributes passed are always the same, avoid passing
+references inline. For example, the C<Callbacks> attribute is specified as a
+hash reference. Be sure to declare it external to the call to
+connect_cached(), such that the hash reference is not re-created on every
+call. A package-level lexical works well:
+
+  package MyDBH;
+  my $cb = {
+      'connect_cached.reused' => sub { delete $_[4]->{AutoCommit} },
+  };
+
+  sub dbh {
+      DBI->connect_cached( $dsn, $username, $auth, { Callbacks => $cb });
+  }
+
+Where multiple separate parts of a program are using connect_cached()
+to connect to the same database with the same (initial) attributes
+it is a good idea to add a private attribute to the connect_cached()
+call to effectively limit the scope of the caching. For example:
+
+  DBI->connect_cached(..., { private_foo_cachekey => "Bar", ... });
+
+Handles returned from that connect_cached() call will only be returned
+by other connect_cached() call elsewhere in the code if those other
+calls also pass in the same attribute values, including the private one.
+(I've used C<private_foo_cachekey> here as an example, you can use
+any attribute name with a C<private_> prefix.)
+
+Taking that one step further, you can limit a particular connect_cached()
+call to return handles unique to that one place in the code by setting the
+private attribute to a unique value for that place:
+
+  DBI->connect_cached(..., { private_foo_cachekey => __FILE__.__LINE__, ... });
+
+By using a private attribute you still get connection caching for
+the individual calls to connect_cached() but, by making separate
+database connections for separate parts of the code, the database
+handles are isolated from any attribute changes made to other handles.
+
+The cache can be accessed (and cleared) via the L</CachedKids> attribute:
+
+  my $CachedKids_hashref = $dbh->{Driver}->{CachedKids};
+  %$CachedKids_hashref = () if $CachedKids_hashref;
+
+
+=head3 C<available_drivers>
+
+  @ary = DBI->available_drivers;
+  @ary = DBI->available_drivers($quiet);
+
+Returns a list of all available drivers by searching for C<DBD::*> modules
+through the directories in C<@INC>. By default, a warning is given if
+some drivers are hidden by others of the same name in earlier
+directories. Passing a true value for C<$quiet> will inhibit the warning.
+
+=head3 C<installed_drivers>
+
+  %drivers = DBI->installed_drivers();
+
+Returns a list of driver name and driver handle pairs for all drivers
+'installed' (loaded) into the current process.  The driver name does not
+include the 'DBD::' prefix.
+
+To get a list of all drivers available in your perl installation you can use
+L</available_drivers>.
+
+Added in DBI 1.49.
+
+=head3 C<installed_versions>
+
+  DBI->installed_versions;
+  @ary  = DBI->installed_versions;
+  $hash = DBI->installed_versions;
+
+Calls available_drivers() and attempts to load each of them in turn
+using install_driver().  For each load that succeeds the driver
+name and version number are added to a hash. When running under
+L<DBI::PurePerl> drivers which appear not be pure-perl are ignored.
+
+When called in array context the list of successfully loaded drivers
+is returned (without the 'DBD::' prefix).
+
+When called in scalar context an extra entry for the C<DBI> is added (and
+C<DBI::PurePerl> if appropriate) and a reference to the hash is returned.
+
+When called in a void context the installed_versions() method will
+print out a formatted list of the hash contents, one per line, along with some
+other information about the DBI version and OS.
+
+Due to the potentially high memory cost and unknown risks of loading
+in an unknown number of drivers that just happen to be installed
+on the system, this method is not recommended for general use.
+Use available_drivers() instead.
+
+The installed_versions() method is primarily intended as a quick
+way to see from the command line what's installed. For example:
+
+  perl -MDBI -e 'DBI->installed_versions'
+
+The installed_versions() method was added in DBI 1.38.
+
+=head3 C<data_sources>
+
+  @ary = DBI->data_sources($driver);
+  @ary = DBI->data_sources($driver, \%attr);
+
+Returns a list of data sources (databases) available via the named
+driver.  If C<$driver> is empty or C<undef>, then the value of the
+C<DBI_DRIVER> environment variable is used.
+
+The driver will be loaded if it hasn't been already. Note that if the
+driver loading fails then data_sources() I<dies> with an error message
+that includes the string "C<install_driver>" and the underlying problem.
+
+Data sources are returned in a form suitable for passing to the
+L</connect> method (that is, they will include the "C<dbi:$driver:>" prefix).
+
+Note that many drivers have no way of knowing what data sources might
+be available for it. These drivers return an empty or incomplete list
+or may require driver-specific attributes.
+
+There is also a data_sources() method defined for database handles.
+
+
+=head3 C<trace>

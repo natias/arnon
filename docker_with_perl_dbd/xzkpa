@@ -1,0 +1,1000 @@
+            $match = q[ $retval =~ $hints->{scalar} ];
+        }
+        elsif ( !defined $hints->{scalar} ) {
+            $match = q[ !defined $retval ];
+        }
+        elsif (SMARTMATCH_ALLOWED) {
+            $match = q[ $retval ~~ $hints->{scalar} ];
+            warnings::warnif('deprecated', sprintf(WARNING_SMARTMATCH_DEPRECATED, 'scalar', $sub));
+            if (SMARTMATCH_CATEGORY) {
+                $match = sprintf q[ do { no warnings '%s'; %s } ], SMARTMATCH_CATEGORY, $match;
+            }
+        }
+        else {
+            croak sprintf(ERROR_SMARTMATCH_HINTS, 'scalar', $sub);
+        }
+
+        return $code . qq{
+            if ( $match ) { $die };
+            $retval_action
+            return \$retval;
+        };
+    }
+
+    return $code .
+    ( $use_defined_or ? qq{
+
+        $die if not defined \$retval;
+        $retval_action
+        return \$retval;
+
+    } : qq{
+
+        $retval_action
+        return \$retval || $die;
+
+    } ) ;
+
+}
+
+# This returns the old copy of the sub, so we can
+# put it back at end of scope.
+
+# TODO : Check to make sure prototypes are restored correctly.
+
+# TODO: Taking a huge list of arguments is awful.  Rewriting to
+#       take a hash would be lovely.
+
+# TODO - BACKCOMPAT - This is not yet compatible with 5.10.0
+
+sub _make_fatal {
+    my($class, $sub, $pkg, $void, $lexical, $filename, $insist, $install_subs) = @_;
+    my($code, $sref, $proto, $core, $call, $hints, $cache, $cache_type);
+    my $ini = $sub;
+    my $name = $sub;
+
+
+    if (index($sub, '::') == -1) {
+        $sub = "${pkg}::$sub";
+        if (substr($name, 0, 1) eq '&') {
+            $name = substr($name, 1);
+        }
+    } else {
+        $name =~ s/.*:://;
+    }
+
+
+    # Figure if we're using lexical or package semantics and
+    # twiddle the appropriate bits.
+
+    if (not $lexical) {
+        $Package_Fatal{$sub} = 1;
+    }
+
+    # TODO - We *should* be able to do skipping, since we know when
+    # we've lexicalised / unlexicalised a subroutine.
+
+
+    warn  "# _make_fatal: sub=$sub pkg=$pkg name=$name void=$void\n" if $Debug;
+    croak(sprintf(ERROR_BADNAME, $class, $name)) unless $name =~ /^\w+$/;
+
+    if (defined(&$sub)) {   # user subroutine
+
+        # NOTE: Previously we would localise $@ at this point, so
+        # the following calls to eval {} wouldn't interfere with anything
+        # that's already in $@.  Unfortunately, it would also stop
+        # any of our croaks from triggering(!), which is even worse.
+
+        # This could be something that we've fatalised that
+        # was in core.
+
+	# Store the current sub in case we need to restore it.
+	$sref = \&$sub;
+
+        if ( $Package_Fatal{$sub} and exists($CORE_prototype_cache{"CORE::$name"})) {
+
+            # Something we previously made Fatal that was core.
+            # This is safe to replace with an autodying to core
+            # version.
+
+            $core  = 1;
+            $call  = "CORE::$name";
+            $proto = $CORE_prototype_cache{$call};
+
+            # We return our $sref from this subroutine later
+            # on, indicating this subroutine should be placed
+            # back when we're finished.
+
+
+
+        } else {
+
+            # If this is something we've already fatalised or played with,
+            # then look-up the name of the original sub for the rest of
+            # our processing.
+
+            if (exists($Is_fatalised_sub{$sref})) {
+                # $sub is one of our wrappers around a CORE sub or a
+                # user sub.  Instead of wrapping our wrapper, lets just
+                # generate a new wrapper for the original sub.
+                # - NB: the current wrapper might be for a different class
+                #   than the one we are generating now (e.g. some limited
+                #   mixing between use Fatal + use autodie can occur).
+                # - Even for nested autodie, we need this as the leak guards
+                #   differ.
+                my $s = $Is_fatalised_sub{$sref};
+                if (defined($s)) {
+                    # It is a wrapper for a user sub
+                    $sub = $s;
+                } else {
+                    # It is a wrapper for a CORE:: sub
+                    $core = 1;
+                    $call = "CORE::$name";
+                    $proto = $CORE_prototype_cache{$call};
+                }
+            }
+
+            # A regular user sub, or a user sub wrapping a
+            # core sub.
+
+            if (!$core) {
+                # A non-CORE sub might have hints and such...
+                $proto = prototype($sref);
+                $call = '&$sref';
+                require autodie::hints;
+
+                $hints = autodie::hints->get_hints_for( $sref );
+
+                # If we've insisted on hints, but don't have them, then
+                # bail out!
+
+                if ($insist and not $hints) {
+                    croak(sprintf(ERROR_NOHINTS, $name));
+                }
+
+                # Otherwise, use the default hints if we don't have
+                # any.
+
+                $hints ||= autodie::hints::DEFAULT_HINTS();
+            }
+
+        }
+
+    } elsif ($sub eq $ini && $sub !~ /^CORE::GLOBAL::/) {
+        # Stray user subroutine
+        croak(sprintf(ERROR_NOTSUB,$sub));
+
+    } elsif ($name eq 'system') {
+
+        # If we're fatalising system, then we need to load
+        # helper code.
+
+        # The business with $E is to avoid clobbering our caller's
+        # $@, and to avoid $@ being localised when we croak.
+
+        my $E;
+
+        {
+            local $@;
+
+            eval {
+                require IPC::System::Simple; # Only load it if we need it.
+                require autodie::exception::system;
+            };
+            $E = $@;
+        }
+
+        if ($E) { croak ERROR_NO_IPC_SYS_SIMPLE; }
+
+        # Make sure we're using a recent version of ISS that actually
+        # support fatalised system.
+        if ($IPC::System::Simple::VERSION < MIN_IPC_SYS_SIMPLE_VER) {
+            croak sprintf(
+            ERROR_IPC_SYS_SIMPLE_OLD, MIN_IPC_SYS_SIMPLE_VER,
+            $IPC::System::Simple::VERSION
+            );
+        }
+
+        $call = 'CORE::system';
+        $core = 1;
+
+    } elsif ($name eq 'exec') {
+        # Exec doesn't have a prototype.  We don't care.  This
+        # breaks the exotic form with lexical scope, and gives
+        # the regular form a "do or die" behavior as expected.
+
+        $call = 'CORE::exec';
+        $core = 1;
+
+    } else {            # CORE subroutine
+        $call = "CORE::$name";
+        if (exists($CORE_prototype_cache{$call})) {
+            $proto = $CORE_prototype_cache{$call};
+        } else {
+            my $E;
+            {
+                local $@;
+                $proto = eval { prototype $call };
+                $E = $@;
+            }
+            croak(sprintf(ERROR_NOT_BUILT,$name)) if $E;
+            croak(sprintf(ERROR_CANT_OVERRIDE,$name)) if not defined $proto;
+            $CORE_prototype_cache{$call} = $proto;
+        }
+        $core = 1;
+    }
+
+    # TODO: This caching works, but I don't like using $void and
+    # $lexical as keys.  In particular, I suspect our code may end up
+    # wrapping already wrapped code when autodie and Fatal are used
+    # together.
+
+    # NB: We must use '$sub' (the name plus package) and not
+    # just '$name' (the short name) here.  Failing to do so
+    # results code that's in the wrong package, and hence has
+    # access to the wrong package filehandles.
+
+    $cache = $Cached_fatalised_sub{$class}{$sub};
+    if ($lexical) {
+        $cache_type = CACHE_AUTODIE_LEAK_GUARD;
+    } else {
+        $cache_type = CACHE_FATAL_WRAPPER;
+        $cache_type = CACHE_FATAL_VOID if $void;
+    }
+
+    if (my $subref = $cache->{$cache_type}) {
+        $install_subs->{$name} = $subref;
+        return $sref;
+    }
+
+    # If our subroutine is reusable (ie, not package depdendent),
+    # then check to see if we've got a cached copy, and use that.
+    # See RT #46984. (Thanks to Niels Thykier for being awesome!)
+
+    if ($core && exists $reusable_builtins{$call}) {
+        # For non-lexical subs, we can just use this cache directly
+        # - for lexical variants, we need a leak guard as well.
+        $code = $reusable_builtins{$call}{$lexical};
+        if (!$lexical && defined($code)) {
+            $install_subs->{$name} = $code;
+            return $sref;
+        }
+    }
+
+    if (!($lexical && $core) && !defined($code)) {
+        # No code available, generate it now.
+        my $wrapper_pkg = $pkg;
+        $wrapper_pkg = undef if (exists($reusable_builtins{$call}));
+        $code = $class->_compile_wrapper($wrapper_pkg, $core, $call, $name,
+                                         $void, $lexical, $sub, $sref,
+                                         $hints, $proto);
+        if (!defined($wrapper_pkg)) {
+            # cache it so we don't recompile this part again
+            $reusable_builtins{$call}{$lexical} = $code;
+        }
+    }
+
+    # Now we need to wrap our fatalised sub inside an itty bitty
+    # closure, which can detect if we've leaked into another file.
+    # Luckily, we only need to do this for lexical (autodie)
+    # subs.  Fatal subs can leak all they want, it's considered
+    # a "feature" (or at least backwards compatible).
+
+    # TODO: Cache our leak guards!
+
+    # TODO: This is pretty hairy code.  A lot more tests would
+    # be really nice for this.
+
+    my $installed_sub = $code;
+
+    if ($lexical) {
+        $installed_sub = $class->_make_leak_guard($filename, $code, $sref, $call,
+                                                  $pkg, $proto);
+    }
+
+    $cache->{$cache_type} = $code;
+
+    $install_subs->{$name} = $installed_sub;
+
+    # Cache that we've now overridden this sub.  If we get called
+    # again, we may need to find that find subroutine again (eg, for hints).
+
+    $Is_fatalised_sub{$installed_sub} = $sref;
+
+    return $sref;
+
+}
+
+# This subroutine exists primarily so that child classes can override
+# it to point to their own exception class.  Doing this is significantly
+# less complex than overriding throw()
+
+sub exception_class { return "autodie::exception" };
+
+{
+    my %exception_class_for;
+    my %class_loaded;
+
+    sub throw {
+        my ($class, @args) = @_;
+
+        # Find our exception class if we need it.
+        my $exception_class =
+             $exception_class_for{$class} ||= $class->exception_class;
+
+        if (not $class_loaded{$exception_class}) {
+            if ($exception_class =~ /[^\w:']/) {
+                confess "Bad exception class '$exception_class'.\nThe '$class->exception_class' method wants to use $exception_class\nfor exceptions, but it contains characters which are not word-characters or colons.";
+            }
+
+            # Alas, Perl does turn barewords into modules unless they're
+            # actually barewords.  As such, we're left doing a string eval
+            # to make sure we load our file correctly.
+
+            my $E;
+
+            {
+                local $@;   # We can't clobber $@, it's wrong!
+                my $pm_file = $exception_class . ".pm";
+                $pm_file =~ s{ (?: :: | ' ) }{/}gx;
+                eval { require $pm_file };
+                $E = $@;    # Save $E despite ending our local.
+            }
+
+            # We need quotes around $@ to make sure it's stringified
+            # while still in scope.  Without them, we run the risk of
+            # $@ having been cleared by us exiting the local() block.
+
+            confess "Failed to load '$exception_class'.\nThis may be a typo in the '$class->exception_class' method,\nor the '$exception_class' module may not exist.\n\n $E" if $E;
+
+            $class_loaded{$exception_class}++;
+
+        }
+
+        return $exception_class->new(@args);
+    }
+}
+
+# Creates and returns a leak guard (with prototype if needed).
+sub _make_leak_guard {
+    my ($class, $filename, $wrapped_sub, $orig_sub, $call, $pkg, $proto) = @_;
+
+    # The leak guard is rather lengthly (in fact it makes up the most
+    # of _make_leak_guard).  It is possible to split it into a large
+    # "generic" part and a small wrapper with call-specific
+    # information.  This was done in v2.19 and profiling suggested
+    # that we ended up using a substantial amount of runtime in "goto"
+    # between the leak guard(s) and the final sub.  Therefore, the two
+    # parts were merged into one to reduce the runtime overhead.
+
+    my $leak_guard = sub {
+        my $caller_level = 0;
+        my $caller;
+
+        while ( ($caller = (caller $caller_level)[1]) =~ m{^\(eval \d+\)$} ) {
+
+            # If our filename is actually an eval, and we
+            # reach it, then go to our autodying code immediatately.
+
+            last if ($caller eq $filename);
+            $caller_level++;
+        }
+
+        # We're now out of the eval stack.
+
+        if ($caller eq $filename) {
+            # No leak, call the wrapper.  NB: In this case, it doesn't
+            # matter if it is a CORE sub or not.
+            if (!defined($wrapped_sub)) {
+                # CORE sub that we were too lazy to compile when we
+                # created this leak guard.
+                die "$call is not CORE::<something>"
+                    if substr($call, 0, 6) ne 'CORE::';
+
+                my $name = substr($call, 6);
+                my $sub = $name;
+                my $lexical = 1;
+                my $wrapper_pkg = $pkg;
+                my $code;
+                if (exists($reusable_builtins{$call})) {
+                    $code = $reusable_builtins{$call}{$lexical};
+                    $wrapper_pkg = undef;
+                }
+                if (!defined($code)) {
+                    $code = $class->_compile_wrapper($wrapper_pkg,
+                                                     1, # core
+                                                     $call,
+                                                     $name,
+                                                     0, # void
+                                                     $lexical,
+                                                     $sub,
+                                                     undef, # subref (not used for core)
+                                                     undef, # hints (not used for core)
+                                                     $proto);
+
+                    if (!defined($wrapper_pkg)) {
+                        # cache it so we don't recompile this part again
+                        $reusable_builtins{$call}{$lexical} = $code;
+                    }
+                }
+                # As $wrapped_sub is "closed over", updating its value will
+                # be "remembered" for the next call.
+                $wrapped_sub = $code;
+            }
+            goto $wrapped_sub;
+        }
+
+        # We leaked, time to call the original function.
+        # - for non-core functions that will be $orig_sub
+        # - for CORE functions, $orig_sub may be a trampoline
+        goto $orig_sub if defined($orig_sub);
+
+        # We are wrapping a CORE sub and we do not have a trampoline
+        # yet.
+        #
+        # If we've cached a trampoline, then use it.  Usually only
+        # resuable subs will have cache hits, but non-reusuably ones
+        # can get it as well in (very) rare cases.  It is mostly in
+        # cases where a package uses autodie multiple times and leaks
+        # from multiple places.  Possibly something like:
+        #
+        #  package Pkg::With::LeakyCode;
+        #  sub a {
+        #      use autodie;
+        #      code_that_leaks();
+        #  }
+        #
+        #  sub b {
+        #      use autodie;
+        #      more_leaky_code();
+        #  }
+        #
+        # Note that we use "Fatal" as package name for reusable subs
+        # because A) that allows us to trivially re-use the
+        # trampolines as well and B) because the reusable sub is
+        # compiled into "package Fatal" as well.
+
+        $pkg = 'Fatal' if exists $reusable_builtins{$call};
+        $orig_sub = $Trampoline_cache{$pkg}{$call};
+
+        if (not $orig_sub) {
+            # If we don't have a trampoline, we need to build it.
+            #
+            # We only generate trampolines when we need them, and
+            # we can cache them by subroutine + package.
+            #
+            # As $orig_sub is "closed over", updating its value will
+            # be "remembered" for the next call.
+
+            $orig_sub = make_core_trampoline($call, $pkg, $proto);
+
+            # We still cache it despite remembering it in $orig_sub as
+            # well.  In particularly, we rely on this to avoid
+            # re-compiling the reusable trampolines.
+            $Trampoline_cache{$pkg}{$call} = $orig_sub;
+        }
+
+        # Bounce to our trampoline, which takes us to our core sub.
+        goto $orig_sub;
+    };  # <-- end of leak guard
+
+    # If there is a prototype on the original sub, copy it to the leak
+    # guard.
+    if (defined $proto) {
+        # The "\&" may appear to be redundant but set_prototype
+        # croaks when it is removed.
+        set_prototype(\&$leak_guard, $proto);
+    }
+
+    return $leak_guard;
+}
+
+sub _compile_wrapper {
+    my ($class, $wrapper_pkg, $core, $call, $name, $void, $lexical, $sub, $sref, $hints, $proto) = @_;
+    my $real_proto = '';
+    my @protos;
+    my $code;
+    if (defined $proto) {
+        $real_proto = " ($proto)";
+    } else {
+        $proto = '@';
+    }
+
+    @protos = fill_protos($proto);
+    $code = qq[
+        sub$real_proto {
+    ];
+
+    if (!$lexical) {
+        $code .= q[
+           local($", $!) = (', ', 0);
+        ];
+    }
+
+    # Don't have perl whine if exec fails, since we'll be handling
+    # the exception now.
+    $code .= "no warnings qw(exec);\n" if $call eq "CORE::exec";
+
+    $code .= $class->_write_invocation($core, $call, $name, $void, $lexical,
+                                       $sub, $sref, @protos);
+    $code .= "}\n";
+    warn $code if $Debug;
+
+    # I thought that changing package was a monumental waste of
+    # time for CORE subs, since they'll always be the same.  However
+    # that's not the case, since they may refer to package-based
+    # filehandles (eg, with open).
+    #
+    # The %reusable_builtins hash defines ones we can aggressively
+    # cache as they never depend upon package-based symbols.
+
+    my $E;
+
+    {
+        no strict 'refs'; ## no critic # to avoid: Can't use string (...) as a symbol ref ...
+        local $@;
+        if (defined($wrapper_pkg)) {
+            $code = eval("package $wrapper_pkg; require Carp; $code");  ## no critic
+        } else {
+            $code = eval("require Carp; $code");  ## no critic
+
+        }
+        $E = $@;
+    }
+
+    if (not $code) {
+        my $true_name = $core ? $call : $sub;
+        croak("Internal error in autodie/Fatal processing $true_name: $E");
+    }
+    return $code;
+}
+
+# For some reason, dying while replacing our subs doesn't
+# kill our calling program.  It simply stops the loading of
+# autodie and keeps going with everything else.  The _autocroak
+# sub allows us to die with a vengeance.  It should *only* ever be
+# used for serious internal errors, since the results of it can't
+# be captured.
+
+sub _autocroak {
+    warn Carp::longmess(@_);
+    exit(255);  # Ugh!
+}
+
+1;
+
+__END__
+
+=head1 NAME
+
+Fatal - Replace functions with equivalents which succeed or die
+
+=head1 SYNOPSIS
+
+    use Fatal qw(open close);
+
+    open(my $fh, "<", $filename);  # No need to check errors!
+
+    use File::Copy qw(move);
+    use Fatal qw(move);
+
+    move($file1, $file2); # No need to check errors!
+
+    sub juggle { . . . }
+    Fatal->import('juggle');
+
+=head1 BEST PRACTICE
+
+B<Fatal has been obsoleted by the new L<autodie> pragma.> Please use
+L<autodie> in preference to C<Fatal>.  L<autodie> supports lexical scoping,
+throws real exception objects, and provides much nicer error messages.
+
+The use of C<:void> with Fatal is discouraged.
+
+=head1 DESCRIPTION
+
+C<Fatal> provides a way to conveniently replace
+functions which normally return a false value when they fail with
+equivalents which raise exceptions if they are not successful.  This
+lets you use these functions without having to test their return
+values explicitly on each call.  Exceptions can be caught using
+C<eval{}>.  See L<perlfunc> and L<perlvar> for details.
+
+The do-or-die equivalents are set up simply by calling Fatal's
+C<import> routine, passing it the names of the functions to be
+replaced.  You may wrap both user-defined functions and overridable
+CORE operators (except C<exec>, C<system>, C<print>, or any other
+built-in that cannot be expressed via prototypes) in this way.
+
+If the symbol C<:void> appears in the import list, then functions
+named later in that import list raise an exception only when
+these are called in void context--that is, when their return
+values are ignored.  For example
+
+    use Fatal qw/:void open close/;
+
+    # properly checked, so no exception raised on error
+    if (not open(my $fh, '<', '/bogotic') {
+        warn "Can't open /bogotic: $!";
+    }
+
+    # not checked, so error raises an exception
+    close FH;
+
+The use of C<:void> is discouraged, as it can result in exceptions
+not being thrown if you I<accidentally> call a method without
+void context.  Use L<autodie> instead if you need to be able to
+disable autodying/Fatal behaviour for a small block of code.
+
+=head1 DIAGNOSTICS
+
+=over 4
+
+=item Bad subroutine name for Fatal: %s
+
+You've called C<Fatal> with an argument that doesn't look like
+a subroutine name, nor a switch that this version of Fatal
+understands.
+
+=item %s is not a Perl subroutine
+
+You've asked C<Fatal> to try and replace a subroutine which does not
+exist, or has not yet been defined.
+
+=item %s is neither a builtin, nor a Perl subroutine
+
+You've asked C<Fatal> to replace a subroutine, but it's not a Perl
+built-in, and C<Fatal> couldn't find it as a regular subroutine.
+It either doesn't exist or has not yet been defined.
+
+=item Cannot make the non-overridable %s fatal
+
+You've tried to use C<Fatal> on a Perl built-in that can't be
+overridden, such as C<print> or C<system>, which means that
+C<Fatal> can't help you, although some other modules might.
+See the L</"SEE ALSO"> section of this documentation.
+
+=item Internal error: %s
+
+You've found a bug in C<Fatal>.  Please report it using
+the C<perlbug> command.
+
+=back
+
+=head1 BUGS
+
+C<Fatal> clobbers the context in which a function is called and always
+makes it a scalar context, except when the C<:void> tag is used.
+This problem does not exist in L<autodie>.
+
+"Used only once" warnings can be generated when C<autodie> or C<Fatal>
+is used with package filehandles (eg, C<FILE>).  It's strongly recommended
+you use scalar filehandles instead.
+
+=head1 AUTHOR
+
+Original module by Lionel Cons (CERN).
+
+Prototype updates by Ilya Zakharevich <ilya@math.ohio-state.edu>.
+
+L<autodie> support, bugfixes, extended diagnostics, C<system>
+support, and major overhauling by Paul Fenwick <pjf@perltraining.com.au>
+
+=head1 LICENSE
+
+This module is free software, you may distribute it under the
+same terms as Perl itself.
+
+=head1 SEE ALSO
+
+L<autodie> for a nicer way to use lexical Fatal.
+
+L<IPC::System::Simple> for a similar idea for calls to C<system()>
+and backticks.
+
+=for Pod::Coverage exception_class fill_protos one_invocation throw write_invocation ERROR_NO_IPC_SYS_SIMPLE LEXICAL_TAG
+
+=cut
+                                                                                                                                                                                                                                                                                                                              usr/local/lib/perl5/5.40.0/File/                                                                    0000755 0000000 0000000 00000000000 14714567415 014365  5                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        usr/local/lib/perl5/5.40.0/File/Basename.pm                                                         0000444 0000000 0000000 00000025713 14714567415 016444  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        =head1 NAME
+
+File::Basename - Parse file paths into directory, filename and suffix.
+
+=head1 SYNOPSIS
+
+    use File::Basename;
+
+    my ($name, $path, $suffix) = fileparse($fullname, @suffixlist);
+    my $name = fileparse($fullname, @suffixlist);
+
+    my $basename = basename($fullname, @suffixlist);
+    my $dirname  = dirname($fullname);
+
+
+=head1 DESCRIPTION
+
+These routines allow you to parse file paths into their directory, filename
+and suffix.
+
+B<NOTE>: C<dirname()> and C<basename()> emulate the behaviours, and
+quirks, of the shell and C functions of the same name.  See each
+function's documentation for details.  If your concern is just parsing
+paths it is safer to use L<File::Spec>'s C<splitpath()> and
+C<splitdir()> methods.
+
+It is guaranteed that
+
+    # Where $path_separator is / for Unix, \ for Windows, etc...
+    dirname($path) . $path_separator . basename($path);
+
+is equivalent to the original path for all systems but VMS.
+
+
+=cut
+
+
+package File::Basename;
+
+# File::Basename is used during the Perl build, when the re extension may
+# not be available, but we only actually need it if running under tainting.
+BEGIN {
+  if (${^TAINT}) {
+    require re;
+    re->import('taint');
+  }
+}
+
+
+use strict;
+use 5.006;
+use warnings;
+our(@ISA, @EXPORT, $VERSION, $Fileparse_fstype, $Fileparse_igncase);
+require Exporter;
+@ISA = qw(Exporter);
+@EXPORT = qw(fileparse fileparse_set_fstype basename dirname);
+$VERSION = "2.86";
+
+fileparse_set_fstype($^O);
+
+
+=over 4
+
+=item C<fileparse>
+X<fileparse>
+
+    my($filename, $dirs, $suffix) = fileparse($path);
+    my($filename, $dirs, $suffix) = fileparse($path, @suffixes);
+    my $filename                  = fileparse($path, @suffixes);
+
+The C<fileparse()> routine divides a file path into its $dirs, $filename
+and (optionally) the filename $suffix.
+
+$dirs contains everything up to and including the last
+directory separator in the $path including the volume (if applicable).
+The remainder of the $path is the $filename.
+
+     # On Unix returns ("baz", "/foo/bar/", "")
+     fileparse("/foo/bar/baz");
+
+     # On Windows returns ("baz", 'C:\foo\bar\', "")
+     fileparse('C:\foo\bar\baz');
+
+     # On Unix returns ("", "/foo/bar/baz/", "")
+     fileparse("/foo/bar/baz/");
+
+If @suffixes are given each element is a pattern (either a string or a
+C<qr//>) matched against the end of the $filename.  The matching
+portion is removed and becomes the $suffix.
+
+     # On Unix returns ("baz", "/foo/bar/", ".txt")
+     fileparse("/foo/bar/baz.txt", qr/\.[^.]*/);
+
+If type is non-Unix (see L</fileparse_set_fstype>) then the pattern
+matching for suffix removal is performed case-insensitively, since
+those systems are not case-sensitive when opening existing files.
+
+You are guaranteed that C<$dirs . $filename . $suffix> will
+denote the same location as the original $path.
+
+=cut
+
+
+sub fileparse {
+  my($fullname,@suffices) = @_;
+
+  unless (defined $fullname) {
+      require Carp;
+      Carp::croak("fileparse(): need a valid pathname");
+  }
+
+  my $orig_type = '';
+  my($type,$igncase) = ($Fileparse_fstype, $Fileparse_igncase);
+
+  my($taint) = substr($fullname,0,0);  # Is $fullname tainted?
+
+  if ($type eq "VMS" and $fullname =~ m{/} ) {
+    # We're doing Unix emulation
+    $orig_type = $type;
+    $type = 'Unix';
+  }
+
+  my($dirpath, $basename);
+
+  if (grep { $type eq $_ } qw(MSDOS DOS MSWin32 Epoc)) {
+    ($dirpath,$basename) = ($fullname =~ /^((?:.*[:\\\/])?)(.*)/s);
+    $dirpath .= '.\\' unless $dirpath =~ /[\\\/]\z/;
+  }
+  elsif ($type eq "OS2") {
+    ($dirpath,$basename) = ($fullname =~ m#^((?:.*[:\\/])?)(.*)#s);
+    $dirpath = './' unless $dirpath;	# Can't be 0
+    $dirpath .= '/' unless $dirpath =~ m#[\\/]\z#;
+  }
+  elsif ($type eq "MacOS") {
+    ($dirpath,$basename) = ($fullname =~ /^(.*:)?(.*)/s);
+    $dirpath = ':' unless $dirpath;
+  }
+  elsif ($type eq "AmigaOS") {
+    ($dirpath,$basename) = ($fullname =~ /(.*[:\/])?(.*)/s);
+    $dirpath = './' unless $dirpath;
+  }
+  elsif ($type eq 'VMS' ) {
+    ($dirpath,$basename) = ($fullname =~ /^(.*[:>\]])?(.*)/s);
+    $dirpath ||= '';  # should always be defined
+  }
+  else { # Default to Unix semantics.
+    ($dirpath,$basename) = ($fullname =~ m{^(.*/)?(.*)}s);
+    if ($orig_type eq 'VMS' and $fullname =~ m{^(/[^/]+/000000(/|$))(.*)}) {
+      # dev:[000000] is top of VMS tree, similar to Unix '/'
+      # so strip it off and treat the rest as "normal"
+      my $devspec  = $1;
+      my $remainder = $3;
+      ($dirpath,$basename) = ($remainder =~ m{^(.*/)?(.*)}s);
+      $dirpath ||= '';  # should always be defined
+      $dirpath = $devspec.$dirpath;
+    }
+    $dirpath = './' unless $dirpath;
+  }
+      
+
+  my $tail   = '';
+  my $suffix = '';
+  if (@suffices) {
+    foreach $suffix (@suffices) {
+      my $pat = ($igncase ? '(?i)' : '') . "($suffix)\$";
+      if ($basename =~ s/$pat//s) {
+        $taint .= substr($suffix,0,0);
+        $tail = $1 . $tail;
+      }
+    }
+  }
+
+  # Ensure taint is propagated from the path to its pieces.
+  $tail .= $taint;
+  wantarray ? ($basename .= $taint, $dirpath .= $taint, $tail)
+            : ($basename .= $taint);
+}
+
+
+
+=item C<basename>
+X<basename> X<filename>
+
+    my $filename = basename($path);
+    my $filename = basename($path, @suffixes);
+
+This function is provided for compatibility with the Unix shell command
+C<basename(1)>.  It does B<NOT> always return the file name portion of a
+path as you might expect.  To be safe, if you want the file name portion of
+a path use C<fileparse()>.
+
+C<basename()> returns the last level of a filepath even if the last
+level is clearly directory.  In effect, it is acting like C<pop()> for
+paths.  This differs from C<fileparse()>'s behaviour.
+
+    # Both return "bar"
+    basename("/foo/bar");
+    basename("/foo/bar/");
+
+@suffixes work as in C<fileparse()> except all regex metacharacters are
+quoted.
+
+    # These two function calls are equivalent.
+    my $filename = basename("/foo/bar/baz.txt",  ".txt");
+    my $filename = fileparse("/foo/bar/baz.txt", qr/\Q.txt\E/);
+
+Also note that in order to be compatible with the shell command,
+C<basename()> does not strip off a suffix if it is identical to the
+remaining characters in the filename.
+
+=cut
+
+
+sub basename {
+  my($path) = shift;
+
+  # From BSD basename(1)
+  # The basename utility deletes any prefix ending with the last slash '/'
+  # character present in string (after first stripping trailing slashes)
+  _strip_trailing_sep($path);
+
+  my($basename, $dirname, $suffix) = fileparse( $path, map("\Q$_\E",@_) );
+
+  # From BSD basename(1)
+  # The suffix is not stripped if it is identical to the remaining 
+  # characters in string.
+  if( length $suffix and !length $basename ) {
+      $basename = $suffix;
+  }
+  
+  # Ensure that basename '/' == '/'
+  if( !length $basename ) {
+      $basename = $dirname;
+  }
+
+  return $basename;
+}
+
+
+
+=item C<dirname>
+X<dirname>
+
+This function is provided for compatibility with the Unix shell
+command C<dirname(1)> and has inherited some of its quirks.  In spite of
+its name it does B<NOT> always return the directory name as you might
+expect.  To be safe, if you want the directory name of a path use
+C<fileparse()>.
+
+Only on VMS (where there is no ambiguity between the file and directory
+portions of a path) and AmigaOS (possibly due to an implementation quirk in
+this module) does C<dirname()> work like C<fileparse($path)>, returning just the
+$dirs.
+
+    # On VMS and AmigaOS
+    my $dirs = dirname($path);
+
+When using Unix or MSDOS syntax this emulates the C<dirname(1)> shell function
+which is subtly different from how C<fileparse()> works.  It returns all but
+the last level of a file path even if the last level is clearly a directory.
+In effect, it is not returning the directory portion but simply the path one
+level up acting like C<chop()> for file paths.
+
+Also unlike C<fileparse()>, C<dirname()> does not include a trailing slash on
+its returned path.
+
+    # returns /foo/bar.  fileparse() would return /foo/bar/
+    dirname("/foo/bar/baz");
+
+    # also returns /foo/bar despite the fact that baz is clearly a 
+    # directory.  fileparse() would return /foo/bar/baz/
+    dirname("/foo/bar/baz/");
+
+    # returns '.'.  fileparse() would return 'foo/'
+    dirname("foo/");
+
+Under VMS, if there is no directory information in the $path, then the
+current default device and directory is used.
+
+=cut
+
+
+sub dirname {
+    my $path = shift;
+
+    my($type) = $Fileparse_fstype;
+
+    if( $type eq 'VMS' and $path =~ m{/} ) {
+        # Parse as Unix
+        local($File::Basename::Fileparse_fstype) = '';
+        return dirname($path);
+    }
+
+    my($basename, $dirname) = fileparse($path);
+
+    if ($type eq 'VMS') { 
+        $dirname ||= $ENV{DEFAULT};
+    }
+    elsif ($type eq 'MacOS') {
+	if( !length($basename) && $dirname !~ /^[^:]+:\z/) {
+            _strip_trailing_sep($dirname);
+	    ($basename,$dirname) = fileparse $dirname;
+	}

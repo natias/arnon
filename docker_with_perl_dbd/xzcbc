@@ -1,0 +1,1000 @@
+
+  if ($syn_forking) {
+    return $self->ping_syn_fork($host, $ip, $start_time, $stop_time);
+  }
+
+  my $fh = FileHandle->new();
+  my $saddr = _pack_sockaddr_in($self->{port_num}, $ip);
+
+  # Create TCP socket
+  if (!socket ($fh, $ip->{family}, SOCK_STREAM, $self->{proto_num})) {
+    croak("tcp socket error - $!");
+  }
+
+  if (defined $self->{local_addr} &&
+      !CORE::bind($fh, _pack_sockaddr_in(0, $self->{local_addr}))) {
+    croak("tcp bind error - $!");
+  }
+
+  $self->_setopts();
+  # Set O_NONBLOCK property on filehandle
+  $self->socket_blocking_mode($fh, 0);
+
+  # Attempt the non-blocking connect
+  # by just sending the TCP SYN packet
+  if (connect($fh, $saddr)) {
+    # Non-blocking, yet still connected?
+    # Must have connected very quickly,
+    # or else it wasn't very non-blocking.
+    #warn "WARNING: Nonblocking connect connected anyway? ($^O)";
+  } else {
+    # Error occurred connecting.
+    if ($! == EINPROGRESS || ($^O eq 'MSWin32' && $! == EWOULDBLOCK)) {
+      # The connection is just still in progress.
+      # This is the expected condition.
+    } else {
+      # Just save the error and continue on.
+      # The ack() can check the status later.
+      $self->{bad}->{$host} = $!;
+    }
+  }
+
+  my $entry = [ $host, $ip, $fh, $start_time, $stop_time, $self->{port_num} ];
+  $self->{syn}->{$fh->fileno} = $entry;
+  if ($self->{stop_time} < $stop_time) {
+    $self->{stop_time} = $stop_time;
+  }
+  vec($self->{wbits}, $fh->fileno, 1) = 1;
+
+  return 1;
+}
+
+sub ping_syn_fork {
+  my ($self, $host, $ip, $start_time, $stop_time) = @_;
+
+  # Buggy Winsock API doesn't allow nonblocking connect.
+  # Hence, if our OS is Windows, we need to create a separate
+  # process to do the blocking connect attempt.
+  my $pid = fork();
+  if (defined $pid) {
+    if ($pid) {
+      # Parent process
+      my $entry = [ $host, $ip, $pid, $start_time, $stop_time ];
+      $self->{syn}->{$pid} = $entry;
+      if ($self->{stop_time} < $stop_time) {
+        $self->{stop_time} = $stop_time;
+      }
+    } else {
+      # Child process
+      my $saddr = _pack_sockaddr_in($self->{port_num}, $ip);
+
+      # Create TCP socket
+      if (!socket ($self->{fh}, $ip->{family}, SOCK_STREAM, $self->{proto_num})) {
+        croak("tcp socket error - $!");
+      }
+
+      if (defined $self->{local_addr} &&
+          !CORE::bind($self->{fh}, _pack_sockaddr_in(0, $self->{local_addr}))) {
+        croak("tcp bind error - $!");
+      }
+
+      $self->_setopts();
+
+      $!=0;
+      # Try to connect (could take a long time)
+      connect($self->{fh}, $saddr);
+      # Notify parent of connect error status
+      my $err = $!+0;
+      my $wrstr = "$$ $err";
+      # Force to 16 chars including \n
+      $wrstr .= " "x(15 - length $wrstr). "\n";
+      syswrite($self->{fork_wr}, $wrstr, length $wrstr);
+      exit;
+    }
+  } else {
+    # fork() failed?
+    die "fork: $!";
+  }
+  return 1;
+}
+
+# Description: Wait for TCP ACK from host specified
+# from ping_syn above.  If no host is specified, wait
+# for TCP ACK from any of the hosts in the SYN queue.
+sub ack
+{
+  my $self = shift;
+
+  if ($self->{proto} eq "syn") {
+    if ($syn_forking) {
+      my @answer = $self->ack_unfork(shift);
+      return wantarray ? @answer : $answer[0];
+    }
+    my $wbits = "";
+    my $stop_time = 0;
+    if (my $host = shift or $self->{host}) {
+      # Host passed as arg or as option to new
+      $host = $self->{host} unless defined $host;
+      if (exists $self->{bad}->{$host}) {
+        if (!$self->{econnrefused} &&
+            $self->{bad}->{ $host } &&
+            (($! = ECONNREFUSED)>0) &&
+            $self->{bad}->{ $host } eq "$!") {
+          # "Connection refused" means reachable
+          # Good, continue
+        } else {
+          # ECONNREFUSED means no good
+          return ();
+        }
+      }
+      my $host_fd = undef;
+      foreach my $fd (keys %{ $self->{syn} }) {
+        my $entry = $self->{syn}->{$fd};
+        if ($entry->[0] eq $host) {
+          $host_fd = $fd;
+          $stop_time = $entry->[4]
+            || croak("Corrupted SYN entry for [$host]");
+          last;
+        }
+      }
+      croak("ack called on [$host] without calling ping first!")
+        unless defined $host_fd;
+      vec($wbits, $host_fd, 1) = 1;
+    } else {
+      # No $host passed so scan all hosts
+      # Use the latest stop_time
+      $stop_time = $self->{stop_time};
+      # Use all the bits
+      $wbits = $self->{wbits};
+    }
+
+    while ($wbits !~ /^\0*\z/) {
+      my $timeout = $stop_time - &time();
+      # Force a minimum of 10 ms timeout.
+      $timeout = 0.01 if $timeout <= 0.01;
+
+      my $winner_fd = undef;
+      my $wout = $wbits;
+      my $fd = 0;
+      # Do "bad" fds from $wbits first
+      while ($wout !~ /^\0*\z/) {
+        if (vec($wout, $fd, 1)) {
+          # Wipe it from future scanning.
+          vec($wout, $fd, 1) = 0;
+          if (my $entry = $self->{syn}->{$fd}) {
+            if ($self->{bad}->{ $entry->[0] }) {
+              $winner_fd = $fd;
+              last;
+            }
+          }
+        }
+        $fd++;
+      }
+
+      if (defined($winner_fd) or my $nfound = mselect(undef, ($wout=$wbits), undef, $timeout)) {
+        if (defined $winner_fd) {
+          $fd = $winner_fd;
+        } else {
+          # Done waiting for one of the ACKs
+          $fd = 0;
+          # Determine which one
+          while ($wout !~ /^\0*\z/ &&
+                 !vec($wout, $fd, 1)) {
+            $fd++;
+          }
+        }
+        if (my $entry = $self->{syn}->{$fd}) {
+          # Wipe it from future scanning.
+          delete $self->{syn}->{$fd};
+          vec($self->{wbits}, $fd, 1) = 0;
+          vec($wbits, $fd, 1) = 0;
+          if (!$self->{econnrefused} &&
+              $self->{bad}->{ $entry->[0] } &&
+              (($! = ECONNREFUSED)>0) &&
+              $self->{bad}->{ $entry->[0] } eq "$!") {
+            # "Connection refused" means reachable
+            # Good, continue
+          } elsif (getpeername($entry->[2])) {
+            # Connection established to remote host
+            # Good, continue
+          } else {
+            # TCP ACK will never come from this host
+            # because there was an error connecting.
+
+            # This should set $! to the correct error.
+            my $char;
+            sysread($entry->[2],$char,1);
+            # Store the excuse why the connection failed.
+            $self->{bad}->{$entry->[0]} = $!;
+            if (!$self->{econnrefused} &&
+                (($! == ECONNREFUSED) ||
+                 ($! == EAGAIN && $^O =~ /cygwin/i))) {
+              # "Connection refused" means reachable
+              # Good, continue
+            } else {
+              # No good, try the next socket...
+              next;
+            }
+          }
+          # Everything passed okay, return the answer
+          return wantarray ?
+            ($entry->[0], &time() - $entry->[3], $self->ntop($entry->[1]), $entry->[5])
+            : $entry->[0];
+        } else {
+          warn "Corrupted SYN entry: unknown fd [$fd] ready!";
+          vec($wbits, $fd, 1) = 0;
+          vec($self->{wbits}, $fd, 1) = 0;
+        }
+      } elsif (defined $nfound) {
+        # Timed out waiting for ACK
+        foreach my $fd (keys %{ $self->{syn} }) {
+          if (vec($wbits, $fd, 1)) {
+            my $entry = $self->{syn}->{$fd};
+            $self->{bad}->{$entry->[0]} = "Timed out";
+            vec($wbits, $fd, 1) = 0;
+            vec($self->{wbits}, $fd, 1) = 0;
+            delete $self->{syn}->{$fd};
+          }
+        }
+      } else {
+        # Weird error occurred with select()
+        warn("select: $!");
+        $self->{syn} = {};
+        $wbits = "";
+      }
+    }
+  }
+  return ();
+}
+
+sub ack_unfork {
+  my ($self,$host) = @_;
+  my $stop_time = $self->{stop_time};
+  if ($host) {
+    # Host passed as arg
+    if (my $entry = $self->{good}->{$host}) {
+      delete $self->{good}->{$host};
+      return ($entry->[0], &time() - $entry->[3], $self->ntop($entry->[1]));
+    }
+  }
+
+  my $rbits = "";
+  my $timeout;
+
+  if (keys %{ $self->{syn} }) {
+    # Scan all hosts that are left
+    vec($rbits, fileno($self->{fork_rd}), 1) = 1;
+    $timeout = $stop_time - &time();
+    # Force a minimum of 10 ms timeout.
+    $timeout = 0.01 if $timeout < 0.01;
+  } else {
+    # No hosts left to wait for
+    $timeout = 0;
+  }
+
+  if ($timeout > 0) {
+    my $nfound;
+    while ( keys %{ $self->{syn} } and
+           $nfound = mselect((my $rout=$rbits), undef, undef, $timeout)) {
+      # Done waiting for one of the ACKs
+      if (!sysread($self->{fork_rd}, $_, 16)) {
+        # Socket closed, which means all children are done.
+        return ();
+      }
+      my ($pid, $how) = split;
+      if ($pid) {
+        # Flush the zombie
+        waitpid($pid, 0);
+        if (my $entry = $self->{syn}->{$pid}) {
+          # Connection attempt to remote host is done
+          delete $self->{syn}->{$pid};
+          if (!$how || # If there was no error connecting
+              (!$self->{econnrefused} &&
+               $how == ECONNREFUSED)) {  # "Connection refused" means reachable
+            if ($host && $entry->[0] ne $host) {
+              # A good connection, but not the host we need.
+              # Move it from the "syn" hash to the "good" hash.
+              $self->{good}->{$entry->[0]} = $entry;
+              # And wait for the next winner
+              next;
+            }
+            return ($entry->[0], &time() - $entry->[3], $self->ntop($entry->[1]));
+          }
+        } else {
+          # Should never happen
+          die "Unknown ping from pid [$pid]";
+        }
+      } else {
+        die "Empty response from status socket?";
+      }
+    }
+    if (defined $nfound) {
+      # Timed out waiting for ACK status
+    } else {
+      # Weird error occurred with select()
+      warn("select: $!");
+    }
+  }
+  if (my @synners = keys %{ $self->{syn} }) {
+    # Kill all the synners
+    kill 9, @synners;
+    foreach my $pid (@synners) {
+      # Wait for the deaths to finish
+      # Then flush off the zombie
+      waitpid($pid, 0);
+    }
+  }
+  $self->{syn} = {};
+  return ();
+}
+
+# Description:  Tell why the ack() failed
+sub nack {
+  my $self = shift;
+  my $host = shift || croak('Usage> nack($failed_ack_host)');
+  return $self->{bad}->{$host} || undef;
+}
+
+# Description:  Close the connection.
+
+sub close
+{
+  my ($self) = @_;
+
+  if ($self->{proto} eq "syn") {
+    delete $self->{syn};
+  } elsif ($self->{proto} eq "tcp") {
+    # The connection will already be closed
+  } elsif ($self->{proto} eq "external") {
+    # Nothing to close
+  } else {
+    $self->{fh}->close();
+  }
+}
+
+sub port_number {
+   my $self = shift;
+   if(@_) {
+       $self->{port_num} = shift @_;
+       $self->service_check(1);
+   }
+   return $self->{port_num};
+}
+
+sub ntop {
+    my($self, $ip) = @_;
+
+    # Vista doesn't define a inet_ntop.  It has InetNtop instead.
+    # Not following ANSI... priceless.  getnameinfo() is defined
+    # for Windows 2000 and later, so that may be the choice.
+
+    # Any port will work, even undef, but this will work for now.
+    # Socket warns when undef is passed in, but it still works.
+    my $port = getservbyname('echo', 'udp');
+    my $sockaddr = _pack_sockaddr_in($port, $ip);
+    my ($error, $address) = getnameinfo($sockaddr, $NI_NUMERICHOST);
+    croak $error if $error;
+    return $address;
+}
+
+sub wakeonlan {
+  my ($mac_addr, $host, $port) = @_;
+
+  # use the discard service if $port not passed in
+  if (! defined $host) { $host = '255.255.255.255' }
+  if (! defined $port || $port !~ /^\d+$/ ) { $port = 9 }
+
+  require IO::Socket::INET;
+  my $sock = IO::Socket::INET->new(Proto=>'udp') || return undef;
+
+  my $ip_addr = inet_aton($host);
+  my $sock_addr = sockaddr_in($port, $ip_addr);
+  $mac_addr =~ s/://g;
+  my $packet = pack('C6H*', 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, $mac_addr x 16);
+
+  setsockopt($sock, SOL_SOCKET, SO_BROADCAST, 1);
+  send($sock, $packet, 0, $sock_addr);
+  $sock->close;
+
+  return 1;
+}
+
+########################################################
+# DNS hostname resolution
+# return:
+#   $h->{name}    = host - as passed in
+#   $h->{host}    = host - as passed in without :port
+#   $h->{port}    = OPTIONAL - if :port, then value of port
+#   $h->{addr}    = resolved numeric address
+#   $h->{addr_in} = aton/pton result
+#   $h->{family}  = AF_INET/6
+############################
+sub _resolv {
+  my ($self,
+      $name,
+      ) = @_;
+
+  my %h;
+  $h{name} = $name;
+  my $family = $self->{family};
+
+  if (defined($self->{family_local})) {
+    $family = $self->{family_local}
+  }
+
+# START - host:port
+  my $cnt = 0;
+
+  # Count ":"
+  $cnt++ while ($name =~ m/:/g);
+
+  # 0 = hostname or IPv4 address
+  if ($cnt == 0) {
+    $h{host} = $name
+  # 1 = IPv4 address with port
+  } elsif ($cnt == 1) {
+    ($h{host}, $h{port}) = split /:/, $name
+  # >=2 = IPv6 address
+  } elsif ($cnt >= 2) {
+    #IPv6 with port - [2001::1]:port
+    if ($name =~ /^\[.*\]:\d{1,5}$/) {
+      ($h{host}, $h{port}) = split /:([^:]+)$/, $name # split after last :
+    # IPv6 without port
+    } else {
+      $h{host} = $name
+    }
+  }
+
+  # Clean up host
+  $h{host} =~ s/\[//g;
+  $h{host} =~ s/\]//g;
+  # Clean up port
+  if (defined($h{port}) && (($h{port} !~ /^\d{1,5}$/) || ($h{port} < 1) || ($h{port} > 65535))) {
+    croak("Invalid port `$h{port}' in `$name'");
+    return undef;
+  }
+# END - host:port
+
+  # address check
+  # new way
+  if ($Socket_VERSION > 1.94) {
+    my %hints = (
+      family   => $AF_UNSPEC,
+      protocol => IPPROTO_TCP,
+      flags => $AI_NUMERICHOST
+    );
+
+    # numeric address, return
+    my ($err, @getaddr) = Socket::getaddrinfo($h{host}, undef, \%hints);
+    if (defined($getaddr[0])) {
+      $h{addr} = $h{host};
+      $h{family} = $getaddr[0]->{family};
+      if ($h{family} == AF_INET) {
+        (undef, $h{addr_in}, undef, undef) = Socket::unpack_sockaddr_in $getaddr[0]->{addr};
+      } else {
+        (undef, $h{addr_in}, undef, undef) = Socket::unpack_sockaddr_in6 $getaddr[0]->{addr};
+      }
+      return \%h
+    }
+  # old way
+  } else {
+    # numeric address, return
+    my $ret = gethostbyname($h{host});
+    if (defined($ret) && (_inet_ntoa($ret) eq $h{host})) {
+      $h{addr} = $h{host};
+      $h{addr_in} = $ret;
+      $h{family} = AF_INET;
+      return \%h
+    }
+  }
+
+  # resolve
+  # new way
+  if ($Socket_VERSION >= 1.94) {
+    my %hints = (
+      family   => $family,
+      protocol => IPPROTO_TCP
+    );
+
+    my ($err, @getaddr) = Socket::getaddrinfo($h{host}, undef, \%hints);
+    if (defined($getaddr[0])) {
+      my ($err, $address) = Socket::getnameinfo($getaddr[0]->{addr}, $NI_NUMERICHOST, $NIx_NOSERV);
+      if (defined($address)) {
+        $h{addr} = $address;
+        $h{addr} =~ s/\%(.)*$//; # remove %ifID if IPv6
+        $h{family} = $getaddr[0]->{family};
+        if ($h{family} == AF_INET) {
+          (undef, $h{addr_in}, undef, undef) = Socket::unpack_sockaddr_in $getaddr[0]->{addr};
+        } else {
+          (undef, $h{addr_in}, undef, undef) = Socket::unpack_sockaddr_in6 $getaddr[0]->{addr};
+        }
+        return \%h;
+      } else {
+        carp("getnameinfo($getaddr[0]->{addr}) failed - $err");
+        return undef;
+      }
+    } else {
+      warn(sprintf("getaddrinfo($h{host},,%s) failed - $err",
+                    $family == AF_INET ? "AF_INET" : "AF_INET6"));
+      return undef;
+    }
+  # old way
+  } else {
+    if ($family == $AF_INET6) {
+      croak("Socket >= 1.94 required for IPv6 - found Socket $Socket::VERSION");
+      return undef;
+    }
+
+    my @gethost = gethostbyname($h{host});
+    if (defined($gethost[4])) {
+      $h{addr} = inet_ntoa($gethost[4]);
+      $h{addr_in} = $gethost[4];
+      $h{family} = AF_INET;
+      return \%h
+    } else {
+      carp("gethostbyname($h{host}) failed - $^E");
+      return undef;
+    }
+  }
+  return undef;
+}
+
+sub _pack_sockaddr_in($$) {
+  my ($port,
+      $ip,
+      ) = @_;
+
+  my $addr = ref($ip) eq "HASH" ? $ip->{addr_in} : $ip;
+  if (length($addr) <= 4 ) {
+    return Socket::pack_sockaddr_in($port, $addr);
+  } else {
+    return Socket::pack_sockaddr_in6($port, $addr);
+  }
+}
+
+sub _unpack_sockaddr_in($;$) {
+  my ($addr,
+      $family,
+      ) = @_;
+
+  my ($port, $host);
+  if ($family == AF_INET || (!defined($family) and length($addr) <= 16 )) {
+    ($port, $host) = Socket::unpack_sockaddr_in($addr);
+  } else {
+    ($port, $host) = Socket::unpack_sockaddr_in6($addr);
+  }
+  return $port, $host
+}
+
+sub _inet_ntoa {
+  my ($addr
+      ) = @_;
+
+  my $ret;
+  if ($Socket_VERSION >= 1.94) {
+    my ($err, $address) = Socket::getnameinfo($addr, $NI_NUMERICHOST);
+    if (defined($address)) {
+      $ret = $address;
+    } else {
+      carp("getnameinfo($addr) failed - $err");
+    }
+  } else {
+    $ret = inet_ntoa($addr)
+  }
+    
+  return $ret
+}
+
+1;
+__END__
+
+=head1 NAME
+
+Net::Ping - check a remote host for reachability
+
+=head1 SYNOPSIS
+
+    use Net::Ping;
+
+    $p = Net::Ping->new();
+    print "$host is alive.\n" if $p->ping($host);
+    $p->close();
+
+    $p = Net::Ping->new("icmp");
+    $p->bind($my_addr); # Specify source interface of pings
+    foreach $host (@host_array)
+    {
+        print "$host is ";
+        print "NOT " unless $p->ping($host, 2);
+        print "reachable.\n";
+        sleep(1);
+    }
+    $p->close();
+
+    $p = Net::Ping->new("icmpv6");
+    $ip = "[fd00:dead:beef::4e]";
+    print "$ip is alive.\n" if $p->ping($ip);
+
+    $p = Net::Ping->new("tcp", 2);
+    # Try connecting to the www port instead of the echo port
+    $p->port_number(scalar(getservbyname("http", "tcp")));
+    while ($stop_time > time())
+    {
+        print "$host not reachable ", scalar(localtime()), "\n"
+            unless $p->ping($host);
+        sleep(300);
+    }
+    undef($p);
+
+    # Like tcp protocol, but with many hosts
+    $p = Net::Ping->new("syn");
+    $p->port_number(getservbyname("http", "tcp"));
+    foreach $host (@host_array) {
+      $p->ping($host);
+    }
+    while (($host,$rtt,$ip) = $p->ack) {
+      print "HOST: $host [$ip] ACKed in $rtt seconds.\n";
+    }
+
+    # High precision syntax (requires Time::HiRes)
+    $p = Net::Ping->new();
+    $p->hires();
+    ($ret, $duration, $ip) = $p->ping($host, 5.5);
+    printf("$host [ip: $ip] is alive (packet return time: %.2f ms)\n",
+            1000 * $duration)
+      if $ret;
+    $p->close();
+
+    # For backward compatibility
+    print "$host is alive.\n" if pingecho($host);
+
+=head1 DESCRIPTION
+
+This module contains methods to test the reachability of remote
+hosts on a network.  A ping object is first created with optional
+parameters, a variable number of hosts may be pinged multiple
+times and then the connection is closed.
+
+You may choose one of six different protocols to use for the
+ping. The "tcp" protocol is the default. Note that a live remote host
+may still fail to be pingable by one or more of these protocols. For
+example, www.microsoft.com is generally alive but not "icmp" pingable.
+
+With the "tcp" protocol the ping() method attempts to establish a
+connection to the remote host's echo port.  If the connection is
+successfully established, the remote host is considered reachable.  No
+data is actually echoed.  This protocol does not require any special
+privileges but has higher overhead than the "udp" and "icmp" protocols.
+
+Specifying the "udp" protocol causes the ping() method to send a udp
+packet to the remote host's echo port.  If the echoed packet is
+received from the remote host and the received packet contains the
+same data as the packet that was sent, the remote host is considered
+reachable.  This protocol does not require any special privileges.
+It should be borne in mind that, for a udp ping, a host
+will be reported as unreachable if it is not running the
+appropriate echo service.  For Unix-like systems see L<inetd(8)>
+for more information.
+
+If the "icmp" protocol is specified, the ping() method sends an icmp
+echo message to the remote host, which is what the UNIX ping program
+does.  If the echoed message is received from the remote host and
+the echoed information is correct, the remote host is considered
+reachable.  Specifying the "icmp" protocol requires that the program
+be run as root or that the program be setuid to root.
+
+If the "external" protocol is specified, the ping() method attempts to
+use the C<Net::Ping::External> module to ping the remote host.
+C<Net::Ping::External> interfaces with your system's default C<ping>
+utility to perform the ping, and generally produces relatively
+accurate results. If C<Net::Ping::External> if not installed on your
+system, specifying the "external" protocol will result in an error.
+
+If the "syn" protocol is specified, the L</ping> method will only
+send a TCP SYN packet to the remote host then immediately return.
+If the syn packet was sent successfully, it will return a true value,
+otherwise it will return false.  NOTE: Unlike the other protocols,
+the return value does NOT determine if the remote host is alive or
+not since the full TCP three-way handshake may not have completed
+yet.  The remote host is only considered reachable if it receives
+a TCP ACK within the timeout specified.  To begin waiting for the
+ACK packets, use the L</ack> method as explained below.  Use the
+"syn" protocol instead the "tcp" protocol to determine reachability
+of multiple destinations simultaneously by sending parallel TCP
+SYN packets.  It will not block while testing each remote host.
+This protocol does not require any special privileges.
+
+=head2 Functions
+
+=over 4
+
+=item Net::Ping->new([proto, timeout, bytes, device, tos, ttl, family,
+                      host, port, bind, gateway, retrans, pingstring,
+                      source_verify econnrefused dontfrag
+                      IPV6_USE_MIN_MTU IPV6_RECVPATHMTU])
+X<new>
+
+Create a new ping object.  All of the parameters are optional and can
+be passed as hash ref.  All options besides the first 7 must be passed
+as hash ref.
+
+C<proto> specifies the protocol to use when doing a ping.  The current
+choices are "tcp", "udp", "icmp", "icmpv6", "stream", "syn", or
+"external".  The default is "tcp".
+
+If a C<timeout> in seconds is provided, it is used
+when a timeout is not given to the ping() method (below).  The timeout
+must be greater than 0 and the default, if not specified, is 5 seconds.
+
+If the number of data bytes (C<bytes>) is given, that many data bytes
+are included in the ping packet sent to the remote host. The number of
+data bytes is ignored if the protocol is "tcp".  The minimum (and
+default) number of data bytes is 1 if the protocol is "udp" and 0
+otherwise.  The maximum number of data bytes that can be specified is
+65535, but staying below the MTU (1472 bytes for ICMP) is recommended.
+Many small devices cannot deal with fragmented ICMP packets.
+
+If C<device> is given, this device is used to bind the source endpoint
+before sending the ping packet.  I believe this only works with
+superuser privileges and with udp and icmp protocols at this time.
+
+If <tos> is given, this ToS is configured into the socket.
+
+For icmp, C<ttl> can be specified to set the TTL of the outgoing packet.
+
+Valid C<family> values for IPv4:
+
+   4, v4, ip4, ipv4, AF_INET (constant)
+
+Valid C<family> values for IPv6:
+
+   6, v6, ip6, ipv6, AF_INET6 (constant)
+
+The C<host> argument implicitly specifies the family if the family
+argument is not given.
+
+The C<port> argument is only valid for a udp, tcp or stream ping, and will not
+do what you think it does. ping returns true when we get a "Connection refused"!
+The default is the echo port.
+
+The C<bind> argument specifies the local_addr to bind to.
+By specifying a bind argument you don't need the bind method.
+
+The C<gateway> argument is only valid for IPv6, and requires a IPv6
+address.
+
+The C<retrans> argument the exponential backoff rate, default 1.2.
+It matches the $def_factor global.
+
+The C<dontfrag> argument sets the IP_DONTFRAG bit, but note that
+IP_DONTFRAG is not yet defined by Socket, and not available on many
+systems. Then it is ignored. On linux it also sets IP_MTU_DISCOVER to
+IP_PMTUDISC_DO but need we don't chunk oversized packets. You need to
+set $data_size manually.
+
+=item $p->ping($host [, $timeout [, $family]]);
+X<ping>
+
+Ping the remote host and wait for a response.  $host can be either the
+hostname or the IP number of the remote host.  The optional timeout
+must be greater than 0 seconds and defaults to whatever was specified
+when the ping object was created.  Returns a success flag.  If the
+hostname cannot be found or there is a problem with the IP number, the
+success flag returned will be undef.  Otherwise, the success flag will
+be 1 if the host is reachable and 0 if it is not.  For most practical
+purposes, undef and 0 and can be treated as the same case.  In array
+context, the elapsed time as well as the string form of the ip the
+host resolved to are also returned.  The elapsed time value will
+be a float, as returned by the Time::HiRes::time() function, if hires()
+has been previously called, otherwise it is returned as an integer.
+
+=item $p->source_verify( { 0 | 1 } );
+X<source_verify>
+
+Allows source endpoint verification to be enabled or disabled.
+This is useful for those remote destinations with multiples
+interfaces where the response may not originate from the same
+endpoint that the original destination endpoint was sent to.
+This only affects udp and icmp protocol pings.
+
+This is enabled by default.
+
+=item $p->service_check( { 0 | 1 } );
+X<service_check>
+
+Set whether or not the connect behavior should enforce
+remote service availability as well as reachability.  Normally,
+if the remote server reported ECONNREFUSED, it must have been
+reachable because of the status packet that it reported.
+With this option enabled, the full three-way tcp handshake
+must have been established successfully before it will
+claim it is reachable.  NOTE:  It still does nothing more
+than connect and disconnect.  It does not speak any protocol
+(i.e., HTTP or FTP) to ensure the remote server is sane in
+any way.  The remote server CPU could be grinding to a halt
+and unresponsive to any clients connecting, but if the kernel
+throws the ACK packet, it is considered alive anyway.  To
+really determine if the server is responding well would be
+application specific and is beyond the scope of Net::Ping.
+For udp protocol, enabling this option demands that the
+remote server replies with the same udp data that it was sent
+as defined by the udp echo service.
+
+This affects the "udp", "tcp", and "syn" protocols.
+
+This is disabled by default.
+
+=item $p->tcp_service_check( { 0 | 1 } );
+X<tcp_service_check>
+
+Deprecated method, but does the same as service_check() method.
+
+=item $p->hires( { 0 | 1 } );
+X<hires>
+
+With 1 causes this module to use Time::HiRes module, allowing milliseconds
+to be returned by subsequent calls to ping().
+
+=item $p->time
+X<time>
+
+The current time, hires or not.
+
+=item $p->socket_blocking_mode( $fh, $mode );
+X<socket_blocking_mode>
+
+Sets or clears the O_NONBLOCK flag on a file handle.
+
+=item $p->IPV6_USE_MIN_MTU
+X<IPV6_USE_MIN_MTU>
+
+With argument sets the option.
+Without returns the option value.
+
+=item $p->IPV6_RECVPATHMTU
+X<IPV6_RECVPATHMTU>
+
+Notify an according IPv6 MTU.
+
+With argument sets the option.
+Without returns the option value.
+
+=item $p->IPV6_HOPLIMIT
+X<IPV6_HOPLIMIT>
+
+With argument sets the option.
+Without returns the option value.
+
+=item $p->IPV6_REACHCONF I<NYI>
+X<IPV6_REACHCONF>
+
+Sets ipv6 reachability
+IPV6_REACHCONF was removed in RFC3542. ping6 -R supports it.
+IPV6_REACHCONF requires root/admin permissions.
+
+With argument sets the option.
+Without returns the option value.
+
+Not yet implemented.
+
+=item $p->bind($local_addr);
+X<bind>
+
+Sets the source address from which pings will be sent.  This must be
+the address of one of the interfaces on the local host.  $local_addr
+may be specified as a hostname or as a text IP address such as
+"192.168.1.1".
+
+If the protocol is set to "tcp", this method may be called any
+number of times, and each call to the ping() method (below) will use
+the most recent $local_addr.  If the protocol is "icmp" or "udp",
+then bind() must be called at most once per object, and (if it is
+called at all) must be called before the first call to ping() for that
+object.
+
+The bind() call can be omitted when specifying the C<bind> option to
+new().
+
+=item $p->message_type([$ping_type]);
+X<message_type>
+
+When you are using the "icmp" protocol, this call permit to change the
+message type to 'echo' or 'timestamp' (only for IPv4, see RFC 792).
+
+Without argument, it returns the currently used icmp protocol message type.
+By default, it returns 'echo'.
+
+=item $p->open($host);
+X<open>
+
+When you are using the "stream" protocol, this call pre-opens the
+tcp socket.  It's only necessary to do this if you want to
+provide a different timeout when creating the connection, or
+remove the overhead of establishing the connection from the
+first ping.  If you don't call C<open()>, the connection is
+automatically opened the first time C<ping()> is called.
+This call simply does nothing if you are using any protocol other
+than stream.
+
+The $host argument can be omitted when specifying the C<host> option to
+new().
+
+=item $p->ack( [ $host ] );
+X<ack>
+
+When using the "syn" protocol, use this method to determine
+the reachability of the remote host.  This method is meant
+to be called up to as many times as ping() was called.  Each
+call returns the host (as passed to ping()) that came back
+with the TCP ACK.  The order in which the hosts are returned
+may not necessarily be the same order in which they were
+SYN queued using the ping() method.  If the timeout is
+reached before the TCP ACK is received, or if the remote
+host is not listening on the port attempted, then the TCP
+connection will not be established and ack() will return
+undef.  In list context, the host, the ack time, the dotted ip 
+string, and the port number will be returned instead of just the host.
+If the optional C<$host> argument is specified, the return
+value will be pertaining to that host only.
+This call simply does nothing if you are using any protocol
+other than "syn".
+
+When L</new> had a host option, this host will be used.
+Without C<$host> argument, all hosts are scanned.
+
+=item $p->nack( $failed_ack_host );
+X<nack>
+
+The reason that C<host $failed_ack_host> did not receive a
+valid ACK.  Useful to find out why when C<ack($fail_ack_host)>
+returns a false value.
+
+=item $p->ack_unfork($host)
+X<ack_unfork>
+
+The variant called by L</ack> with the "syn" protocol and C<$syn_forking>
+enabled.
+
+=item $p->ping_icmp([$host, $timeout, $family])
+X<ping_icmp>
+
+The L</ping> method used with the icmp protocol.
+
+=item $p->ping_icmpv6([$host, $timeout, $family])
+X<ping_icmpv6>
+
+The L</ping> method used with the icmpv6 protocol.
+
+=item $p->ping_stream([$host, $timeout, $family])
+X<ping_stream>
+
+The L</ping> method used with the stream protocol.
+
+Perform a stream ping.  If the tcp connection isn't
+already open, it opens it.  It then sends some data and waits for
+a reply.  It leaves the stream open on exit.
+
+=item $p->ping_syn([$host, $ip, $start_time, $stop_time])
+X<ping_syn>
+
+The L</ping> method used with the syn protocol.
+Sends a TCP SYN packet to host specified.
+
+=item $p->ping_syn_fork([$host, $timeout, $family])
+X<ping_syn_fork>
+
+The L</ping> method used with the forking syn protocol.
+
+=item $p->ping_tcp([$host, $timeout, $family])
+X<ping_tcp>
+
+The L</ping> method used with the tcp protocol.
+
+=item $p->ping_udp([$host, $timeout, $family])
+X<ping_udp>
+
+The L</ping> method used with the udp protocol.
+
+Perform a udp echo ping.  Construct a message of
+at least the one-byte sequence number and any additional data bytes.
+Send the message out and wait for a message to come back.  If we

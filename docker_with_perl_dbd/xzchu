@@ -1,0 +1,1000 @@
+              ? ( $DollarCaretP_flags_r{$n}
+                  || sprintf( '0x%x', $n ) )
+              : ()
+          } 0 .. 31
+    );
+    return @bits ? join( '|', @bits ) : 0;
+}
+
+=over 4
+
+=item rerun
+
+Rerun the current session to:
+
+    rerun        current position
+
+    rerun 4      command number 4
+
+    rerun -4     current command minus 4 (go back 4 steps)
+
+Whether this always makes sense, in the current context is unknowable, and is
+in part left as a useful exercise for the reader.  This sub returns the
+appropriate arguments to rerun the current session.
+
+=cut
+
+sub rerun {
+    my $i = shift;
+    my @args;
+    pop(@truehist);                      # strim
+    unless (defined $truehist[$i]) {
+        print "Unable to return to non-existent command: $i\n";
+    } else {
+        $#truehist = ($i < 0 ? $#truehist + $i : $i > 0 ? $i : $#truehist);
+        my @temp = @truehist;            # store
+        push(@DB::typeahead, @truehist); # saved
+        @truehist = @hist = ();          # flush
+        @args = restart();              # setup
+        get_list("PERLDB_HIST");        # clean
+        set_list("PERLDB_HIST", @temp); # reset
+    }
+    return @args;
+}
+
+=item restart
+
+Restarting the debugger is a complex operation that occurs in several phases.
+First, we try to reconstruct the command line that was used to invoke Perl
+and the debugger.
+
+=cut
+
+sub restart {
+    # I may not be able to resurrect you, but here goes ...
+    print $OUT
+"Warning: some settings and command-line options may be lost!\n";
+    my ( @script, @flags, $cl );
+
+    # If warn was on before, turn it on again.
+    push @flags, '-w' if $ini_warn;
+
+    # Rebuild the -I flags that were on the initial
+    # command line.
+    for (@ini_INC) {
+        push @flags, '-I', $_;
+    }
+
+    # Turn on taint if it was on before.
+    push @flags, '-T' if ${^TAINT};
+
+    # Arrange for setting the old INC:
+    # Save the current @init_INC in the environment.
+    set_list( "PERLDB_INC", @ini_INC );
+
+    # If this was a perl one-liner, go to the "file"
+    # corresponding to the one-liner read all the lines
+    # out of it (except for the first one, which is going
+    # to be added back on again when 'perl -d' runs: that's
+    # the 'require perl5db.pl;' line), and add them back on
+    # to the command line to be executed.
+    if ( $0 eq '-e' ) {
+        my $lines = *{$main::{'_<-e'}}{ARRAY};
+        for ( 1 .. $#$lines ) {  # The first line is PERL5DB
+            chomp( $cl = $lines->[$_] );
+            push @script, '-e', $cl;
+        }
+    } ## end if ($0 eq '-e')
+
+    # Otherwise we just reuse the original name we had
+    # before.
+    else {
+        @script = $0;
+    }
+
+=pod
+
+After the command line  has been reconstructed, the next step is to save
+the debugger's status in environment variables. The C<DB::set_list> routine
+is used to save aggregate variables (both hashes and arrays); scalars are
+just popped into environment variables directly.
+
+=cut
+
+    # If the terminal supported history, grab it and
+    # save that in the environment.
+    set_list( "PERLDB_HIST",
+          $term->Features->{getHistory}
+        ? $term->GetHistory
+        : @hist );
+
+    # Find all the files that were visited during this
+    # session (i.e., the debugger had magic hashes
+    # corresponding to them) and stick them in the environment.
+    my @had_breakpoints = keys %had_breakpoints;
+    set_list( "PERLDB_VISITED", @had_breakpoints );
+
+    # Save the debugger options we chose.
+    set_list( "PERLDB_OPT", %option );
+    # set_list( "PERLDB_OPT", options2remember() );
+
+    # Save the break-on-loads.
+    set_list( "PERLDB_ON_LOAD", %break_on_load );
+
+=pod
+
+The most complex part of this is the saving of all of the breakpoints. They
+can live in an awful lot of places, and we have to go through all of them,
+find the breakpoints, and then save them in the appropriate environment
+variable via C<DB::set_list>.
+
+=cut
+
+    # Go through all the breakpoints and make sure they're
+    # still valid.
+    my @hard;
+    for ( 0 .. $#had_breakpoints ) {
+
+        # We were in this file.
+        my $file = $had_breakpoints[$_];
+
+        # Grab that file's magic line hash.
+        *dbline = $main::{ '_<' . $file };
+
+        # Skip out if it doesn't exist, or if the breakpoint
+        # is in a postponed file (we'll do postponed ones
+        # later).
+        next unless %dbline or $postponed_file{$file};
+
+        # In an eval. This is a little harder, so we'll
+        # do more processing on that below.
+        ( push @hard, $file ), next
+          if $file =~ /^\(\w*eval/;
+
+        # XXX I have no idea what this is doing. Yet.
+        my @add;
+        @add = %{ $postponed_file{$file} }
+          if $postponed_file{$file};
+
+        # Save the list of all the breakpoints for this file.
+        set_list( "PERLDB_FILE_$_", %dbline, @add );
+
+        # Serialize the extra data %breakpoints_data hash.
+        # That's a bug fix.
+        set_list( "PERLDB_FILE_ENABLED_$_",
+            map { _is_breakpoint_enabled($file, $_) ? 1 : 0 }
+            sort { $a <=> $b } keys(%dbline)
+        )
+    } ## end for (0 .. $#had_breakpoints)
+
+    # The breakpoint was inside an eval. This is a little
+    # more difficult. XXX and I don't understand it.
+    foreach my $hard_file (@hard) {
+        # Get over to the eval in question.
+        *dbline = $main::{ '_<' . $hard_file };
+        my $quoted = quotemeta $hard_file;
+        my %subs;
+        for my $sub ( keys %sub ) {
+            if (my ($n1, $n2) = $sub{$sub} =~ /\A$quoted:(\d+)-(\d+)\z/) {
+                $subs{$sub} = [ $n1, $n2 ];
+            }
+        }
+        unless (%subs) {
+            print {$OUT}
+            "No subroutines in $hard_file, ignoring breakpoints.\n";
+            next;
+        }
+        LINES: foreach my $line ( keys %dbline ) {
+
+            # One breakpoint per sub only:
+            my ( $offset, $found );
+            SUBS: foreach my $sub ( keys %subs ) {
+                if (
+                    $subs{$sub}->[1] >= $line    # Not after the subroutine
+                    and (
+                        not defined $offset    # Not caught
+                            or $offset < 0
+                    )
+                )
+                {                              # or badly caught
+                    $found  = $sub;
+                    $offset = $line - $subs{$sub}->[0];
+                    if ($offset >= 0) {
+                        $offset = "+$offset";
+                        last SUBS;
+                    }
+                } ## end if ($subs{$sub}->[1] >=...
+            } ## end for $sub (keys %subs)
+            if ( defined $offset ) {
+                $postponed{$found} =
+                "break $offset if $dbline{$line}";
+            }
+            else {
+                print {$OUT}
+                ("Breakpoint in ${hard_file}:$line ignored:"
+                . " after all the subroutines.\n");
+            }
+        } ## end for $line (keys %dbline)
+    } ## end for (@hard)
+
+    # Save the other things that don't need to be
+    # processed.
+    set_list( "PERLDB_POSTPONE",  %postponed );
+    set_list( "PERLDB_PRETYPE",   @$pretype );
+    set_list( "PERLDB_PRE",       @$pre );
+    set_list( "PERLDB_POST",      @$post );
+    set_list( "PERLDB_TYPEAHEAD", @typeahead );
+
+    # We are officially restarting.
+    $ENV{PERLDB_RESTART} = 1;
+
+    # We are junking all child debuggers.
+    delete $ENV{PERLDB_PIDS};    # Restore ini state
+
+    # Set this back to the initial pid.
+    $ENV{PERLDB_PIDS} = $ini_pids if defined $ini_pids;
+
+=pod
+
+After all the debugger status has been saved, we take the command we built up
+and then return it, so we can C<exec()> it. The debugger will spot the
+C<PERLDB_RESTART> environment variable and realize it needs to reload its state
+from the environment.
+
+=cut
+
+    # And run Perl again. Add the "-d" flag, all the
+    # flags we built up, the script (whether a one-liner
+    # or a file), add on the -emacs flag for a client editor,
+    # and then the old arguments.
+
+    return ($^X, '-d', @flags, @script, ($client_editor ? '-emacs' : ()), @ARGS);
+
+};  # end restart
+
+=back
+
+=head1 END PROCESSING - THE C<END> BLOCK
+
+Come here at the very end of processing. We want to go into a
+loop where we allow the user to enter commands and interact with the
+debugger, but we don't want anything else to execute.
+
+First we set the C<$finished> variable, so that some commands that
+shouldn't be run after the end of program quit working.
+
+We then figure out whether we're truly done (as in the user entered a C<q>
+command, or we finished execution while running nonstop). If we aren't,
+we set C<$single> to 1 (causing the debugger to get control again).
+
+We then call C<DB::fake::at_exit()>, which returns the C<Use 'q' to quit ...>
+message and returns control to the debugger. Repeat.
+
+When the user finally enters a C<q> command, C<$fall_off_end> is set to
+1 and the C<END> block simply exits with C<$single> set to 0 (don't
+break, run to completion.).
+
+=cut
+
+END {
+    $finished = 1 if $inhibit_exit;    # So that some commands may be disabled.
+    $fall_off_end = 1 unless $inhibit_exit;
+
+    # Do not stop in at_exit() and destructors on exit:
+    if ($fall_off_end or $runnonstop) {
+        save_hist();
+    } else {
+        $DB::single = 1;
+        DB::fake::at_exit();
+    }
+} ## end END
+
+=head1 PRE-5.8 COMMANDS
+
+Some of the commands changed function quite a bit in the 5.8 command
+realignment, so much so that the old code had to be replaced completely.
+Because we wanted to retain the option of being able to go back to the
+former command set, we moved the old code off to this section.
+
+There's an awful lot of duplicated code here. We've duplicated the
+comments to keep things clear.
+
+=head2 Null command
+
+Does nothing. Used to I<turn off> commands.
+
+=cut
+
+sub cmd_pre580_null {
+
+    # do nothing...
+}
+
+=head2 Old C<a> command.
+
+This version added actions if you supplied them, and deleted them
+if you didn't.
+
+=cut
+
+sub cmd_pre580_a {
+    my $xcmd = shift;
+    my $cmd  = shift;
+
+    # Argument supplied. Add the action.
+    if ( $cmd =~ /^(\d*)\s*(.*)/ ) {
+
+        # If the line isn't there, use the current line.
+        my $i = $1 || $line;
+        my $j = $2;
+
+        # If there is an action ...
+        if ( length $j ) {
+
+            # ... but the line isn't breakable, skip it.
+            if ( $dbline[$i] == 0 ) {
+                print $OUT "Line $i may not have an action.\n";
+            }
+            else {
+
+                # ... and the line is breakable:
+                # Mark that there's an action in this file.
+                $had_breakpoints{$filename} |= 2;
+
+                # Delete any current action.
+                $dbline{$i} =~ s/\0[^\0]*//;
+
+                # Add the new action, continuing the line as needed.
+                $dbline{$i} .= "\0" . action($j);
+            }
+        } ## end if (length $j)
+
+        # No action supplied.
+        else {
+
+            # Delete the action.
+            $dbline{$i} =~ s/\0[^\0]*//;
+
+            # Mark as having no break or action if nothing's left.
+            delete $dbline{$i} if $dbline{$i} eq '';
+        }
+    } ## end if ($cmd =~ /^(\d*)\s*(.*)/)
+} ## end sub cmd_pre580_a
+
+=head2 Old C<b> command
+
+Add breakpoints.
+
+=cut
+
+sub cmd_pre580_b {
+    my $xcmd   = shift;
+    my $cmd    = shift;
+    my $dbline = shift;
+
+    # Break on load.
+    if ( $cmd =~ /^load\b\s*(.*)/ ) {
+        my $file = $1;
+        $file =~ s/\s+$//;
+        cmd_b_load($file);
+    }
+
+    # b compile|postpone <some sub> [<condition>]
+    # The interpreter actually traps this one for us; we just put the
+    # necessary condition in the %postponed hash.
+    elsif ( $cmd =~ /^(postpone|compile)\b\s*([':A-Za-z_][':\w]*)\s*(.*)/ ) {
+
+        # Capture the condition if there is one. Make it true if none.
+        my $cond = length $3 ? $3 : '1';
+
+        # Save the sub name and set $break to 1 if $1 was 'postpone', 0
+        # if it was 'compile'.
+        my ( $subname, $break ) = ( $2, $1 eq 'postpone' );
+
+        # De-Perl4-ify the name - ' separators to ::.
+        $subname =~ s/\'/::/g;
+
+        # Qualify it into the current package unless it's already qualified.
+        $subname = "${package}::" . $subname
+          unless $subname =~ /::/;
+
+        # Add main if it starts with ::.
+        $subname = "main" . $subname if substr( $subname, 0, 2 ) eq "::";
+
+        # Save the break type for this sub.
+        $postponed{$subname} = $break ? "break +0 if $cond" : "compile";
+    } ## end elsif ($cmd =~ ...
+
+    # b <sub name> [<condition>]
+    elsif ( $cmd =~ /^([':A-Za-z_][':\w]*(?:\[.*\])?)\s*(.*)/ ) {
+        my $subname = $1;
+        my $cond = length $2 ? $2 : '1';
+        cmd_b_sub( $subname, $cond );
+    }
+    # b <line> [<condition>].
+    elsif ( $cmd =~ /^(\d*)\s*(.*)/ ) {
+        my $i = $1 || $dbline;
+        my $cond = length $2 ? $2 : '1';
+        cmd_b_line( $i, $cond );
+    }
+} ## end sub cmd_pre580_b
+
+=head2 Old C<D> command.
+
+Delete all breakpoints unconditionally.
+
+=cut
+
+sub cmd_pre580_D {
+    my $xcmd = shift;
+    my $cmd  = shift;
+    if ( $cmd =~ /^\s*$/ ) {
+        print $OUT "Deleting all breakpoints...\n";
+
+        # %had_breakpoints lists every file that had at least one
+        # breakpoint in it.
+        my $file;
+        for $file ( keys %had_breakpoints ) {
+
+            # Switch to the desired file temporarily.
+            local *dbline = $main::{ '_<' . $file };
+
+            $max = $#dbline;
+            my $was;
+
+            # For all lines in this file ...
+            for my $i (1 .. $max) {
+
+                # If there's a breakpoint or action on this line ...
+                if ( defined $dbline{$i} ) {
+
+                    # ... remove the breakpoint.
+                    $dbline{$i} =~ s/^[^\0]+//;
+                    if ( $dbline{$i} =~ s/^\0?$// ) {
+
+                        # Remove the entry altogether if no action is there.
+                        delete $dbline{$i};
+                    }
+                } ## end if (defined $dbline{$i...
+            } ## end for my $i (1 .. $max)
+
+            # If, after we turn off the "there were breakpoints in this file"
+            # bit, the entry in %had_breakpoints for this file is zero,
+            # we should remove this file from the hash.
+            if ( not $had_breakpoints{$file} &= ~1 ) {
+                delete $had_breakpoints{$file};
+            }
+        } ## end for $file (keys %had_breakpoints)
+
+        # Kill off all the other breakpoints that are waiting for files that
+        # haven't been loaded yet.
+        undef %postponed;
+        undef %postponed_file;
+        undef %break_on_load;
+    } ## end if ($cmd =~ /^\s*$/)
+} ## end sub cmd_pre580_D
+
+=head2 Old C<h> command
+
+Print help. Defaults to printing the long-form help; the 5.8 version
+prints the summary by default.
+
+=cut
+
+sub cmd_pre580_h {
+    my $xcmd = shift;
+    my $cmd  = shift;
+
+    # Print the *right* help, long format.
+    if ( $cmd =~ /^\s*$/ ) {
+        print_help($pre580_help);
+    }
+
+    # 'h h' - explicitly-requested summary.
+    elsif ( $cmd =~ /^h\s*/ ) {
+        print_help($pre580_summary);
+    }
+
+    # Find and print a command's help.
+    elsif ( $cmd =~ /^h\s+(\S.*)$/ ) {
+        my $asked  = $1;                   # for proper errmsg
+        my $qasked = quotemeta($asked);    # for searching
+                                           # XXX: finds CR but not <CR>
+        if (
+            $pre580_help =~ /^
+                              <?           # Optional '<'
+                              (?:[IB]<)    # Optional markup
+                              $qasked      # The command name
+                            /mx
+          )
+        {
+
+            while (
+                $pre580_help =~ /^
+                                  (             # The command help:
+                                   <?           # Optional '<'
+                                   (?:[IB]<)    # Optional markup
+                                   $qasked      # The command name
+                                   ([\s\S]*?)   # Lines starting with tabs
+                                   \n           # Final newline
+                                  )
+                                  (?!\s)/mgx
+              )    # Line not starting with space
+                   # (Next command's help)
+            {
+                print_help($1);
+            }
+        } ## end if ($pre580_help =~ /^<?(?:[IB]<)$qasked/m)
+
+        # Help not found.
+        else {
+            print_help("B<$asked> is not a debugger command.\n");
+        }
+    } ## end elsif ($cmd =~ /^h\s+(\S.*)$/)
+} ## end sub cmd_pre580_h
+
+=head2 Old C<W> command
+
+C<W E<lt>exprE<gt>> adds a watch expression, C<W> deletes them all.
+
+=cut
+
+sub cmd_pre580_W {
+    my $xcmd = shift;
+    my $cmd  = shift;
+
+    # Delete all watch expressions.
+    if ( $cmd =~ /^$/ ) {
+
+        # No watching is going on.
+        $trace &= ~2;
+
+        # Kill all the watch expressions and values.
+        @to_watch = @old_watch = ();
+    }
+
+    # Add a watch expression.
+    elsif ( $cmd =~ /^(.*)/s ) {
+
+        # add it to the list to be watched.
+        push @to_watch, $1;
+
+        # Get the current value of the expression.
+        # Doesn't handle expressions returning list values!
+        $evalarg = $1;
+        # The &-call is here to ascertain the mutability of @_.
+        my ($val) = &DB::eval;
+        $val = ( defined $val ) ? "'$val'" : 'undef';
+
+        # Save it.
+        push @old_watch, $val;
+
+        # We're watching stuff.
+        $trace |= 2;
+
+    } ## end elsif ($cmd =~ /^(.*)/s)
+} ## end sub cmd_pre580_W
+
+=head1 PRE-AND-POST-PROMPT COMMANDS AND ACTIONS
+
+The debugger used to have a bunch of nearly-identical code to handle
+the pre-and-post-prompt action commands. C<cmd_pre590_prepost> and
+C<cmd_prepost> unify all this into one set of code to handle the
+appropriate actions.
+
+=head2 C<cmd_pre590_prepost>
+
+A small wrapper around C<cmd_prepost>; it makes sure that the default doesn't
+do something destructive. In pre 5.8 debuggers, the default action was to
+delete all the actions.
+
+=cut
+
+sub cmd_pre590_prepost {
+    my $cmd    = shift;
+    my $line   = shift || '*';
+    my $dbline = shift;
+
+    return cmd_prepost( $cmd, $line, $dbline );
+} ## end sub cmd_pre590_prepost
+
+=head2 C<cmd_prepost>
+
+Actually does all the handling for C<E<lt>>, C<E<gt>>, C<{{>, C<{>, etc.
+Since the lists of actions are all held in arrays that are pointed to by
+references anyway, all we have to do is pick the right array reference and
+then use generic code to all, delete, or list actions.
+
+=cut
+
+sub cmd_prepost {
+    my $cmd = shift;
+
+    # No action supplied defaults to 'list'.
+    my $line = shift || '?';
+
+    # Figure out what to put in the prompt.
+    my $which = '';
+
+    # Make sure we have some array or another to address later.
+    # This means that if for some reason the tests fail, we won't be
+    # trying to stash actions or delete them from the wrong place.
+    my $aref = [];
+
+    # < - Perl code to run before prompt.
+    if ( $cmd =~ /^\</o ) {
+        $which = 'pre-perl';
+        $aref  = $pre;
+    }
+
+    # > - Perl code to run after prompt.
+    elsif ( $cmd =~ /^\>/o ) {
+        $which = 'post-perl';
+        $aref  = $post;
+    }
+
+    # { - first check for properly-balanced braces.
+    elsif ( $cmd =~ /^\{/o ) {
+        if ( $cmd =~ /^\{.*\}$/o && unbalanced( substr( $cmd, 1 ) ) ) {
+            print $OUT
+"$cmd is now a debugger command\nuse ';$cmd' if you mean Perl code\n";
+        }
+
+        # Properly balanced. Pre-prompt debugger actions.
+        else {
+            $which = 'pre-debugger';
+            $aref  = $pretype;
+        }
+    } ## end elsif ( $cmd =~ /^\{/o )
+
+    # Did we find something that makes sense?
+    unless ($which) {
+        print $OUT "Confused by command: $cmd\n";
+    }
+
+    # Yes.
+    else {
+
+        # List actions.
+        if ( $line =~ /^\s*\?\s*$/o ) {
+            unless (@$aref) {
+
+                # Nothing there. Complain.
+                print $OUT "No $which actions.\n";
+            }
+            else {
+
+                # List the actions in the selected list.
+                print $OUT "$which commands:\n";
+                foreach my $action (@$aref) {
+                    print $OUT "\t$cmd -- $action\n";
+                }
+            } ## end else
+        } ## end if ( $line =~ /^\s*\?\s*$/o)
+
+        # Might be a delete.
+        else {
+            if ( length($cmd) == 1 ) {
+                if ( $line =~ /^\s*\*\s*$/o ) {
+
+                    # It's a delete. Get rid of the old actions in the
+                    # selected list..
+                    @$aref = ();
+                    print $OUT "All $cmd actions cleared.\n";
+                }
+                else {
+
+                    # Replace all the actions. (This is a <, >, or {).
+                    @$aref = action($line);
+                }
+            } ## end if ( length($cmd) == 1)
+            elsif ( length($cmd) == 2 ) {
+
+                # Add the action to the line. (This is a <<, >>, or {{).
+                push @$aref, action($line);
+            }
+            else {
+
+                # <<<, >>>>, {{{{{{ ... something not a command.
+                print $OUT
+                  "Confused by strange length of $which command($cmd)...\n";
+            }
+        } ## end else [ if ( $line =~ /^\s*\?\s*$/o)
+    } ## end else
+} ## end sub cmd_prepost
+
+=head1 C<DB::fake>
+
+Contains the C<at_exit> routine that the debugger uses to issue the
+C<Debugged program terminated ...> message after the program completes. See
+the C<END> block documentation for more details.
+
+=cut
+
+package DB::fake;
+
+sub at_exit {
+    "Debugged program terminated.  Use 'q' to quit or 'R' to restart.";
+}
+
+package DB;    # Do not trace this 1; below!
+
+1;
+
+
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           usr/share/perl/5.36.0/perlfaq.pm                                                                    0000644 0000000 0000000 00000000115 14530460112 014633  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        use strict;
+use warnings;
+package perlfaq;
+
+our $VERSION = '5.20210520';
+
+1;
+                                                                                                                                                                                                                                                                                                                                                                                                                                                   usr/share/perl/5.36.0/pod/                                                                          0000755 0000000 0000000 00000000000 14714551115 013440  5                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        usr/share/perl/5.36.0/pod/perldiag.pod                                                              0000644 0000000 0000000 00001112222 14530460112 015724  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        =head1 NAME
+
+perldiag - various Perl diagnostics
+
+=head1 DESCRIPTION
+
+These messages are classified as follows (listed in increasing order of
+desperation):
+
+    (W) A warning (optional).
+    (D) A deprecation (enabled by default).
+    (S) A severe warning (enabled by default).
+    (F) A fatal error (trappable).
+    (P) An internal error you should never see (trappable).
+    (X) A very fatal error (nontrappable).
+    (A) An alien error message (not generated by Perl).
+
+The majority of messages from the first three classifications above
+(W, D & S) can be controlled using the C<warnings> pragma.
+
+If a message can be controlled by the C<warnings> pragma, its warning
+category is included with the classification letter in the description
+below.  E.g. C<(W closed)> means a warning in the C<closed> category.
+
+Optional warnings are enabled by using the C<warnings> pragma or the B<-w>
+and B<-W> switches.  Warnings may be captured by setting C<$SIG{__WARN__}>
+to a reference to a routine that will be called on each warning instead
+of printing it.  See L<perlvar>.
+
+Severe warnings are always enabled, unless they are explicitly disabled
+with the C<warnings> pragma or the B<-X> switch.
+
+Trappable errors may be trapped using the eval operator.  See
+L<perlfunc/eval>.  In almost all cases, warnings may be selectively
+disabled or promoted to fatal errors using the C<warnings> pragma.
+See L<warnings>.
+
+The messages are in alphabetical order, without regard to upper or
+lower-case.  Some of these messages are generic.  Spots that vary are
+denoted with a %s or other printf-style escape.  These escapes are
+ignored by the alphabetical order, as are all characters other than
+letters.  To look up your message, just ignore anything that is not a
+letter.
+
+=over 4
+
+=item accept() on closed socket %s
+
+(W closed) You tried to do an accept on a closed socket.  Did you forget
+to check the return value of your socket() call?  See
+L<perlfunc/accept>.
+
+=item Aliasing via reference is experimental
+
+(S experimental::refaliasing) This warning is emitted if you use
+a reference constructor on the left-hand side of an assignment to
+alias one variable to another.  Simply suppress the warning if you
+want to use the feature, but know that in doing so you are taking
+the risk of using an experimental feature which may change or be
+removed in a future Perl version:
+
+    no warnings "experimental::refaliasing";
+    use feature "refaliasing";
+    \$x = \$y;
+
+=item '%c' allowed only after types %s in %s
+
+(F) The modifiers '!', '<' and '>' are allowed in pack() or unpack() only
+after certain types.  See L<perlfunc/pack>.
+
+=item alpha->numify() is lossy
+
+(W numeric) An alpha version can not be numified without losing
+information.
+
+=item Ambiguous call resolved as CORE::%s(), qualify as such or use &
+
+(W ambiguous) A subroutine you have declared has the same name as a Perl
+keyword, and you have used the name without qualification for calling
+one or the other.  Perl decided to call the builtin because the
+subroutine is not imported.
+
+To force interpretation as a subroutine call, either put an ampersand
+before the subroutine name, or qualify the name with its package.
+Alternatively, you can import the subroutine (or pretend that it's
+imported with the C<use subs> pragma).
+
+To silently interpret it as the Perl operator, use the C<CORE::> prefix
+on the operator (e.g. C<CORE::log($x)>) or declare the subroutine
+to be an object method (see L<perlsub/"Subroutine Attributes"> or
+L<attributes>).
+
+=item Ambiguous range in transliteration operator
+
+(F) You wrote something like C<tr/a-z-0//> which doesn't mean anything at
+all.  To include a C<-> character in a transliteration, put it either
+first or last.  (In the past, C<tr/a-z-0//> was synonymous with
+C<tr/a-y//>, which was probably not what you would have expected.)
+
+=item Ambiguous use of %s resolved as %s
+
+(S ambiguous) You said something that may not be interpreted the way
+you thought.  Normally it's pretty easy to disambiguate it by supplying
+a missing quote, operator, parenthesis pair or declaration.
+
+=item Ambiguous use of -%s resolved as -&%s()
+
+(S ambiguous) You wrote something like C<-foo>, which might be the
+string C<"-foo">, or a call to the function C<foo>, negated.  If you meant
+the string, just write C<"-foo">.  If you meant the function call,
+write C<-foo()>.
+
+=item Ambiguous use of %c resolved as operator %c
+
+(S ambiguous) C<%>, C<&>, and C<*> are both infix operators (modulus,
+bitwise and, and multiplication) I<and> initial special characters
+(denoting hashes, subroutines and typeglobs), and you said something
+like C<*foo * foo> that might be interpreted as either of them.  We
+assumed you meant the infix operator, but please try to make it more
+clear -- in the example given, you might write C<*foo * foo()> if you
+really meant to multiply a glob by the result of calling a function.
+
+=item Ambiguous use of %c{%s} resolved to %c%s
+
+(W ambiguous) You wrote something like C<@{foo}>, which might be
+asking for the variable C<@foo>, or it might be calling a function
+named foo, and dereferencing it as an array reference.  If you wanted
+the variable, you can just write C<@foo>.  If you wanted to call the
+function, write C<@{foo()}> ... or you could just not have a variable
+and a function with the same name, and save yourself a lot of trouble.
+
+=item Ambiguous use of %c{%s[...]} resolved to %c%s[...]
+
+=item Ambiguous use of %c{%s{...}} resolved to %c%s{...}
+
+(W ambiguous) You wrote something like C<${foo[2]}> (where foo represents
+the name of a Perl keyword), which might be looking for element number
+2 of the array named C<@foo>, in which case please write C<$foo[2]>, or you
+might have meant to pass an anonymous arrayref to the function named
+foo, and then do a scalar deref on the value it returns.  If you meant
+that, write C<${foo([2])}>.
+
+In regular expressions, the C<${foo[2]}> syntax is sometimes necessary
+to disambiguate between array subscripts and character classes.
+C</$length[2345]/>, for instance, will be interpreted as C<$length> followed
+by the character class C<[2345]>.  If an array subscript is what you
+want, you can avoid the warning by changing C</${length[2345]}/> to the
+unsightly C</${\$length[2345]}/>, by renaming your array to something
+that does not coincide with a built-in keyword, or by simply turning
+off warnings with C<no warnings 'ambiguous';>.
+
+=item '|' and '<' may not both be specified on command line
+
+(F) An error peculiar to VMS.  Perl does its own command line
+redirection, and found that STDIN was a pipe, and that you also tried to
+redirect STDIN using '<'.  Only one STDIN stream to a customer, please.
+
+=item '|' and '>' may not both be specified on command line
+
+(F) An error peculiar to VMS.  Perl does its own command line
+redirection, and thinks you tried to redirect stdout both to a file and
+into a pipe to another command.  You need to choose one or the other,
+though nothing's stopping you from piping into a program or Perl script
+which 'splits' output into two streams, such as
+
+    open(OUT,">$ARGV[0]") or die "Can't write to $ARGV[0]: $!";
+    while (<STDIN>) {
+        print;
+        print OUT;
+    }
+    close OUT;
+
+=item Applying %s to %s will act on scalar(%s)
+
+(W misc) The pattern match (C<//>), substitution (C<s///>), and
+transliteration (C<tr///>) operators work on scalar values.  If you apply
+one of them to an array or a hash, it will convert the array or hash to
+a scalar value (the length of an array, or the population info of a
+hash) and then work on that scalar value.  This is probably not what
+you meant to do.  See L<perlfunc/grep> and L<perlfunc/map> for
+alternatives.
+
+=item Arg too short for msgsnd
+
+(F) msgsnd() requires a string at least as long as sizeof(long).
+
+=item Argument "%s" isn't numeric%s
+
+(W numeric) The indicated string was fed as an argument to an operator
+that expected a numeric value instead.  If you're fortunate the message
+will identify which operator was so unfortunate.
+
+Note that for the C<Inf> and C<NaN> (infinity and not-a-number) the
+definition of "numeric" is somewhat unusual: the strings themselves
+(like "Inf") are considered numeric, and anything following them is
+considered non-numeric.
+
+=item Argument list not closed for PerlIO layer "%s"
+
+(W layer) When pushing a layer with arguments onto the Perl I/O
+system you forgot the ) that closes the argument list.  (Layers
+take care of transforming data between external and internal
+representations.)  Perl stopped parsing the layer list at this
+point and did not attempt to push this layer.  If your program
+didn't explicitly request the failing operation, it may be the
+result of the value of the environment variable PERLIO.
+
+=item Argument "%s" treated as 0 in increment (++)
+
+(W numeric) The indicated string was fed as an argument to the C<++>
+operator which expects either a number or a string matching
+C</^[a-zA-Z]*[0-9]*\z/>.  See L<perlop/Auto-increment and
+Auto-decrement> for details.
+
+=item Array passed to stat will be coerced to a scalar%s
+
+(W syntax) You called stat() on an array, but the array will be
+coerced to a scalar - the number of elements in the array.
+
+=item A signature parameter must start with '$', '@' or '%'
+
+(F) Each subroutine signature parameter declaration must start with a valid
+sigil; for example:
+
+    sub foo ($a, $, $b = 1, @c) {}
+
+=item A slurpy parameter may not have a default value
+
+(F) Only scalar subroutine signature parameters may have a default value;
+for example:
+
+    sub foo ($a = 1)        {} # legal
+    sub foo (@a = (1))      {} # invalid
+    sub foo (%a = (a => b)) {} # invalid
+
+=item assertion botched: %s
+
+(X) The malloc package that comes with Perl had an internal failure.
+
+=item Assertion %s failed: file "%s", line %d
+
+(X) A general assertion failed.  The file in question must be examined.
+
+=item Assigned value is not a reference
+
+(F) You tried to assign something that was not a reference to an lvalue
+reference (e.g., C<\$x = $y>).  If you meant to make $x an alias to $y, use
+C<\$x = \$y>.
+
+=item Assigned value is not %s reference
+
+(F) You tried to assign a reference to a reference constructor, but the
+two references were not of the same type.  You cannot alias a scalar to
+an array, or an array to a hash; the two types must match.
+
+    \$x = \@y;  # error
+    \@x = \%y;  # error
+     $y = [];
+    \$x = $y;   # error; did you mean \$y?
+
+=item Assigning non-zero to $[ is no longer possible
+
+(F) When the "array_base" feature is disabled
+(e.g., and under C<use v5.16;>, and as of Perl 5.30)
+the special variable C<$[>, which is deprecated, is now a fixed zero value.
+
+=item Assignment to both a list and a scalar
+
+(F) If you assign to a conditional operator, the 2nd and 3rd arguments

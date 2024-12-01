@@ -1,0 +1,1000 @@
+                    after.setdefault(pos, []).append(b'  !!! nested #if\n')
+                skipping = not self._iftest(lsplit[1:])
+                after.setdefault(pos, []).append(l)
+            elif l.startswith(b'#else'):
+                if skipping is None:
+                    after.setdefault(pos, []).append(b'  !!! missing #if\n')
+                skipping = not skipping
+                after.setdefault(pos, []).append(l)
+            elif l.startswith(b'#endif'):
+                if skipping is None:
+                    after.setdefault(pos, []).append(b'  !!! missing #if\n')
+                skipping = None
+                after.setdefault(pos, []).append(l)
+            elif skipping:
+                after.setdefault(pos, []).append(l)
+            elif l.startswith(b'  >>> '):  # python inlines
+                after.setdefault(pos, []).append(l)
+                prepos = pos
+                pos = n
+                if not inpython:
+                    # We've just entered a Python block. Add the header.
+                    inpython = True
+                    addsalt(prepos, False)  # Make sure we report the exit code.
+                    script.append(b'"%s" -m heredoctest <<EOF\n' % PYTHON)
+                addsalt(n, True)
+                script.append(l[2:])
+            elif l.startswith(b'  ... '):  # python inlines
+                after.setdefault(prepos, []).append(l)
+                script.append(l[2:])
+            elif l.startswith(b'  $ '):  # commands
+                if inpython:
+                    script.append(b'EOF\n')
+                    inpython = False
+                after.setdefault(pos, []).append(l)
+                prepos = pos
+                pos = n
+                addsalt(n, False)
+                rawcmd = l[4:]
+                cmd = rawcmd.split()
+                toggletrace(rawcmd)
+                if len(cmd) == 2 and cmd[0] == b'cd':
+                    rawcmd = b'cd %s || exit 1\n' % cmd[1]
+                script.append(rawcmd)
+            elif l.startswith(b'  > '):  # continuations
+                after.setdefault(prepos, []).append(l)
+                script.append(l[4:])
+            elif l.startswith(b'  '):  # results
+                # Queue up a list of expected results.
+                expected.setdefault(pos, []).append(l[2:])
+            else:
+                if inpython:
+                    script.append(b'EOF\n')
+                    inpython = False
+                # Non-command/result. Queue up for merged output.
+                after.setdefault(pos, []).append(l)
+
+        if inpython:
+            script.append(b'EOF\n')
+        if skipping is not None:
+            after.setdefault(pos, []).append(b'  !!! missing #endif\n')
+        addsalt(n + 1, False)
+        # Need to end any current per-command trace
+        if activetrace:
+            toggletrace()
+        return salt, script, after, expected
+
+    def _processoutput(self, exitcode, output, salt, after, expected):
+        # Merge the script output back into a unified test.
+        warnonly = WARN_UNDEFINED  # 1: not yet; 2: yes; 3: for sure not
+        if exitcode != 0:
+            warnonly = WARN_NO
+
+        pos = -1
+        postout = []
+        for out_rawline in output:
+            out_line, cmd_line = out_rawline, None
+            if salt in out_rawline:
+                out_line, cmd_line = out_rawline.split(salt, 1)
+
+            pos, postout, warnonly = self._process_out_line(
+                out_line, pos, postout, expected, warnonly
+            )
+            pos, postout = self._process_cmd_line(cmd_line, pos, postout, after)
+
+        if pos in after:
+            postout += after.pop(pos)
+
+        if warnonly == WARN_YES:
+            exitcode = False  # Set exitcode to warned.
+
+        return exitcode, postout
+
+    def _process_out_line(self, out_line, pos, postout, expected, warnonly):
+        while out_line:
+            if not out_line.endswith(b'\n'):
+                out_line += b' (no-eol)\n'
+
+            # Find the expected output at the current position.
+            els = [None]
+            if expected.get(pos, None):
+                els = expected[pos]
+
+            optional = []
+            for i, el in enumerate(els):
+                r = False
+                if el:
+                    r, exact = self.linematch(el, out_line)
+                if isinstance(r, str):
+                    if r == '-glob':
+                        out_line = ''.join(el.rsplit(' (glob)', 1))
+                        r = ''  # Warn only this line.
+                    elif r == "retry":
+                        postout.append(b'  ' + el)
+                    else:
+                        log('\ninfo, unknown linematch result: %r\n' % r)
+                        r = False
+                if r:
+                    els.pop(i)
+                    break
+                if el:
+                    if isoptional(el):
+                        optional.append(i)
+                    else:
+                        m = optline.match(el)
+                        if m:
+                            conditions = [c for c in m.group(2).split(b' ')]
+
+                            if not self._iftest(conditions):
+                                optional.append(i)
+                    if exact:
+                        # Don't allow line to be matches against a later
+                        # line in the output
+                        els.pop(i)
+                        break
+
+            if r:
+                if r == "retry":
+                    continue
+                # clean up any optional leftovers
+                for i in optional:
+                    postout.append(b'  ' + els[i])
+                for i in reversed(optional):
+                    del els[i]
+                postout.append(b'  ' + el)
+            else:
+                if self.NEEDESCAPE(out_line):
+                    out_line = TTest._stringescape(
+                        b'%s (esc)\n' % out_line.rstrip(b'\n')
+                    )
+                postout.append(b'  ' + out_line)  # Let diff deal with it.
+                if r != '':  # If line failed.
+                    warnonly = WARN_NO
+                elif warnonly == WARN_UNDEFINED:
+                    warnonly = WARN_YES
+            break
+        else:
+            # clean up any optional leftovers
+            while expected.get(pos, None):
+                el = expected[pos].pop(0)
+                if el:
+                    if not isoptional(el):
+                        m = optline.match(el)
+                        if m:
+                            conditions = [c for c in m.group(2).split(b' ')]
+
+                            if self._iftest(conditions):
+                                # Don't append as optional line
+                                continue
+                        else:
+                            continue
+                postout.append(b'  ' + el)
+        return pos, postout, warnonly
+
+    def _process_cmd_line(self, cmd_line, pos, postout, after):
+        """process a "command" part of a line from unified test output"""
+        if cmd_line:
+            # Add on last return code.
+            ret = int(cmd_line.split()[1])
+            if ret != 0:
+                postout.append(b'  [%d]\n' % ret)
+            if pos in after:
+                # Merge in non-active test bits.
+                postout += after.pop(pos)
+            pos = int(cmd_line.split()[0])
+        return pos, postout
+
+    @staticmethod
+    def rematch(el, l):
+        try:
+            # parse any flags at the beginning of the regex. Only 'i' is
+            # supported right now, but this should be easy to extend.
+            flags, el = re.match(br'^(\(\?i\))?(.*)', el).groups()[0:2]
+            flags = flags or b''
+            el = flags + b'(?:' + el + b')'
+            # use \Z to ensure that the regex matches to the end of the string
+            if WINDOWS:
+                return re.match(el + br'\r?\n\Z', l)
+            return re.match(el + br'\n\Z', l)
+        except re.error:
+            # el is an invalid regex
+            return False
+
+    @staticmethod
+    def globmatch(el, l):
+        # The only supported special characters are * and ? plus / which also
+        # matches \ on windows. Escaping of these characters is supported.
+        if el + b'\n' == l:
+            if os.altsep:
+                # matching on "/" is not needed for this line
+                for pat in checkcodeglobpats:
+                    if pat.match(el):
+                        return True
+                return b'-glob'
+            return True
+        el = el.replace(b'$LOCALIP', b'*')
+        i, n = 0, len(el)
+        res = b''
+        while i < n:
+            c = el[i : i + 1]
+            i += 1
+            if c == b'\\' and i < n and el[i : i + 1] in b'*?\\/':
+                res += el[i - 1 : i + 1]
+                i += 1
+            elif c == b'*':
+                res += b'.*'
+            elif c == b'?':
+                res += b'.'
+            elif c == b'/' and os.altsep:
+                res += b'[/\\\\]'
+            else:
+                res += re.escape(c)
+        return TTest.rematch(res, l)
+
+    def linematch(self, el, l):
+        if el == l:  # perfect match (fast)
+            return True, True
+        retry = False
+        if isoptional(el):
+            retry = "retry"
+            el = el[: -len(MARK_OPTIONAL)] + b"\n"
+        else:
+            m = optline.match(el)
+            if m:
+                conditions = [c for c in m.group(2).split(b' ')]
+
+                el = m.group(1) + b"\n"
+                if not self._iftest(conditions):
+                    # listed feature missing, should not match
+                    return "retry", False
+
+        if el.endswith(b" (esc)\n"):
+            el = el[:-7].decode('unicode_escape') + '\n'
+            el = el.encode('latin-1')
+        if el == l or WINDOWS and el[:-1] + b'\r\n' == l:
+            return True, True
+        if el.endswith(b" (re)\n"):
+            return (TTest.rematch(el[:-6], l) or retry), False
+        if el.endswith(b" (glob)\n"):
+            # ignore '(glob)' added to l by 'replacements'
+            if l.endswith(b" (glob)\n"):
+                l = l[:-8] + b"\n"
+            return (TTest.globmatch(el[:-8], l) or retry), False
+        if os.altsep:
+            _l = l.replace(b'\\', b'/')
+            if el == _l or WINDOWS and el[:-1] + b'\r\n' == _l:
+                return True, True
+        return retry, True
+
+    @staticmethod
+    def parsehghaveoutput(lines):
+        """Parse hghave log lines.
+
+        Return tuple of lists (missing, failed):
+          * the missing/unknown features
+          * the features for which existence check failed"""
+        missing = []
+        failed = []
+        for line in lines:
+            if line.startswith(TTest.SKIPPED_PREFIX):
+                line = line.splitlines()[0]
+                missing.append(_bytes2sys(line[len(TTest.SKIPPED_PREFIX) :]))
+            elif line.startswith(TTest.FAILED_PREFIX):
+                line = line.splitlines()[0]
+                failed.append(_bytes2sys(line[len(TTest.FAILED_PREFIX) :]))
+
+        return missing, failed
+
+    @staticmethod
+    def _escapef(m):
+        return TTest.ESCAPEMAP[m.group(0)]
+
+    @staticmethod
+    def _stringescape(s):
+        return TTest.ESCAPESUB(TTest._escapef, s)
+
+
+iolock = threading.RLock()
+firstlock = threading.RLock()
+firsterror = False
+
+base_class = unittest.TextTestResult
+
+
+class TestResult(base_class):
+    """Holds results when executing via unittest."""
+
+    def __init__(self, options, *args, **kwargs):
+        super(TestResult, self).__init__(*args, **kwargs)
+
+        self._options = options
+
+        # unittest.TestResult didn't have skipped until 2.7. We need to
+        # polyfill it.
+        self.skipped = []
+
+        # We have a custom "ignored" result that isn't present in any Python
+        # unittest implementation. It is very similar to skipped. It may make
+        # sense to map it into skip some day.
+        self.ignored = []
+
+        self.times = []
+        self._firststarttime = None
+        # Data stored for the benefit of generating xunit reports.
+        self.successes = []
+        self.faildata = {}
+
+        if options.color == 'auto':
+            isatty = self.stream.isatty()
+            # For some reason, redirecting stdout on Windows disables the ANSI
+            # color processing of stderr, which is what is used to print the
+            # output.  Therefore, both must be tty on Windows to enable color.
+            if WINDOWS:
+                isatty = isatty and sys.stdout.isatty()
+            self.color = pygmentspresent and isatty
+        elif options.color == 'never':
+            self.color = False
+        else:  # 'always', for testing purposes
+            self.color = pygmentspresent
+
+    def onStart(self, test):
+        """Can be overriden by custom TestResult"""
+
+    def onEnd(self):
+        """Can be overriden by custom TestResult"""
+
+    def addFailure(self, test, reason):
+        self.failures.append((test, reason))
+
+        if self._options.first:
+            self.stop()
+        else:
+            with iolock:
+                if reason == "timed out":
+                    self.stream.write('t')
+                else:
+                    if not self._options.nodiff:
+                        self.stream.write('\n')
+                        # Exclude the '\n' from highlighting to lex correctly
+                        formatted = 'ERROR: %s output changed\n' % test
+                        self.stream.write(highlightmsg(formatted, self.color))
+                    self.stream.write('!')
+
+                self.stream.flush()
+
+    def addSuccess(self, test):
+        with iolock:
+            super(TestResult, self).addSuccess(test)
+        self.successes.append(test)
+
+    def addError(self, test, err):
+        super(TestResult, self).addError(test, err)
+        if self._options.first:
+            self.stop()
+
+    # Polyfill.
+    def addSkip(self, test, reason):
+        self.skipped.append((test, reason))
+        with iolock:
+            if self.showAll:
+                self.stream.writeln('skipped %s' % reason)
+            else:
+                self.stream.write('s')
+                self.stream.flush()
+
+    def addIgnore(self, test, reason):
+        self.ignored.append((test, reason))
+        with iolock:
+            if self.showAll:
+                self.stream.writeln('ignored %s' % reason)
+            else:
+                if reason not in ('not retesting', "doesn't match keyword"):
+                    self.stream.write('i')
+                else:
+                    self.testsRun += 1
+                self.stream.flush()
+
+    def addOutputMismatch(self, test, ret, got, expected):
+        """Record a mismatch in test output for a particular test."""
+        if self.shouldStop or firsterror:
+            # don't print, some other test case already failed and
+            # printed, we're just stale and probably failed due to our
+            # temp dir getting cleaned up.
+            return
+
+        accepted = False
+        lines = []
+
+        with iolock:
+            if self._options.nodiff:
+                pass
+            elif self._options.view:
+                v = self._options.view
+                subprocess.call(
+                    r'"%s" "%s" "%s"'
+                    % (v, _bytes2sys(test.refpath), _bytes2sys(test.errpath)),
+                    shell=True,
+                )
+            else:
+                servefail, lines = getdiff(
+                    expected, got, test.refpath, test.errpath
+                )
+                self.stream.write('\n')
+                for line in lines:
+                    line = highlightdiff(line, self.color)
+                    self.stream.flush()
+                    self.stream.buffer.write(line)
+                    self.stream.buffer.flush()
+
+                if servefail:
+                    raise test.failureException(
+                        'server failed to start (HGPORT=%s)' % test._startport
+                    )
+
+            # handle interactive prompt without releasing iolock
+            if self._options.interactive:
+                if test.readrefout() != expected:
+                    self.stream.write(
+                        'Reference output has changed (run again to prompt '
+                        'changes)'
+                    )
+                else:
+                    self.stream.write('Accept this change? [y/N] ')
+                    self.stream.flush()
+                    answer = sys.stdin.readline().strip()
+                    if answer.lower() in ('y', 'yes'):
+                        if test.path.endswith(b'.t'):
+                            rename(test.errpath, test.path)
+                        else:
+                            rename(test.errpath, b'%s.out' % test.path)
+                        accepted = True
+            if not accepted:
+                self.faildata[test.name] = b''.join(lines)
+
+        return accepted
+
+    def startTest(self, test):
+        super(TestResult, self).startTest(test)
+
+        # os.times module computes the user time and system time spent by
+        # child's processes along with real elapsed time taken by a process.
+        # This module has one limitation. It can only work for Linux user
+        # and not for Windows. Hence why we fall back to another function
+        # for wall time calculations.
+        test.started_times = os.times()
+        # TODO use a monotonic clock once support for Python 2.7 is dropped.
+        test.started_time = time.time()
+        if self._firststarttime is None:  # thread racy but irrelevant
+            self._firststarttime = test.started_time
+
+    def stopTest(self, test, interrupted=False):
+        super(TestResult, self).stopTest(test)
+
+        test.stopped_times = os.times()
+        stopped_time = time.time()
+
+        starttime = test.started_times
+        endtime = test.stopped_times
+        origin = self._firststarttime
+        self.times.append(
+            (
+                test.name,
+                endtime[2] - starttime[2],  # user space CPU time
+                endtime[3] - starttime[3],  # sys  space CPU time
+                stopped_time - test.started_time,  # real time
+                test.started_time - origin,  # start date in run context
+                stopped_time - origin,  # end date in run context
+            )
+        )
+
+        if interrupted:
+            with iolock:
+                self.stream.writeln(
+                    'INTERRUPTED: %s (after %d seconds)'
+                    % (test.name, self.times[-1][3])
+                )
+
+
+def getTestResult():
+    """
+    Returns the relevant test result
+    """
+    if "CUSTOM_TEST_RESULT" in os.environ:
+        testresultmodule = __import__(os.environ["CUSTOM_TEST_RESULT"])
+        return testresultmodule.TestResult
+    else:
+        return TestResult
+
+
+class TestSuite(unittest.TestSuite):
+    """Custom unittest TestSuite that knows how to execute Mercurial tests."""
+
+    def __init__(
+        self,
+        testdir,
+        jobs=1,
+        whitelist=None,
+        blacklist=None,
+        keywords=None,
+        loop=False,
+        runs_per_test=1,
+        loadtest=None,
+        showchannels=False,
+        *args,
+        **kwargs
+    ):
+        """Create a new instance that can run tests with a configuration.
+
+        testdir specifies the directory where tests are executed from. This
+        is typically the ``tests`` directory from Mercurial's source
+        repository.
+
+        jobs specifies the number of jobs to run concurrently. Each test
+        executes on its own thread. Tests actually spawn new processes, so
+        state mutation should not be an issue.
+
+        If there is only one job, it will use the main thread.
+
+        whitelist and blacklist denote tests that have been whitelisted and
+        blacklisted, respectively. These arguments don't belong in TestSuite.
+        Instead, whitelist and blacklist should be handled by the thing that
+        populates the TestSuite with tests. They are present to preserve
+        backwards compatible behavior which reports skipped tests as part
+        of the results.
+
+        keywords denotes key words that will be used to filter which tests
+        to execute. This arguably belongs outside of TestSuite.
+
+        loop denotes whether to loop over tests forever.
+        """
+        super(TestSuite, self).__init__(*args, **kwargs)
+
+        self._jobs = jobs
+        self._whitelist = whitelist
+        self._blacklist = blacklist
+        self._keywords = keywords
+        self._loop = loop
+        self._runs_per_test = runs_per_test
+        self._loadtest = loadtest
+        self._showchannels = showchannels
+
+    def run(self, result):
+        # We have a number of filters that need to be applied. We do this
+        # here instead of inside Test because it makes the running logic for
+        # Test simpler.
+        tests = []
+        num_tests = [0]
+        for test in self._tests:
+
+            def get():
+                num_tests[0] += 1
+                if getattr(test, 'should_reload', False):
+                    return self._loadtest(test, num_tests[0])
+                return test
+
+            if not os.path.exists(test.path):
+                result.addSkip(test, "Doesn't exist")
+                continue
+
+            is_whitelisted = self._whitelist and (
+                test.relpath in self._whitelist or test.bname in self._whitelist
+            )
+            if not is_whitelisted:
+                is_blacklisted = self._blacklist and (
+                    test.relpath in self._blacklist
+                    or test.bname in self._blacklist
+                )
+                if is_blacklisted:
+                    result.addSkip(test, 'blacklisted')
+                    continue
+                if self._keywords:
+                    with open(test.path, 'rb') as f:
+                        t = f.read().lower() + test.bname.lower()
+                    ignored = False
+                    for k in self._keywords.lower().split():
+                        if k not in t:
+                            result.addIgnore(test, "doesn't match keyword")
+                            ignored = True
+                            break
+
+                    if ignored:
+                        continue
+            for _ in range(self._runs_per_test):
+                tests.append(get())
+
+        runtests = list(tests)
+        done = queue.Queue()
+        running = 0
+
+        channels_lock = threading.Lock()
+        channels = [""] * self._jobs
+
+        def job(test, result):
+            with channels_lock:
+                for n, v in enumerate(channels):
+                    if not v:
+                        channel = n
+                        break
+                else:
+                    raise ValueError('Could not find output channel')
+                channels[channel] = "=" + test.name[5:].split(".")[0]
+
+            r = None
+            try:
+                test(result)
+            except KeyboardInterrupt:
+                pass
+            except:  # re-raises
+                r = ('!', test, 'run-test raised an error, see traceback')
+                raise
+            finally:
+                try:
+                    channels[channel] = ''
+                except IndexError:
+                    pass
+                done.put(r)
+
+        def stat():
+            count = 0
+            while channels:
+                d = '\n%03s  ' % count
+                for n, v in enumerate(channels):
+                    if v:
+                        d += v[0]
+                        channels[n] = v[1:] or '.'
+                    else:
+                        d += ' '
+                    d += ' '
+                with iolock:
+                    sys.stdout.write(d + '  ')
+                    sys.stdout.flush()
+                for x in range(10):
+                    if channels:
+                        time.sleep(0.1)
+                count += 1
+
+        stoppedearly = False
+
+        if self._showchannels:
+            statthread = threading.Thread(target=stat, name="stat")
+            statthread.start()
+
+        try:
+            while tests or running:
+                if not done.empty() or running == self._jobs or not tests:
+                    try:
+                        done.get(True, 1)
+                        running -= 1
+                        if result and result.shouldStop:
+                            stoppedearly = True
+                            break
+                    except queue.Empty:
+                        continue
+                if tests and not running == self._jobs:
+                    test = tests.pop(0)
+                    if self._loop:
+                        if getattr(test, 'should_reload', False):
+                            num_tests[0] += 1
+                            tests.append(self._loadtest(test, num_tests[0]))
+                        else:
+                            tests.append(test)
+                    if self._jobs == 1:
+                        job(test, result)
+                    else:
+                        t = threading.Thread(
+                            target=job, name=test.name, args=(test, result)
+                        )
+                        t.start()
+                    running += 1
+
+            # If we stop early we still need to wait on started tests to
+            # finish. Otherwise, there is a race between the test completing
+            # and the test's cleanup code running. This could result in the
+            # test reporting incorrect.
+            if stoppedearly:
+                while running:
+                    try:
+                        done.get(True, 1)
+                        running -= 1
+                    except queue.Empty:
+                        continue
+        except KeyboardInterrupt:
+            for test in runtests:
+                test.abort()
+
+        channels = []
+
+        return result
+
+
+# Save the most recent 5 wall-clock runtimes of each test to a
+# human-readable text file named .testtimes. Tests are sorted
+# alphabetically, while times for each test are listed from oldest to
+# newest.
+
+
+def loadtimes(outputdir):
+    times = []
+    try:
+        with open(os.path.join(outputdir, b'.testtimes')) as fp:
+            for line in fp:
+                m = re.match('(.*?) ([0-9. ]+)', line)
+                times.append(
+                    (m.group(1), [float(t) for t in m.group(2).split()])
+                )
+    except FileNotFoundError:
+        pass
+    return times
+
+
+def savetimes(outputdir, result):
+    saved = dict(loadtimes(outputdir))
+    maxruns = 5
+    skipped = {str(t[0]) for t in result.skipped}
+    for tdata in result.times:
+        test, real = tdata[0], tdata[3]
+        if test not in skipped:
+            ts = saved.setdefault(test, [])
+            ts.append(real)
+            ts[:] = ts[-maxruns:]
+
+    fd, tmpname = tempfile.mkstemp(
+        prefix=b'.testtimes', dir=outputdir, text=True
+    )
+    with os.fdopen(fd, 'w') as fp:
+        for name, ts in sorted(saved.items()):
+            fp.write('%s %s\n' % (name, ' '.join(['%.3f' % (t,) for t in ts])))
+    timepath = os.path.join(outputdir, b'.testtimes')
+    try:
+        os.unlink(timepath)
+    except OSError:
+        pass
+    try:
+        os.rename(tmpname, timepath)
+    except OSError:
+        pass
+
+
+class TextTestRunner(unittest.TextTestRunner):
+    """Custom unittest test runner that uses appropriate settings."""
+
+    def __init__(self, runner, *args, **kwargs):
+        super(TextTestRunner, self).__init__(*args, **kwargs)
+
+        self._runner = runner
+
+        self._result = getTestResult()(
+            self._runner.options, self.stream, self.descriptions, self.verbosity
+        )
+
+    def listtests(self, test):
+        test = sorted(test, key=lambda t: t.name)
+
+        self._result.onStart(test)
+
+        for t in test:
+            print(t.name)
+            self._result.addSuccess(t)
+
+        if self._runner.options.xunit:
+            with open(self._runner.options.xunit, "wb") as xuf:
+                self._writexunit(self._result, xuf)
+
+        if self._runner.options.json:
+            jsonpath = os.path.join(self._runner._outputdir, b'report.json')
+            with open(jsonpath, 'w') as fp:
+                self._writejson(self._result, fp)
+
+        return self._result
+
+    def run(self, test):
+        self._result.onStart(test)
+        test(self._result)
+
+        failed = len(self._result.failures)
+        skipped = len(self._result.skipped)
+        ignored = len(self._result.ignored)
+
+        with iolock:
+            self.stream.writeln('')
+
+            if not self._runner.options.noskips:
+                for test, msg in sorted(
+                    self._result.skipped, key=lambda s: s[0].name
+                ):
+                    formatted = 'Skipped %s: %s\n' % (test.name, msg)
+                    msg = highlightmsg(formatted, self._result.color)
+                    self.stream.write(msg)
+            for test, msg in sorted(
+                self._result.failures, key=lambda f: f[0].name
+            ):
+                formatted = 'Failed %s: %s\n' % (test.name, msg)
+                self.stream.write(highlightmsg(formatted, self._result.color))
+            for test, msg in sorted(
+                self._result.errors, key=lambda e: e[0].name
+            ):
+                self.stream.writeln('Errored %s: %s' % (test.name, msg))
+
+            if self._runner.options.xunit:
+                with open(self._runner.options.xunit, "wb") as xuf:
+                    self._writexunit(self._result, xuf)
+
+            if self._runner.options.json:
+                jsonpath = os.path.join(self._runner._outputdir, b'report.json')
+                with open(jsonpath, 'w') as fp:
+                    self._writejson(self._result, fp)
+
+            self._runner._checkhglib('Tested')
+
+            savetimes(self._runner._outputdir, self._result)
+
+            if failed and self._runner.options.known_good_rev:
+                self._bisecttests(t for t, m in self._result.failures)
+            self.stream.writeln(
+                '# Ran %d tests, %d skipped, %d failed.'
+                % (self._result.testsRun, skipped + ignored, failed)
+            )
+            if failed:
+                self.stream.writeln(
+                    'python hash seed: %s' % os.environ['PYTHONHASHSEED']
+                )
+            if self._runner.options.time:
+                self.printtimes(self._result.times)
+
+            if self._runner.options.exceptions:
+                exceptions = aggregateexceptions(
+                    os.path.join(self._runner._outputdir, b'exceptions')
+                )
+
+                self.stream.writeln('Exceptions Report:')
+                self.stream.writeln(
+                    '%d total from %d frames'
+                    % (exceptions['total'], len(exceptions['exceptioncounts']))
+                )
+                combined = exceptions['combined']
+                for key in sorted(combined, key=combined.get, reverse=True):
+                    frame, line, exc = key
+                    totalcount, testcount, leastcount, leasttest = combined[key]
+
+                    self.stream.writeln(
+                        '%d (%d tests)\t%s: %s (%s - %d total)'
+                        % (
+                            totalcount,
+                            testcount,
+                            frame,
+                            exc,
+                            leasttest,
+                            leastcount,
+                        )
+                    )
+
+            self.stream.flush()
+
+        return self._result
+
+    def _bisecttests(self, tests):
+        bisectcmd = ['hg', 'bisect']
+        bisectrepo = self._runner.options.bisect_repo
+        if bisectrepo:
+            bisectcmd.extend(['-R', os.path.abspath(bisectrepo)])
+
+        def pread(args):
+            env = os.environ.copy()
+            env['HGPLAIN'] = '1'
+            p = subprocess.Popen(
+                args, stderr=subprocess.STDOUT, stdout=subprocess.PIPE, env=env
+            )
+            data = p.stdout.read()
+            p.wait()
+            return data
+
+        for test in tests:
+            pread(bisectcmd + ['--reset']),
+            pread(bisectcmd + ['--bad', '.'])
+            pread(bisectcmd + ['--good', self._runner.options.known_good_rev])
+            # TODO: we probably need to forward more options
+            # that alter hg's behavior inside the tests.
+            opts = ''
+            withhg = self._runner.options.with_hg
+            if withhg:
+                opts += ' --with-hg=%s ' % shellquote(_bytes2sys(withhg))
+            rtc = '%s %s %s %s' % (sysexecutable, sys.argv[0], opts, test)
+            data = pread(bisectcmd + ['--command', rtc])
+            m = re.search(
+                (
+                    br'\nThe first (?P<goodbad>bad|good) revision '
+                    br'is:\nchangeset: +\d+:(?P<node>[a-f0-9]+)\n.*\n'
+                    br'summary: +(?P<summary>[^\n]+)\n'
+                ),
+                data,
+                (re.MULTILINE | re.DOTALL),
+            )
+            if m is None:
+                self.stream.writeln(
+                    'Failed to identify failure point for %s' % test
+                )
+                continue
+            dat = m.groupdict()
+            verb = 'broken' if dat['goodbad'] == b'bad' else 'fixed'
+            self.stream.writeln(
+                '%s %s by %s (%s)'
+                % (
+                    test,
+                    verb,
+                    dat['node'].decode('ascii'),
+                    dat['summary'].decode('utf8', 'ignore'),
+                )
+            )
+
+    def printtimes(self, times):
+        # iolock held by run
+        self.stream.writeln('# Producing time report')
+        times.sort(key=lambda t: (t[3]))
+        cols = '%7.3f %7.3f %7.3f %7.3f %7.3f   %s'
+        self.stream.writeln(
+            '%-7s %-7s %-7s %-7s %-7s   %s'
+            % ('start', 'end', 'cuser', 'csys', 'real', 'Test')
+        )
+        for tdata in times:
+            test = tdata[0]
+            cuser, csys, real, start, end = tdata[1:6]
+            self.stream.writeln(cols % (start, end, cuser, csys, real, test))
+
+    @staticmethod
+    def _writexunit(result, outf):
+        # See http://llg.cubic.org/docs/junit/ for a reference.
+        timesd = {t[0]: t[3] for t in result.times}
+        doc = minidom.Document()
+        s = doc.createElement('testsuite')
+        s.setAttribute('errors', "0")  # TODO
+        s.setAttribute('failures', str(len(result.failures)))
+        s.setAttribute('name', 'run-tests')
+        s.setAttribute(
+            'skipped', str(len(result.skipped) + len(result.ignored))
+        )
+        s.setAttribute('tests', str(result.testsRun))
+        doc.appendChild(s)
+        for tc in result.successes:
+            t = doc.createElement('testcase')
+            t.setAttribute('name', tc.name)
+            tctime = timesd.get(tc.name)
+            if tctime is not None:
+                t.setAttribute('time', '%.3f' % tctime)
+            s.appendChild(t)
+        for tc, err in sorted(result.faildata.items()):
+            t = doc.createElement('testcase')
+            t.setAttribute('name', tc)
+            tctime = timesd.get(tc)
+            if tctime is not None:
+                t.setAttribute('time', '%.3f' % tctime)
+            # createCDATASection expects a unicode or it will
+            # convert using default conversion rules, which will
+            # fail if string isn't ASCII.
+            err = cdatasafe(err).decode('utf-8', 'replace')
+            cd = doc.createCDATASection(err)
+            # Use 'failure' here instead of 'error' to match errors = 0,
+            # failures = len(result.failures) in the testsuite element.
+            failelem = doc.createElement('failure')
+            failelem.setAttribute('message', 'output changed')
+            failelem.setAttribute('type', 'output-mismatch')
+            failelem.appendChild(cd)
+            t.appendChild(failelem)
+            s.appendChild(t)
+        for tc, message in result.skipped:
+            # According to the schema, 'skipped' has no attributes. So store
+            # the skip message as a text node instead.
+            t = doc.createElement('testcase')
+            t.setAttribute('name', tc.name)
+            binmessage = message.encode('utf-8')
+            message = cdatasafe(binmessage).decode('utf-8', 'replace')
+            cd = doc.createCDATASection(message)
+            skipelem = doc.createElement('skipped')
+            skipelem.appendChild(cd)
+            t.appendChild(skipelem)
+            s.appendChild(t)
+        outf.write(doc.toprettyxml(indent='  ', encoding='utf-8'))
+
+    @staticmethod
+    def _writejson(result, outf):
+        timesd = {}
+        for tdata in result.times:

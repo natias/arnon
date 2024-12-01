@@ -1,0 +1,1000 @@
+
+    results = ([], [], [], [], [], [], [], [])
+    addsrc = results[0].append
+    adddst = results[1].append
+    advsrc = results[2].append
+    advdst = results[3].append
+    diverge = results[4].append
+    differ = results[5].append
+    invalid = results[6].append
+    same = results[7].append
+
+    for b in sorted(bset):
+        if b not in srcmarks:
+            if b in dstmarks:
+                adddst((b, None, dstmarks[b]))
+            else:
+                invalid((b, None, None))
+        elif b not in dstmarks:
+            addsrc((b, srcmarks[b], None))
+        else:
+            scid = srcmarks[b]
+            dcid = dstmarks[b]
+            if scid == dcid:
+                same((b, scid, dcid))
+            elif scid in repo and dcid in repo:
+                sctx = repo[scid]
+                dctx = repo[dcid]
+                if sctx.rev() < dctx.rev():
+                    if validdest(repo, sctx, dctx):
+                        advdst((b, scid, dcid))
+                    else:
+                        diverge((b, scid, dcid))
+                else:
+                    if validdest(repo, dctx, sctx):
+                        advsrc((b, scid, dcid))
+                    else:
+                        diverge((b, scid, dcid))
+            else:
+                # it is too expensive to examine in detail, in this case
+                differ((b, scid, dcid))
+
+    return results
+
+
+def _diverge(ui, b, path, localmarks, remotenode):
+    """Return appropriate diverged bookmark for specified ``path``
+
+    This returns None, if it is failed to assign any divergent
+    bookmark name.
+
+    This reuses already existing one with "@number" suffix, if it
+    refers ``remotenode``.
+    """
+    if b == b'@':
+        b = b''
+    # try to use an @pathalias suffix
+    # if an @pathalias already exists, we overwrite (update) it
+    if path.startswith(b"file:"):
+        path = urlutil.url(path).path
+    for name, p in urlutil.list_paths(ui):
+        loc = p.rawloc
+        if loc.startswith(b"file:"):
+            loc = urlutil.url(loc).path
+        if path == loc:
+            return b'%s@%s' % (b, name)
+
+    # assign a unique "@number" suffix newly
+    for x in range(1, 100):
+        n = b'%s@%d' % (b, x)
+        if n not in localmarks or localmarks[n] == remotenode:
+            return n
+
+    return None
+
+
+def unhexlifybookmarks(marks):
+    binremotemarks = {}
+    for name, node in marks.items():
+        binremotemarks[name] = bin(node)
+    return binremotemarks
+
+
+_binaryentry = struct.Struct(b'>20sH')
+
+
+def binaryencode(repo, bookmarks):
+    """encode a '(bookmark, node)' iterable into a binary stream
+
+    the binary format is:
+
+        <node><bookmark-length><bookmark-name>
+
+    :node: is a 20 bytes binary node,
+    :bookmark-length: an unsigned short,
+    :bookmark-name: the name of the bookmark (of length <bookmark-length>)
+
+    wdirid (all bits set) will be used as a special value for "missing"
+    """
+    binarydata = []
+    for book, node in bookmarks:
+        if not node:  # None or ''
+            node = repo.nodeconstants.wdirid
+        binarydata.append(_binaryentry.pack(node, len(book)))
+        binarydata.append(book)
+    return b''.join(binarydata)
+
+
+def binarydecode(repo, stream):
+    """decode a binary stream into an '(bookmark, node)' iterable
+
+    the binary format is:
+
+        <node><bookmark-length><bookmark-name>
+
+    :node: is a 20 bytes binary node,
+    :bookmark-length: an unsigned short,
+    :bookmark-name: the name of the bookmark (of length <bookmark-length>))
+
+    wdirid (all bits set) will be used as a special value for "missing"
+    """
+    entrysize = _binaryentry.size
+    books = []
+    while True:
+        entry = stream.read(entrysize)
+        if len(entry) < entrysize:
+            if entry:
+                raise error.Abort(_(b'bad bookmark stream'))
+            break
+        node, length = _binaryentry.unpack(entry)
+        bookmark = stream.read(length)
+        if len(bookmark) < length:
+            if entry:
+                raise error.Abort(_(b'bad bookmark stream'))
+        if node == repo.nodeconstants.wdirid:
+            node = None
+        books.append((bookmark, node))
+    return books
+
+
+def mirroring_remote(ui, repo, remotemarks):
+    """computes the bookmark changes that set the local bookmarks to
+    remotemarks"""
+    changed = []
+    localmarks = repo._bookmarks
+    for (b, id) in remotemarks.items():
+        if id != localmarks.get(b, None) and id in repo:
+            changed.append((b, id, ui.debug, _(b"updating bookmark %s\n") % b))
+    for b in localmarks:
+        if b not in remotemarks:
+            changed.append(
+                (b, None, ui.debug, _(b"removing bookmark %s\n") % b)
+            )
+    return changed
+
+
+def merging_from_remote(ui, repo, remotemarks, path, explicit=()):
+    """computes the bookmark changes that merge remote bookmarks into the
+    local bookmarks, based on comparebookmarks"""
+    localmarks = repo._bookmarks
+    (
+        addsrc,
+        adddst,
+        advsrc,
+        advdst,
+        diverge,
+        differ,
+        invalid,
+        same,
+    ) = comparebookmarks(repo, remotemarks, localmarks)
+
+    status = ui.status
+    warn = ui.warn
+    if ui.configbool(b'ui', b'quietbookmarkmove'):
+        status = warn = ui.debug
+
+    explicit = set(explicit)
+    changed = []
+    for b, scid, dcid in addsrc:
+        if scid in repo:  # add remote bookmarks for changes we already have
+            changed.append(
+                (b, scid, status, _(b"adding remote bookmark %s\n") % b)
+            )
+        elif b in explicit:
+            explicit.remove(b)
+            ui.warn(
+                _(b"remote bookmark %s points to locally missing %s\n")
+                % (b, hex(scid)[:12])
+            )
+
+    for b, scid, dcid in advsrc:
+        changed.append((b, scid, status, _(b"updating bookmark %s\n") % b))
+    # remove normal movement from explicit set
+    explicit.difference_update(d[0] for d in changed)
+
+    for b, scid, dcid in diverge:
+        if b in explicit:
+            explicit.discard(b)
+            changed.append((b, scid, status, _(b"importing bookmark %s\n") % b))
+        else:
+            db = _diverge(ui, b, path, localmarks, scid)
+            if db:
+                changed.append(
+                    (
+                        db,
+                        scid,
+                        warn,
+                        _(b"divergent bookmark %s stored as %s\n") % (b, db),
+                    )
+                )
+            else:
+                warn(
+                    _(
+                        b"warning: failed to assign numbered name "
+                        b"to divergent bookmark %s\n"
+                    )
+                    % b
+                )
+    for b, scid, dcid in adddst + advdst:
+        if b in explicit:
+            explicit.discard(b)
+            changed.append((b, scid, status, _(b"importing bookmark %s\n") % b))
+    for b, scid, dcid in differ:
+        if b in explicit:
+            explicit.remove(b)
+            ui.warn(
+                _(b"remote bookmark %s points to locally missing %s\n")
+                % (b, hex(scid)[:12])
+            )
+    return changed
+
+
+def updatefromremote(
+    ui, repo, remotemarks, path, trfunc, explicit=(), mode=None
+):
+    if mode == b'ignore':
+        # This should move to an higher level to avoid fetching bookmark at all
+        return
+    ui.debug(b"checking for updated bookmarks\n")
+    if mode == b'mirror':
+        changed = mirroring_remote(ui, repo, remotemarks)
+    else:
+        changed = merging_from_remote(ui, repo, remotemarks, path, explicit)
+
+    if changed:
+        tr = trfunc()
+        changes = []
+        key = lambda t: (t[0], t[1] or b'')
+        for b, node, writer, msg in sorted(changed, key=key):
+            changes.append((b, node))
+            writer(msg)
+        repo._bookmarks.applychanges(repo, tr, changes)
+
+
+def incoming(ui, repo, peer, mode=None):
+    """Show bookmarks incoming from other to repo"""
+    if mode == b'ignore':
+        ui.status(_(b"bookmarks exchange disabled with this path\n"))
+        return 0
+    ui.status(_(b"searching for changed bookmarks\n"))
+
+    with peer.commandexecutor() as e:
+        remotemarks = unhexlifybookmarks(
+            e.callcommand(
+                b'listkeys',
+                {
+                    b'namespace': b'bookmarks',
+                },
+            ).result()
+        )
+
+    incomings = []
+    if ui.debugflag:
+        getid = lambda id: id
+    else:
+        getid = lambda id: id[:12]
+    if ui.verbose:
+
+        def add(b, id, st):
+            incomings.append(b"   %-25s %s %s\n" % (b, getid(id), st))
+
+    else:
+
+        def add(b, id, st):
+            incomings.append(b"   %-25s %s\n" % (b, getid(id)))
+
+    if mode == b'mirror':
+        localmarks = repo._bookmarks
+        allmarks = set(remotemarks.keys()) | set(localmarks.keys())
+        for b in sorted(allmarks):
+            loc = localmarks.get(b)
+            rem = remotemarks.get(b)
+            if loc == rem:
+                continue
+            elif loc is None:
+                add(b, hex(rem), _(b'added'))
+            elif rem is None:
+                add(b, hex(repo.nullid), _(b'removed'))
+            else:
+                add(b, hex(rem), _(b'changed'))
+    else:
+        r = comparebookmarks(repo, remotemarks, repo._bookmarks)
+        addsrc, adddst, advsrc, advdst, diverge, differ, invalid, same = r
+
+        for b, scid, dcid in addsrc:
+            # i18n: "added" refers to a bookmark
+            add(b, hex(scid), _(b'added'))
+        for b, scid, dcid in advsrc:
+            # i18n: "advanced" refers to a bookmark
+            add(b, hex(scid), _(b'advanced'))
+        for b, scid, dcid in diverge:
+            # i18n: "diverged" refers to a bookmark
+            add(b, hex(scid), _(b'diverged'))
+        for b, scid, dcid in differ:
+            # i18n: "changed" refers to a bookmark
+            add(b, hex(scid), _(b'changed'))
+
+    if not incomings:
+        ui.status(_(b"no changed bookmarks found\n"))
+        return 1
+
+    for s in sorted(incomings):
+        ui.write(s)
+
+    return 0
+
+
+def outgoing(ui, repo, other):
+    """Show bookmarks outgoing from repo to other"""
+    ui.status(_(b"searching for changed bookmarks\n"))
+
+    remotemarks = unhexlifybookmarks(other.listkeys(b'bookmarks'))
+    r = comparebookmarks(repo, repo._bookmarks, remotemarks)
+    addsrc, adddst, advsrc, advdst, diverge, differ, invalid, same = r
+
+    outgoings = []
+    if ui.debugflag:
+        getid = lambda id: id
+    else:
+        getid = lambda id: id[:12]
+    if ui.verbose:
+
+        def add(b, id, st):
+            outgoings.append(b"   %-25s %s %s\n" % (b, getid(id), st))
+
+    else:
+
+        def add(b, id, st):
+            outgoings.append(b"   %-25s %s\n" % (b, getid(id)))
+
+    for b, scid, dcid in addsrc:
+        # i18n: "added refers to a bookmark
+        add(b, hex(scid), _(b'added'))
+    for b, scid, dcid in adddst:
+        # i18n: "deleted" refers to a bookmark
+        add(b, b' ' * 40, _(b'deleted'))
+    for b, scid, dcid in advsrc:
+        # i18n: "advanced" refers to a bookmark
+        add(b, hex(scid), _(b'advanced'))
+    for b, scid, dcid in diverge:
+        # i18n: "diverged" refers to a bookmark
+        add(b, hex(scid), _(b'diverged'))
+    for b, scid, dcid in differ:
+        # i18n: "changed" refers to a bookmark
+        add(b, hex(scid), _(b'changed'))
+
+    if not outgoings:
+        ui.status(_(b"no changed bookmarks found\n"))
+        return 1
+
+    for s in sorted(outgoings):
+        ui.write(s)
+
+    return 0
+
+
+def summary(repo, peer):
+    """Compare bookmarks between repo and other for "hg summary" output
+
+    This returns "(# of incoming, # of outgoing)" tuple.
+    """
+    with peer.commandexecutor() as e:
+        remotemarks = unhexlifybookmarks(
+            e.callcommand(
+                b'listkeys',
+                {
+                    b'namespace': b'bookmarks',
+                },
+            ).result()
+        )
+
+    r = comparebookmarks(repo, remotemarks, repo._bookmarks)
+    addsrc, adddst, advsrc, advdst, diverge, differ, invalid, same = r
+    return (len(addsrc), len(adddst))
+
+
+def validdest(repo, old, new):
+    """Is the new bookmark destination a valid update from the old one"""
+    repo = repo.unfiltered()
+    if old == new:
+        # Old == new -> nothing to update.
+        return False
+    elif not old:
+        # old is nullrev, anything is valid.
+        # (new != nullrev has been excluded by the previous check)
+        return True
+    elif repo.obsstore:
+        return new.node() in obsutil.foreground(repo, [old.node()])
+    else:
+        # still an independent clause as it is lazier (and therefore faster)
+        return old.isancestorof(new)
+
+
+def checkformat(repo, mark):
+    """return a valid version of a potential bookmark name
+
+    Raises an abort error if the bookmark name is not valid.
+    """
+    mark = mark.strip()
+    if not mark:
+        raise error.InputError(
+            _(b"bookmark names cannot consist entirely of whitespace")
+        )
+    scmutil.checknewlabel(repo, mark, b'bookmark')
+    return mark
+
+
+def delete(repo, tr, names):
+    """remove a mark from the bookmark store
+
+    Raises an abort error if mark does not exist.
+    """
+    marks = repo._bookmarks
+    changes = []
+    for mark in names:
+        if mark not in marks:
+            raise error.InputError(_(b"bookmark '%s' does not exist") % mark)
+        if mark == repo._activebookmark:
+            deactivate(repo)
+        changes.append((mark, None))
+    marks.applychanges(repo, tr, changes)
+
+
+def rename(repo, tr, old, new, force=False, inactive=False):
+    """rename a bookmark from old to new
+
+    If force is specified, then the new name can overwrite an existing
+    bookmark.
+
+    If inactive is specified, then do not activate the new bookmark.
+
+    Raises an abort error if old is not in the bookmark store.
+    """
+    marks = repo._bookmarks
+    mark = checkformat(repo, new)
+    if old not in marks:
+        raise error.InputError(_(b"bookmark '%s' does not exist") % old)
+    changes = []
+    for bm in marks.checkconflict(mark, force):
+        changes.append((bm, None))
+    changes.extend([(mark, marks[old]), (old, None)])
+    marks.applychanges(repo, tr, changes)
+    if repo._activebookmark == old and not inactive:
+        activate(repo, mark)
+
+
+def addbookmarks(repo, tr, names, rev=None, force=False, inactive=False):
+    """add a list of bookmarks
+
+    If force is specified, then the new name can overwrite an existing
+    bookmark.
+
+    If inactive is specified, then do not activate any bookmark. Otherwise, the
+    first bookmark is activated.
+
+    Raises an abort error if old is not in the bookmark store.
+    """
+    marks = repo._bookmarks
+    cur = repo[b'.'].node()
+    newact = None
+    changes = []
+
+    # unhide revs if any
+    if rev:
+        repo = scmutil.unhidehashlikerevs(repo, [rev], b'nowarn')
+
+    ctx = scmutil.revsingle(repo, rev, None)
+    # bookmarking wdir means creating a bookmark on p1 and activating it
+    activatenew = not inactive and ctx.rev() is None
+    if ctx.node() is None:
+        ctx = ctx.p1()
+    tgt = ctx.node()
+    assert tgt
+
+    for mark in names:
+        mark = checkformat(repo, mark)
+        if newact is None:
+            newact = mark
+        if inactive and mark == repo._activebookmark:
+            deactivate(repo)
+            continue
+        for bm in marks.checkconflict(mark, force, tgt):
+            changes.append((bm, None))
+        changes.append((mark, tgt))
+
+    # nothing changed but for the one deactivated above
+    if not changes:
+        return
+
+    if ctx.hidden():
+        repo.ui.warn(_(b"bookmarking hidden changeset %s\n") % ctx.hex()[:12])
+
+        if ctx.obsolete():
+            msg = obsutil._getfilteredreason(repo, ctx.hex()[:12], ctx)
+            repo.ui.warn(b"(%s)\n" % msg)
+
+    marks.applychanges(repo, tr, changes)
+    if activatenew and cur == marks[newact]:
+        activate(repo, newact)
+    elif cur != tgt and newact == repo._activebookmark:
+        deactivate(repo)
+
+
+def _printbookmarks(ui, repo, fm, bmarks):
+    """private method to print bookmarks
+
+    Provides a way for extensions to control how bookmarks are printed (e.g.
+    prepend or postpend names)
+    """
+    hexfn = fm.hexfunc
+    if len(bmarks) == 0 and fm.isplain():
+        ui.status(_(b"no bookmarks set\n"))
+    for bmark, (n, prefix, label) in sorted(bmarks.items()):
+        fm.startitem()
+        fm.context(repo=repo)
+        if not ui.quiet:
+            fm.plain(b' %s ' % prefix, label=label)
+        fm.write(b'bookmark', b'%s', bmark, label=label)
+        pad = b" " * (25 - encoding.colwidth(bmark))
+        fm.condwrite(
+            not ui.quiet,
+            b'rev node',
+            pad + b' %d:%s',
+            repo.changelog.rev(n),
+            hexfn(n),
+            label=label,
+        )
+        fm.data(active=(activebookmarklabel in label))
+        fm.plain(b'\n')
+
+
+def printbookmarks(ui, repo, fm, names=None):
+    """print bookmarks by the given formatter
+
+    Provides a way for extensions to control how bookmarks are printed.
+    """
+    marks = repo._bookmarks
+    bmarks = {}
+    for bmark in names or marks:
+        if bmark not in marks:
+            raise error.InputError(_(b"bookmark '%s' does not exist") % bmark)
+        active = repo._activebookmark
+        if bmark == active:
+            prefix, label = b'*', activebookmarklabel
+        else:
+            prefix, label = b' ', b''
+
+        bmarks[bmark] = (marks[bmark], prefix, label)
+    _printbookmarks(ui, repo, fm, bmarks)
+
+
+def preparehookargs(name, old, new):
+    if new is None:
+        new = b''
+    if old is None:
+        old = b''
+    return {b'bookmark': name, b'node': hex(new), b'oldnode': hex(old)}
+                                                                                                                                                                                                                                                                                                                                                                                                                                        usr/lib/python3/dist-packages/mercurial/branchmap.py                                                0000644 0000000 0000000 00000077004 14355257011 021251  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        # branchmap.py - logic to computes, maintain and stores branchmap for local repo
+#
+# Copyright 2005-2007 Olivia Mackall <olivia@selenic.com>
+#
+# This software may be used and distributed according to the terms of the
+# GNU General Public License version 2 or any later version.
+
+
+import struct
+
+from .node import (
+    bin,
+    hex,
+    nullrev,
+)
+from . import (
+    encoding,
+    error,
+    obsolete,
+    pycompat,
+    scmutil,
+    util,
+)
+from .utils import (
+    repoviewutil,
+    stringutil,
+)
+
+if pycompat.TYPE_CHECKING:
+    from typing import (
+        Any,
+        Callable,
+        Dict,
+        Iterable,
+        List,
+        Optional,
+        Set,
+        Tuple,
+        Union,
+    )
+    from . import localrepo
+
+    assert any(
+        (
+            Any,
+            Callable,
+            Dict,
+            Iterable,
+            List,
+            Optional,
+            Set,
+            Tuple,
+            Union,
+            localrepo,
+        )
+    )
+
+subsettable = repoviewutil.subsettable
+
+calcsize = struct.calcsize
+pack_into = struct.pack_into
+unpack_from = struct.unpack_from
+
+
+class BranchMapCache:
+    """mapping of filtered views of repo with their branchcache"""
+
+    def __init__(self):
+        self._per_filter = {}
+
+    def __getitem__(self, repo):
+        self.updatecache(repo)
+        return self._per_filter[repo.filtername]
+
+    def updatecache(self, repo):
+        """Update the cache for the given filtered view on a repository"""
+        # This can trigger updates for the caches for subsets of the filtered
+        # view, e.g. when there is no cache for this filtered view or the cache
+        # is stale.
+
+        cl = repo.changelog
+        filtername = repo.filtername
+        bcache = self._per_filter.get(filtername)
+        if bcache is None or not bcache.validfor(repo):
+            # cache object missing or cache object stale? Read from disk
+            bcache = branchcache.fromfile(repo)
+
+        revs = []
+        if bcache is None:
+            # no (fresh) cache available anymore, perhaps we can re-use
+            # the cache for a subset, then extend that to add info on missing
+            # revisions.
+            subsetname = subsettable.get(filtername)
+            if subsetname is not None:
+                subset = repo.filtered(subsetname)
+                bcache = self[subset].copy()
+                extrarevs = subset.changelog.filteredrevs - cl.filteredrevs
+                revs.extend(r for r in extrarevs if r <= bcache.tiprev)
+            else:
+                # nothing to fall back on, start empty.
+                bcache = branchcache(repo)
+
+        revs.extend(cl.revs(start=bcache.tiprev + 1))
+        if revs:
+            bcache.update(repo, revs)
+
+        assert bcache.validfor(repo), filtername
+        self._per_filter[repo.filtername] = bcache
+
+    def replace(self, repo, remotebranchmap):
+        """Replace the branchmap cache for a repo with a branch mapping.
+
+        This is likely only called during clone with a branch map from a
+        remote.
+
+        """
+        cl = repo.changelog
+        clrev = cl.rev
+        clbranchinfo = cl.branchinfo
+        rbheads = []
+        closed = set()
+        for bheads in remotebranchmap.values():
+            rbheads += bheads
+            for h in bheads:
+                r = clrev(h)
+                b, c = clbranchinfo(r)
+                if c:
+                    closed.add(h)
+
+        if rbheads:
+            rtiprev = max((int(clrev(node)) for node in rbheads))
+            cache = branchcache(
+                repo,
+                remotebranchmap,
+                repo[rtiprev].node(),
+                rtiprev,
+                closednodes=closed,
+            )
+
+            # Try to stick it as low as possible
+            # filter above served are unlikely to be fetch from a clone
+            for candidate in (b'base', b'immutable', b'served'):
+                rview = repo.filtered(candidate)
+                if cache.validfor(rview):
+                    self._per_filter[candidate] = cache
+                    cache.write(rview)
+                    return
+
+    def clear(self):
+        self._per_filter.clear()
+
+    def write_delayed(self, repo):
+        unfi = repo.unfiltered()
+        for filtername, cache in self._per_filter.items():
+            if cache._delayed:
+                repo = unfi.filtered(filtername)
+                cache.write(repo)
+
+
+def _unknownnode(node):
+    """raises ValueError when branchcache found a node which does not exists"""
+    raise ValueError('node %s does not exist' % node.hex())
+
+
+def _branchcachedesc(repo):
+    if repo.filtername is not None:
+        return b'branch cache (%s)' % repo.filtername
+    else:
+        return b'branch cache'
+
+
+class branchcache:
+    """A dict like object that hold branches heads cache.
+
+    This cache is used to avoid costly computations to determine all the
+    branch heads of a repo.
+
+    The cache is serialized on disk in the following format:
+
+    <tip hex node> <tip rev number> [optional filtered repo hex hash]
+    <branch head hex node> <open/closed state> <branch name>
+    <branch head hex node> <open/closed state> <branch name>
+    ...
+
+    The first line is used to check if the cache is still valid. If the
+    branch cache is for a filtered repo view, an optional third hash is
+    included that hashes the hashes of all filtered and obsolete revisions.
+
+    The open/closed state is represented by a single letter 'o' or 'c'.
+    This field can be used to avoid changelog reads when determining if a
+    branch head closes a branch or not.
+    """
+
+    def __init__(
+        self,
+        repo,
+        entries=(),
+        tipnode=None,
+        tiprev=nullrev,
+        filteredhash=None,
+        closednodes=None,
+        hasnode=None,
+    ):
+        # type: (localrepo.localrepository, Union[Dict[bytes, List[bytes]], Iterable[Tuple[bytes, List[bytes]]]], bytes,  int, Optional[bytes], Optional[Set[bytes]], Optional[Callable[[bytes], bool]]) -> None
+        """hasnode is a function which can be used to verify whether changelog
+        has a given node or not. If it's not provided, we assume that every node
+        we have exists in changelog"""
+        self._repo = repo
+        self._delayed = False
+        if tipnode is None:
+            self.tipnode = repo.nullid
+        else:
+            self.tipnode = tipnode
+        self.tiprev = tiprev
+        self.filteredhash = filteredhash
+        # closednodes is a set of nodes that close their branch. If the branch
+        # cache has been updated, it may contain nodes that are no longer
+        # heads.
+        if closednodes is None:
+            self._closednodes = set()
+        else:
+            self._closednodes = closednodes
+        self._entries = dict(entries)
+        # whether closed nodes are verified or not
+        self._closedverified = False
+        # branches for which nodes are verified
+        self._verifiedbranches = set()
+        self._hasnode = hasnode
+        if self._hasnode is None:
+            self._hasnode = lambda x: True
+
+    def _verifyclosed(self):
+        """verify the closed nodes we have"""
+        if self._closedverified:
+            return
+        for node in self._closednodes:
+            if not self._hasnode(node):
+                _unknownnode(node)
+
+        self._closedverified = True
+
+    def _verifybranch(self, branch):
+        """verify head nodes for the given branch."""
+        if branch not in self._entries or branch in self._verifiedbranches:
+            return
+        for n in self._entries[branch]:
+            if not self._hasnode(n):
+                _unknownnode(n)
+
+        self._verifiedbranches.add(branch)
+
+    def _verifyall(self):
+        """verifies nodes of all the branches"""
+        needverification = set(self._entries.keys()) - self._verifiedbranches
+        for b in needverification:
+            self._verifybranch(b)
+
+    def __iter__(self):
+        return iter(self._entries)
+
+    def __setitem__(self, key, value):
+        self._entries[key] = value
+
+    def __getitem__(self, key):
+        self._verifybranch(key)
+        return self._entries[key]
+
+    def __contains__(self, key):
+        self._verifybranch(key)
+        return key in self._entries
+
+    def iteritems(self):
+        for k, v in self._entries.items():
+            self._verifybranch(k)
+            yield k, v
+
+    items = iteritems
+
+    def hasbranch(self, label):
+        """checks whether a branch of this name exists or not"""
+        self._verifybranch(label)
+        return label in self._entries
+
+    @classmethod
+    def fromfile(cls, repo):
+        f = None
+        try:
+            f = repo.cachevfs(cls._filename(repo))
+            lineiter = iter(f)
+            cachekey = next(lineiter).rstrip(b'\n').split(b" ", 2)
+            last, lrev = cachekey[:2]
+            last, lrev = bin(last), int(lrev)
+            filteredhash = None
+            hasnode = repo.changelog.hasnode
+            if len(cachekey) > 2:
+                filteredhash = bin(cachekey[2])
+            bcache = cls(
+                repo,
+                tipnode=last,
+                tiprev=lrev,
+                filteredhash=filteredhash,
+                hasnode=hasnode,
+            )
+            if not bcache.validfor(repo):
+                # invalidate the cache
+                raise ValueError('tip differs')
+            bcache.load(repo, lineiter)
+        except (IOError, OSError):
+            return None
+
+        except Exception as inst:
+            if repo.ui.debugflag:
+                msg = b'invalid %s: %s\n'
+                repo.ui.debug(
+                    msg
+                    % (
+                        _branchcachedesc(repo),
+                        stringutil.forcebytestr(inst),
+                    )
+                )
+            bcache = None
+
+        finally:
+            if f:
+                f.close()
+
+        return bcache
+
+    def load(self, repo, lineiter):
+        """fully loads the branchcache by reading from the file using the line
+        iterator passed"""
+        for line in lineiter:
+            line = line.rstrip(b'\n')
+            if not line:
+                continue
+            node, state, label = line.split(b" ", 2)
+            if state not in b'oc':
+                raise ValueError('invalid branch state')
+            label = encoding.tolocal(label.strip())
+            node = bin(node)
+            self._entries.setdefault(label, []).append(node)
+            if state == b'c':
+                self._closednodes.add(node)
+
+    @staticmethod
+    def _filename(repo):
+        """name of a branchcache file for a given repo or repoview"""
+        filename = b"branch2"
+        if repo.filtername:
+            filename = b'%s-%s' % (filename, repo.filtername)
+        return filename
+
+    def validfor(self, repo):
+        """check that cache contents are valid for (a subset of) this repo
+
+        - False when the order of changesets changed or if we detect a strip.
+        - True when cache is up-to-date for the current repo or its subset."""
+        try:
+            node = repo.changelog.node(self.tiprev)
+        except IndexError:
+            # changesets were stripped and now we don't even have enough to
+            # find tiprev
+            return False
+        if self.tipnode != node:
+            # tiprev doesn't correspond to tipnode: repo was stripped, or this
+            # repo has a different order of changesets
+            return False
+        tiphash = scmutil.filteredhash(repo, self.tiprev, needobsolete=True)
+        # hashes don't match if this repo view has a different set of filtered
+        # revisions (e.g. due to phase changes) or obsolete revisions (e.g.
+        # history was rewritten)
+        return self.filteredhash == tiphash
+
+    def _branchtip(self, heads):
+        """Return tuple with last open head in heads and false,
+        otherwise return last closed head and true."""
+        tip = heads[-1]
+        closed = True
+        for h in reversed(heads):
+            if h not in self._closednodes:
+                tip = h
+                closed = False
+                break
+        return tip, closed
+
+    def branchtip(self, branch):
+        """Return the tipmost open head on branch head, otherwise return the
+        tipmost closed head on branch.
+        Raise KeyError for unknown branch."""
+        return self._branchtip(self[branch])[0]
+
+    def iteropen(self, nodes):
+        return (n for n in nodes if n not in self._closednodes)
+
+    def branchheads(self, branch, closed=False):
+        self._verifybranch(branch)
+        heads = self._entries[branch]
+        if not closed:
+            heads = list(self.iteropen(heads))
+        return heads
+
+    def iterbranches(self):
+        for bn, heads in self.items():
+            yield (bn, heads) + self._branchtip(heads)
+
+    def iterheads(self):
+        """returns all the heads"""
+        self._verifyall()
+        return self._entries.values()
+
+    def copy(self):
+        """return an deep copy of the branchcache object"""
+        return type(self)(
+            self._repo,
+            self._entries,
+            self.tipnode,
+            self.tiprev,
+            self.filteredhash,
+            self._closednodes,
+        )
+
+    def write(self, repo):
+        tr = repo.currenttransaction()
+        if not getattr(tr, 'finalized', True):

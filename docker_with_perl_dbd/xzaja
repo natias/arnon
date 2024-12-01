@@ -1,0 +1,1000 @@
+    # add GC header size
+    if ((type(o) == type) and (o.__flags__ & _TPFLAGS_HEAPTYPE) or\
+        ((type(o) != type) and (type(o).__flags__ & _TPFLAGS_HAVE_GC))):
+        size += _testinternalcapi.SIZEOF_PYGC_HEAD
+    msg = 'wrong size for %s: got %d, expected %d' \
+            % (type(o), result, size)
+    test.assertEqual(result, size, msg)
+
+#=======================================================================
+# Decorator for running a function in a different locale, correctly resetting
+# it afterwards.
+
+@contextlib.contextmanager
+def run_with_locale(catstr, *locales):
+    try:
+        import locale
+        category = getattr(locale, catstr)
+        orig_locale = locale.setlocale(category)
+    except AttributeError:
+        # if the test author gives us an invalid category string
+        raise
+    except:
+        # cannot retrieve original locale, so do nothing
+        locale = orig_locale = None
+    else:
+        for loc in locales:
+            try:
+                locale.setlocale(category, loc)
+                break
+            except:
+                pass
+
+    try:
+        yield
+    finally:
+        if locale and orig_locale:
+            locale.setlocale(category, orig_locale)
+
+#=======================================================================
+# Decorator for running a function in a specific timezone, correctly
+# resetting it afterwards.
+
+def run_with_tz(tz):
+    def decorator(func):
+        def inner(*args, **kwds):
+            try:
+                tzset = time.tzset
+            except AttributeError:
+                raise unittest.SkipTest("tzset required")
+            if 'TZ' in os.environ:
+                orig_tz = os.environ['TZ']
+            else:
+                orig_tz = None
+            os.environ['TZ'] = tz
+            tzset()
+
+            # now run the function, resetting the tz on exceptions
+            try:
+                return func(*args, **kwds)
+            finally:
+                if orig_tz is None:
+                    del os.environ['TZ']
+                else:
+                    os.environ['TZ'] = orig_tz
+                time.tzset()
+
+        inner.__name__ = func.__name__
+        inner.__doc__ = func.__doc__
+        return inner
+    return decorator
+
+#=======================================================================
+# Big-memory-test support. Separate from 'resources' because memory use
+# should be configurable.
+
+# Some handy shorthands. Note that these are used for byte-limits as well
+# as size-limits, in the various bigmem tests
+_1M = 1024*1024
+_1G = 1024 * _1M
+_2G = 2 * _1G
+_4G = 4 * _1G
+
+MAX_Py_ssize_t = sys.maxsize
+
+def set_memlimit(limit):
+    global max_memuse
+    global real_max_memuse
+    sizes = {
+        'k': 1024,
+        'm': _1M,
+        'g': _1G,
+        't': 1024*_1G,
+    }
+    m = re.match(r'(\d+(\.\d+)?) (K|M|G|T)b?$', limit,
+                 re.IGNORECASE | re.VERBOSE)
+    if m is None:
+        raise ValueError('Invalid memory limit %r' % (limit,))
+    memlimit = int(float(m.group(1)) * sizes[m.group(3).lower()])
+    real_max_memuse = memlimit
+    if memlimit > MAX_Py_ssize_t:
+        memlimit = MAX_Py_ssize_t
+    if memlimit < _2G - 1:
+        raise ValueError('Memory limit %r too low to be useful' % (limit,))
+    max_memuse = memlimit
+
+class _MemoryWatchdog:
+    """An object which periodically watches the process' memory consumption
+    and prints it out.
+    """
+
+    def __init__(self):
+        self.procfile = '/proc/{pid}/statm'.format(pid=os.getpid())
+        self.started = False
+
+    def start(self):
+        import warnings
+        try:
+            f = open(self.procfile, 'r')
+        except OSError as e:
+            warnings.warn('/proc not available for stats: {}'.format(e),
+                          RuntimeWarning)
+            sys.stderr.flush()
+            return
+
+        import subprocess
+        with f:
+            watchdog_script = findfile("memory_watchdog.py")
+            self.mem_watchdog = subprocess.Popen([sys.executable, watchdog_script],
+                                                 stdin=f,
+                                                 stderr=subprocess.DEVNULL)
+        self.started = True
+
+    def stop(self):
+        if self.started:
+            self.mem_watchdog.terminate()
+            self.mem_watchdog.wait()
+
+
+def bigmemtest(size, memuse, dry_run=True):
+    """Decorator for bigmem tests.
+
+    'size' is a requested size for the test (in arbitrary, test-interpreted
+    units.) 'memuse' is the number of bytes per unit for the test, or a good
+    estimate of it. For example, a test that needs two byte buffers, of 4 GiB
+    each, could be decorated with @bigmemtest(size=_4G, memuse=2).
+
+    The 'size' argument is normally passed to the decorated test method as an
+    extra argument. If 'dry_run' is true, the value passed to the test method
+    may be less than the requested value. If 'dry_run' is false, it means the
+    test doesn't support dummy runs when -M is not specified.
+    """
+    def decorator(f):
+        def wrapper(self):
+            size = wrapper.size
+            memuse = wrapper.memuse
+            if not real_max_memuse:
+                maxsize = 5147
+            else:
+                maxsize = size
+
+            if ((real_max_memuse or not dry_run)
+                and real_max_memuse < maxsize * memuse):
+                raise unittest.SkipTest(
+                    "not enough memory: %.1fG minimum needed"
+                    % (size * memuse / (1024 ** 3)))
+
+            if real_max_memuse and verbose:
+                print()
+                print(" ... expected peak memory use: {peak:.1f}G"
+                      .format(peak=size * memuse / (1024 ** 3)))
+                watchdog = _MemoryWatchdog()
+                watchdog.start()
+            else:
+                watchdog = None
+
+            try:
+                return f(self, maxsize)
+            finally:
+                if watchdog:
+                    watchdog.stop()
+
+        wrapper.size = size
+        wrapper.memuse = memuse
+        return wrapper
+    return decorator
+
+def bigaddrspacetest(f):
+    """Decorator for tests that fill the address space."""
+    def wrapper(self):
+        if max_memuse < MAX_Py_ssize_t:
+            if MAX_Py_ssize_t >= 2**63 - 1 and max_memuse >= 2**31:
+                raise unittest.SkipTest(
+                    "not enough memory: try a 32-bit build instead")
+            else:
+                raise unittest.SkipTest(
+                    "not enough memory: %.1fG minimum needed"
+                    % (MAX_Py_ssize_t / (1024 ** 3)))
+        else:
+            return f(self)
+    return wrapper
+
+#=======================================================================
+# unittest integration.
+
+class BasicTestRunner:
+    def run(self, test):
+        result = unittest.TestResult()
+        test(result)
+        return result
+
+def _id(obj):
+    return obj
+
+def requires_resource(resource):
+    if resource == 'gui' and not _is_gui_available():
+        return unittest.skip(_is_gui_available.reason)
+    if is_resource_enabled(resource):
+        return _id
+    else:
+        return unittest.skip("resource {0!r} is not enabled".format(resource))
+
+def cpython_only(test):
+    """
+    Decorator for tests only applicable on CPython.
+    """
+    return impl_detail(cpython=True)(test)
+
+def impl_detail(msg=None, **guards):
+    if check_impl_detail(**guards):
+        return _id
+    if msg is None:
+        guardnames, default = _parse_guards(guards)
+        if default:
+            msg = "implementation detail not available on {0}"
+        else:
+            msg = "implementation detail specific to {0}"
+        guardnames = sorted(guardnames.keys())
+        msg = msg.format(' or '.join(guardnames))
+    return unittest.skip(msg)
+
+def _parse_guards(guards):
+    # Returns a tuple ({platform_name: run_me}, default_value)
+    if not guards:
+        return ({'cpython': True}, False)
+    is_true = list(guards.values())[0]
+    assert list(guards.values()) == [is_true] * len(guards)   # all True or all False
+    return (guards, not is_true)
+
+# Use the following check to guard CPython's implementation-specific tests --
+# or to run them only on the implementation(s) guarded by the arguments.
+def check_impl_detail(**guards):
+    """This function returns True or False depending on the host platform.
+       Examples:
+          if check_impl_detail():               # only on CPython (default)
+          if check_impl_detail(jython=True):    # only on Jython
+          if check_impl_detail(cpython=False):  # everywhere except on CPython
+    """
+    guards, default = _parse_guards(guards)
+    return guards.get(sys.implementation.name, default)
+
+
+def no_tracing(func):
+    """Decorator to temporarily turn off tracing for the duration of a test."""
+    if not hasattr(sys, 'gettrace'):
+        return func
+    else:
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            original_trace = sys.gettrace()
+            try:
+                sys.settrace(None)
+                return func(*args, **kwargs)
+            finally:
+                sys.settrace(original_trace)
+        return wrapper
+
+
+def refcount_test(test):
+    """Decorator for tests which involve reference counting.
+
+    To start, the decorator does not run the test if is not run by CPython.
+    After that, any trace function is unset during the test to prevent
+    unexpected refcounts caused by the trace function.
+
+    """
+    return no_tracing(cpython_only(test))
+
+
+def _filter_suite(suite, pred):
+    """Recursively filter test cases in a suite based on a predicate."""
+    newtests = []
+    for test in suite._tests:
+        if isinstance(test, unittest.TestSuite):
+            _filter_suite(test, pred)
+            newtests.append(test)
+        else:
+            if pred(test):
+                newtests.append(test)
+    suite._tests = newtests
+
+def _run_suite(suite):
+    """Run tests from a unittest.TestSuite-derived class."""
+    runner = get_test_runner(sys.stdout,
+                             verbosity=verbose,
+                             capture_output=(junit_xml_list is not None))
+
+    result = runner.run(suite)
+
+    if junit_xml_list is not None:
+        junit_xml_list.append(result.get_xml_element())
+
+    if not result.testsRun and not result.skipped:
+        raise TestDidNotRun
+    if not result.wasSuccessful():
+        if len(result.errors) == 1 and not result.failures:
+            err = result.errors[0][1]
+        elif len(result.failures) == 1 and not result.errors:
+            err = result.failures[0][1]
+        else:
+            err = "multiple errors occurred"
+            if not verbose: err += "; run in verbose mode for details"
+        errors = [(str(tc), exc_str) for tc, exc_str in result.errors]
+        failures = [(str(tc), exc_str) for tc, exc_str in result.failures]
+        raise TestFailedWithDetails(err, errors, failures)
+
+
+# By default, don't filter tests
+_match_test_func = None
+
+_accept_test_patterns = None
+_ignore_test_patterns = None
+
+
+def match_test(test):
+    # Function used by support.run_unittest() and regrtest --list-cases
+    if _match_test_func is None:
+        return True
+    else:
+        return _match_test_func(test.id())
+
+
+def _is_full_match_test(pattern):
+    # If a pattern contains at least one dot, it's considered
+    # as a full test identifier.
+    # Example: 'test.test_os.FileTests.test_access'.
+    #
+    # ignore patterns which contain fnmatch patterns: '*', '?', '[...]'
+    # or '[!...]'. For example, ignore 'test_access*'.
+    return ('.' in pattern) and (not re.search(r'[?*\[\]]', pattern))
+
+
+def set_match_tests(accept_patterns=None, ignore_patterns=None):
+    global _match_test_func, _accept_test_patterns, _ignore_test_patterns
+
+
+    if accept_patterns is None:
+        accept_patterns = ()
+    if ignore_patterns is None:
+        ignore_patterns = ()
+
+    accept_func = ignore_func = None
+
+    if accept_patterns != _accept_test_patterns:
+        accept_patterns, accept_func = _compile_match_function(accept_patterns)
+    if ignore_patterns != _ignore_test_patterns:
+        ignore_patterns, ignore_func = _compile_match_function(ignore_patterns)
+
+    # Create a copy since patterns can be mutable and so modified later
+    _accept_test_patterns = tuple(accept_patterns)
+    _ignore_test_patterns = tuple(ignore_patterns)
+
+    if accept_func is not None or ignore_func is not None:
+        def match_function(test_id):
+            accept = True
+            ignore = False
+            if accept_func:
+                accept = accept_func(test_id)
+            if ignore_func:
+                ignore = ignore_func(test_id)
+            return accept and not ignore
+
+        _match_test_func = match_function
+
+
+def _compile_match_function(patterns):
+    if not patterns:
+        func = None
+        # set_match_tests(None) behaves as set_match_tests(())
+        patterns = ()
+    elif all(map(_is_full_match_test, patterns)):
+        # Simple case: all patterns are full test identifier.
+        # The test.bisect_cmd utility only uses such full test identifiers.
+        func = set(patterns).__contains__
+    else:
+        import fnmatch
+        regex = '|'.join(map(fnmatch.translate, patterns))
+        # The search *is* case sensitive on purpose:
+        # don't use flags=re.IGNORECASE
+        regex_match = re.compile(regex).match
+
+        def match_test_regex(test_id):
+            if regex_match(test_id):
+                # The regex matches the whole identifier, for example
+                # 'test.test_os.FileTests.test_access'.
+                return True
+            else:
+                # Try to match parts of the test identifier.
+                # For example, split 'test.test_os.FileTests.test_access'
+                # into: 'test', 'test_os', 'FileTests' and 'test_access'.
+                return any(map(regex_match, test_id.split(".")))
+
+        func = match_test_regex
+
+    return patterns, func
+
+
+def run_unittest(*classes):
+    """Run tests from unittest.TestCase-derived classes."""
+    valid_types = (unittest.TestSuite, unittest.TestCase)
+    loader = unittest.TestLoader()
+    suite = unittest.TestSuite()
+    for cls in classes:
+        if isinstance(cls, str):
+            if cls in sys.modules:
+                suite.addTest(loader.loadTestsFromModule(sys.modules[cls]))
+            else:
+                raise ValueError("str arguments must be keys in sys.modules")
+        elif isinstance(cls, valid_types):
+            suite.addTest(cls)
+        else:
+            suite.addTest(loader.loadTestsFromTestCase(cls))
+    _filter_suite(suite, match_test)
+    _run_suite(suite)
+
+#=======================================================================
+# Check for the presence of docstrings.
+
+# Rather than trying to enumerate all the cases where docstrings may be
+# disabled, we just check for that directly
+
+def _check_docstrings():
+    """Just used to check if docstrings are enabled"""
+
+MISSING_C_DOCSTRINGS = (check_impl_detail() and
+                        sys.platform != 'win32' and
+                        not sysconfig.get_config_var('WITH_DOC_STRINGS'))
+
+HAVE_DOCSTRINGS = (_check_docstrings.__doc__ is not None and
+                   not MISSING_C_DOCSTRINGS)
+
+requires_docstrings = unittest.skipUnless(HAVE_DOCSTRINGS,
+                                          "test requires docstrings")
+
+
+#=======================================================================
+# doctest driver.
+
+def run_doctest(module, verbosity=None, optionflags=0):
+    """Run doctest on the given module.  Return (#failures, #tests).
+
+    If optional argument verbosity is not specified (or is None), pass
+    support's belief about verbosity on to doctest.  Else doctest's
+    usual behavior is used (it searches sys.argv for -v).
+    """
+
+    import doctest
+
+    if verbosity is None:
+        verbosity = verbose
+    else:
+        verbosity = None
+
+    f, t = doctest.testmod(module, verbose=verbosity, optionflags=optionflags)
+    if f:
+        raise TestFailed("%d of %d doctests failed" % (f, t))
+    if verbose:
+        print('doctest (%s) ... %d tests with zero failures' %
+              (module.__name__, t))
+    return f, t
+
+
+#=======================================================================
+# Support for saving and restoring the imported modules.
+
+def flush_std_streams():
+    if sys.stdout is not None:
+        sys.stdout.flush()
+    if sys.stderr is not None:
+        sys.stderr.flush()
+
+
+def print_warning(msg):
+    # bpo-45410: Explicitly flush stdout to keep logs in order
+    flush_std_streams()
+    stream = print_warning.orig_stderr
+    for line in msg.splitlines():
+        print(f"Warning -- {line}", file=stream)
+    stream.flush()
+
+# bpo-39983: Store the original sys.stderr at Python startup to be able to
+# log warnings even if sys.stderr is captured temporarily by a test.
+print_warning.orig_stderr = sys.stderr
+
+
+# Flag used by saved_test_environment of test.libregrtest.save_env,
+# to check if a test modified the environment. The flag should be set to False
+# before running a new test.
+#
+# For example, threading_helper.threading_cleanup() sets the flag is the function fails
+# to cleanup threads.
+environment_altered = False
+
+def reap_children():
+    """Use this function at the end of test_main() whenever sub-processes
+    are started.  This will help ensure that no extra children (zombies)
+    stick around to hog resources and create problems when looking
+    for refleaks.
+    """
+    global environment_altered
+
+    # Need os.waitpid(-1, os.WNOHANG): Windows is not supported
+    if not (hasattr(os, 'waitpid') and hasattr(os, 'WNOHANG')):
+        return
+    elif not has_subprocess_support:
+        return
+
+    # Reap all our dead child processes so we don't leave zombies around.
+    # These hog resources and might be causing some of the buildbots to die.
+    while True:
+        try:
+            # Read the exit status of any child process which already completed
+            pid, status = os.waitpid(-1, os.WNOHANG)
+        except OSError:
+            break
+
+        if pid == 0:
+            break
+
+        print_warning(f"reap_children() reaped child process {pid}")
+        environment_altered = True
+
+
+@contextlib.contextmanager
+def swap_attr(obj, attr, new_val):
+    """Temporary swap out an attribute with a new object.
+
+    Usage:
+        with swap_attr(obj, "attr", 5):
+            ...
+
+        This will set obj.attr to 5 for the duration of the with: block,
+        restoring the old value at the end of the block. If `attr` doesn't
+        exist on `obj`, it will be created and then deleted at the end of the
+        block.
+
+        The old value (or None if it doesn't exist) will be assigned to the
+        target of the "as" clause, if there is one.
+    """
+    if hasattr(obj, attr):
+        real_val = getattr(obj, attr)
+        setattr(obj, attr, new_val)
+        try:
+            yield real_val
+        finally:
+            setattr(obj, attr, real_val)
+    else:
+        setattr(obj, attr, new_val)
+        try:
+            yield
+        finally:
+            if hasattr(obj, attr):
+                delattr(obj, attr)
+
+@contextlib.contextmanager
+def swap_item(obj, item, new_val):
+    """Temporary swap out an item with a new object.
+
+    Usage:
+        with swap_item(obj, "item", 5):
+            ...
+
+        This will set obj["item"] to 5 for the duration of the with: block,
+        restoring the old value at the end of the block. If `item` doesn't
+        exist on `obj`, it will be created and then deleted at the end of the
+        block.
+
+        The old value (or None if it doesn't exist) will be assigned to the
+        target of the "as" clause, if there is one.
+    """
+    if item in obj:
+        real_val = obj[item]
+        obj[item] = new_val
+        try:
+            yield real_val
+        finally:
+            obj[item] = real_val
+    else:
+        obj[item] = new_val
+        try:
+            yield
+        finally:
+            if item in obj:
+                del obj[item]
+
+def args_from_interpreter_flags():
+    """Return a list of command-line arguments reproducing the current
+    settings in sys.flags and sys.warnoptions."""
+    import subprocess
+    return subprocess._args_from_interpreter_flags()
+
+def optim_args_from_interpreter_flags():
+    """Return a list of command-line arguments reproducing the current
+    optimization settings in sys.flags."""
+    import subprocess
+    return subprocess._optim_args_from_interpreter_flags()
+
+
+class Matcher(object):
+
+    _partial_matches = ('msg', 'message')
+
+    def matches(self, d, **kwargs):
+        """
+        Try to match a single dict with the supplied arguments.
+
+        Keys whose values are strings and which are in self._partial_matches
+        will be checked for partial (i.e. substring) matches. You can extend
+        this scheme to (for example) do regular expression matching, etc.
+        """
+        result = True
+        for k in kwargs:
+            v = kwargs[k]
+            dv = d.get(k)
+            if not self.match_value(k, dv, v):
+                result = False
+                break
+        return result
+
+    def match_value(self, k, dv, v):
+        """
+        Try to match a single stored value (dv) with a supplied value (v).
+        """
+        if type(v) != type(dv):
+            result = False
+        elif type(dv) is not str or k not in self._partial_matches:
+            result = (v == dv)
+        else:
+            result = dv.find(v) >= 0
+        return result
+
+
+_buggy_ucrt = None
+def skip_if_buggy_ucrt_strfptime(test):
+    """
+    Skip decorator for tests that use buggy strptime/strftime
+
+    If the UCRT bugs are present time.localtime().tm_zone will be
+    an empty string, otherwise we assume the UCRT bugs are fixed
+
+    See bpo-37552 [Windows] strptime/strftime return invalid
+    results with UCRT version 17763.615
+    """
+    import locale
+    global _buggy_ucrt
+    if _buggy_ucrt is None:
+        if(sys.platform == 'win32' and
+                locale.getencoding() == 'cp65001' and
+                time.localtime().tm_zone == ''):
+            _buggy_ucrt = True
+        else:
+            _buggy_ucrt = False
+    return unittest.skip("buggy MSVC UCRT strptime/strftime")(test) if _buggy_ucrt else test
+
+class PythonSymlink:
+    """Creates a symlink for the current Python executable"""
+    def __init__(self, link=None):
+        from .os_helper import TESTFN
+
+        self.link = link or os.path.abspath(TESTFN)
+        self._linked = []
+        self.real = os.path.realpath(sys.executable)
+        self._also_link = []
+
+        self._env = None
+
+        self._platform_specific()
+
+    if sys.platform == "win32":
+        def _platform_specific(self):
+            import glob
+            import _winapi
+
+            if os.path.lexists(self.real) and not os.path.exists(self.real):
+                # App symlink appears to not exist, but we want the
+                # real executable here anyway
+                self.real = _winapi.GetModuleFileName(0)
+
+            dll = _winapi.GetModuleFileName(sys.dllhandle)
+            src_dir = os.path.dirname(dll)
+            dest_dir = os.path.dirname(self.link)
+            self._also_link.append((
+                dll,
+                os.path.join(dest_dir, os.path.basename(dll))
+            ))
+            for runtime in glob.glob(os.path.join(glob.escape(src_dir), "vcruntime*.dll")):
+                self._also_link.append((
+                    runtime,
+                    os.path.join(dest_dir, os.path.basename(runtime))
+                ))
+
+            self._env = {k.upper(): os.getenv(k) for k in os.environ}
+            self._env["PYTHONHOME"] = os.path.dirname(self.real)
+            if sysconfig.is_python_build():
+                self._env["PYTHONPATH"] = STDLIB_DIR
+    else:
+        def _platform_specific(self):
+            pass
+
+    def __enter__(self):
+        os.symlink(self.real, self.link)
+        self._linked.append(self.link)
+        for real, link in self._also_link:
+            os.symlink(real, link)
+            self._linked.append(link)
+        return self
+
+    def __exit__(self, exc_type, exc_value, exc_tb):
+        for link in self._linked:
+            try:
+                os.remove(link)
+            except IOError as ex:
+                if verbose:
+                    print("failed to clean up {}: {}".format(link, ex))
+
+    def _call(self, python, args, env, returncode):
+        import subprocess
+        cmd = [python, *args]
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE, env=env)
+        r = p.communicate()
+        if p.returncode != returncode:
+            if verbose:
+                print(repr(r[0]))
+                print(repr(r[1]), file=sys.stderr)
+            raise RuntimeError(
+                'unexpected return code: {0} (0x{0:08X})'.format(p.returncode))
+        return r
+
+    def call_real(self, *args, returncode=0):
+        return self._call(self.real, args, None, returncode)
+
+    def call_link(self, *args, returncode=0):
+        return self._call(self.link, args, self._env, returncode)
+
+
+def skip_if_pgo_task(test):
+    """Skip decorator for tests not run in (non-extended) PGO task"""
+    ok = not PGO or PGO_EXTENDED
+    msg = "Not run for (non-extended) PGO task"
+    return test if ok else unittest.skip(msg)(test)
+
+
+def detect_api_mismatch(ref_api, other_api, *, ignore=()):
+    """Returns the set of items in ref_api not in other_api, except for a
+    defined list of items to be ignored in this check.
+
+    By default this skips private attributes beginning with '_' but
+    includes all magic methods, i.e. those starting and ending in '__'.
+    """
+    missing_items = set(dir(ref_api)) - set(dir(other_api))
+    if ignore:
+        missing_items -= set(ignore)
+    missing_items = set(m for m in missing_items
+                        if not m.startswith('_') or m.endswith('__'))
+    return missing_items
+
+
+def check__all__(test_case, module, name_of_module=None, extra=(),
+                 not_exported=()):
+    """Assert that the __all__ variable of 'module' contains all public names.
+
+    The module's public names (its API) are detected automatically based on
+    whether they match the public name convention and were defined in
+    'module'.
+
+    The 'name_of_module' argument can specify (as a string or tuple thereof)
+    what module(s) an API could be defined in in order to be detected as a
+    public API. One case for this is when 'module' imports part of its public
+    API from other modules, possibly a C backend (like 'csv' and its '_csv').
+
+    The 'extra' argument can be a set of names that wouldn't otherwise be
+    automatically detected as "public", like objects without a proper
+    '__module__' attribute. If provided, it will be added to the
+    automatically detected ones.
+
+    The 'not_exported' argument can be a set of names that must not be treated
+    as part of the public API even though their names indicate otherwise.
+
+    Usage:
+        import bar
+        import foo
+        import unittest
+        from test import support
+
+        class MiscTestCase(unittest.TestCase):
+            def test__all__(self):
+                support.check__all__(self, foo)
+
+        class OtherTestCase(unittest.TestCase):
+            def test__all__(self):
+                extra = {'BAR_CONST', 'FOO_CONST'}
+                not_exported = {'baz'}  # Undocumented name.
+                # bar imports part of its API from _bar.
+                support.check__all__(self, bar, ('bar', '_bar'),
+                                     extra=extra, not_exported=not_exported)
+
+    """
+
+    if name_of_module is None:
+        name_of_module = (module.__name__, )
+    elif isinstance(name_of_module, str):
+        name_of_module = (name_of_module, )
+
+    expected = set(extra)
+
+    for name in dir(module):
+        if name.startswith('_') or name in not_exported:
+            continue
+        obj = getattr(module, name)
+        if (getattr(obj, '__module__', None) in name_of_module or
+                (not hasattr(obj, '__module__') and
+                 not isinstance(obj, types.ModuleType))):
+            expected.add(name)
+    test_case.assertCountEqual(module.__all__, expected)
+
+
+def suppress_msvcrt_asserts(verbose=False):
+    try:
+        import msvcrt
+    except ImportError:
+        return
+
+    msvcrt.SetErrorMode(msvcrt.SEM_FAILCRITICALERRORS
+                        | msvcrt.SEM_NOALIGNMENTFAULTEXCEPT
+                        | msvcrt.SEM_NOGPFAULTERRORBOX
+                        | msvcrt.SEM_NOOPENFILEERRORBOX)
+
+    # CrtSetReportMode() is only available in debug build
+    if hasattr(msvcrt, 'CrtSetReportMode'):
+        for m in [msvcrt.CRT_WARN, msvcrt.CRT_ERROR, msvcrt.CRT_ASSERT]:
+            if verbose:
+                msvcrt.CrtSetReportMode(m, msvcrt.CRTDBG_MODE_FILE)
+                msvcrt.CrtSetReportFile(m, msvcrt.CRTDBG_FILE_STDERR)
+            else:
+                msvcrt.CrtSetReportMode(m, 0)
+
+
+class SuppressCrashReport:
+    """Try to prevent a crash report from popping up.
+
+    On Windows, don't display the Windows Error Reporting dialog.  On UNIX,
+    disable the creation of coredump file.
+    """
+    old_value = None
+    old_modes = None
+
+    def __enter__(self):
+        """On Windows, disable Windows Error Reporting dialogs using
+        SetErrorMode() and CrtSetReportMode().
+
+        On UNIX, try to save the previous core file size limit, then set
+        soft limit to 0.
+        """
+        if sys.platform.startswith('win'):
+            # see http://msdn.microsoft.com/en-us/library/windows/desktop/ms680621.aspx
+            try:
+                import msvcrt
+            except ImportError:
+                return
+
+            self.old_value = msvcrt.GetErrorMode()
+
+            msvcrt.SetErrorMode(self.old_value | msvcrt.SEM_NOGPFAULTERRORBOX)
+
+            # bpo-23314: Suppress assert dialogs in debug builds.
+            # CrtSetReportMode() is only available in debug build.
+            if hasattr(msvcrt, 'CrtSetReportMode'):
+                self.old_modes = {}
+                for report_type in [msvcrt.CRT_WARN,
+                                    msvcrt.CRT_ERROR,
+                                    msvcrt.CRT_ASSERT]:
+                    old_mode = msvcrt.CrtSetReportMode(report_type,
+                            msvcrt.CRTDBG_MODE_FILE)
+                    old_file = msvcrt.CrtSetReportFile(report_type,
+                            msvcrt.CRTDBG_FILE_STDERR)
+                    self.old_modes[report_type] = old_mode, old_file
+
+        else:
+            try:
+                import resource
+                self.resource = resource
+            except ImportError:
+                self.resource = None
+            if self.resource is not None:
+                try:
+                    self.old_value = self.resource.getrlimit(self.resource.RLIMIT_CORE)
+                    self.resource.setrlimit(self.resource.RLIMIT_CORE,
+                                            (0, self.old_value[1]))
+                except (ValueError, OSError):
+                    pass
+
+            if sys.platform == 'darwin':
+                import subprocess
+                # Check if the 'Crash Reporter' on OSX was configured
+                # in 'Developer' mode and warn that it will get triggered
+                # when it is.
+                #
+                # This assumes that this context manager is used in tests
+                # that might trigger the next manager.
+                cmd = ['/usr/bin/defaults', 'read',
+                       'com.apple.CrashReporter', 'DialogType']
+                proc = subprocess.Popen(cmd,
+                                        stdout=subprocess.PIPE,
+                                        stderr=subprocess.PIPE)
+                with proc:
+                    stdout = proc.communicate()[0]
+                if stdout.strip() == b'developer':
+                    print("this test triggers the Crash Reporter, "
+                          "that is intentional", end='', flush=True)
+
+        return self
+
+    def __exit__(self, *ignore_exc):
+        """Restore Windows ErrorMode or core file behavior to initial value."""
+        if self.old_value is None:
+            return
+
+        if sys.platform.startswith('win'):
+            import msvcrt
+            msvcrt.SetErrorMode(self.old_value)
+
+            if self.old_modes:
+                for report_type, (old_mode, old_file) in self.old_modes.items():
+                    msvcrt.CrtSetReportMode(report_type, old_mode)
+                    msvcrt.CrtSetReportFile(report_type, old_file)
+        else:
+            if self.resource is not None:
+                try:
+                    self.resource.setrlimit(self.resource.RLIMIT_CORE, self.old_value)
+                except (ValueError, OSError):
+                    pass
+
+
+def patch(test_instance, object_to_patch, attr_name, new_value):
+    """Override 'object_to_patch'.'attr_name' with 'new_value'.
+
+    Also, add a cleanup procedure to 'test_instance' to restore
+    'object_to_patch' value for 'attr_name'.
+    The 'attr_name' should be a valid attribute for 'object_to_patch'.
+
+    """
+    # check that 'attr_name' is a real attribute for 'object_to_patch'
+    # will raise AttributeError if it does not exist
+    getattr(object_to_patch, attr_name)
+
+    # keep a copy of the old value
+    attr_is_local = False
+    try:
+        old_value = object_to_patch.__dict__[attr_name]
+    except (AttributeError, KeyError):
+        old_value = getattr(object_to_patch, attr_name, None)
+    else:
+        attr_is_local = True
+
+    # restore the value when the test is done
+    def cleanup():
+        if attr_is_local:
+            setattr(object_to_patch, attr_name, old_value)
+        else:
+            delattr(object_to_patch, attr_name)
+
+    test_instance.addCleanup(cleanup)
+
+    # actually override the attribute
+    setattr(object_to_patch, attr_name, new_value)
+
+
+@contextlib.contextmanager
+def patch_list(orig):
+    """Like unittest.mock.patch.dict, but for lists."""
+    try:
+        saved = orig[:]
+        yield
+    finally:
+        orig[:] = saved
+
+
+def run_in_subinterp(code):
+    """
+    Run code in a subinterpreter. Raise unittest.SkipTest if the tracemalloc

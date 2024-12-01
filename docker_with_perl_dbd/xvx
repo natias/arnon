@@ -1,0 +1,1000 @@
+
+
+def encodebatchcmds(req):
+    """Return a ``cmds`` argument value for the ``batch`` command."""
+    escapearg = wireprototypes.escapebatcharg
+
+    cmds = []
+    for op, argsdict in req:
+        # Old servers didn't properly unescape argument names. So prevent
+        # the sending of argument names that may not be decoded properly by
+        # servers.
+        assert all(escapearg(k) == k for k in argsdict)
+
+        args = b','.join(
+            b'%s=%s' % (escapearg(k), escapearg(v)) for k, v in argsdict.items()
+        )
+        cmds.append(b'%s %s' % (op, args))
+
+    return b';'.join(cmds)
+
+
+class unsentfuture(futures.Future):
+    """A Future variation to represent an unsent command.
+
+    Because we buffer commands and don't submit them immediately, calling
+    ``result()`` on an unsent future could deadlock. Futures for buffered
+    commands are represented by this type, which wraps ``result()`` to
+    call ``sendcommands()``.
+    """
+
+    def result(self, timeout=None):
+        if self.done():
+            return futures.Future.result(self, timeout)
+
+        self._peerexecutor.sendcommands()
+
+        # This looks like it will infinitely recurse. However,
+        # sendcommands() should modify __class__. This call serves as a check
+        # on that.
+        return self.result(timeout)
+
+
+@interfaceutil.implementer(repository.ipeercommandexecutor)
+class peerexecutor:
+    def __init__(self, peer):
+        self._peer = peer
+        self._sent = False
+        self._closed = False
+        self._calls = []
+        self._futures = weakref.WeakSet()
+        self._responseexecutor = None
+        self._responsef = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exctype, excvalee, exctb):
+        self.close()
+
+    def callcommand(self, command, args):
+        if self._sent:
+            raise error.ProgrammingError(
+                b'callcommand() cannot be used after commands are sent'
+            )
+
+        if self._closed:
+            raise error.ProgrammingError(
+                b'callcommand() cannot be used after close()'
+            )
+
+        # Commands are dispatched through methods on the peer.
+        fn = getattr(self._peer, pycompat.sysstr(command), None)
+
+        if not fn:
+            raise error.ProgrammingError(
+                b'cannot call command %s: method of same name not available '
+                b'on peer' % command
+            )
+
+        # Commands are either batchable or they aren't. If a command
+        # isn't batchable, we send it immediately because the executor
+        # can no longer accept new commands after a non-batchable command.
+        # If a command is batchable, we queue it for later. But we have
+        # to account for the case of a non-batchable command arriving after
+        # a batchable one and refuse to service it.
+
+        def addcall():
+            f = futures.Future()
+            self._futures.add(f)
+            self._calls.append((command, args, fn, f))
+            return f
+
+        if getattr(fn, 'batchable', False):
+            f = addcall()
+
+            # But since we don't issue it immediately, we wrap its result()
+            # to trigger sending so we avoid deadlocks.
+            f.__class__ = unsentfuture
+            f._peerexecutor = self
+        else:
+            if self._calls:
+                raise error.ProgrammingError(
+                    b'%s is not batchable and cannot be called on a command '
+                    b'executor along with other commands' % command
+                )
+
+            f = addcall()
+
+            # Non-batchable commands can never coexist with another command
+            # in this executor. So send the command immediately.
+            self.sendcommands()
+
+        return f
+
+    def sendcommands(self):
+        if self._sent:
+            return
+
+        if not self._calls:
+            return
+
+        self._sent = True
+
+        # Unhack any future types so caller seens a clean type and to break
+        # cycle between us and futures.
+        for f in self._futures:
+            if isinstance(f, unsentfuture):
+                f.__class__ = futures.Future
+                f._peerexecutor = None
+
+        calls = self._calls
+        # Mainly to destroy references to futures.
+        self._calls = None
+
+        # Simple case of a single command. We call it synchronously.
+        if len(calls) == 1:
+            command, args, fn, f = calls[0]
+
+            # Future was cancelled. Ignore it.
+            if not f.set_running_or_notify_cancel():
+                return
+
+            try:
+                result = fn(**pycompat.strkwargs(args))
+            except Exception:
+                pycompat.future_set_exception_info(f, sys.exc_info()[1:])
+            else:
+                f.set_result(result)
+
+            return
+
+        # Batch commands are a bit harder. First, we have to deal with the
+        # @batchable coroutine. That's a bit annoying. Furthermore, we also
+        # need to preserve streaming. i.e. it should be possible for the
+        # futures to resolve as data is coming in off the wire without having
+        # to wait for the final byte of the final response. We do this by
+        # spinning up a thread to read the responses.
+
+        requests = []
+        states = []
+
+        for command, args, fn, f in calls:
+            # Future was cancelled. Ignore it.
+            if not f.set_running_or_notify_cancel():
+                continue
+
+            try:
+                encoded_args_or_res, decode = fn.batchable(
+                    fn.__self__, **pycompat.strkwargs(args)
+                )
+            except Exception:
+                pycompat.future_set_exception_info(f, sys.exc_info()[1:])
+                return
+
+            if not decode:
+                f.set_result(encoded_args_or_res)
+            else:
+                requests.append((command, encoded_args_or_res))
+                states.append((command, f, batchable, decode))
+
+        if not requests:
+            return
+
+        # This will emit responses in order they were executed.
+        wireresults = self._peer._submitbatch(requests)
+
+        # The use of a thread pool executor here is a bit weird for something
+        # that only spins up a single thread. However, thread management is
+        # hard and it is easy to encounter race conditions, deadlocks, etc.
+        # concurrent.futures already solves these problems and its thread pool
+        # executor has minimal overhead. So we use it.
+        self._responseexecutor = futures.ThreadPoolExecutor(1)
+        self._responsef = self._responseexecutor.submit(
+            self._readbatchresponse, states, wireresults
+        )
+
+    def close(self):
+        self.sendcommands()
+
+        if self._closed:
+            return
+
+        self._closed = True
+
+        if not self._responsef:
+            return
+
+        # We need to wait on our in-flight response and then shut down the
+        # executor once we have a result.
+        try:
+            self._responsef.result()
+        finally:
+            self._responseexecutor.shutdown(wait=True)
+            self._responsef = None
+            self._responseexecutor = None
+
+            # If any of our futures are still in progress, mark them as
+            # errored. Otherwise a result() could wait indefinitely.
+            for f in self._futures:
+                if not f.done():
+                    f.set_exception(
+                        error.ResponseError(
+                            _(b'unfulfilled batch command response'), None
+                        )
+                    )
+
+            self._futures = None
+
+    def _readbatchresponse(self, states, wireresults):
+        # Executes in a thread to read data off the wire.
+
+        for command, f, batchable, decode in states:
+            # Grab raw result off the wire and teach the internal future
+            # about it.
+            try:
+                remoteresult = next(wireresults)
+            except StopIteration:
+                # This can happen in particular because next(batchable)
+                # in the previous iteration can call peer._abort, which
+                # may close the peer.
+                f.set_exception(
+                    error.ResponseError(
+                        _(b'unfulfilled batch command response'), None
+                    )
+                )
+            else:
+                try:
+                    result = decode(remoteresult)
+                except Exception:
+                    pycompat.future_set_exception_info(f, sys.exc_info()[1:])
+                else:
+                    f.set_result(result)
+
+
+@interfaceutil.implementer(
+    repository.ipeercommands, repository.ipeerlegacycommands
+)
+class wirepeer(repository.peer):
+    """Client-side interface for communicating with a peer repository.
+
+    Methods commonly call wire protocol commands of the same name.
+
+    See also httppeer.py and sshpeer.py for protocol-specific
+    implementations of this interface.
+    """
+
+    def commandexecutor(self):
+        return peerexecutor(self)
+
+    # Begin of ipeercommands interface.
+
+    def clonebundles(self):
+        self.requirecap(b'clonebundles', _(b'clone bundles'))
+        return self._call(b'clonebundles')
+
+    @batchable
+    def lookup(self, key):
+        self.requirecap(b'lookup', _(b'look up remote revision'))
+
+        def decode(d):
+            success, data = d[:-1].split(b" ", 1)
+            if int(success):
+                return bin(data)
+            else:
+                self._abort(error.RepoError(data))
+
+        return {b'key': encoding.fromlocal(key)}, decode
+
+    @batchable
+    def heads(self):
+        def decode(d):
+            try:
+                return wireprototypes.decodelist(d[:-1])
+            except ValueError:
+                self._abort(error.ResponseError(_(b"unexpected response:"), d))
+
+        return {}, decode
+
+    @batchable
+    def known(self, nodes):
+        def decode(d):
+            try:
+                return [bool(int(b)) for b in pycompat.iterbytestr(d)]
+            except ValueError:
+                self._abort(error.ResponseError(_(b"unexpected response:"), d))
+
+        return {b'nodes': wireprototypes.encodelist(nodes)}, decode
+
+    @batchable
+    def branchmap(self):
+        def decode(d):
+            try:
+                branchmap = {}
+                for branchpart in d.splitlines():
+                    branchname, branchheads = branchpart.split(b' ', 1)
+                    branchname = encoding.tolocal(urlreq.unquote(branchname))
+                    branchheads = wireprototypes.decodelist(branchheads)
+                    branchmap[branchname] = branchheads
+                return branchmap
+            except TypeError:
+                self._abort(error.ResponseError(_(b"unexpected response:"), d))
+
+        return {}, decode
+
+    @batchable
+    def listkeys(self, namespace):
+        if not self.capable(b'pushkey'):
+            return {}, None
+        self.ui.debug(b'preparing listkeys for "%s"\n' % namespace)
+
+        def decode(d):
+            self.ui.debug(
+                b'received listkey for "%s": %i bytes\n' % (namespace, len(d))
+            )
+            return pushkeymod.decodekeys(d)
+
+        return {b'namespace': encoding.fromlocal(namespace)}, decode
+
+    @batchable
+    def pushkey(self, namespace, key, old, new):
+        if not self.capable(b'pushkey'):
+            return False, None
+        self.ui.debug(b'preparing pushkey for "%s:%s"\n' % (namespace, key))
+
+        def decode(d):
+            d, output = d.split(b'\n', 1)
+            try:
+                d = bool(int(d))
+            except ValueError:
+                raise error.ResponseError(
+                    _(b'push failed (unexpected response):'), d
+                )
+            for l in output.splitlines(True):
+                self.ui.status(_(b'remote: '), l)
+            return d
+
+        return {
+            b'namespace': encoding.fromlocal(namespace),
+            b'key': encoding.fromlocal(key),
+            b'old': encoding.fromlocal(old),
+            b'new': encoding.fromlocal(new),
+        }, decode
+
+    def stream_out(self):
+        return self._callstream(b'stream_out')
+
+    def getbundle(self, source, **kwargs):
+        kwargs = pycompat.byteskwargs(kwargs)
+        self.requirecap(b'getbundle', _(b'look up remote changes'))
+        opts = {}
+        bundlecaps = kwargs.get(b'bundlecaps') or set()
+        for key, value in kwargs.items():
+            if value is None:
+                continue
+            keytype = wireprototypes.GETBUNDLE_ARGUMENTS.get(key)
+            if keytype is None:
+                raise error.ProgrammingError(
+                    b'Unexpectedly None keytype for key %s' % key
+                )
+            elif keytype == b'nodes':
+                value = wireprototypes.encodelist(value)
+            elif keytype == b'csv':
+                value = b','.join(value)
+            elif keytype == b'scsv':
+                value = b','.join(sorted(value))
+            elif keytype == b'boolean':
+                value = b'%i' % bool(value)
+            elif keytype != b'plain':
+                raise KeyError(b'unknown getbundle option type %s' % keytype)
+            opts[key] = value
+        f = self._callcompressable(b"getbundle", **pycompat.strkwargs(opts))
+        if any((cap.startswith(b'HG2') for cap in bundlecaps)):
+            return bundle2.getunbundler(self.ui, f)
+        else:
+            return changegroupmod.cg1unpacker(f, b'UN')
+
+    def unbundle(self, bundle, heads, url):
+        """Send cg (a readable file-like object representing the
+        changegroup to push, typically a chunkbuffer object) to the
+        remote server as a bundle.
+
+        When pushing a bundle10 stream, return an integer indicating the
+        result of the push (see changegroup.apply()).
+
+        When pushing a bundle20 stream, return a bundle20 stream.
+
+        `url` is the url the client thinks it's pushing to, which is
+        visible to hooks.
+        """
+
+        if heads != [b'force'] and self.capable(b'unbundlehash'):
+            heads = wireprototypes.encodelist(
+                [b'hashed', hashutil.sha1(b''.join(sorted(heads))).digest()]
+            )
+        else:
+            heads = wireprototypes.encodelist(heads)
+
+        if util.safehasattr(bundle, b'deltaheader'):
+            # this a bundle10, do the old style call sequence
+            ret, output = self._callpush(b"unbundle", bundle, heads=heads)
+            if ret == b"":
+                raise error.ResponseError(_(b'push failed:'), output)
+            try:
+                ret = int(ret)
+            except ValueError:
+                raise error.ResponseError(
+                    _(b'push failed (unexpected response):'), ret
+                )
+
+            for l in output.splitlines(True):
+                self.ui.status(_(b'remote: '), l)
+        else:
+            # bundle2 push. Send a stream, fetch a stream.
+            stream = self._calltwowaystream(b'unbundle', bundle, heads=heads)
+            ret = bundle2.getunbundler(self.ui, stream)
+        return ret
+
+    # End of ipeercommands interface.
+
+    # Begin of ipeerlegacycommands interface.
+
+    def branches(self, nodes):
+        n = wireprototypes.encodelist(nodes)
+        d = self._call(b"branches", nodes=n)
+        try:
+            br = [tuple(wireprototypes.decodelist(b)) for b in d.splitlines()]
+            return br
+        except ValueError:
+            self._abort(error.ResponseError(_(b"unexpected response:"), d))
+
+    def between(self, pairs):
+        batch = 8  # avoid giant requests
+        r = []
+        for i in range(0, len(pairs), batch):
+            n = b" ".join(
+                [
+                    wireprototypes.encodelist(p, b'-')
+                    for p in pairs[i : i + batch]
+                ]
+            )
+            d = self._call(b"between", pairs=n)
+            try:
+                r.extend(
+                    l and wireprototypes.decodelist(l) or []
+                    for l in d.splitlines()
+                )
+            except ValueError:
+                self._abort(error.ResponseError(_(b"unexpected response:"), d))
+        return r
+
+    def changegroup(self, nodes, source):
+        n = wireprototypes.encodelist(nodes)
+        f = self._callcompressable(b"changegroup", roots=n)
+        return changegroupmod.cg1unpacker(f, b'UN')
+
+    def changegroupsubset(self, bases, heads, source):
+        self.requirecap(b'changegroupsubset', _(b'look up remote changes'))
+        bases = wireprototypes.encodelist(bases)
+        heads = wireprototypes.encodelist(heads)
+        f = self._callcompressable(
+            b"changegroupsubset", bases=bases, heads=heads
+        )
+        return changegroupmod.cg1unpacker(f, b'UN')
+
+    # End of ipeerlegacycommands interface.
+
+    def _submitbatch(self, req):
+        """run batch request <req> on the server
+
+        Returns an iterator of the raw responses from the server.
+        """
+        ui = self.ui
+        if ui.debugflag and ui.configbool(b'devel', b'debug.peer-request'):
+            ui.debug(b'devel-peer-request: batched-content\n')
+            for op, args in req:
+                msg = b'devel-peer-request:    - %s (%d arguments)\n'
+                ui.debug(msg % (op, len(args)))
+
+        unescapearg = wireprototypes.unescapebatcharg
+
+        rsp = self._callstream(b"batch", cmds=encodebatchcmds(req))
+        chunk = rsp.read(1024)
+        work = [chunk]
+        while chunk:
+            while b';' not in chunk and chunk:
+                chunk = rsp.read(1024)
+                work.append(chunk)
+            merged = b''.join(work)
+            while b';' in merged:
+                one, merged = merged.split(b';', 1)
+                yield unescapearg(one)
+            chunk = rsp.read(1024)
+            work = [merged, chunk]
+        yield unescapearg(b''.join(work))
+
+    def _submitone(self, op, args):
+        return self._call(op, **pycompat.strkwargs(args))
+
+    def debugwireargs(self, one, two, three=None, four=None, five=None):
+        # don't pass optional arguments left at their default value
+        opts = {}
+        if three is not None:
+            opts['three'] = three
+        if four is not None:
+            opts['four'] = four
+        return self._call(b'debugwireargs', one=one, two=two, **opts)
+
+    def _call(self, cmd, **args):
+        """execute <cmd> on the server
+
+        The command is expected to return a simple string.
+
+        returns the server reply as a string."""
+        raise NotImplementedError()
+
+    def _callstream(self, cmd, **args):
+        """execute <cmd> on the server
+
+        The command is expected to return a stream. Note that if the
+        command doesn't return a stream, _callstream behaves
+        differently for ssh and http peers.
+
+        returns the server reply as a file like object.
+        """
+        raise NotImplementedError()
+
+    def _callcompressable(self, cmd, **args):
+        """execute <cmd> on the server
+
+        The command is expected to return a stream.
+
+        The stream may have been compressed in some implementations. This
+        function takes care of the decompression. This is the only difference
+        with _callstream.
+
+        returns the server reply as a file like object.
+        """
+        raise NotImplementedError()
+
+    def _callpush(self, cmd, fp, **args):
+        """execute a <cmd> on server
+
+        The command is expected to be related to a push. Push has a special
+        return method.
+
+        returns the server reply as a (ret, output) tuple. ret is either
+        empty (error) or a stringified int.
+        """
+        raise NotImplementedError()
+
+    def _calltwowaystream(self, cmd, fp, **args):
+        """execute <cmd> on server
+
+        The command will send a stream to the server and get a stream in reply.
+        """
+        raise NotImplementedError()
+
+    def _abort(self, exception):
+        """clearly abort the wire protocol connection and raise the exception"""
+        raise NotImplementedError()
+                                                                                             usr/lib/python3/dist-packages/mercurial/wireprotov1server.py                                        0000644 0000000 0000000 00000064422 14355257011 023046  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        # wireprotov1server.py - Wire protocol version 1 server functionality
+#
+# Copyright 2005-2010 Olivia Mackall <olivia@selenic.com>
+#
+# This software may be used and distributed according to the terms of the
+# GNU General Public License version 2 or any later version.
+
+
+import binascii
+import os
+
+from .i18n import _
+from .node import hex
+from .pycompat import getattr
+
+from . import (
+    bundle2,
+    bundlecaches,
+    changegroup as changegroupmod,
+    discovery,
+    encoding,
+    error,
+    exchange,
+    pushkey as pushkeymod,
+    pycompat,
+    requirements as requirementsmod,
+    streamclone,
+    util,
+    wireprototypes,
+)
+
+from .utils import (
+    procutil,
+    stringutil,
+)
+
+urlerr = util.urlerr
+urlreq = util.urlreq
+
+bundle2requiredmain = _(b'incompatible Mercurial client; bundle2 required')
+bundle2requiredhint = _(
+    b'see https://www.mercurial-scm.org/wiki/IncompatibleClient'
+)
+bundle2required = b'%s\n(%s)\n' % (bundle2requiredmain, bundle2requiredhint)
+
+
+def clientcompressionsupport(proto):
+    """Returns a list of compression methods supported by the client.
+
+    Returns a list of the compression methods supported by the client
+    according to the protocol capabilities. If no such capability has
+    been announced, fallback to the default of zlib and uncompressed.
+    """
+    for cap in proto.getprotocaps():
+        if cap.startswith(b'comp='):
+            return cap[5:].split(b',')
+    return [b'zlib', b'none']
+
+
+# wire protocol command can either return a string or one of these classes.
+
+
+def getdispatchrepo(repo, proto, command):
+    """Obtain the repo used for processing wire protocol commands.
+
+    The intent of this function is to serve as a monkeypatch point for
+    extensions that need commands to operate on different repo views under
+    specialized circumstances.
+    """
+    viewconfig = repo.ui.config(b'server', b'view')
+    return repo.filtered(viewconfig)
+
+
+def dispatch(repo, proto, command):
+    repo = getdispatchrepo(repo, proto, command)
+
+    func, spec = commands[command]
+    args = proto.getargs(spec)
+
+    return func(repo, proto, *args)
+
+
+def options(cmd, keys, others):
+    opts = {}
+    for k in keys:
+        if k in others:
+            opts[k] = others[k]
+            del others[k]
+    if others:
+        procutil.stderr.write(
+            b"warning: %s ignored unexpected arguments %s\n"
+            % (cmd, b",".join(others))
+        )
+    return opts
+
+
+def bundle1allowed(repo, action):
+    """Whether a bundle1 operation is allowed from the server.
+
+    Priority is:
+
+    1. server.bundle1gd.<action> (if generaldelta active)
+    2. server.bundle1.<action>
+    3. server.bundle1gd (if generaldelta active)
+    4. server.bundle1
+    """
+    ui = repo.ui
+    gd = requirementsmod.GENERALDELTA_REQUIREMENT in repo.requirements
+
+    if gd:
+        v = ui.configbool(b'server', b'bundle1gd.%s' % action)
+        if v is not None:
+            return v
+
+    v = ui.configbool(b'server', b'bundle1.%s' % action)
+    if v is not None:
+        return v
+
+    if gd:
+        v = ui.configbool(b'server', b'bundle1gd')
+        if v is not None:
+            return v
+
+    return ui.configbool(b'server', b'bundle1')
+
+
+commands = wireprototypes.commanddict()
+
+
+def wireprotocommand(name, args=None, permission=b'push'):
+    """Decorator to declare a wire protocol command.
+
+    ``name`` is the name of the wire protocol command being provided.
+
+    ``args`` defines the named arguments accepted by the command. It is
+    a space-delimited list of argument names. ``*`` denotes a special value
+    that says to accept all named arguments.
+
+    ``permission`` defines the permission type needed to run this command.
+    Can be ``push`` or ``pull``. These roughly map to read-write and read-only,
+    respectively. Default is to assume command requires ``push`` permissions
+    because otherwise commands not declaring their permissions could modify
+    a repository that is supposed to be read-only.
+    """
+    transports = {
+        k for k, v in wireprototypes.TRANSPORTS.items() if v[b'version'] == 1
+    }
+
+    if permission not in (b'push', b'pull'):
+        raise error.ProgrammingError(
+            b'invalid wire protocol permission; '
+            b'got %s; expected "push" or "pull"' % permission
+        )
+
+    if args is None:
+        args = b''
+
+    if not isinstance(args, bytes):
+        raise error.ProgrammingError(
+            b'arguments for version 1 commands must be declared as bytes'
+        )
+
+    def register(func):
+        if name in commands:
+            raise error.ProgrammingError(
+                b'%s command already registered for version 1' % name
+            )
+        commands[name] = wireprototypes.commandentry(
+            func, args=args, transports=transports, permission=permission
+        )
+
+        return func
+
+    return register
+
+
+# TODO define a more appropriate permissions type to use for this.
+@wireprotocommand(b'batch', b'cmds *', permission=b'pull')
+def batch(repo, proto, cmds, others):
+    unescapearg = wireprototypes.unescapebatcharg
+    res = []
+    for pair in cmds.split(b';'):
+        op, args = pair.split(b' ', 1)
+        vals = {}
+        for a in args.split(b','):
+            if a:
+                n, v = a.split(b'=')
+                vals[unescapearg(n)] = unescapearg(v)
+        func, spec = commands[op]
+
+        # Validate that client has permissions to perform this command.
+        perm = commands[op].permission
+        assert perm in (b'push', b'pull')
+        proto.checkperm(perm)
+
+        if spec:
+            keys = spec.split()
+            data = {}
+            for k in keys:
+                if k == b'*':
+                    star = {}
+                    for key in vals.keys():
+                        if key not in keys:
+                            star[key] = vals[key]
+                    data[b'*'] = star
+                else:
+                    data[k] = vals[k]
+            result = func(repo, proto, *[data[k] for k in keys])
+        else:
+            result = func(repo, proto)
+        if isinstance(result, wireprototypes.ooberror):
+            return result
+
+        # For now, all batchable commands must return bytesresponse or
+        # raw bytes (for backwards compatibility).
+        assert isinstance(result, (wireprototypes.bytesresponse, bytes))
+        if isinstance(result, wireprototypes.bytesresponse):
+            result = result.data
+        res.append(wireprototypes.escapebatcharg(result))
+
+    return wireprototypes.bytesresponse(b';'.join(res))
+
+
+@wireprotocommand(b'between', b'pairs', permission=b'pull')
+def between(repo, proto, pairs):
+    pairs = [wireprototypes.decodelist(p, b'-') for p in pairs.split(b" ")]
+    r = []
+    for b in repo.between(pairs):
+        r.append(wireprototypes.encodelist(b) + b"\n")
+
+    return wireprototypes.bytesresponse(b''.join(r))
+
+
+@wireprotocommand(b'branchmap', permission=b'pull')
+def branchmap(repo, proto):
+    branchmap = repo.branchmap()
+    heads = []
+    for branch, nodes in branchmap.items():
+        branchname = urlreq.quote(encoding.fromlocal(branch))
+        branchnodes = wireprototypes.encodelist(nodes)
+        heads.append(b'%s %s' % (branchname, branchnodes))
+
+    return wireprototypes.bytesresponse(b'\n'.join(heads))
+
+
+@wireprotocommand(b'branches', b'nodes', permission=b'pull')
+def branches(repo, proto, nodes):
+    nodes = wireprototypes.decodelist(nodes)
+    r = []
+    for b in repo.branches(nodes):
+        r.append(wireprototypes.encodelist(b) + b"\n")
+
+    return wireprototypes.bytesresponse(b''.join(r))
+
+
+@wireprotocommand(b'clonebundles', b'', permission=b'pull')
+def clonebundles(repo, proto):
+    """Server command for returning info for available bundles to seed clones.
+
+    Clients will parse this response and determine what bundle to fetch.
+
+    Extensions may wrap this command to filter or dynamically emit data
+    depending on the request. e.g. you could advertise URLs for the closest
+    data center given the client's IP address.
+    """
+    return wireprototypes.bytesresponse(
+        repo.vfs.tryread(bundlecaches.CB_MANIFEST_FILE)
+    )
+
+
+wireprotocaps = [
+    b'lookup',
+    b'branchmap',
+    b'pushkey',
+    b'known',
+    b'getbundle',
+    b'unbundlehash',
+]
+
+
+def _capabilities(repo, proto):
+    """return a list of capabilities for a repo
+
+    This function exists to allow extensions to easily wrap capabilities
+    computation
+
+    - returns a lists: easy to alter
+    - change done here will be propagated to both `capabilities` and `hello`
+      command without any other action needed.
+    """
+    # copy to prevent modification of the global list
+    caps = list(wireprotocaps)
+
+    # Command of same name as capability isn't exposed to version 1 of
+    # transports. So conditionally add it.
+    if commands.commandavailable(b'changegroupsubset', proto):
+        caps.append(b'changegroupsubset')
+
+    if streamclone.allowservergeneration(repo):
+        if repo.ui.configbool(b'server', b'preferuncompressed'):
+            caps.append(b'stream-preferred')
+        requiredformats = streamclone.streamed_requirements(repo)
+        # if our local revlogs are just revlogv1, add 'stream' cap
+        if not requiredformats - {requirementsmod.REVLOGV1_REQUIREMENT}:
+            caps.append(b'stream')
+        # otherwise, add 'streamreqs' detailing our local revlog format
+        else:
+            caps.append(b'streamreqs=%s' % b','.join(sorted(requiredformats)))
+    if repo.ui.configbool(b'experimental', b'bundle2-advertise'):
+        capsblob = bundle2.encodecaps(bundle2.getrepocaps(repo, role=b'server'))
+        caps.append(b'bundle2=' + urlreq.quote(capsblob))
+    caps.append(b'unbundle=%s' % b','.join(bundle2.bundlepriority))
+
+    if repo.ui.configbool(b'experimental', b'narrow'):
+        caps.append(wireprototypes.NARROWCAP)
+        if repo.ui.configbool(b'experimental', b'narrowservebrokenellipses'):
+            caps.append(wireprototypes.ELLIPSESCAP)
+
+    return proto.addcapabilities(repo, caps)
+
+
+# If you are writing an extension and consider wrapping this function. Wrap
+# `_capabilities` instead.
+@wireprotocommand(b'capabilities', permission=b'pull')
+def capabilities(repo, proto):
+    caps = _capabilities(repo, proto)
+    return wireprototypes.bytesresponse(b' '.join(sorted(caps)))
+
+
+@wireprotocommand(b'changegroup', b'roots', permission=b'pull')
+def changegroup(repo, proto, roots):
+    nodes = wireprototypes.decodelist(roots)
+    outgoing = discovery.outgoing(
+        repo, missingroots=nodes, ancestorsof=repo.heads()
+    )
+    cg = changegroupmod.makechangegroup(repo, outgoing, b'01', b'serve')
+    gen = iter(lambda: cg.read(32768), b'')
+    return wireprototypes.streamres(gen=gen)
+
+
+@wireprotocommand(b'changegroupsubset', b'bases heads', permission=b'pull')
+def changegroupsubset(repo, proto, bases, heads):
+    bases = wireprototypes.decodelist(bases)
+    heads = wireprototypes.decodelist(heads)
+    outgoing = discovery.outgoing(repo, missingroots=bases, ancestorsof=heads)
+    cg = changegroupmod.makechangegroup(repo, outgoing, b'01', b'serve')
+    gen = iter(lambda: cg.read(32768), b'')
+    return wireprototypes.streamres(gen=gen)
+
+
+@wireprotocommand(b'debugwireargs', b'one two *', permission=b'pull')
+def debugwireargs(repo, proto, one, two, others):
+    # only accept optional args from the known set
+    opts = options(b'debugwireargs', [b'three', b'four'], others)
+    return wireprototypes.bytesresponse(
+        repo.debugwireargs(one, two, **pycompat.strkwargs(opts))
+    )
+
+
+def find_pullbundle(repo, proto, opts, clheads, heads, common):
+    """Return a file object for the first matching pullbundle.
+
+    Pullbundles are specified in .hg/pullbundles.manifest similar to
+    clonebundles.
+    For each entry, the bundle specification is checked for compatibility:
+    - Client features vs the BUNDLESPEC.
+    - Revisions shared with the clients vs base revisions of the bundle.
+      A bundle can be applied only if all its base revisions are known by
+      the client.
+    - At least one leaf of the bundle's DAG is missing on the client.
+    - Every leaf of the bundle's DAG is part of node set the client wants.
+      E.g. do not send a bundle of all changes if the client wants only
+      one specific branch of many.
+    """
+
+    def decodehexstring(s):
+        return {binascii.unhexlify(h) for h in s.split(b';')}
+
+    manifest = repo.vfs.tryread(b'pullbundles.manifest')
+    if not manifest:
+        return None
+    res = bundlecaches.parseclonebundlesmanifest(repo, manifest)
+    res = bundlecaches.filterclonebundleentries(repo, res)
+    if not res:
+        return None
+    cl = repo.unfiltered().changelog
+    heads_anc = cl.ancestors([cl.rev(rev) for rev in heads], inclusive=True)
+    common_anc = cl.ancestors([cl.rev(rev) for rev in common], inclusive=True)
+    compformats = clientcompressionsupport(proto)
+    for entry in res:
+        comp = entry.get(b'COMPRESSION')
+        altcomp = util.compengines._bundlenames.get(comp)
+        if comp and comp not in compformats and altcomp not in compformats:
+            continue
+        # No test yet for VERSION, since V2 is supported by any client
+        # that advertises partial pulls
+        if b'heads' in entry:
+            try:
+                bundle_heads = decodehexstring(entry[b'heads'])
+            except TypeError:
+                # Bad heads entry
+                continue
+            if bundle_heads.issubset(common):
+                continue  # Nothing new
+            if all(cl.rev(rev) in common_anc for rev in bundle_heads):
+                continue  # Still nothing new
+            if any(
+                cl.rev(rev) not in heads_anc and cl.rev(rev) not in common_anc
+                for rev in bundle_heads
+            ):
+                continue
+        if b'bases' in entry:
+            try:
+                bundle_bases = decodehexstring(entry[b'bases'])
+            except TypeError:
+                # Bad bases entry
+                continue
+            if not all(cl.rev(rev) in common_anc for rev in bundle_bases):
+                continue
+        path = entry[b'URL']

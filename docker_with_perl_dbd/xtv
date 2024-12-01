@@ -1,0 +1,1000 @@
+                    l = fp.readline()
+                    try:
+                        name, size = l.split(b'\0', 1)
+                        size = int(size)
+                    except (ValueError, TypeError):
+                        raise error.ResponseError(
+                            _(b'unexpected response from remote server:'), l
+                        )
+                    if repo.ui.debugflag:
+                        repo.ui.debug(
+                            b'adding %s (%s)\n' % (name, util.bytecount(size))
+                        )
+                    # for backwards compat, name was partially encoded
+                    path = store.decodedir(name)
+                    with repo.svfs(path, b'w', backgroundclose=True) as ofp:
+                        for chunk in util.filechunkiter(fp, limit=size):
+                            progress.increment(step=len(chunk))
+                            ofp.write(chunk)
+
+            # force @filecache properties to be reloaded from
+            # streamclone-ed file at next access
+            repo.invalidate(clearfilecache=True)
+
+        elapsed = util.timer() - start
+        if elapsed <= 0:
+            elapsed = 0.001
+        progress.complete()
+        repo.ui.status(
+            _(b'transferred %s in %.1f seconds (%s/sec)\n')
+            % (
+                util.bytecount(bytecount),
+                elapsed,
+                util.bytecount(bytecount / elapsed),
+            )
+        )
+
+
+def readbundle1header(fp):
+    compression = fp.read(2)
+    if compression != b'UN':
+        raise error.Abort(
+            _(
+                b'only uncompressed stream clone bundles are '
+                b'supported; got %s'
+            )
+            % compression
+        )
+
+    filecount, bytecount = struct.unpack(b'>QQ', fp.read(16))
+    requireslen = struct.unpack(b'>H', fp.read(2))[0]
+    requires = fp.read(requireslen)
+
+    if not requires.endswith(b'\0'):
+        raise error.Abort(
+            _(
+                b'malformed stream clone bundle: '
+                b'requirements not properly encoded'
+            )
+        )
+
+    requirements = set(requires.rstrip(b'\0').split(b','))
+
+    return filecount, bytecount, requirements
+
+
+def applybundlev1(repo, fp):
+    """Apply the content from a stream clone bundle version 1.
+
+    We assume the 4 byte header has been read and validated and the file handle
+    is at the 2 byte compression identifier.
+    """
+    if len(repo):
+        raise error.Abort(
+            _(b'cannot apply stream clone bundle on non-empty repo')
+        )
+
+    filecount, bytecount, requirements = readbundle1header(fp)
+    missingreqs = requirements - repo.supported
+    if missingreqs:
+        raise error.Abort(
+            _(b'unable to apply stream clone: unsupported format: %s')
+            % b', '.join(sorted(missingreqs))
+        )
+
+    consumev1(repo, fp, filecount, bytecount)
+    nodemap.post_stream_cleanup(repo)
+
+
+class streamcloneapplier:
+    """Class to manage applying streaming clone bundles.
+
+    We need to wrap ``applybundlev1()`` in a dedicated type to enable bundle
+    readers to perform bundle type-specific functionality.
+    """
+
+    def __init__(self, fh):
+        self._fh = fh
+
+    def apply(self, repo):
+        return applybundlev1(repo, self._fh)
+
+
+# type of file to stream
+_fileappend = 0  # append only file
+_filefull = 1  # full snapshot file
+
+# Source of the file
+_srcstore = b's'  # store (svfs)
+_srccache = b'c'  # cache (cache)
+
+# This is it's own function so extensions can override it.
+def _walkstreamfullstorefiles(repo):
+    """list snapshot file from the store"""
+    fnames = []
+    if not repo.publishing():
+        fnames.append(b'phaseroots')
+    return fnames
+
+
+def _filterfull(entry, copy, vfsmap):
+    """actually copy the snapshot files"""
+    src, name, ftype, data = entry
+    if ftype != _filefull:
+        return entry
+    return (src, name, ftype, copy(vfsmap[src].join(name)))
+
+
+@contextlib.contextmanager
+def maketempcopies():
+    """return a function to temporary copy file"""
+
+    files = []
+    dst_dir = pycompat.mkdtemp(prefix=b'hg-clone-')
+    try:
+
+        def copy(src):
+            fd, dst = pycompat.mkstemp(
+                prefix=os.path.basename(src), dir=dst_dir
+            )
+            os.close(fd)
+            files.append(dst)
+            util.copyfiles(src, dst, hardlink=True)
+            return dst
+
+        yield copy
+    finally:
+        for tmp in files:
+            util.tryunlink(tmp)
+        util.tryrmdir(dst_dir)
+
+
+def _makemap(repo):
+    """make a (src -> vfs) map for the repo"""
+    vfsmap = {
+        _srcstore: repo.svfs,
+        _srccache: repo.cachevfs,
+    }
+    # we keep repo.vfs out of the on purpose, ther are too many danger there
+    # (eg: .hg/hgrc)
+    assert repo.vfs not in vfsmap.values()
+
+    return vfsmap
+
+
+def _emit2(repo, entries, totalfilesize):
+    """actually emit the stream bundle"""
+    vfsmap = _makemap(repo)
+    # we keep repo.vfs out of the on purpose, ther are too many danger there
+    # (eg: .hg/hgrc),
+    #
+    # this assert is duplicated (from _makemap) as author might think this is
+    # fine, while this is really not fine.
+    if repo.vfs in vfsmap.values():
+        raise error.ProgrammingError(
+            b'repo.vfs must not be added to vfsmap for security reasons'
+        )
+
+    progress = repo.ui.makeprogress(
+        _(b'bundle'), total=totalfilesize, unit=_(b'bytes')
+    )
+    progress.update(0)
+    with maketempcopies() as copy, progress:
+        # copy is delayed until we are in the try
+        entries = [_filterfull(e, copy, vfsmap) for e in entries]
+        yield None  # this release the lock on the repository
+        totalbytecount = 0
+
+        for src, name, ftype, data in entries:
+            vfs = vfsmap[src]
+            yield src
+            yield util.uvarintencode(len(name))
+            if ftype == _fileappend:
+                fp = vfs(name)
+                size = data
+            elif ftype == _filefull:
+                fp = open(data, b'rb')
+                size = util.fstat(fp).st_size
+            bytecount = 0
+            try:
+                yield util.uvarintencode(size)
+                yield name
+                if size <= 65536:
+                    chunks = (fp.read(size),)
+                else:
+                    chunks = util.filechunkiter(fp, limit=size)
+                for chunk in chunks:
+                    bytecount += len(chunk)
+                    totalbytecount += len(chunk)
+                    progress.update(totalbytecount)
+                    yield chunk
+                if bytecount != size:
+                    # Would most likely be caused by a race due to `hg strip` or
+                    # a revlog split
+                    raise error.Abort(
+                        _(
+                            b'clone could only read %d bytes from %s, but '
+                            b'expected %d bytes'
+                        )
+                        % (bytecount, name, size)
+                    )
+            finally:
+                fp.close()
+
+
+def _test_sync_point_walk_1(repo):
+    """a function for synchronisation during tests"""
+
+
+def _test_sync_point_walk_2(repo):
+    """a function for synchronisation during tests"""
+
+
+def _v2_walk(repo, includes, excludes, includeobsmarkers):
+    """emit a seris of files information useful to clone a repo
+
+    return (entries, totalfilesize)
+
+    entries is a list of tuple (vfs-key, file-path, file-type, size)
+
+    - `vfs-key`: is a key to the right vfs to write the file (see _makemap)
+    - `name`: file path of the file to copy (to be feed to the vfss)
+    - `file-type`: do this file need to be copied with the source lock ?
+    - `size`: the size of the file (or None)
+    """
+    assert repo._currentlock(repo._lockref) is not None
+    entries = []
+    totalfilesize = 0
+
+    matcher = None
+    if includes or excludes:
+        matcher = narrowspec.match(repo.root, includes, excludes)
+
+    for rl_type, name, size in _walkstreamfiles(repo, matcher):
+        if size:
+            ft = _fileappend
+            if rl_type & store.FILEFLAGS_VOLATILE:
+                ft = _filefull
+            entries.append((_srcstore, name, ft, size))
+            totalfilesize += size
+    for name in _walkstreamfullstorefiles(repo):
+        if repo.svfs.exists(name):
+            totalfilesize += repo.svfs.lstat(name).st_size
+            entries.append((_srcstore, name, _filefull, None))
+    if includeobsmarkers and repo.svfs.exists(b'obsstore'):
+        totalfilesize += repo.svfs.lstat(b'obsstore').st_size
+        entries.append((_srcstore, b'obsstore', _filefull, None))
+    for name in cacheutil.cachetocopy(repo):
+        if repo.cachevfs.exists(name):
+            totalfilesize += repo.cachevfs.lstat(name).st_size
+            entries.append((_srccache, name, _filefull, None))
+    return entries, totalfilesize
+
+
+def generatev2(repo, includes, excludes, includeobsmarkers):
+    """Emit content for version 2 of a streaming clone.
+
+    the data stream consists the following entries:
+    1) A char representing the file destination (eg: store or cache)
+    2) A varint containing the length of the filename
+    3) A varint containing the length of file data
+    4) N bytes containing the filename (the internal, store-agnostic form)
+    5) N bytes containing the file data
+
+    Returns a 3-tuple of (file count, file size, data iterator).
+    """
+
+    with repo.lock():
+
+        repo.ui.debug(b'scanning\n')
+
+        entries, totalfilesize = _v2_walk(
+            repo,
+            includes=includes,
+            excludes=excludes,
+            includeobsmarkers=includeobsmarkers,
+        )
+
+        chunks = _emit2(repo, entries, totalfilesize)
+        first = next(chunks)
+        assert first is None
+        _test_sync_point_walk_1(repo)
+    _test_sync_point_walk_2(repo)
+
+    return len(entries), totalfilesize, chunks
+
+
+@contextlib.contextmanager
+def nested(*ctxs):
+    this = ctxs[0]
+    rest = ctxs[1:]
+    with this:
+        if rest:
+            with nested(*rest):
+                yield
+        else:
+            yield
+
+
+def consumev2(repo, fp, filecount, filesize):
+    """Apply the contents from a version 2 streaming clone.
+
+    Data is read from an object that only needs to provide a ``read(size)``
+    method.
+    """
+    with repo.lock():
+        repo.ui.status(
+            _(b'%d files to transfer, %s of data\n')
+            % (filecount, util.bytecount(filesize))
+        )
+
+        start = util.timer()
+        progress = repo.ui.makeprogress(
+            _(b'clone'), total=filesize, unit=_(b'bytes')
+        )
+        progress.update(0)
+
+        vfsmap = _makemap(repo)
+        # we keep repo.vfs out of the on purpose, ther are too many danger
+        # there (eg: .hg/hgrc),
+        #
+        # this assert is duplicated (from _makemap) as author might think this
+        # is fine, while this is really not fine.
+        if repo.vfs in vfsmap.values():
+            raise error.ProgrammingError(
+                b'repo.vfs must not be added to vfsmap for security reasons'
+            )
+
+        with repo.transaction(b'clone'):
+            ctxs = (vfs.backgroundclosing(repo.ui) for vfs in vfsmap.values())
+            with nested(*ctxs):
+                for i in range(filecount):
+                    src = util.readexactly(fp, 1)
+                    vfs = vfsmap[src]
+                    namelen = util.uvarintdecodestream(fp)
+                    datalen = util.uvarintdecodestream(fp)
+
+                    name = util.readexactly(fp, namelen)
+
+                    if repo.ui.debugflag:
+                        repo.ui.debug(
+                            b'adding [%s] %s (%s)\n'
+                            % (src, name, util.bytecount(datalen))
+                        )
+
+                    with vfs(name, b'w') as ofp:
+                        for chunk in util.filechunkiter(fp, limit=datalen):
+                            progress.increment(step=len(chunk))
+                            ofp.write(chunk)
+
+            # force @filecache properties to be reloaded from
+            # streamclone-ed file at next access
+            repo.invalidate(clearfilecache=True)
+
+        elapsed = util.timer() - start
+        if elapsed <= 0:
+            elapsed = 0.001
+        repo.ui.status(
+            _(b'transferred %s in %.1f seconds (%s/sec)\n')
+            % (
+                util.bytecount(progress.pos),
+                elapsed,
+                util.bytecount(progress.pos / elapsed),
+            )
+        )
+        progress.complete()
+
+
+def applybundlev2(repo, fp, filecount, filesize, requirements):
+    from . import localrepo
+
+    missingreqs = [r for r in requirements if r not in repo.supported]
+    if missingreqs:
+        raise error.Abort(
+            _(b'unable to apply stream clone: unsupported format: %s')
+            % b', '.join(sorted(missingreqs))
+        )
+
+    consumev2(repo, fp, filecount, filesize)
+
+    repo.requirements = new_stream_clone_requirements(
+        repo.requirements,
+        requirements,
+    )
+    repo.svfs.options = localrepo.resolvestorevfsoptions(
+        repo.ui, repo.requirements, repo.features
+    )
+    scmutil.writereporequirements(repo)
+    nodemap.post_stream_cleanup(repo)
+
+
+def _copy_files(src_vfs_map, dst_vfs_map, entries, progress):
+    hardlink = [True]
+
+    def copy_used():
+        hardlink[0] = False
+        progress.topic = _(b'copying')
+
+    for k, path, size in entries:
+        src_vfs = src_vfs_map[k]
+        dst_vfs = dst_vfs_map[k]
+        src_path = src_vfs.join(path)
+        dst_path = dst_vfs.join(path)
+        # We cannot use dirname and makedirs of dst_vfs here because the store
+        # encoding confuses them. See issue 6581 for details.
+        dirname = os.path.dirname(dst_path)
+        if not os.path.exists(dirname):
+            util.makedirs(dirname)
+        dst_vfs.register_file(path)
+        # XXX we could use the #nb_bytes argument.
+        util.copyfile(
+            src_path,
+            dst_path,
+            hardlink=hardlink[0],
+            no_hardlink_cb=copy_used,
+            check_fs_hardlink=False,
+        )
+        progress.increment()
+    return hardlink[0]
+
+
+def local_copy(src_repo, dest_repo):
+    """copy all content from one local repository to another
+
+    This is useful for local clone"""
+    src_store_requirements = {
+        r
+        for r in src_repo.requirements
+        if r not in requirementsmod.WORKING_DIR_REQUIREMENTS
+    }
+    dest_store_requirements = {
+        r
+        for r in dest_repo.requirements
+        if r not in requirementsmod.WORKING_DIR_REQUIREMENTS
+    }
+    assert src_store_requirements == dest_store_requirements
+
+    with dest_repo.lock():
+        with src_repo.lock():
+
+            # bookmark is not integrated to the streaming as it might use the
+            # `repo.vfs` and they are too many sentitive data accessible
+            # through `repo.vfs` to expose it to streaming clone.
+            src_book_vfs = bookmarks.bookmarksvfs(src_repo)
+            srcbookmarks = src_book_vfs.join(b'bookmarks')
+            bm_count = 0
+            if os.path.exists(srcbookmarks):
+                bm_count = 1
+
+            entries, totalfilesize = _v2_walk(
+                src_repo,
+                includes=None,
+                excludes=None,
+                includeobsmarkers=True,
+            )
+            src_vfs_map = _makemap(src_repo)
+            dest_vfs_map = _makemap(dest_repo)
+            progress = src_repo.ui.makeprogress(
+                topic=_(b'linking'),
+                total=len(entries) + bm_count,
+                unit=_(b'files'),
+            )
+            # copy  files
+            #
+            # We could copy the full file while the source repository is locked
+            # and the other one without the lock. However, in the linking case,
+            # this would also requires checks that nobody is appending any data
+            # to the files while we do the clone, so this is not done yet. We
+            # could do this blindly when copying files.
+            files = ((k, path, size) for k, path, ftype, size in entries)
+            hardlink = _copy_files(src_vfs_map, dest_vfs_map, files, progress)
+
+            # copy bookmarks over
+            if bm_count:
+                dst_book_vfs = bookmarks.bookmarksvfs(dest_repo)
+                dstbookmarks = dst_book_vfs.join(b'bookmarks')
+                util.copyfile(srcbookmarks, dstbookmarks)
+        progress.complete()
+        if hardlink:
+            msg = b'linked %d files\n'
+        else:
+            msg = b'copied %d files\n'
+        src_repo.ui.debug(msg % (len(entries) + bm_count))
+
+        with dest_repo.transaction(b"localclone") as tr:
+            dest_repo.store.write(tr)
+
+        # clean up transaction file as they do not make sense
+        undo_files = [(dest_repo.svfs, b'undo.backupfiles')]
+        undo_files.extend(dest_repo.undofiles())
+        for undovfs, undofile in undo_files:
+            try:
+                undovfs.unlink(undofile)
+            except OSError as e:
+                if e.errno != errno.ENOENT:
+                    msg = _(b'error removing %s: %s\n')
+                    path = undovfs.join(undofile)
+                    e_msg = stringutil.forcebytestr(e)
+                    msg %= (path, e_msg)
+                    dest_repo.ui.warn(msg)
+                                                                                                                                                                              usr/lib/python3/dist-packages/mercurial/strip.py                                                    0000644 0000000 0000000 00000021253 14355257011 020452  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        from .i18n import _
+from .pycompat import getattr
+from . import (
+    bookmarks as bookmarksmod,
+    cmdutil,
+    error,
+    hg,
+    lock as lockmod,
+    logcmdutil,
+    mergestate as mergestatemod,
+    pycompat,
+    registrar,
+    repair,
+    scmutil,
+    util,
+)
+
+release = lockmod.release
+
+cmdtable = {}
+command = registrar.command(cmdtable)
+
+
+def checklocalchanges(repo, force=False):
+    s = repo.status()
+    if not force:
+        cmdutil.checkunfinished(repo)
+        cmdutil.bailifchanged(repo)
+    else:
+        cmdutil.checkunfinished(repo, skipmerge=True)
+    return s
+
+
+def _findupdatetarget(repo, nodes):
+    unode, p2 = repo.changelog.parents(nodes[0])
+    currentbranch = repo[None].branch()
+
+    if (
+        util.safehasattr(repo, b'mq')
+        and p2 != repo.nullid
+        and p2 in [x.node for x in repo.mq.applied]
+    ):
+        unode = p2
+    elif currentbranch != repo[unode].branch():
+        pwdir = b'parents(wdir())'
+        revset = b'max(((parents(%ln::%r) + %r) - %ln::%r) and branch(%s))'
+        branchtarget = repo.revs(
+            revset, nodes, pwdir, pwdir, nodes, pwdir, currentbranch
+        )
+        if branchtarget:
+            cl = repo.changelog
+            unode = cl.node(branchtarget.first())
+
+    return unode
+
+
+def strip(
+    ui,
+    repo,
+    revs,
+    update=True,
+    backup=True,
+    force=None,
+    bookmarks=None,
+    soft=False,
+):
+    with repo.wlock(), repo.lock():
+
+        if update:
+            checklocalchanges(repo, force=force)
+            urev = _findupdatetarget(repo, revs)
+            hg.clean(repo, urev)
+            repo.dirstate.write(repo.currenttransaction())
+
+        if soft:
+            repair.softstrip(ui, repo, revs, backup)
+        else:
+            repair.strip(ui, repo, revs, backup)
+
+        repomarks = repo._bookmarks
+        if bookmarks:
+            with repo.transaction(b'strip') as tr:
+                if repo._activebookmark in bookmarks:
+                    bookmarksmod.deactivate(repo)
+                repomarks.applychanges(repo, tr, [(b, None) for b in bookmarks])
+            for bookmark in sorted(bookmarks):
+                ui.write(_(b"bookmark '%s' deleted\n") % bookmark)
+
+
+@command(
+    b"debugstrip",
+    [
+        (
+            b'r',
+            b'rev',
+            [],
+            _(
+                b'strip specified revision (optional, '
+                b'can specify revisions without this '
+                b'option)'
+            ),
+            _(b'REV'),
+        ),
+        (
+            b'f',
+            b'force',
+            None,
+            _(
+                b'force removal of changesets, discard '
+                b'uncommitted changes (no backup)'
+            ),
+        ),
+        (b'', b'no-backup', None, _(b'do not save backup bundle')),
+        (
+            b'',
+            b'nobackup',
+            None,
+            _(b'do not save backup bundle (DEPRECATED)'),
+        ),
+        (b'n', b'', None, _(b'ignored  (DEPRECATED)')),
+        (
+            b'k',
+            b'keep',
+            None,
+            _(b"do not modify working directory during strip"),
+        ),
+        (
+            b'B',
+            b'bookmark',
+            [],
+            _(b"remove revs only reachable from given bookmark"),
+            _(b'BOOKMARK'),
+        ),
+        (
+            b'',
+            b'soft',
+            None,
+            _(b"simply drop changesets from visible history (EXPERIMENTAL)"),
+        ),
+    ],
+    _(b'hg debugstrip [-k] [-f] [-B bookmark] [-r] REV...'),
+    helpcategory=command.CATEGORY_MAINTENANCE,
+)
+def debugstrip(ui, repo, *revs, **opts):
+    """strip changesets and all their descendants from the repository
+
+    The strip command removes the specified changesets and all their
+    descendants. If the working directory has uncommitted changes, the
+    operation is aborted unless the --force flag is supplied, in which
+    case changes will be discarded.
+
+    If a parent of the working directory is stripped, then the working
+    directory will automatically be updated to the most recent
+    available ancestor of the stripped parent after the operation
+    completes.
+
+    Any stripped changesets are stored in ``.hg/strip-backup`` as a
+    bundle (see :hg:`help bundle` and :hg:`help unbundle`). They can
+    be restored by running :hg:`unbundle .hg/strip-backup/BUNDLE`,
+    where BUNDLE is the bundle file created by the strip. Note that
+    the local revision numbers will in general be different after the
+    restore.
+
+    Use the --no-backup option to discard the backup bundle once the
+    operation completes.
+
+    Strip is not a history-rewriting operation and can be used on
+    changesets in the public phase. But if the stripped changesets have
+    been pushed to a remote repository you will likely pull them again.
+
+    Return 0 on success.
+    """
+    opts = pycompat.byteskwargs(opts)
+    backup = True
+    if opts.get(b'no_backup') or opts.get(b'nobackup'):
+        backup = False
+
+    cl = repo.changelog
+    revs = list(revs) + opts.get(b'rev')
+    revs = set(logcmdutil.revrange(repo, revs))
+
+    with repo.wlock():
+        bookmarks = set(opts.get(b'bookmark'))
+        if bookmarks:
+            repomarks = repo._bookmarks
+            if not bookmarks.issubset(repomarks):
+                raise error.Abort(
+                    _(b"bookmark '%s' not found")
+                    % b','.join(sorted(bookmarks - set(repomarks.keys())))
+                )
+
+            # If the requested bookmark is not the only one pointing to a
+            # a revision we have to only delete the bookmark and not strip
+            # anything. revsets cannot detect that case.
+            nodetobookmarks = {}
+            for mark, node in repomarks.items():
+                nodetobookmarks.setdefault(node, []).append(mark)
+            for marks in nodetobookmarks.values():
+                if bookmarks.issuperset(marks):
+                    rsrevs = scmutil.bookmarkrevs(repo, marks[0])
+                    revs.update(set(rsrevs))
+            if not revs:
+                with repo.lock(), repo.transaction(b'bookmark') as tr:
+                    bmchanges = [(b, None) for b in bookmarks]
+                    repomarks.applychanges(repo, tr, bmchanges)
+                for bookmark in sorted(bookmarks):
+                    ui.write(_(b"bookmark '%s' deleted\n") % bookmark)
+
+        if not revs:
+            raise error.Abort(_(b'empty revision set'))
+
+        descendants = set(cl.descendants(revs))
+        strippedrevs = revs.union(descendants)
+        roots = revs.difference(descendants)
+
+        # if one of the wdir parent is stripped we'll need
+        # to update away to an earlier revision
+        update = any(
+            p != repo.nullid and cl.rev(p) in strippedrevs
+            for p in repo.dirstate.parents()
+        )
+
+        rootnodes = {cl.node(r) for r in roots}
+
+        q = getattr(repo, 'mq', None)
+        if q is not None and q.applied:
+            # refresh queue state if we're about to strip
+            # applied patches
+            if cl.rev(repo.lookup(b'qtip')) in strippedrevs:
+                q.applieddirty = True
+                start = 0
+                end = len(q.applied)
+                for i, statusentry in enumerate(q.applied):
+                    if statusentry.node in rootnodes:
+                        # if one of the stripped roots is an applied
+                        # patch, only part of the queue is stripped
+                        start = i
+                        break
+                del q.applied[start:end]
+                q.savedirty()
+
+        revs = sorted(rootnodes)
+        if update and opts.get(b'keep'):
+            urev = _findupdatetarget(repo, revs)
+            uctx = repo[urev]
+
+            # only reset the dirstate for files that would actually change
+            # between the working context and uctx
+            descendantrevs = repo.revs(b"only(., %d)", uctx.rev())
+            changedfiles = []
+            for rev in descendantrevs:
+                # blindly reset the files, regardless of what actually changed
+                changedfiles.extend(repo[rev].files())
+
+            # reset files that only changed in the dirstate too
+            dirstate = repo.dirstate
+            dirchanges = [
+                f for f in dirstate if not dirstate.get_entry(f).maybe_clean
+            ]
+            changedfiles.extend(dirchanges)
+
+            repo.dirstate.rebuild(urev, uctx.manifest(), changedfiles)
+            repo.dirstate.write(repo.currenttransaction())
+
+            # clear resolve state
+            mergestatemod.mergestate.clean(repo)
+
+            update = False
+
+        strip(
+            ui,
+            repo,
+            revs,
+            backup=backup,
+            update=update,
+            force=opts.get(b'force'),
+            bookmarks=bookmarks,
+            soft=opts[b'soft'],
+        )
+
+    return 0
+                                                                                                                                                                                                                                                                                                                                                     usr/lib/python3/dist-packages/mercurial/subrepo.py                                                  0000644 0000000 0000000 00000216724 14355257011 021001  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        # subrepo.py - sub-repository classes and factory
+#
+# Copyright 2009-2010 Olivia Mackall <olivia@selenic.com>
+#
+# This software may be used and distributed according to the terms of the
+# GNU General Public License version 2 or any later version.
+
+
+import copy
+import errno
+import os
+import re
+import stat
+import subprocess
+import sys
+import tarfile
+import xml.dom.minidom
+
+from .i18n import _
+from .node import (
+    bin,
+    hex,
+    short,
+)
+from . import (
+    cmdutil,
+    encoding,
+    error,
+    exchange,
+    logcmdutil,
+    match as matchmod,
+    merge as merge,
+    pathutil,
+    phases,
+    pycompat,
+    scmutil,
+    subrepoutil,
+    util,
+    vfs as vfsmod,
+)
+from .utils import (
+    dateutil,
+    hashutil,
+    procutil,
+    urlutil,
+)
+
+hg = None
+reporelpath = subrepoutil.reporelpath
+subrelpath = subrepoutil.subrelpath
+_abssource = subrepoutil._abssource
+propertycache = util.propertycache
+
+
+def _expandedabspath(path):
+    """
+    get a path or url and if it is a path expand it and return an absolute path
+    """
+    expandedpath = urlutil.urllocalpath(util.expandpath(path))
+    u = urlutil.url(expandedpath)
+    if not u.scheme:
+        path = util.normpath(util.abspath(u.path))
+    return path
+
+
+def _getstorehashcachename(remotepath):
+    '''get a unique filename for the store hash cache of a remote repository'''
+    return hex(hashutil.sha1(_expandedabspath(remotepath)).digest())[0:12]
+
+
+class SubrepoAbort(error.Abort):
+    """Exception class used to avoid handling a subrepo error more than once"""
+
+    def __init__(self, *args, **kw):
+        self.subrepo = kw.pop('subrepo', None)
+        self.cause = kw.pop('cause', None)
+        error.Abort.__init__(self, *args, **kw)
+
+
+def annotatesubrepoerror(func):
+    def decoratedmethod(self, *args, **kargs):
+        try:
+            res = func(self, *args, **kargs)
+        except SubrepoAbort as ex:
+            # This exception has already been handled
+            raise ex
+        except error.Abort as ex:
+            subrepo = subrelpath(self)
+            errormsg = (
+                ex.message + b' ' + _(b'(in subrepository "%s")') % subrepo
+            )
+            # avoid handling this exception by raising a SubrepoAbort exception
+            raise SubrepoAbort(
+                errormsg, hint=ex.hint, subrepo=subrepo, cause=sys.exc_info()
+            )
+        return res
+
+    return decoratedmethod
+
+
+def _updateprompt(ui, sub, dirty, local, remote):
+    if dirty:
+        msg = _(
+            b' subrepository sources for %s differ\n'
+            b'you can use (l)ocal source (%s) or (r)emote source (%s).\n'
+            b'what do you want to do?'
+            b'$$ &Local $$ &Remote'
+        ) % (subrelpath(sub), local, remote)
+    else:
+        msg = _(
+            b' subrepository sources for %s differ (in checked out '
+            b'version)\n'
+            b'you can use (l)ocal source (%s) or (r)emote source (%s).\n'
+            b'what do you want to do?'
+            b'$$ &Local $$ &Remote'
+        ) % (subrelpath(sub), local, remote)
+    return ui.promptchoice(msg, 0)
+
+
+def _sanitize(ui, vfs, ignore):
+    for dirname, dirs, names in vfs.walk():
+        for i, d in enumerate(dirs):
+            if d.lower() == ignore:
+                del dirs[i]
+                break
+        if vfs.basename(dirname).lower() != b'.hg':
+            continue
+        for f in names:
+            if f.lower() == b'hgrc':
+                ui.warn(
+                    _(
+                        b"warning: removing potentially hostile 'hgrc' "
+                        b"in '%s'\n"
+                    )
+                    % vfs.join(dirname)
+                )
+                vfs.unlink(vfs.reljoin(dirname, f))
+
+
+def _auditsubrepopath(repo, path):
+    # sanity check for potentially unsafe paths such as '~' and '$FOO'
+    if path.startswith(b'~') or b'$' in path or util.expandpath(path) != path:
+        raise error.Abort(
+            _(b'subrepo path contains illegal component: %s') % path
+        )
+    # auditor doesn't check if the path itself is a symlink
+    pathutil.pathauditor(repo.root)(path)
+    if repo.wvfs.islink(path):
+        raise error.Abort(_(b"subrepo '%s' traverses symbolic link") % path)
+
+
+SUBREPO_ALLOWED_DEFAULTS = {
+    b'hg': True,
+    b'git': False,
+    b'svn': False,
+}
+
+
+def _checktype(ui, kind):
+    # subrepos.allowed is a master kill switch. If disabled, subrepos are
+    # disabled period.
+    if not ui.configbool(b'subrepos', b'allowed', True):
+        raise error.Abort(
+            _(b'subrepos not enabled'),
+            hint=_(b"see 'hg help config.subrepos' for details"),
+        )
+
+    default = SUBREPO_ALLOWED_DEFAULTS.get(kind, False)
+    if not ui.configbool(b'subrepos', b'%s:allowed' % kind, default):
+        raise error.Abort(
+            _(b'%s subrepos not allowed') % kind,
+            hint=_(b"see 'hg help config.subrepos' for details"),
+        )
+
+    if kind not in types:
+        raise error.Abort(_(b'unknown subrepo type %s') % kind)
+
+
+def subrepo(ctx, path, allowwdir=False, allowcreate=True):
+    """return instance of the right subrepo class for subrepo in path"""
+    # subrepo inherently violates our import layering rules
+    # because it wants to make repo objects from deep inside the stack
+    # so we manually delay the circular imports to not break
+    # scripts that don't use our demand-loading
+    global hg
+    from . import hg as h
+
+    hg = h
+
+    repo = ctx.repo()
+    _auditsubrepopath(repo, path)
+    state = ctx.substate[path]
+    _checktype(repo.ui, state[2])
+    if allowwdir:
+        state = (state[0], ctx.subrev(path), state[2])
+    return types[state[2]](ctx, path, state[:2], allowcreate)
+
+
+def nullsubrepo(ctx, path, pctx):
+    """return an empty subrepo in pctx for the extant subrepo in ctx"""

@@ -1,0 +1,1000 @@
+            tm = time.strftime('%M:%S', time.localtime(secs))
+            sys.stderr.write('  %s.%02d %s\n' % (tm, (secs*100)%100, s))
+            sys.stderr.flush()
+
+        def _dump_ur(self, untagged_resp_dict):
+            if not untagged_resp_dict:
+                return
+            items = (f'{key}: {value!r}'
+                    for key, value in untagged_resp_dict.items())
+            self._mesg('untagged responses dump:' + '\n\t\t'.join(items))
+
+        def _log(self, line):
+            # Keep log of last `_cmd_log_len' interactions for debugging.
+            self._cmd_log[self._cmd_log_idx] = (line, time.time())
+            self._cmd_log_idx += 1
+            if self._cmd_log_idx >= self._cmd_log_len:
+                self._cmd_log_idx = 0
+
+        def print_log(self):
+            self._mesg('last %d IMAP4 interactions:' % len(self._cmd_log))
+            i, n = self._cmd_log_idx, self._cmd_log_len
+            while n:
+                try:
+                    self._mesg(*self._cmd_log[i])
+                except:
+                    pass
+                i += 1
+                if i >= self._cmd_log_len:
+                    i = 0
+                n -= 1
+
+
+if HAVE_SSL:
+
+    class IMAP4_SSL(IMAP4):
+
+        """IMAP4 client class over SSL connection
+
+        Instantiate with: IMAP4_SSL([host[, port[, keyfile[, certfile[, ssl_context[, timeout=None]]]]]])
+
+                host - host's name (default: localhost);
+                port - port number (default: standard IMAP4 SSL port);
+                keyfile - PEM formatted file that contains your private key (default: None);
+                certfile - PEM formatted certificate chain file (default: None);
+                ssl_context - a SSLContext object that contains your certificate chain
+                              and private key (default: None)
+                Note: if ssl_context is provided, then parameters keyfile or
+                certfile should not be set otherwise ValueError is raised.
+                timeout - socket timeout (default: None) If timeout is not given or is None,
+                          the global default socket timeout is used
+
+        for more documentation see the docstring of the parent class IMAP4.
+        """
+
+
+        def __init__(self, host='', port=IMAP4_SSL_PORT, keyfile=None,
+                     certfile=None, ssl_context=None, timeout=None):
+            if ssl_context is not None and keyfile is not None:
+                raise ValueError("ssl_context and keyfile arguments are mutually "
+                                 "exclusive")
+            if ssl_context is not None and certfile is not None:
+                raise ValueError("ssl_context and certfile arguments are mutually "
+                                 "exclusive")
+            if keyfile is not None or certfile is not None:
+                import warnings
+                warnings.warn("keyfile and certfile are deprecated, use a "
+                              "custom ssl_context instead", DeprecationWarning, 2)
+            self.keyfile = keyfile
+            self.certfile = certfile
+            if ssl_context is None:
+                ssl_context = ssl._create_stdlib_context(certfile=certfile,
+                                                         keyfile=keyfile)
+            self.ssl_context = ssl_context
+            IMAP4.__init__(self, host, port, timeout)
+
+        def _create_socket(self, timeout):
+            sock = IMAP4._create_socket(self, timeout)
+            return self.ssl_context.wrap_socket(sock,
+                                                server_hostname=self.host)
+
+        def open(self, host='', port=IMAP4_SSL_PORT, timeout=None):
+            """Setup connection to remote server on "host:port".
+                (default: localhost:standard IMAP4 SSL port).
+            This connection will be used by the routines:
+                read, readline, send, shutdown.
+            """
+            IMAP4.open(self, host, port, timeout)
+
+    __all__.append("IMAP4_SSL")
+
+
+class IMAP4_stream(IMAP4):
+
+    """IMAP4 client class over a stream
+
+    Instantiate with: IMAP4_stream(command)
+
+            "command" - a string that can be passed to subprocess.Popen()
+
+    for more documentation see the docstring of the parent class IMAP4.
+    """
+
+
+    def __init__(self, command):
+        self.command = command
+        IMAP4.__init__(self)
+
+
+    def open(self, host=None, port=None, timeout=None):
+        """Setup a stream connection.
+        This connection will be used by the routines:
+            read, readline, send, shutdown.
+        """
+        self.host = None        # For compatibility with parent class
+        self.port = None
+        self.sock = None
+        self.file = None
+        self.process = subprocess.Popen(self.command,
+            bufsize=DEFAULT_BUFFER_SIZE,
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            shell=True, close_fds=True)
+        self.writefile = self.process.stdin
+        self.readfile = self.process.stdout
+
+    def read(self, size):
+        """Read 'size' bytes from remote."""
+        return self.readfile.read(size)
+
+
+    def readline(self):
+        """Read line from remote."""
+        return self.readfile.readline()
+
+
+    def send(self, data):
+        """Send data to remote."""
+        self.writefile.write(data)
+        self.writefile.flush()
+
+
+    def shutdown(self):
+        """Close I/O established in "open"."""
+        self.readfile.close()
+        self.writefile.close()
+        self.process.wait()
+
+
+
+class _Authenticator:
+
+    """Private class to provide en/decoding
+            for base64-based authentication conversation.
+    """
+
+    def __init__(self, mechinst):
+        self.mech = mechinst    # Callable object to provide/process data
+
+    def process(self, data):
+        ret = self.mech(self.decode(data))
+        if ret is None:
+            return b'*'     # Abort conversation
+        return self.encode(ret)
+
+    def encode(self, inp):
+        #
+        #  Invoke binascii.b2a_base64 iteratively with
+        #  short even length buffers, strip the trailing
+        #  line feed from the result and append.  "Even"
+        #  means a number that factors to both 6 and 8,
+        #  so when it gets to the end of the 8-bit input
+        #  there's no partial 6-bit output.
+        #
+        oup = b''
+        if isinstance(inp, str):
+            inp = inp.encode('utf-8')
+        while inp:
+            if len(inp) > 48:
+                t = inp[:48]
+                inp = inp[48:]
+            else:
+                t = inp
+                inp = b''
+            e = binascii.b2a_base64(t)
+            if e:
+                oup = oup + e[:-1]
+        return oup
+
+    def decode(self, inp):
+        if not inp:
+            return b''
+        return binascii.a2b_base64(inp)
+
+Months = ' Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec'.split(' ')
+Mon2num = {s.encode():n+1 for n, s in enumerate(Months[1:])}
+
+def Internaldate2tuple(resp):
+    """Parse an IMAP4 INTERNALDATE string.
+
+    Return corresponding local time.  The return value is a
+    time.struct_time tuple or None if the string has wrong format.
+    """
+
+    mo = InternalDate.match(resp)
+    if not mo:
+        return None
+
+    mon = Mon2num[mo.group('mon')]
+    zonen = mo.group('zonen')
+
+    day = int(mo.group('day'))
+    year = int(mo.group('year'))
+    hour = int(mo.group('hour'))
+    min = int(mo.group('min'))
+    sec = int(mo.group('sec'))
+    zoneh = int(mo.group('zoneh'))
+    zonem = int(mo.group('zonem'))
+
+    # INTERNALDATE timezone must be subtracted to get UT
+
+    zone = (zoneh*60 + zonem)*60
+    if zonen == b'-':
+        zone = -zone
+
+    tt = (year, mon, day, hour, min, sec, -1, -1, -1)
+    utc = calendar.timegm(tt) - zone
+
+    return time.localtime(utc)
+
+
+
+def Int2AP(num):
+
+    """Convert integer to A-P string representation."""
+
+    val = b''; AP = b'ABCDEFGHIJKLMNOP'
+    num = int(abs(num))
+    while num:
+        num, mod = divmod(num, 16)
+        val = AP[mod:mod+1] + val
+    return val
+
+
+
+def ParseFlags(resp):
+
+    """Convert IMAP4 flags response to python tuple."""
+
+    mo = Flags.match(resp)
+    if not mo:
+        return ()
+
+    return tuple(mo.group('flags').split())
+
+
+def Time2Internaldate(date_time):
+
+    """Convert date_time to IMAP4 INTERNALDATE representation.
+
+    Return string in form: '"DD-Mmm-YYYY HH:MM:SS +HHMM"'.  The
+    date_time argument can be a number (int or float) representing
+    seconds since epoch (as returned by time.time()), a 9-tuple
+    representing local time, an instance of time.struct_time (as
+    returned by time.localtime()), an aware datetime instance or a
+    double-quoted string.  In the last case, it is assumed to already
+    be in the correct format.
+    """
+    if isinstance(date_time, (int, float)):
+        dt = datetime.fromtimestamp(date_time,
+                                    timezone.utc).astimezone()
+    elif isinstance(date_time, tuple):
+        try:
+            gmtoff = date_time.tm_gmtoff
+        except AttributeError:
+            if time.daylight:
+                dst = date_time[8]
+                if dst == -1:
+                    dst = time.localtime(time.mktime(date_time))[8]
+                gmtoff = -(time.timezone, time.altzone)[dst]
+            else:
+                gmtoff = -time.timezone
+        delta = timedelta(seconds=gmtoff)
+        dt = datetime(*date_time[:6], tzinfo=timezone(delta))
+    elif isinstance(date_time, datetime):
+        if date_time.tzinfo is None:
+            raise ValueError("date_time must be aware")
+        dt = date_time
+    elif isinstance(date_time, str) and (date_time[0],date_time[-1]) == ('"','"'):
+        return date_time        # Assume in correct format
+    else:
+        raise ValueError("date_time not of a known type")
+    fmt = '"%d-{}-%Y %H:%M:%S %z"'.format(Months[dt.month])
+    return dt.strftime(fmt)
+
+
+
+if __name__ == '__main__':
+
+    # To test: invoke either as 'python imaplib.py [IMAP4_server_hostname]'
+    # or 'python imaplib.py -s "rsh IMAP4_server_hostname exec /etc/rimapd"'
+    # to test the IMAP4_stream class
+
+    import getopt, getpass
+
+    try:
+        optlist, args = getopt.getopt(sys.argv[1:], 'd:s:')
+    except getopt.error as val:
+        optlist, args = (), ()
+
+    stream_command = None
+    for opt,val in optlist:
+        if opt == '-d':
+            Debug = int(val)
+        elif opt == '-s':
+            stream_command = val
+            if not args: args = (stream_command,)
+
+    if not args: args = ('',)
+
+    host = args[0]
+
+    USER = getpass.getuser()
+    PASSWD = getpass.getpass("IMAP password for %s on %s: " % (USER, host or "localhost"))
+
+    test_mesg = 'From: %(user)s@localhost%(lf)sSubject: IMAP4 test%(lf)s%(lf)sdata...%(lf)s' % {'user':USER, 'lf':'\n'}
+    test_seq1 = (
+    ('login', (USER, PASSWD)),
+    ('create', ('/tmp/xxx 1',)),
+    ('rename', ('/tmp/xxx 1', '/tmp/yyy')),
+    ('CREATE', ('/tmp/yyz 2',)),
+    ('append', ('/tmp/yyz 2', None, None, test_mesg)),
+    ('list', ('/tmp', 'yy*')),
+    ('select', ('/tmp/yyz 2',)),
+    ('search', (None, 'SUBJECT', 'test')),
+    ('fetch', ('1', '(FLAGS INTERNALDATE RFC822)')),
+    ('store', ('1', 'FLAGS', r'(\Deleted)')),
+    ('namespace', ()),
+    ('expunge', ()),
+    ('recent', ()),
+    ('close', ()),
+    )
+
+    test_seq2 = (
+    ('select', ()),
+    ('response',('UIDVALIDITY',)),
+    ('uid', ('SEARCH', 'ALL')),
+    ('response', ('EXISTS',)),
+    ('append', (None, None, None, test_mesg)),
+    ('recent', ()),
+    ('logout', ()),
+    )
+
+    def run(cmd, args):
+        M._mesg('%s %s' % (cmd, args))
+        typ, dat = getattr(M, cmd)(*args)
+        M._mesg('%s => %s %s' % (cmd, typ, dat))
+        if typ == 'NO': raise dat[0]
+        return dat
+
+    try:
+        if stream_command:
+            M = IMAP4_stream(stream_command)
+        else:
+            M = IMAP4(host)
+        if M.state == 'AUTH':
+            test_seq1 = test_seq1[1:]   # Login not needed
+        M._mesg('PROTOCOL_VERSION = %s' % M.PROTOCOL_VERSION)
+        M._mesg('CAPABILITIES = %r' % (M.capabilities,))
+
+        for cmd,args in test_seq1:
+            run(cmd, args)
+
+        for ml in run('list', ('/tmp/', 'yy%')):
+            mo = re.match(r'.*"([^"]+)"$', ml)
+            if mo: path = mo.group(1)
+            else: path = ml.split()[-1]
+            run('delete', (path,))
+
+        for cmd,args in test_seq2:
+            dat = run(cmd, args)
+
+            if (cmd,args) != ('uid', ('SEARCH', 'ALL')):
+                continue
+
+            uid = dat[-1].split()
+            if not uid: continue
+            run('uid', ('FETCH', '%s' % uid[-1],
+                    '(FLAGS INTERNALDATE RFC822.SIZE RFC822.HEADER RFC822.TEXT)'))
+
+        print('\nAll tests OK.')
+
+    except:
+        print('\nTests failed.')
+
+        if not Debug:
+            print('''
+If you would like to see debugging output,
+try: %s -d5
+''' % sys.argv[0])
+
+        raise
+                                                                                                                                                                                                                                                                                                                                                                                                                                               usr/lib/python3.11/imghdr.py                                                                        0000644 0000000 0000000 00000007560 14671176116 014315  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        """Recognize image file formats based on their first few bytes."""
+
+from os import PathLike
+import warnings
+
+__all__ = ["what"]
+
+
+warnings._deprecated(__name__, remove=(3, 13))
+
+
+#-------------------------#
+# Recognize image headers #
+#-------------------------#
+
+def what(file, h=None):
+    f = None
+    try:
+        if h is None:
+            if isinstance(file, (str, PathLike)):
+                f = open(file, 'rb')
+                h = f.read(32)
+            else:
+                location = file.tell()
+                h = file.read(32)
+                file.seek(location)
+        for tf in tests:
+            res = tf(h, f)
+            if res:
+                return res
+    finally:
+        if f: f.close()
+    return None
+
+
+#---------------------------------#
+# Subroutines per image file type #
+#---------------------------------#
+
+tests = []
+
+def test_jpeg(h, f):
+    """JPEG data with JFIF or Exif markers; and raw JPEG"""
+    if h[6:10] in (b'JFIF', b'Exif'):
+        return 'jpeg'
+    elif h[:4] == b'\xff\xd8\xff\xdb':
+        return 'jpeg'
+
+tests.append(test_jpeg)
+
+def test_png(h, f):
+    if h.startswith(b'\211PNG\r\n\032\n'):
+        return 'png'
+
+tests.append(test_png)
+
+def test_gif(h, f):
+    """GIF ('87 and '89 variants)"""
+    if h[:6] in (b'GIF87a', b'GIF89a'):
+        return 'gif'
+
+tests.append(test_gif)
+
+def test_tiff(h, f):
+    """TIFF (can be in Motorola or Intel byte order)"""
+    if h[:2] in (b'MM', b'II'):
+        return 'tiff'
+
+tests.append(test_tiff)
+
+def test_rgb(h, f):
+    """SGI image library"""
+    if h.startswith(b'\001\332'):
+        return 'rgb'
+
+tests.append(test_rgb)
+
+def test_pbm(h, f):
+    """PBM (portable bitmap)"""
+    if len(h) >= 3 and \
+        h[0] == ord(b'P') and h[1] in b'14' and h[2] in b' \t\n\r':
+        return 'pbm'
+
+tests.append(test_pbm)
+
+def test_pgm(h, f):
+    """PGM (portable graymap)"""
+    if len(h) >= 3 and \
+        h[0] == ord(b'P') and h[1] in b'25' and h[2] in b' \t\n\r':
+        return 'pgm'
+
+tests.append(test_pgm)
+
+def test_ppm(h, f):
+    """PPM (portable pixmap)"""
+    if len(h) >= 3 and \
+        h[0] == ord(b'P') and h[1] in b'36' and h[2] in b' \t\n\r':
+        return 'ppm'
+
+tests.append(test_ppm)
+
+def test_rast(h, f):
+    """Sun raster file"""
+    if h.startswith(b'\x59\xA6\x6A\x95'):
+        return 'rast'
+
+tests.append(test_rast)
+
+def test_xbm(h, f):
+    """X bitmap (X10 or X11)"""
+    if h.startswith(b'#define '):
+        return 'xbm'
+
+tests.append(test_xbm)
+
+def test_bmp(h, f):
+    if h.startswith(b'BM'):
+        return 'bmp'
+
+tests.append(test_bmp)
+
+def test_webp(h, f):
+    if h.startswith(b'RIFF') and h[8:12] == b'WEBP':
+        return 'webp'
+
+tests.append(test_webp)
+
+def test_exr(h, f):
+    if h.startswith(b'\x76\x2f\x31\x01'):
+        return 'exr'
+
+tests.append(test_exr)
+
+#--------------------#
+# Small test program #
+#--------------------#
+
+def test():
+    import sys
+    recursive = 0
+    if sys.argv[1:] and sys.argv[1] == '-r':
+        del sys.argv[1:2]
+        recursive = 1
+    try:
+        if sys.argv[1:]:
+            testall(sys.argv[1:], recursive, 1)
+        else:
+            testall(['.'], recursive, 1)
+    except KeyboardInterrupt:
+        sys.stderr.write('\n[Interrupted]\n')
+        sys.exit(1)
+
+def testall(list, recursive, toplevel):
+    import sys
+    import os
+    for filename in list:
+        if os.path.isdir(filename):
+            print(filename + '/:', end=' ')
+            if recursive or toplevel:
+                print('recursing down:')
+                import glob
+                names = glob.glob(os.path.join(glob.escape(filename), '*'))
+                testall(names, recursive, 0)
+            else:
+                print('*** directory (use -r) ***')
+        else:
+            print(filename + ':', end=' ')
+            sys.stdout.flush()
+            try:
+                print(what(filename))
+            except OSError:
+                print('*** not found ***')
+
+if __name__ == '__main__':
+    test()
+                                                                                                                                                usr/lib/python3.11/imp.py                                                                           0000644 0000000 0000000 00000024556 14671176116 013634  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        """This module provides the components needed to build your own __import__
+function.  Undocumented functions are obsolete.
+
+In most cases it is preferred you consider using the importlib module's
+functionality over this module.
+
+"""
+# (Probably) need to stay in _imp
+from _imp import (lock_held, acquire_lock, release_lock,
+                  get_frozen_object, is_frozen_package,
+                  init_frozen, is_builtin, is_frozen,
+                  _fix_co_filename, _frozen_module_names)
+try:
+    from _imp import create_dynamic
+except ImportError:
+    # Platform doesn't support dynamic loading.
+    create_dynamic = None
+
+from importlib._bootstrap import _ERR_MSG, _exec, _load, _builtin_from_name
+from importlib._bootstrap_external import SourcelessFileLoader
+
+from importlib import machinery
+from importlib import util
+import importlib
+import os
+import sys
+import tokenize
+import types
+import warnings
+
+warnings.warn("the imp module is deprecated in favour of importlib and slated "
+              "for removal in Python 3.12; "
+              "see the module's documentation for alternative uses",
+              DeprecationWarning, stacklevel=2)
+
+# DEPRECATED
+SEARCH_ERROR = 0
+PY_SOURCE = 1
+PY_COMPILED = 2
+C_EXTENSION = 3
+PY_RESOURCE = 4
+PKG_DIRECTORY = 5
+C_BUILTIN = 6
+PY_FROZEN = 7
+PY_CODERESOURCE = 8
+IMP_HOOK = 9
+
+
+def new_module(name):
+    """**DEPRECATED**
+
+    Create a new module.
+
+    The module is not entered into sys.modules.
+
+    """
+    return types.ModuleType(name)
+
+
+def get_magic():
+    """**DEPRECATED**
+
+    Return the magic number for .pyc files.
+    """
+    return util.MAGIC_NUMBER
+
+
+def get_tag():
+    """Return the magic tag for .pyc files."""
+    return sys.implementation.cache_tag
+
+
+def cache_from_source(path, debug_override=None):
+    """**DEPRECATED**
+
+    Given the path to a .py file, return the path to its .pyc file.
+
+    The .py file does not need to exist; this simply returns the path to the
+    .pyc file calculated as if the .py file were imported.
+
+    If debug_override is not None, then it must be a boolean and is used in
+    place of sys.flags.optimize.
+
+    If sys.implementation.cache_tag is None then NotImplementedError is raised.
+
+    """
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore')
+        return util.cache_from_source(path, debug_override)
+
+
+def source_from_cache(path):
+    """**DEPRECATED**
+
+    Given the path to a .pyc. file, return the path to its .py file.
+
+    The .pyc file does not need to exist; this simply returns the path to
+    the .py file calculated to correspond to the .pyc file.  If path does
+    not conform to PEP 3147 format, ValueError will be raised. If
+    sys.implementation.cache_tag is None then NotImplementedError is raised.
+
+    """
+    return util.source_from_cache(path)
+
+
+def get_suffixes():
+    """**DEPRECATED**"""
+    extensions = [(s, 'rb', C_EXTENSION) for s in machinery.EXTENSION_SUFFIXES]
+    source = [(s, 'r', PY_SOURCE) for s in machinery.SOURCE_SUFFIXES]
+    bytecode = [(s, 'rb', PY_COMPILED) for s in machinery.BYTECODE_SUFFIXES]
+
+    return extensions + source + bytecode
+
+
+class NullImporter:
+
+    """**DEPRECATED**
+
+    Null import object.
+
+    """
+
+    def __init__(self, path):
+        if path == '':
+            raise ImportError('empty pathname', path='')
+        elif os.path.isdir(path):
+            raise ImportError('existing directory', path=path)
+
+    def find_module(self, fullname):
+        """Always returns None."""
+        return None
+
+
+class _HackedGetData:
+
+    """Compatibility support for 'file' arguments of various load_*()
+    functions."""
+
+    def __init__(self, fullname, path, file=None):
+        super().__init__(fullname, path)
+        self.file = file
+
+    def get_data(self, path):
+        """Gross hack to contort loader to deal w/ load_*()'s bad API."""
+        if self.file and path == self.path:
+            # The contract of get_data() requires us to return bytes. Reopen the
+            # file in binary mode if needed.
+            if not self.file.closed:
+                file = self.file
+                if 'b' not in file.mode:
+                    file.close()
+            if self.file.closed:
+                self.file = file = open(self.path, 'rb')
+
+            with file:
+                return file.read()
+        else:
+            return super().get_data(path)
+
+
+class _LoadSourceCompatibility(_HackedGetData, machinery.SourceFileLoader):
+
+    """Compatibility support for implementing load_source()."""
+
+
+def load_source(name, pathname, file=None):
+    loader = _LoadSourceCompatibility(name, pathname, file)
+    spec = util.spec_from_file_location(name, pathname, loader=loader)
+    if name in sys.modules:
+        module = _exec(spec, sys.modules[name])
+    else:
+        module = _load(spec)
+    # To allow reloading to potentially work, use a non-hacked loader which
+    # won't rely on a now-closed file object.
+    module.__loader__ = machinery.SourceFileLoader(name, pathname)
+    module.__spec__.loader = module.__loader__
+    return module
+
+
+class _LoadCompiledCompatibility(_HackedGetData, SourcelessFileLoader):
+
+    """Compatibility support for implementing load_compiled()."""
+
+
+def load_compiled(name, pathname, file=None):
+    """**DEPRECATED**"""
+    loader = _LoadCompiledCompatibility(name, pathname, file)
+    spec = util.spec_from_file_location(name, pathname, loader=loader)
+    if name in sys.modules:
+        module = _exec(spec, sys.modules[name])
+    else:
+        module = _load(spec)
+    # To allow reloading to potentially work, use a non-hacked loader which
+    # won't rely on a now-closed file object.
+    module.__loader__ = SourcelessFileLoader(name, pathname)
+    module.__spec__.loader = module.__loader__
+    return module
+
+
+def load_package(name, path):
+    """**DEPRECATED**"""
+    if os.path.isdir(path):
+        extensions = (machinery.SOURCE_SUFFIXES[:] +
+                      machinery.BYTECODE_SUFFIXES[:])
+        for extension in extensions:
+            init_path = os.path.join(path, '__init__' + extension)
+            if os.path.exists(init_path):
+                path = init_path
+                break
+        else:
+            raise ValueError('{!r} is not a package'.format(path))
+    spec = util.spec_from_file_location(name, path,
+                                        submodule_search_locations=[])
+    if name in sys.modules:
+        return _exec(spec, sys.modules[name])
+    else:
+        return _load(spec)
+
+
+def load_module(name, file, filename, details):
+    """**DEPRECATED**
+
+    Load a module, given information returned by find_module().
+
+    The module name must include the full package name, if any.
+
+    """
+    suffix, mode, type_ = details
+    if mode and (not mode.startswith('r') or '+' in mode):
+        raise ValueError('invalid file open mode {!r}'.format(mode))
+    elif file is None and type_ in {PY_SOURCE, PY_COMPILED}:
+        msg = 'file object required for import (type code {})'.format(type_)
+        raise ValueError(msg)
+    elif type_ == PY_SOURCE:
+        return load_source(name, filename, file)
+    elif type_ == PY_COMPILED:
+        return load_compiled(name, filename, file)
+    elif type_ == C_EXTENSION and load_dynamic is not None:
+        if file is None:
+            with open(filename, 'rb') as opened_file:
+                return load_dynamic(name, filename, opened_file)
+        else:
+            return load_dynamic(name, filename, file)
+    elif type_ == PKG_DIRECTORY:
+        return load_package(name, filename)
+    elif type_ == C_BUILTIN:
+        return init_builtin(name)
+    elif type_ == PY_FROZEN:
+        return init_frozen(name)
+    else:
+        msg =  "Don't know how to import {} (type code {})".format(name, type_)
+        raise ImportError(msg, name=name)
+
+
+def find_module(name, path=None):
+    """**DEPRECATED**
+
+    Search for a module.
+
+    If path is omitted or None, search for a built-in, frozen or special
+    module and continue search in sys.path. The module name cannot
+    contain '.'; to search for a submodule of a package, pass the
+    submodule name and the package's __path__.
+
+    """
+    if not isinstance(name, str):
+        raise TypeError("'name' must be a str, not {}".format(type(name)))
+    elif not isinstance(path, (type(None), list)):
+        # Backwards-compatibility
+        raise RuntimeError("'path' must be None or a list, "
+                           "not {}".format(type(path)))
+
+    if path is None:
+        if is_builtin(name):
+            return None, None, ('', '', C_BUILTIN)
+        elif is_frozen(name):
+            return None, None, ('', '', PY_FROZEN)
+        else:
+            path = sys.path
+
+    for entry in path:
+        package_directory = os.path.join(entry, name)
+        for suffix in ['.py', machinery.BYTECODE_SUFFIXES[0]]:
+            package_file_name = '__init__' + suffix
+            file_path = os.path.join(package_directory, package_file_name)
+            if os.path.isfile(file_path):
+                return None, package_directory, ('', '', PKG_DIRECTORY)
+        for suffix, mode, type_ in get_suffixes():
+            file_name = name + suffix
+            file_path = os.path.join(entry, file_name)
+            if os.path.isfile(file_path):
+                break
+        else:
+            continue
+        break  # Break out of outer loop when breaking out of inner loop.
+    else:
+        raise ImportError(_ERR_MSG.format(name), name=name)
+
+    encoding = None
+    if 'b' not in mode:
+        with open(file_path, 'rb') as file:
+            encoding = tokenize.detect_encoding(file.readline)[0]
+    file = open(file_path, mode, encoding=encoding)
+    return file, file_path, (suffix, mode, type_)
+
+
+def reload(module):
+    """**DEPRECATED**
+
+    Reload the module and return it.
+
+    The module must have been successfully imported before.
+
+    """
+    return importlib.reload(module)
+
+
+def init_builtin(name):
+    """**DEPRECATED**
+
+    Load and return a built-in module by name, or None is such module doesn't
+    exist
+    """
+    try:
+        return _builtin_from_name(name)
+    except ImportError:
+        return None
+
+
+if create_dynamic:
+    def load_dynamic(name, path, file=None):
+        """**DEPRECATED**
+
+        Load an extension module.
+        """
+        import importlib.machinery
+        loader = importlib.machinery.ExtensionFileLoader(name, path)
+
+        # Issue #24748: Skip the sys.modules check in _load_module_shim;
+        # always load new extension
+        spec = importlib.machinery.ModuleSpec(
+            name=name, loader=loader, origin=path)
+        return _load(spec)
+
+else:
+    load_dynamic = None
+                                                                                                                                                  usr/lib/python3.11/importlib/                                                                       0000755 0000000 0000000 00000000000 14714551116 014455  5                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        usr/lib/python3.11/importlib/__init__.py                                                            0000644 0000000 0000000 00000013711 14671176116 016576  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        """A pure Python implementation of import."""
+__all__ = ['__import__', 'import_module', 'invalidate_caches', 'reload']
+
+# Bootstrap help #####################################################
+
+# Until bootstrapping is complete, DO NOT import any modules that attempt
+# to import importlib._bootstrap (directly or indirectly). Since this
+# partially initialised package would be present in sys.modules, those
+# modules would get an uninitialised copy of the source version, instead
+# of a fully initialised version (either the frozen one or the one
+# initialised below if the frozen one is not available).
+import _imp  # Just the builtin component, NOT the full Python module
+import sys
+
+try:
+    import _frozen_importlib as _bootstrap
+except ImportError:
+    from . import _bootstrap
+    _bootstrap._setup(sys, _imp)
+else:
+    # importlib._bootstrap is the built-in import, ensure we don't create
+    # a second copy of the module.
+    _bootstrap.__name__ = 'importlib._bootstrap'
+    _bootstrap.__package__ = 'importlib'
+    try:
+        _bootstrap.__file__ = __file__.replace('__init__.py', '_bootstrap.py')
+    except NameError:
+        # __file__ is not guaranteed to be defined, e.g. if this code gets
+        # frozen by a tool like cx_Freeze.
+        pass
+    sys.modules['importlib._bootstrap'] = _bootstrap
+
+try:
+    import _frozen_importlib_external as _bootstrap_external
+except ImportError:
+    from . import _bootstrap_external
+    _bootstrap_external._set_bootstrap_module(_bootstrap)
+    _bootstrap._bootstrap_external = _bootstrap_external
+else:
+    _bootstrap_external.__name__ = 'importlib._bootstrap_external'
+    _bootstrap_external.__package__ = 'importlib'
+    try:
+        _bootstrap_external.__file__ = __file__.replace('__init__.py', '_bootstrap_external.py')
+    except NameError:
+        # __file__ is not guaranteed to be defined, e.g. if this code gets
+        # frozen by a tool like cx_Freeze.
+        pass
+    sys.modules['importlib._bootstrap_external'] = _bootstrap_external
+
+# To simplify imports in test code
+_pack_uint32 = _bootstrap_external._pack_uint32
+_unpack_uint32 = _bootstrap_external._unpack_uint32
+
+# Fully bootstrapped at this point, import whatever you like, circular
+# dependencies and startup overhead minimisation permitting :)
+
+import warnings
+
+
+# Public API #########################################################
+
+from ._bootstrap import __import__
+
+
+def invalidate_caches():
+    """Call the invalidate_caches() method on all meta path finders stored in
+    sys.meta_path (where implemented)."""
+    for finder in sys.meta_path:
+        if hasattr(finder, 'invalidate_caches'):
+            finder.invalidate_caches()
+
+
+def find_loader(name, path=None):
+    """Return the loader for the specified module.
+
+    This is a backward-compatible wrapper around find_spec().
+
+    This function is deprecated in favor of importlib.util.find_spec().
+

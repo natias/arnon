@@ -1,0 +1,1000 @@
+reference-counted. It's used mainly in a few places like call_sv() which
+can be called from anywhere, and thus have to deal with both cases.
+
+So for example, rather than using rpp_xpush_1(), call_sv() has lines like:
+
+        rpp_extend(1);
+        *++PL_stack_sp = sv;
+    #ifdef PERL_RC_STACK
+        if (rpp_stack_is_rc())
+            SvREFCNT_inc_simple_void_NN(sv);
+    #endif
+
+which works on both standard builds and RC builds, and works whether
+call_sv() is called from a standard PP function (rpp_stack_is_rc() is
+true) or from a wrapped PP or XS function (rpp_stack_is_rc() is false).
+Note that you're unlikely to need to use this function, as in most places,
+such as PP or XS functions, it is always RC or non-RC respectively. In
+fact on debugging builds under C<PERL_RC_STACK>, PUSHs() and similar
+macros include an C<assert(!rpp_stack_is_rc())>, while rpp_push_1() and
+similar functions have C<assert(rpp_stack_is_rc())>.
+
+The macros for pushing new stackinfos have been replaced with inline
+functions which don't rely on C<dSP> being in scope, and which have less
+ambiguous names: they make it clear that a new I<stackinfo> is being
+pushed, rather than just some sort of I<stack>. push_stackinfo() also has
+a boolean argument indicating whether the new argument stack should be
+reference-counted or not. For backwards compatibility, PUSHSTACKi(type) is
+defined to be push_stackinfo(type, 0).
+
+Some test scripts check for things like leaks by testing that the
+reference count of a particular variable has an expected value. If this
+is different on a perl built with C<PERL_RC_STACK>, then the perl
+function Internals::stack_refcounted() can be used. This returns an
+integer, the lowest bit of which indicates that perl was built with
+C<PERL_RC_STACK>. Other bits are reserved for future use and should be
+masked out.
+
+=head1 Slab-based operator allocation
+
+B<Note:> this section describes a non-public internal API that is subject
+to change without notice.
+
+Perl's internal error-handling mechanisms implement C<die> (and its internal
+equivalents) using longjmp. If this occurs during lexing, parsing or
+compilation, we must ensure that any ops allocated as part of the compilation
+process are freed. (Older Perl versions did not adequately handle this
+situation: when failing a parse, they would leak ops that were stored in
+C C<auto> variables and not linked anywhere else.)
+
+To handle this situation, Perl uses I<op slabs> that are attached to the
+currently-compiling CV. A slab is a chunk of allocated memory. New ops are
+allocated as regions of the slab. If the slab fills up, a new one is created
+(and linked from the previous one). When an error occurs and the CV is freed,
+any ops remaining are freed.
+
+Each op is preceded by two pointers: one points to the next op in the slab, and
+the other points to the slab that owns it. The next-op pointer is needed so
+that Perl can iterate over a slab and free all its ops. (Op structures are of
+different sizes, so the slab's ops can't merely be treated as a dense array.)
+The slab pointer is needed for accessing a reference count on the slab: when
+the last op on a slab is freed, the slab itself is freed.
+
+The slab allocator puts the ops at the end of the slab first. This will tend to
+allocate the leaves of the op tree first, and the layout will therefore
+hopefully be cache-friendly. In addition, this means that there's no need to
+store the size of the slab (see below on why slabs vary in size), because Perl
+can follow pointers to find the last op.
+
+It might seem possible to eliminate slab reference counts altogether, by having
+all ops implicitly attached to C<PL_compcv> when allocated and freed when the
+CV is freed. That would also allow C<op_free> to skip C<FreeOp> altogether, and
+thus free ops faster. But that doesn't work in those cases where ops need to
+survive beyond their CVs, such as re-evals.
+
+The CV also has to have a reference count on the slab. Sometimes the first op
+created is immediately freed. If the reference count of the slab reaches 0,
+then it will be freed with the CV still pointing to it.
+
+CVs use the C<CVf_SLABBED> flag to indicate that the CV has a reference count
+on the slab. When this flag is set, the slab is accessible via C<CvSTART> when
+C<CvROOT> is not set, or by subtracting two pointers C<(2*sizeof(I32 *))> from
+C<CvROOT> when it is set. The alternative to this approach of sneaking the slab
+into C<CvSTART> during compilation would be to enlarge the C<xpvcv> struct by
+another pointer. But that would make all CVs larger, even though slab-based op
+freeing is typically of benefit only for programs that make significant use of
+string eval.
+
+=for apidoc_section $concurrency
+=for apidoc  Cmnh|    |CVf_SLABBED
+=for apidoc_item |OP *|CvROOT|CV * sv
+=for apidoc_item |OP *|CvSTART|CV * sv
+
+When the C<CVf_SLABBED> flag is set, the CV takes responsibility for freeing
+the slab. If C<CvROOT> is not set when the CV is freed or undeffed, it is
+assumed that a compilation error has occurred, so the op slab is traversed and
+all the ops are freed.
+
+Under normal circumstances, the CV forgets about its slab (decrementing the
+reference count) when the root is attached. So the slab reference counting that
+happens when ops are freed takes care of freeing the slab. In some cases, the
+CV is told to forget about the slab (C<cv_forget_slab>) precisely so that the
+ops can survive after the CV is done away with.
+
+Forgetting the slab when the root is attached is not strictly necessary, but
+avoids potential problems with C<CvROOT> being written over. There is code all
+over the place, both in core and on CPAN, that does things with C<CvROOT>, so
+forgetting the slab makes things more robust and avoids potential problems.
+
+Since the CV takes ownership of its slab when flagged, that flag is never
+copied when a CV is cloned, as one CV could free a slab that another CV still
+points to, since forced freeing of ops ignores the reference count (but asserts
+that it looks right).
+
+To avoid slab fragmentation, freed ops are marked as freed and attached to the
+slab's freed chain (an idea stolen from DBM::Deep). Those freed ops are reused
+when possible. Not reusing freed ops would be simpler, but it would result in
+significantly higher memory usage for programs with large C<if (DEBUG) {...}>
+blocks.
+
+C<SAVEFREEOP> is slightly problematic under this scheme. Sometimes it can cause
+an op to be freed after its CV. If the CV has forcibly freed the ops on its
+slab and the slab itself, then we will be fiddling with a freed slab. Making
+C<SAVEFREEOP> a no-op doesn't help, as sometimes an op can be savefreed when
+there is no compilation error, so the op would never be freed. It holds
+a reference count on the slab, so the whole slab would leak. So C<SAVEFREEOP>
+now sets a special flag on the op (C<< ->op_savefree >>). The forced freeing of
+ops after a compilation error won't free any ops thus marked.
+
+Since many pieces of code create tiny subroutines consisting of only a few ops,
+and since a huge slab would be quite a bit of baggage for those to carry
+around, the first slab is always very small. To avoid allocating too many
+slabs for a single CV, each subsequent slab is twice the size of the previous.
+
+Smartmatch expects to be able to allocate an op at run time, run it, and then
+throw it away. For that to work the op is simply malloced when C<PL_compcv> hasn't
+been set up. So all slab-allocated ops are marked as such (C<< ->op_slabbed >>),
+to distinguish them from malloced ops.
+
+
+=head1 AUTHORS
+
+Until May 1997, this document was maintained by Jeff Okamoto
+E<lt>okamoto@corp.hp.comE<gt>.  It is now maintained as part of Perl
+itself by the Perl 5 Porters E<lt>perl5-porters@perl.orgE<gt>.
+
+With lots of help and suggestions from Dean Roehrich, Malcolm Beattie,
+Andreas Koenig, Paul Hudson, Ilya Zakharevich, Paul Marquess, Neil
+Bowers, Matthew Green, Tim Bunce, Spider Boardman, Ulrich Pfeifer,
+Stephen McCamant, and Gurusamy Sarathy.
+
+=head1 SEE ALSO
+
+L<perlapi>, L<perlintern>, L<perlxs>, L<perlembed>
+                                                                        usr/local/lib/perl5/5.40.0/pod/perlhack.pod                                                         0000644 0000000 0000000 00000127745 14714567415 016605  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        =encoding utf8
+
+=for comment
+Consistent formatting of this file is achieved with:
+  perl ./Porting/podtidy pod/perlhack.pod
+
+=head1 NAME
+
+perlhack - How to hack on Perl
+
+=head1 DESCRIPTION
+
+This document explains how Perl development works.  It includes details
+about the Perl 5 Porters email list, the Perl repository, the Perl
+bug tracker, patch guidelines, and commentary on Perl development
+philosophy.
+
+=head1 SUPER QUICK PATCH GUIDE
+
+If you just want to submit a single small patch like a pod fix, a test
+for a bug, comment fixes, etc., it's easy! Here's how:
+
+=over 4
+
+=item * Check out the source repository
+
+The perl source is in a git repository.  You can clone the repository
+with the following command:
+
+  % git clone https://github.com/Perl/perl5.git perl
+
+=item * Ensure you're following the latest advice
+
+In case the advice in this guide has been updated recently, read the
+latest version directly from the perl source:
+
+  % perldoc pod/perlhack.pod
+
+=item * Create a branch for your change
+
+Create a branch based on blead to commit your change to, which will
+later be used to send it to the Perl issue tracker.
+
+  % git checkout -b mychange
+
+=item * Make your change
+
+Hack, hack, hack.  Keep in mind that Perl runs on many different
+platforms, with different operating systems that have different
+capabilities, different filesystem organizations, and even different
+character sets.  L<perlhacktips> gives advice on this.
+
+=item * Test your change
+
+You can run all the tests with the following commands:
+
+  % ./Configure -des -Dusedevel
+  % make test
+
+Keep hacking until the tests pass.
+
+=item * Commit your change
+
+Committing your work will save the change I<on your local system>:
+
+  % git commit -a -m 'Commit message goes here'
+
+Make sure the commit message describes your change in a single
+sentence.  For example, "Fixed spelling errors in perlhack.pod".
+
+=item * Send your change to the Perl issue tracker
+
+The next step is to submit your patch to the Perl core ticket system.
+
+Create a GitHub fork of the perl5 repository and add it as a remote,
+if you haven't already, as described in the GitHub documentation at
+L<https://help.github.com/en/articles/working-with-forks>.
+
+  % git remote add fork git@github.com:MyUser/perl5.git
+
+For more information, see L<"Connecting to GitHub with SSH"|https://docs.github.com/en/free-pro-team@latest/github/authenticating-to-github/connecting-to-github-with-ssh>.
+
+If you'd rather use an HTTPS URL for your C<git push> see L<"Cloning with
+HTTPS URLs"|https://docs.github.com/en/free-pro-team@latest/github/using-git/which-remote-url-should-i-use#cloning-with-https-urls>.
+
+  % git remote add fork https://github.com/MyUser/perl5.git
+
+Then, push your new branch to your fork.
+
+  % git push -u fork mychange
+
+Finally, create a Pull Request on GitHub from your branch to blead as
+described in the GitHub documentation at
+L<https://help.github.com/en/articles/creating-a-pull-request-from-a-fork>.
+
+=item * Thank you
+
+The porters appreciate the time you spent helping to make Perl better.
+Thank you!
+
+=item * Acknowledgement
+
+All contributors are credited (by name and email address) in the
+AUTHORS file, which is part of the perl distribution, as well as the
+Git commit history.
+
+If you don’t want to be included in the AUTHORS file, just let us
+know. Otherwise we will take your submission of a patch as permission
+to credit you in the AUTHORS file.
+
+=item * Next time
+
+The next time you wish to make a patch, you need to start from the
+latest perl in a pristine state.  Check you don't have any local changes
+or added files in your perl check-out which you wish to keep, then run
+these commands:
+
+  % git checkout blead
+  % git pull
+  % git reset --hard origin/blead
+  % git clean -dxf
+
+=back
+
+=head1 BUG REPORTING
+
+If you want to report a bug in Perl, or browse existing Perl bugs and
+patches, use the GitHub issue tracker at
+L<https://github.com/perl/perl5/issues>.
+
+Please check the archive of the perl5-porters list (see below) and/or
+the bug tracking system before submitting a bug report.  Often, you'll
+find that the bug has been reported already.
+
+You can log in to the bug tracking system and comment on existing bug
+reports.  If you have additional information regarding an existing bug,
+please add it.  This will help the porters fix the bug.
+
+=head1 PERL 5 PORTERS
+
+The perl5-porters (p5p) mailing list is where the Perl standard
+distribution is maintained and developed.  The people who maintain Perl
+are also referred to as the "Perl 5 Porters", "p5p" or just the
+"porters".
+
+A searchable archive of the list is available at
+L<https://markmail.org/search/?q=perl5-porters>.  There is also an archive at
+L<https://archive.develooper.com/perl5-porters@perl.org/>.
+
+=head2 perl-changes mailing list
+
+The perl5-changes mailing list receives a copy of each patch that gets
+submitted to the maintenance and development branches of the perl
+repository.  See L<https://lists.perl.org/list/perl5-changes.html> for
+subscription and archive information.
+
+=head2 #p5p on IRC
+
+Many porters are also active on the L<irc://irc.perl.org/#p5p> channel.
+Feel free to join the channel and ask questions about hacking on the
+Perl core.
+
+=head1 GETTING THE PERL SOURCE
+
+All of Perl's source code is kept centrally in a Git repository at
+I<github.com>.  The repository contains many Perl revisions
+from Perl 1 onwards and all the revisions from Perforce, the previous
+version control system.
+
+For much more detail on using git with the Perl repository, please see
+L<perlgit>.
+
+=head2 Read access via Git
+
+You will need a copy of Git for your computer.  You can fetch a copy of
+the repository using the git protocol:
+
+  % git clone git@github.com:Perl/perl5.git perl
+
+This clones the repository and makes a local copy in the F<perl>
+directory.
+
+If you cannot use the git protocol for firewall reasons, you can also
+clone via http:
+
+  % git clone https://github.com/Perl/perl5.git perl
+
+=head2 Read access via the web
+
+You may access the repository over the web.  This allows you to browse
+the tree, see recent commits, subscribe to repository notifications,
+search for particular commits and more.  You may access it at
+L<https://github.com/Perl/perl5>.
+
+=head2 Write access via git
+
+If you have a commit bit, please see L<perlgit> for more details on
+using git.
+
+=head1 PATCHING PERL
+
+If you're planning to do more extensive work than a single small fix,
+we encourage you to read the documentation below.  This will help you
+focus your work and make your patches easier to incorporate into the
+Perl source.
+
+=head2 Submitting patches
+
+If you have a small patch to submit, please submit it via the GitHub
+Pull Request workflow.  You may also send patches to the p5p list.
+
+Patches are reviewed and discussed on GitHub or the p5p list.  Simple,
+uncontroversial patches will usually be applied without any discussion.
+When the patch is applied, the ticket will be updated and you will
+receive email.
+
+In other cases, the patch will need more work or discussion.
+You are encouraged to participate in the discussion and advocate for
+your patch.  Sometimes your patch may get lost in the shuffle.  It's
+appropriate to send a reminder email to p5p if no action has been taken
+in a month.  Please remember that the Perl 5 developers are all
+volunteers, and be polite.
+
+Changes are always applied directly to the main development branch,
+called "blead".  Some patches may be backported to a maintenance
+branch.  If you think your patch is appropriate for the maintenance
+branch (see L<perlpolicy/MAINTENANCE BRANCHES>), please explain why
+when you submit it.
+
+=head2 Getting your patch accepted
+
+If you are submitting a code patch there are several things that you
+can do to help the Perl 5 Porters accept your patch.
+
+=head3 Patch style
+
+Using the GitHub Pull Request workflow, your patch will automatically
+be available in a suitable format.  If you wish to submit a patch to
+the p5p list for review, make sure to create it appropriately.
+
+If you used git to check out the Perl source, then using C<git
+format-patch> will produce a patch in a style suitable for Perl.  The
+C<format-patch> command produces one patch file for each commit you
+made.  If you prefer to send a single patch for all commits, you can
+use C<git diff>.
+
+  % git checkout blead
+  % git pull
+  % git diff blead my-branch-name
+
+This produces a patch based on the difference between blead and your
+current branch.  It's important to make sure that blead is up to date
+before producing the diff, that's why we call C<git pull> first.
+
+We strongly recommend that you use git if possible.  It will make your
+life easier, and ours as well.
+
+However, if you're not using git, you can still produce a suitable
+patch.  You'll need a pristine copy of the Perl source to diff against.
+The porters prefer unified diffs.  Using GNU C<diff>, you can produce a
+diff like this:
+
+  % diff -Npurd perl.pristine perl.mine
+
+Make sure that you C<make realclean> in your copy of Perl to remove any
+build artifacts, or you may get a confusing result.
+
+=head3 Commit message
+
+As you craft each patch you intend to submit to the Perl core, it's
+important to write a good commit message.  This is especially important
+if your submission will consist of a series of commits.
+
+The first line of the commit message should be a short description
+without a period.  It should be no longer than the subject line of an
+email, 50 characters being a good rule of thumb.
+
+A lot of Git tools (Gitweb, GitHub, git log --pretty=oneline, ...) will
+only display the first line (cut off at 50 characters) when presenting
+commit summaries.
+
+The commit message should include a description of the problem that the
+patch corrects or new functionality that the patch adds.
+
+As a general rule of thumb, your commit message should help a
+programmer who knows the Perl core quickly understand what you were
+trying to do, how you were trying to do it, and why the change matters
+to Perl.
+
+=over 4
+
+=item * Why
+
+Your commit message should describe why the change you are making is
+important.  When someone looks at your change in six months or six
+years, your intent should be clear.
+
+If you're deprecating a feature with the intent of later simplifying
+another bit of code, say so.  If you're fixing a performance problem or
+adding a new feature to support some other bit of the core, mention
+that.
+
+=item * What
+
+Your commit message should describe what part of the Perl core you're
+changing and what you expect your patch to do.
+
+=item * How
+
+While it's not necessary for documentation changes, new tests or
+trivial patches, it's often worth explaining how your change works.
+Even if it's clear to you today, it may not be clear to a porter next
+month or next year.
+
+=back
+
+A commit message isn't intended to take the place of comments in your
+code.  Commit messages should describe the change you made, while code
+comments should describe the current state of the code.
+
+If you've just implemented a new feature, complete with doc, tests and
+well-commented code, a brief commit message will often suffice.  If,
+however, you've just changed a single character deep in the parser or
+lexer, you might need to write a small novel to ensure that future
+readers understand what you did and why you did it.
+
+=head3 Comments, Comments, Comments
+
+Be sure to adequately comment your code.  While commenting every line
+is unnecessary, anything that takes advantage of side effects of
+operators, that creates changes that will be felt outside of the
+function being patched, or that others may find confusing should be
+documented.  If you are going to err, it is better to err on the side
+of adding too many comments than too few.
+
+The best comments explain I<why> the code does what it does, not I<what
+it does>.
+
+=head3 Style
+
+In general, please follow the particular style of the code you are
+patching.
+
+In particular, follow these general guidelines for patching Perl
+sources:
+
+=over 4
+
+=item *
+
+4-wide indents for code, 2-wide indents for nested CPP C<#define>s,
+with 8-wide tabstops.
+
+=item *
+
+Use spaces for indentation, not tab characters.
+
+The codebase is a mixture of tabs and spaces for indentation, and we
+are moving to spaces only.  Converting lines you're patching from 8-wide
+tabs to spaces will help this migration.
+
+=item *
+
+Try not to exceed 79 columns
+
+In general, we target 80 column lines.  When sticking to 80 columns would lead
+to torturous code or rework, it's fine to go longer.  Try to keep your excess
+past 80 to a minimum.
+
+=item *
+
+ANSI C prototypes
+
+=item *
+
+Uncuddled elses and "K&R" style for indenting control constructs
+
+=item *
+
+No C++ style (//) comments
+
+=item *
+
+Mark places that need to be revisited with XXX (and revisit often!)
+
+=item *
+
+Opening brace lines up with "if" when conditional spans multiple lines;
+should be at end-of-line otherwise
+
+=item *
+
+In function definitions, name starts in column 0 (return value-type is on
+previous line)
+
+=item *
+
+Single space after keywords that are followed by parens, no space
+between function name and following paren
+
+=item *
+
+Avoid assignments in conditionals, but if they're unavoidable, use
+extra paren, e.g. "if (a && (b = c)) ..."
+
+=item *
+
+"return foo;" rather than "return(foo);"
+
+=item *
+
+"if (!foo) ..." rather than "if (foo == FALSE) ..." etc.
+
+=item *
+
+Do not declare variables using "register".  It may be counterproductive
+with modern compilers, and is deprecated in C++, under which the Perl
+source is regularly compiled.
+
+=item *
+
+In-line functions that are in headers that are accessible to XS code
+need to be able to compile without warnings with commonly used extra
+compilation flags, such as gcc's C<-Wswitch-default> which warns
+whenever a switch statement does not have a "default" case.  The use of
+these extra flags is to catch potential problems in legal C code, and
+is often used by Perl aggregators, such as Linux distributors.
+
+=back
+
+=head3 Test suite
+
+If your patch changes code (rather than just changing documentation),
+you should also include one or more test cases which illustrate the bug
+you're fixing or validate the new functionality you're adding.  In
+general, you should update an existing test file rather than create a
+new one.
+
+Your test suite additions should generally follow these guidelines
+(courtesy of Gurusamy Sarathy <gsar@activestate.com>):
+
+=over 4
+
+=item *
+
+Know what you're testing.  Read the docs, and the source.
+
+=item *
+
+Tend to fail, not succeed.
+
+=item *
+
+Interpret results strictly.
+
+=item *
+
+Use unrelated features (this will flush out bizarre interactions).
+
+=item *
+
+Use non-standard idioms (otherwise you are not testing TIMTOWTDI).
+
+=item *
+
+Avoid using hardcoded test numbers whenever possible (the EXPECTED/GOT
+found in t/op/tie.t is much more maintainable, and gives better failure
+reports).
+
+=item *
+
+Give meaningful error messages when a test fails.
+
+=item *
+
+Avoid using qx// and system() unless you are testing for them.  If you
+do use them, make sure that you cover _all_ perl platforms.
+
+=item *
+
+Unlink any temporary files you create.
+
+=item *
+
+Promote unforeseen warnings to errors with $SIG{__WARN__}.
+
+=item *
+
+Be sure to use the libraries and modules shipped with the version being
+tested, not those that were already installed.
+
+=item *
+
+Add comments to the code explaining what you are testing for.
+
+=item *
+
+Make updating the '1..42' string unnecessary.  Or make sure that you
+update it.
+
+=item *
+
+Test _all_ behaviors of a given operator, library, or function.
+
+Test all optional arguments.
+
+Test return values in various contexts (boolean, scalar, list, lvalue).
+
+Use both global and lexical variables.
+
+Don't forget the exceptional, pathological cases.
+
+=back
+
+=head2 Patching a core module
+
+This works just like patching anything else, with one extra
+consideration.
+
+Modules in the F<cpan/> directory of the source tree are maintained
+outside of the Perl core.  When the author updates the module, the
+updates are simply copied into the core.  See that module's
+documentation or its listing on L<https://metacpan.org/> for more
+information on reporting bugs and submitting patches.
+
+In most cases, patches to modules in F<cpan/> should be sent upstream
+and should not be applied to the Perl core individually.  If a patch to
+a file in F<cpan/> absolutely cannot wait for the fix to be made
+upstream, released to CPAN and copied to blead, you must add (or
+update) a C<CUSTOMIZED> entry in the F<Porting/Maintainers.pl> file
+to flag that a local modification has been made.  See
+F<Porting/Maintainers.pl> for more details.
+
+In contrast, modules in the F<dist/> directory are maintained in the
+core.
+
+=head2 Updating perldelta
+
+For changes significant enough to warrant a F<pod/perldelta.pod> entry,
+the porters will greatly appreciate it if you submit a delta entry
+along with your actual change.  Significant changes include, but are
+not limited to:
+
+=over 4
+
+=item *
+
+Adding, deprecating, or removing core features
+
+=item *
+
+Adding, deprecating, removing, or upgrading core or dual-life modules
+
+=item *
+
+Adding new core tests
+
+=item *
+
+Fixing security issues and user-visible bugs in the core
+
+=item *
+
+Changes that might break existing code, either on the perl or C level
+
+=item *
+
+Significant performance improvements
+
+=item *
+
+Adding, removing, or significantly changing documentation in the
+F<pod/> directory
+
+=item *
+
+Important platform-specific changes
+
+=back
+
+Please make sure you add the perldelta entry to the right section
+within F<pod/perldelta.pod>.  More information on how to write good
+perldelta entries is available in the C<Style> section of
+F<Porting/how_to_write_a_perldelta.pod>.
+
+=head2 What makes for a good patch?
+
+New features and extensions to the language can be contentious.  There
+is no specific set of criteria which determine what features get added,
+but here are some questions to consider when developing a patch:
+
+=head3 Does the concept match the general goals of Perl?
+
+Our goals include, but are not limited to:
+
+=over 4
+
+=item 1.
+
+Keep it fast, simple, and useful.
+
+=item 2.
+
+Keep features/concepts as orthogonal as possible.
+
+=item 3.
+
+No arbitrary limits (platforms, data sizes, cultures).
+
+=item 4.
+
+Keep it open and exciting to use/patch/advocate Perl everywhere.
+
+=item 5.
+
+Either assimilate new technologies, or build bridges to them.
+
+=back
+
+=head3 Where is the implementation?
+
+All the talk in the world is useless without an implementation.  In
+almost every case, the person or people who argue for a new feature
+will be expected to be the ones who implement it.  Porters capable of
+coding new features have their own agendas, and are not available to
+implement your (possibly good) idea.
+
+=head3 Backwards compatibility
+
+It's a cardinal sin to break existing Perl programs.  New warnings can
+be contentious--some say that a program that emits warnings is not
+broken, while others say it is.  Adding keywords has the potential to
+break programs, changing the meaning of existing token sequences or
+functions might break programs.
+
+The Perl 5 core includes mechanisms to help porters make backwards
+incompatible changes more compatible such as the L<feature> and
+L<deprecate> modules.  Please use them when appropriate.
+
+=head3 Could it be a module instead?
+
+Perl 5 has extension mechanisms, modules and XS, specifically to avoid
+the need to keep changing the Perl interpreter.  You can write modules
+that export functions, you can give those functions prototypes so they
+can be called like built-in functions, you can even write XS code to
+mess with the runtime data structures of the Perl interpreter if you
+want to implement really complicated things.
+
+Whenever possible, new features should be prototyped in a CPAN module
+before they will be considered for the core.
+
+=head3 Is the feature generic enough?
+
+Is this something that only the submitter wants added to the language,
+or is it broadly useful?  Sometimes, instead of adding a feature with a
+tight focus, the porters might decide to wait until someone implements
+the more generalized feature.
+
+=head3 Does it potentially introduce new bugs?
+
+Radical rewrites of large chunks of the Perl interpreter have the
+potential to introduce new bugs.
+
+=head3 How big is it?
+
+The smaller and more localized the change, the better.  Similarly, a
+series of small patches is greatly preferred over a single large patch.
+
+=head3 Does it preclude other desirable features?
+
+A patch is likely to be rejected if it closes off future avenues of
+development.  For instance, a patch that placed a true and final
+interpretation on prototypes is likely to be rejected because there are
+still options for the future of prototypes that haven't been addressed.
+
+=head3 Is the implementation robust?
+
+Good patches (tight code, complete, correct) stand more chance of going
+in.  Sloppy or incorrect patches might be placed on the back burner
+until fixes can be made, or they might be discarded altogether
+without further notice.
+
+=head3 Is the implementation generic enough to be portable?
+
+The worst patches make use of system-specific features.  It's highly
+unlikely that non-portable additions to the Perl language will be
+accepted.
+
+=head3 Is the implementation tested?
+
+Patches which change behaviour (fixing bugs or introducing new
+features) must include regression tests to verify that everything works
+as expected.
+
+Without tests provided by the original author, how can anyone else
+changing perl in the future be sure that they haven't unwittingly
+broken the behaviour the patch implements? And without tests, how can
+the patch's author be confident that his/her hard work put into the
+patch won't be accidentally thrown away by someone in the future?
+
+=head3 Is there enough documentation?
+
+Patches without documentation are probably ill-thought out or
+incomplete.  No features can be added or changed without documentation,
+so submitting a patch for the appropriate pod docs as well as the
+source code is important.
+
+=head3 Is there another way to do it?
+
+Larry said "Although the Perl Slogan is I<There's More Than One Way to
+Do It>, I hesitate to make 10 ways to do something".  This is a tricky
+heuristic to navigate, though--one man's essential addition is another
+man's pointless cruft.
+
+=head3 Does it create too much work?
+
+Work for the committers, work for Perl programmers, work for module
+authors, ... Perl is supposed to be easy.
+
+=head3 Patches speak louder than words
+
+Working code is always preferred to pie-in-the-sky ideas.  A patch to
+add a feature stands a much higher chance of making it to the language
+than does a random feature request, no matter how fervently argued the
+request might be.  This ties into "Will it be useful?", as the fact
+that someone took the time to make the patch demonstrates a strong
+desire for the feature.
+
+=head1 TESTING
+
+The core uses the same testing style as the rest of Perl, a simple
+"ok/not ok" run through Test::Harness, but there are a few special
+considerations.
+
+There are three ways to write a test in the core: L<Test::More>,
+F<t/test.pl> and ad hoc C<print $test ? "ok 42\n" : "not ok 42\n">.
+The decision of which to use depends on what part of the test suite
+you're working on.  This is a measure to prevent a high-level failure
+(such as Config.pm breaking) from causing basic functionality tests to
+fail.
+
+The F<t/test.pl> library provides some of the features of
+L<Test::More>, but avoids loading most modules and uses as few core
+features as possible.
+
+If you write your own test, use the L<Test Anything
+Protocol|https://testanything.org>.
+
+=over 4
+
+=item * F<t/base>, F<t/comp> and F<t/opbasic>
+
+Since we don't know if C<require> works, or even subroutines, use ad hoc
+tests for these three.  Step carefully to avoid using the feature being
+tested.  Tests in F<t/opbasic>, for instance, have been placed there
+rather than in F<t/op> because they test functionality which
+F<t/test.pl> presumes has already been demonstrated to work.
+
+=item * All other subdirectories of F<t/>
+
+Now that basic require() and subroutines are tested, you can use the
+F<t/test.pl> library.
+
+You can also use certain libraries like L<Config> conditionally, but be
+sure to skip the test gracefully if it's not there.
+
+=item * Test files not found under F<t/>
+
+This category includes F<.t> files underneath directories such as F<dist>,
+F<ext> and F<lib>.  Since the core of Perl has now been tested, L<Test::More>
+can and now should be used.  You can also use the full suite of core modules
+in the tests.  (As noted in L<"Patching a core module"> above, changes to
+F<.t> files found under F<cpan/> should be submitted to the upstream
+maintainers of those modules.)
+
+=back
+
+When you say "make test", Perl uses the F<t/TEST> program to run the
+test suite (except under Win32 where it uses F<t/harness> instead).
+All tests are run from the F<t/> directory, B<not> the directory which
+contains the test.  This causes some problems with the tests in
+F<lib/>, so here's some opportunity for some patching.
+
+You must be triply conscious of cross-platform concerns.  This usually
+boils down to using L<File::Spec>, avoiding things like C<fork()>
+and C<system()> unless absolutely necessary, and not assuming that a
+given character has a particular ordinal value (code point) or that its
+UTF-8 representation is composed of particular bytes.
+
+There are several functions available to specify characters and code
+points portably in tests.  The always-preloaded functions
+C<utf8::unicode_to_native()> and its inverse
+C<utf8::native_to_unicode()> take code points and translate
+appropriately.  The file F<t/charset_tools.pl> has several functions
+that can be useful.  It has versions of the previous two functions
+that take strings as inputs -- not single numeric code points:
+C<uni_to_native()> and C<native_to_uni()>.  If you must look at the
+individual bytes comprising a UTF-8 encoded string,
+C<byte_utf8a_to_utf8n()> takes as input a string of those bytes encoded
+for an ASCII platform, and returns the equivalent string in the native
+platform.  For example, C<byte_utf8a_to_utf8n("\xC2\xA0")> returns the
+byte sequence on the current platform that form the UTF-8 for C<U+00A0>,
+since C<"\xC2\xA0"> are the UTF-8 bytes on an ASCII platform for that
+code point.  This function returns C<"\xC2\xA0"> on an ASCII platform, and
+C<"\x80\x41"> on an EBCDIC 1047 one.
+
+But easiest is, if the character is specifiable as a literal, like
+C<"A"> or C<"%">, to use that; if not so specificable, you can use
+C<\N{}> , if the side effects aren't troublesome.  Simply specify all
+your characters in hex, using C<\N{U+ZZ}> instead of C<\xZZ>.  C<\N{}>
+is the Unicode name, and so it
+always gives you the Unicode character.  C<\N{U+41}> is the character
+whose Unicode code point is C<0x41>, hence is C<'A'> on all platforms.
+The side effects are:
+
+=over 4
+
+=item *
+
+These select Unicode rules.  That means that in double-quotish strings,
+the string is always converted to UTF-8 to force a Unicode
+interpretation (you can C<utf8::downgrade()> afterwards to convert back
+to non-UTF8, if possible).  In regular expression patterns, the
+conversion isn't done, but if the character set modifier would
+otherwise be C</d>, it is changed to C</u>.
+
+=item *
+
+If you use the form C<\N{I<character name>}>, the L<charnames> module
+gets automatically loaded.  This may not be suitable for the test level
+you are doing.
+
+=back
+
+If you are testing locales (see L<perllocale>), there are helper
+functions in F<t/loc_tools.pl> to enable you to see what locales there
+are on the current platform.
+
+=head2 Special C<make test> targets
+
+There are various special make targets that can be used to test Perl
+slightly differently than the standard "test" target.  Not all them are
+expected to give a 100% success rate.  Many of them have several
+aliases, and many of them are not available on certain operating
+systems.
+
+=over 4

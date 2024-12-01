@@ -1,0 +1,1000 @@
+        # "modified". We do not deal with them yet.
+        pass
+    else:
+        # An impossible case, the diff algorithm should not return entry if the
+        # file is missing on both side.
+        assert False, "unreachable"
+
+
+def _missing_from_all_ancestors(mas, filename):
+    return all(_find(ma, filename) is None for ma in mas)
+
+
+def computechangesetfilesadded(ctx):
+    """return the list of files added in a changeset"""
+    added = []
+    for f in ctx.files():
+        if not any(f in p for p in ctx.parents()):
+            added.append(f)
+    return added
+
+
+def get_removal_filter(ctx, x=None):
+    """return a function to detect files "wrongly" detected as `removed`
+
+    When a file is removed relative to p1 in a merge, this
+    function determines whether the absence is due to a
+    deletion from a parent, or whether the merge commit
+    itself deletes the file. We decide this by doing a
+    simplified three way merge of the manifest entry for
+    the file. There are two ways we decide the merge
+    itself didn't delete a file:
+    - neither parent (nor the merge) contain the file
+    - exactly one parent contains the file, and that
+      parent has the same filelog entry as the merge
+      ancestor (or all of them if there two). In other
+      words, that parent left the file unchanged while the
+      other one deleted it.
+    One way to think about this is that deleting a file is
+    similar to emptying it, so the list of changed files
+    should be similar either way. The computation
+    described above is not done directly in _filecommit
+    when creating the list of changed files, however
+    it does something very similar by comparing filelog
+    nodes.
+    """
+
+    if x is not None:
+        p1, p2, m1, m2 = x
+    else:
+        p1 = ctx.p1()
+        p2 = ctx.p2()
+        m1 = p1.manifest()
+        m2 = p2.manifest()
+
+    @util.cachefunc
+    def mas():
+        p1n = p1.node()
+        p2n = p2.node()
+        cahs = ctx.repo().changelog.commonancestorsheads(p1n, p2n)
+        if not cahs:
+            cahs = [nullrev]
+        return [ctx.repo()[r].manifest() for r in cahs]
+
+    def deletionfromparent(f):
+        if f in m1:
+            return f not in m2 and all(
+                f in ma and ma.find(f) == m1.find(f) for ma in mas()
+            )
+        elif f in m2:
+            return all(f in ma and ma.find(f) == m2.find(f) for ma in mas())
+        else:
+            return True
+
+    return deletionfromparent
+
+
+def computechangesetfilesremoved(ctx):
+    """return the list of files removed in a changeset"""
+    removed = []
+    for f in ctx.files():
+        if f not in ctx:
+            removed.append(f)
+    if removed:
+        rf = get_removal_filter(ctx)
+        removed = [r for r in removed if not rf(r)]
+    return removed
+
+
+def computechangesetfilesmerged(ctx):
+    """return the list of files merged in a changeset"""
+    merged = []
+    if len(ctx.parents()) < 2:
+        return merged
+    for f in ctx.files():
+        if f in ctx:
+            fctx = ctx[f]
+            parents = fctx._filelog.parents(fctx._filenode)
+            if parents[1] != ctx.repo().nullid:
+                merged.append(f)
+    return merged
+
+
+def computechangesetcopies(ctx):
+    """return the copies data for a changeset
+
+    The copies data are returned as a pair of dictionnary (p1copies, p2copies).
+
+    Each dictionnary are in the form: `{newname: oldname}`
+    """
+    p1copies = {}
+    p2copies = {}
+    p1 = ctx.p1()
+    p2 = ctx.p2()
+    narrowmatch = ctx._repo.narrowmatch()
+    for dst in ctx.files():
+        if not narrowmatch(dst) or dst not in ctx:
+            continue
+        copied = ctx[dst].renamed()
+        if not copied:
+            continue
+        src, srcnode = copied
+        if src in p1 and p1[src].filenode() == srcnode:
+            p1copies[dst] = src
+        elif src in p2 and p2[src].filenode() == srcnode:
+            p2copies[dst] = src
+    return p1copies, p2copies
+
+
+def encodecopies(files, copies):
+    items = []
+    for i, dst in enumerate(files):
+        if dst in copies:
+            items.append(b'%d\0%s' % (i, copies[dst]))
+    if len(items) != len(copies):
+        raise error.ProgrammingError(
+            b'some copy targets missing from file list'
+        )
+    return b"\n".join(items)
+
+
+def decodecopies(files, data):
+    try:
+        copies = {}
+        if not data:
+            return copies
+        for l in data.split(b'\n'):
+            strindex, src = l.split(b'\0')
+            i = int(strindex)
+            dst = files[i]
+            copies[dst] = src
+        return copies
+    except (ValueError, IndexError):
+        # Perhaps someone had chosen the same key name (e.g. "p1copies") and
+        # used different syntax for the value.
+        return None
+
+
+def encodefileindices(files, subset):
+    subset = set(subset)
+    indices = []
+    for i, f in enumerate(files):
+        if f in subset:
+            indices.append(b'%d' % i)
+    return b'\n'.join(indices)
+
+
+def decodefileindices(files, data):
+    try:
+        subset = []
+        if not data:
+            return subset
+        for strindex in data.split(b'\n'):
+            i = int(strindex)
+            if i < 0 or i >= len(files):
+                return None
+            subset.append(files[i])
+        return subset
+    except (ValueError, IndexError):
+        # Perhaps someone had chosen the same key name (e.g. "added") and
+        # used different syntax for the value.
+        return None
+
+
+# see mercurial/helptext/internals/revlogs.txt for details about the format
+
+ACTION_MASK = int("111" "00", 2)
+# note: untouched file used as copy source will as `000` for this mask.
+ADDED_FLAG = int("001" "00", 2)
+MERGED_FLAG = int("010" "00", 2)
+REMOVED_FLAG = int("011" "00", 2)
+SALVAGED_FLAG = int("100" "00", 2)
+TOUCHED_FLAG = int("101" "00", 2)
+
+COPIED_MASK = int("11", 2)
+COPIED_FROM_P1_FLAG = int("10", 2)
+COPIED_FROM_P2_FLAG = int("11", 2)
+
+# structure is <flag><filename-end><copy-source>
+INDEX_HEADER = struct.Struct(">L")
+INDEX_ENTRY = struct.Struct(">bLL")
+
+
+def encode_files_sidedata(files):
+    all_files = set(files.touched)
+    all_files.update(files.copied_from_p1.values())
+    all_files.update(files.copied_from_p2.values())
+    all_files = sorted(all_files)
+    file_idx = {f: i for (i, f) in enumerate(all_files)}
+    file_idx[None] = 0
+
+    chunks = [INDEX_HEADER.pack(len(all_files))]
+
+    filename_length = 0
+    for f in all_files:
+        filename_size = len(f)
+        filename_length += filename_size
+        flag = 0
+        if f in files.added:
+            flag |= ADDED_FLAG
+        elif f in files.merged:
+            flag |= MERGED_FLAG
+        elif f in files.removed:
+            flag |= REMOVED_FLAG
+        elif f in files.salvaged:
+            flag |= SALVAGED_FLAG
+        elif f in files.touched:
+            flag |= TOUCHED_FLAG
+
+        copy = None
+        if f in files.copied_from_p1:
+            flag |= COPIED_FROM_P1_FLAG
+            copy = files.copied_from_p1.get(f)
+        elif f in files.copied_from_p2:
+            copy = files.copied_from_p2.get(f)
+            flag |= COPIED_FROM_P2_FLAG
+        copy_idx = file_idx[copy]
+        chunks.append(INDEX_ENTRY.pack(flag, filename_length, copy_idx))
+    chunks.extend(all_files)
+    return {sidedatamod.SD_FILES: b''.join(chunks)}
+
+
+def decode_files_sidedata(sidedata):
+    md = ChangingFiles()
+    raw = sidedata.get(sidedatamod.SD_FILES)
+
+    if raw is None:
+        return md
+
+    copies = []
+    all_files = []
+
+    assert len(raw) >= INDEX_HEADER.size
+    total_files = INDEX_HEADER.unpack_from(raw, 0)[0]
+
+    offset = INDEX_HEADER.size
+    file_offset_base = offset + (INDEX_ENTRY.size * total_files)
+    file_offset_last = file_offset_base
+
+    assert len(raw) >= file_offset_base
+
+    for idx in range(total_files):
+        flag, file_end, copy_idx = INDEX_ENTRY.unpack_from(raw, offset)
+        file_end += file_offset_base
+        filename = raw[file_offset_last:file_end]
+        filesize = file_end - file_offset_last
+        assert len(filename) == filesize
+        offset += INDEX_ENTRY.size
+        file_offset_last = file_end
+        all_files.append(filename)
+        if flag & ACTION_MASK == ADDED_FLAG:
+            md.mark_added(filename)
+        elif flag & ACTION_MASK == MERGED_FLAG:
+            md.mark_merged(filename)
+        elif flag & ACTION_MASK == REMOVED_FLAG:
+            md.mark_removed(filename)
+        elif flag & ACTION_MASK == SALVAGED_FLAG:
+            md.mark_salvaged(filename)
+        elif flag & ACTION_MASK == TOUCHED_FLAG:
+            md.mark_touched(filename)
+
+        copied = None
+        if flag & COPIED_MASK == COPIED_FROM_P1_FLAG:
+            copied = md.mark_copied_from_p1
+        elif flag & COPIED_MASK == COPIED_FROM_P2_FLAG:
+            copied = md.mark_copied_from_p2
+
+        if copied is not None:
+            copies.append((copied, filename, copy_idx))
+
+    for copied, filename, copy_idx in copies:
+        copied(all_files[copy_idx], filename)
+
+    return md
+
+
+def _getsidedata(srcrepo, rev):
+    ctx = srcrepo[rev]
+    files = compute_all_files_changes(ctx)
+    return encode_files_sidedata(files), files.has_copies_info
+
+
+def copies_sidedata_computer(repo, revlog, rev, existing_sidedata):
+    sidedata, has_copies_info = _getsidedata(repo, rev)
+    flags_to_add = sidedataflag.REVIDX_HASCOPIESINFO if has_copies_info else 0
+    return sidedata, (flags_to_add, 0)
+
+
+def _sidedata_worker(srcrepo, revs_queue, sidedata_queue, tokens):
+    """The function used by worker precomputing sidedata
+
+    It read an input queue containing revision numbers
+    It write in an output queue containing (rev, <sidedata-map>)
+
+    The `None` input value is used as a stop signal.
+
+    The `tokens` semaphore is user to avoid having too many unprocessed
+    entries. The workers needs to acquire one token before fetching a task.
+    They will be released by the consumer of the produced data.
+    """
+    tokens.acquire()
+    rev = revs_queue.get()
+    while rev is not None:
+        data = _getsidedata(srcrepo, rev)
+        sidedata_queue.put((rev, data))
+        tokens.acquire()
+        rev = revs_queue.get()
+    # processing of `None` is completed, release the token.
+    tokens.release()
+
+
+BUFF_PER_WORKER = 50
+
+
+def _get_worker_sidedata_adder(srcrepo, destrepo):
+    """The parallel version of the sidedata computation
+
+    This code spawn a pool of worker that precompute a buffer of sidedata
+    before we actually need them"""
+    # avoid circular import copies -> scmutil -> worker -> copies
+    from . import worker
+
+    nbworkers = worker._numworkers(srcrepo.ui)
+
+    tokens = multiprocessing.BoundedSemaphore(nbworkers * BUFF_PER_WORKER)
+    revsq = multiprocessing.Queue()
+    sidedataq = multiprocessing.Queue()
+
+    assert srcrepo.filtername is None
+    # queue all tasks beforehand, revision numbers are small and it make
+    # synchronisation simpler
+    #
+    # Since the computation for each node can be quite expensive, the overhead
+    # of using a single queue is not revelant. In practice, most computation
+    # are fast but some are very expensive and dominate all the other smaller
+    # cost.
+    for r in srcrepo.changelog.revs():
+        revsq.put(r)
+    # queue the "no more tasks" markers
+    for i in range(nbworkers):
+        revsq.put(None)
+
+    allworkers = []
+    for i in range(nbworkers):
+        args = (srcrepo, revsq, sidedataq, tokens)
+        w = multiprocessing.Process(target=_sidedata_worker, args=args)
+        allworkers.append(w)
+        w.start()
+
+    # dictionnary to store results for revision higher than we one we are
+    # looking for. For example, if we need the sidedatamap for 42, and 43 is
+    # received, when shelve 43 for later use.
+    staging = {}
+
+    def sidedata_companion(repo, revlog, rev, old_sidedata):
+        # Is the data previously shelved ?
+        data = staging.pop(rev, None)
+        if data is None:
+            # look at the queued result until we find the one we are lookig
+            # for (shelve the other ones)
+            r, data = sidedataq.get()
+            while r != rev:
+                staging[r] = data
+                r, data = sidedataq.get()
+        tokens.release()
+        sidedata, has_copies_info = data
+        new_flag = 0
+        if has_copies_info:
+            new_flag = sidedataflag.REVIDX_HASCOPIESINFO
+        return sidedata, (new_flag, 0)
+
+    return sidedata_companion
+                                                                                                                                                                                                                                                  usr/lib/python3/dist-packages/mercurial/minifileset.py                                              0000644 0000000 0000000 00000006775 14355257011 021635  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        # minifileset.py - a simple language to select files
+#
+# Copyright 2017 Facebook, Inc.
+#
+# This software may be used and distributed according to the terms of the
+# GNU General Public License version 2 or any later version.
+
+
+from .i18n import _
+from . import (
+    error,
+    fileset,
+    filesetlang,
+    pycompat,
+)
+
+
+def _sizep(x):
+    # i18n: "size" is a keyword
+    expr = filesetlang.getstring(x, _(b"size requires an expression"))
+    return fileset.sizematcher(expr)
+
+
+def _compile(tree):
+    if not tree:
+        raise error.ParseError(_(b"missing argument"))
+    op = tree[0]
+    if op == b'withstatus':
+        return _compile(tree[1])
+    elif op in {b'symbol', b'string', b'kindpat'}:
+        name = filesetlang.getpattern(
+            tree, {b'path'}, _(b'invalid file pattern')
+        )
+        if name.startswith(b'**'):  # file extension test, ex. "**.tar.gz"
+            ext = name[2:]
+            for c in pycompat.bytestr(ext):
+                if c in b'*{}[]?/\\':
+                    raise error.ParseError(_(b'reserved character: %s') % c)
+            return lambda n, s: n.endswith(ext)
+        elif name.startswith(b'path:'):  # directory or full path test
+            p = name[5:]  # prefix
+            pl = len(p)
+            f = lambda n, s: n.startswith(p) and (
+                len(n) == pl or n[pl : pl + 1] == b'/'
+            )
+            return f
+        raise error.ParseError(
+            _(b"unsupported file pattern: %s") % name,
+            hint=_(b'paths must be prefixed with "path:"'),
+        )
+    elif op in {b'or', b'patterns'}:
+        funcs = [_compile(x) for x in tree[1:]]
+        return lambda n, s: any(f(n, s) for f in funcs)
+    elif op == b'and':
+        func1 = _compile(tree[1])
+        func2 = _compile(tree[2])
+        return lambda n, s: func1(n, s) and func2(n, s)
+    elif op == b'not':
+        return lambda n, s: not _compile(tree[1])(n, s)
+    elif op == b'func':
+        symbols = {
+            b'all': lambda n, s: True,
+            b'none': lambda n, s: False,
+            b'size': lambda n, s: _sizep(tree[2])(s),
+        }
+
+        name = filesetlang.getsymbol(tree[1])
+        if name in symbols:
+            return symbols[name]
+
+        raise error.UnknownIdentifier(name, symbols.keys())
+    elif op == b'minus':  # equivalent to 'x and not y'
+        func1 = _compile(tree[1])
+        func2 = _compile(tree[2])
+        return lambda n, s: func1(n, s) and not func2(n, s)
+    elif op == b'list':
+        raise error.ParseError(
+            _(b"can't use a list in this context"),
+            hint=_(b'see \'hg help "filesets.x or y"\''),
+        )
+    raise error.ProgrammingError(b'illegal tree: %r' % (tree,))
+
+
+def compile(text):
+    """generate a function (path, size) -> bool from filter specification.
+
+    "text" could contain the operators defined by the fileset language for
+    common logic operations, and parenthesis for grouping.  The supported path
+    tests are '**.extname' for file extension test, and '"path:dir/subdir"'
+    for prefix test.  The ``size()`` predicate is borrowed from filesets to test
+    file size.  The predicates ``all()`` and ``none()`` are also supported.
+
+    '(**.php & size(">10MB")) | **.zip | (path:bin & !path:bin/README)' for
+    example, will catch all php files whose size is greater than 10 MB, all
+    files whose name ends with ".zip", and all files under "bin" in the repo
+    root except for "bin/README".
+    """
+    tree = filesetlang.parse(text)
+    tree = filesetlang.analyze(tree)
+    tree = filesetlang.optimize(tree)
+    return _compile(tree)
+   usr/lib/python3/dist-packages/mercurial/minirst.py                                                  0000644 0000000 0000000 00000072105 14355257011 021000  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        # minirst.py - minimal reStructuredText parser
+#
+# Copyright 2009, 2010 Olivia Mackall <olivia@selenic.com> and others
+#
+# This software may be used and distributed according to the terms of the
+# GNU General Public License version 2 or any later version.
+
+"""simplified reStructuredText parser.
+
+This parser knows just enough about reStructuredText to parse the
+Mercurial docstrings.
+
+It cheats in a major way: nested blocks are not really nested. They
+are just indented blocks that look like they are nested. This relies
+on the user to keep the right indentation for the blocks.
+
+Remember to update https://mercurial-scm.org/wiki/HelpStyleGuide
+when adding support for new constructs.
+"""
+
+
+import re
+
+from .i18n import _
+from . import (
+    encoding,
+    pycompat,
+    url,
+)
+from .utils import stringutil
+
+
+def section(s):
+    return b"%s\n%s\n\n" % (s, b"\"" * encoding.colwidth(s))
+
+
+def subsection(s):
+    return b"%s\n%s\n\n" % (s, b'=' * encoding.colwidth(s))
+
+
+def subsubsection(s):
+    return b"%s\n%s\n\n" % (s, b"-" * encoding.colwidth(s))
+
+
+def subsubsubsection(s):
+    return b"%s\n%s\n\n" % (s, b"." * encoding.colwidth(s))
+
+
+def subsubsubsubsection(s):
+    return b"%s\n%s\n\n" % (s, b"'" * encoding.colwidth(s))
+
+
+def replace(text, substs):
+    """
+    Apply a list of (find, replace) pairs to a text.
+
+    >>> replace(b"foo bar", [(b'f', b'F'), (b'b', b'B')])
+    'Foo Bar'
+    >>> encoding.encoding = b'latin1'
+    >>> replace(b'\\x81\\\\', [(b'\\\\', b'/')])
+    '\\x81/'
+    >>> encoding.encoding = b'shiftjis'
+    >>> replace(b'\\x81\\\\', [(b'\\\\', b'/')])
+    '\\x81\\\\'
+    """
+
+    # some character encodings (cp932 for Japanese, at least) use
+    # ASCII characters other than control/alphabet/digit as a part of
+    # multi-bytes characters, so direct replacing with such characters
+    # on strings in local encoding causes invalid byte sequences.
+    utext = text.decode(pycompat.sysstr(encoding.encoding))
+    for f, t in substs:
+        utext = utext.replace(f.decode("ascii"), t.decode("ascii"))
+    return utext.encode(pycompat.sysstr(encoding.encoding))
+
+
+_blockre = re.compile(br"\n(?:\s*\n)+")
+
+
+def findblocks(text):
+    """Find continuous blocks of lines in text.
+
+    Returns a list of dictionaries representing the blocks. Each block
+    has an 'indent' field and a 'lines' field.
+    """
+    blocks = []
+    for b in _blockre.split(text.lstrip(b'\n').rstrip()):
+        lines = b.splitlines()
+        if lines:
+            indent = min((len(l) - len(l.lstrip())) for l in lines)
+            lines = [l[indent:] for l in lines]
+            blocks.append({b'indent': indent, b'lines': lines})
+    return blocks
+
+
+def findliteralblocks(blocks):
+    """Finds literal blocks and adds a 'type' field to the blocks.
+
+    Literal blocks are given the type 'literal', all other blocks are
+    given type the 'paragraph'.
+    """
+    i = 0
+    while i < len(blocks):
+        # Searching for a block that looks like this:
+        #
+        # +------------------------------+
+        # | paragraph                    |
+        # | (ends with "::")             |
+        # +------------------------------+
+        #    +---------------------------+
+        #    | indented literal block    |
+        #    +---------------------------+
+        blocks[i][b'type'] = b'paragraph'
+        if blocks[i][b'lines'][-1].endswith(b'::') and i + 1 < len(blocks):
+            indent = blocks[i][b'indent']
+            adjustment = blocks[i + 1][b'indent'] - indent
+
+            if blocks[i][b'lines'] == [b'::']:
+                # Expanded form: remove block
+                del blocks[i]
+                i -= 1
+            elif blocks[i][b'lines'][-1].endswith(b' ::'):
+                # Partially minimized form: remove space and both
+                # colons.
+                blocks[i][b'lines'][-1] = blocks[i][b'lines'][-1][:-3]
+            elif (
+                len(blocks[i][b'lines']) == 1
+                and blocks[i][b'lines'][0].lstrip(b' ').startswith(b'.. ')
+                and blocks[i][b'lines'][0].find(b' ', 3) == -1
+            ):
+                # directive on its own line, not a literal block
+                i += 1
+                continue
+            else:
+                # Fully minimized form: remove just one colon.
+                blocks[i][b'lines'][-1] = blocks[i][b'lines'][-1][:-1]
+
+            # List items are formatted with a hanging indent. We must
+            # correct for this here while we still have the original
+            # information on the indentation of the subsequent literal
+            # blocks available.
+            m = _bulletre.match(blocks[i][b'lines'][0])
+            if m:
+                indent += m.end()
+                adjustment -= m.end()
+
+            # Mark the following indented blocks.
+            while i + 1 < len(blocks) and blocks[i + 1][b'indent'] > indent:
+                blocks[i + 1][b'type'] = b'literal'
+                blocks[i + 1][b'indent'] -= adjustment
+                i += 1
+        i += 1
+    return blocks
+
+
+_bulletre = re.compile(br'(\*|-|[0-9A-Za-z]+\.|\(?[0-9A-Za-z]+\)|\|) ')
+_optionre = re.compile(
+    br'^(-([a-zA-Z0-9]), )?(--[a-z0-9-]+)' br'((.*)  +)(.*)$'
+)
+_fieldre = re.compile(br':(?![: ])((?:\:|[^:])*)(?<! ):[ ]+(.*)')
+_definitionre = re.compile(br'[^ ]')
+_tablere = re.compile(br'(=+\s+)*=+')
+
+
+def splitparagraphs(blocks):
+    """Split paragraphs into lists."""
+    # Tuples with (list type, item regexp, single line items?). Order
+    # matters: definition lists has the least specific regexp and must
+    # come last.
+    listtypes = [
+        (b'bullet', _bulletre, True),
+        (b'option', _optionre, True),
+        (b'field', _fieldre, True),
+        (b'definition', _definitionre, False),
+    ]
+
+    def match(lines, i, itemre, singleline):
+        """Does itemre match an item at line i?
+
+        A list item can be followed by an indented line or another list
+        item (but only if singleline is True).
+        """
+        line1 = lines[i]
+        line2 = i + 1 < len(lines) and lines[i + 1] or b''
+        if not itemre.match(line1):
+            return False
+        if singleline:
+            return line2 == b'' or line2[0:1] == b' ' or itemre.match(line2)
+        else:
+            return line2.startswith(b' ')
+
+    i = 0
+    while i < len(blocks):
+        if blocks[i][b'type'] == b'paragraph':
+            lines = blocks[i][b'lines']
+            for type, itemre, singleline in listtypes:
+                if match(lines, 0, itemre, singleline):
+                    items = []
+                    for j, line in enumerate(lines):
+                        if match(lines, j, itemre, singleline):
+                            items.append(
+                                {
+                                    b'type': type,
+                                    b'lines': [],
+                                    b'indent': blocks[i][b'indent'],
+                                }
+                            )
+                        items[-1][b'lines'].append(line)
+                    blocks[i : i + 1] = items
+                    break
+        i += 1
+    return blocks
+
+
+_fieldwidth = 14
+
+
+def updatefieldlists(blocks):
+    """Find key for field lists."""
+    i = 0
+    while i < len(blocks):
+        if blocks[i][b'type'] != b'field':
+            i += 1
+            continue
+
+        j = i
+        while j < len(blocks) and blocks[j][b'type'] == b'field':
+            m = _fieldre.match(blocks[j][b'lines'][0])
+            key, rest = m.groups()
+            blocks[j][b'lines'][0] = rest
+            blocks[j][b'key'] = key.replace(br'\:', b':')
+            j += 1
+
+        i = j + 1
+
+    return blocks
+
+
+def updateoptionlists(blocks):
+    i = 0
+    while i < len(blocks):
+        if blocks[i][b'type'] != b'option':
+            i += 1
+            continue
+
+        optstrwidth = 0
+        j = i
+        while j < len(blocks) and blocks[j][b'type'] == b'option':
+            m = _optionre.match(blocks[j][b'lines'][0])
+
+            shortoption = m.group(2)
+            group3 = m.group(3)
+            longoption = group3[2:].strip()
+            desc = m.group(6).strip()
+            longoptionarg = m.group(5).strip()
+            blocks[j][b'lines'][0] = desc
+
+            noshortop = b''
+            if not shortoption:
+                noshortop = b'   '
+
+            opt = b"%s%s" % (
+                shortoption and b"-%s " % shortoption or b'',
+                b"%s--%s %s" % (noshortop, longoption, longoptionarg),
+            )
+            opt = opt.rstrip()
+            blocks[j][b'optstr'] = opt
+            optstrwidth = max(optstrwidth, encoding.colwidth(opt))
+            j += 1
+
+        for block in blocks[i:j]:
+            block[b'optstrwidth'] = optstrwidth
+        i = j + 1
+    return blocks
+
+
+def prunecontainers(blocks, keep):
+    """Prune unwanted containers.
+
+    The blocks must have a 'type' field, i.e., they should have been
+    run through findliteralblocks first.
+    """
+    pruned = []
+    i = 0
+    while i + 1 < len(blocks):
+        # Searching for a block that looks like this:
+        #
+        # +-------+---------------------------+
+        # | ".. container ::" type            |
+        # +---+                               |
+        #     | blocks                        |
+        #     +-------------------------------+
+        if blocks[i][b'type'] == b'paragraph' and blocks[i][b'lines'][
+            0
+        ].startswith(b'.. container::'):
+            indent = blocks[i][b'indent']
+            adjustment = blocks[i + 1][b'indent'] - indent
+            containertype = blocks[i][b'lines'][0][15:]
+            prune = True
+            for c in keep:
+                if c in containertype.split(b'.'):
+                    prune = False
+            if prune:
+                pruned.append(containertype)
+
+            # Always delete "..container:: type" block
+            del blocks[i]
+            j = i
+            i -= 1
+            while j < len(blocks) and blocks[j][b'indent'] > indent:
+                if prune:
+                    del blocks[j]
+                else:
+                    blocks[j][b'indent'] -= adjustment
+                    j += 1
+        i += 1
+    return blocks, pruned
+
+
+_sectionre = re.compile(br"""^([-=`:.'"~^_*+#])\1+$""")
+
+
+def findtables(blocks):
+    """Find simple tables
+
+    Only simple one-line table elements are supported
+    """
+
+    for block in blocks:
+        # Searching for a block that looks like this:
+        #
+        # === ==== ===
+        #  A    B   C
+        # === ==== ===  <- optional
+        #  1    2   3
+        #  x    y   z
+        # === ==== ===
+        if (
+            block[b'type'] == b'paragraph'
+            and len(block[b'lines']) > 2
+            and _tablere.match(block[b'lines'][0])
+            and block[b'lines'][0] == block[b'lines'][-1]
+        ):
+            block[b'type'] = b'table'
+            block[b'header'] = False
+            div = block[b'lines'][0]
+
+            # column markers are ASCII so we can calculate column
+            # position in bytes
+            columns = [
+                x
+                for x in range(len(div))
+                if div[x : x + 1] == b'=' and (x == 0 or div[x - 1 : x] == b' ')
+            ]
+            rows = []
+            for l in block[b'lines'][1:-1]:
+                if l == div:
+                    block[b'header'] = True
+                    continue
+                row = []
+                # we measure columns not in bytes or characters but in
+                # colwidth which makes things tricky
+                pos = columns[0]  # leading whitespace is bytes
+                for n, start in enumerate(columns):
+                    if n + 1 < len(columns):
+                        width = columns[n + 1] - start
+                        v = encoding.getcols(l, pos, width)  # gather columns
+                        pos += len(v)  # calculate byte position of end
+                        row.append(v.strip())
+                    else:
+                        row.append(l[pos:].strip())
+                rows.append(row)
+
+            block[b'table'] = rows
+
+    return blocks
+
+
+def findsections(blocks):
+    """Finds sections.
+
+    The blocks must have a 'type' field, i.e., they should have been
+    run through findliteralblocks first.
+    """
+    for block in blocks:
+        # Searching for a block that looks like this:
+        #
+        # +------------------------------+
+        # | Section title                |
+        # | -------------                |
+        # +------------------------------+
+        if (
+            block[b'type'] == b'paragraph'
+            and len(block[b'lines']) == 2
+            and encoding.colwidth(block[b'lines'][0]) == len(block[b'lines'][1])
+            and _sectionre.match(block[b'lines'][1])
+        ):
+            block[b'underline'] = block[b'lines'][1][0:1]
+            block[b'type'] = b'section'
+            del block[b'lines'][1]
+    return blocks
+
+
+def inlineliterals(blocks):
+    substs = [(b'``', b'"')]
+    for b in blocks:
+        if b[b'type'] in (b'paragraph', b'section'):
+            b[b'lines'] = [replace(l, substs) for l in b[b'lines']]
+    return blocks
+
+
+def hgrole(blocks):
+    substs = [(b':hg:`', b"'hg "), (b'`', b"'")]
+    for b in blocks:
+        if b[b'type'] in (b'paragraph', b'section'):
+            # Turn :hg:`command` into "hg command". This also works
+            # when there is a line break in the command and relies on
+            # the fact that we have no stray back-quotes in the input
+            # (run the blocks through inlineliterals first).
+            b[b'lines'] = [replace(l, substs) for l in b[b'lines']]
+    return blocks
+
+
+def addmargins(blocks):
+    """Adds empty blocks for vertical spacing.
+
+    This groups bullets, options, and definitions together with no vertical
+    space between them, and adds an empty block between all other blocks.
+    """
+    i = 1
+    while i < len(blocks):
+        if blocks[i][b'type'] == blocks[i - 1][b'type'] and blocks[i][
+            b'type'
+        ] in (
+            b'bullet',
+            b'option',
+            b'field',
+        ):
+            i += 1
+        elif not blocks[i - 1][b'lines']:
+            # no lines in previous block, do not separate
+            i += 1
+        else:
+            blocks.insert(
+                i, {b'lines': [b''], b'indent': 0, b'type': b'margin'}
+            )
+            i += 2
+    return blocks
+
+
+def prunecomments(blocks):
+    """Remove comments."""
+    i = 0
+    while i < len(blocks):
+        b = blocks[i]
+        if b[b'type'] == b'paragraph' and (
+            b[b'lines'][0].startswith(b'.. ') or b[b'lines'] == [b'..']
+        ):
+            del blocks[i]
+            if i < len(blocks) and blocks[i][b'type'] == b'margin':
+                del blocks[i]
+        else:
+            i += 1
+    return blocks
+
+
+def findadmonitions(blocks, admonitions=None):
+    """
+    Makes the type of the block an admonition block if
+    the first line is an admonition directive
+    """
+    admonitions = admonitions or _admonitiontitles.keys()
+
+    admonitionre = re.compile(
+        br'\.\. (%s)::' % b'|'.join(sorted(admonitions)), flags=re.IGNORECASE
+    )
+
+    i = 0
+    while i < len(blocks):
+        m = admonitionre.match(blocks[i][b'lines'][0])
+        if m:
+            blocks[i][b'type'] = b'admonition'
+            admonitiontitle = blocks[i][b'lines'][0][3 : m.end() - 2].lower()
+
+            firstline = blocks[i][b'lines'][0][m.end() + 1 :]
+            if firstline:
+                blocks[i][b'lines'].insert(1, b'   ' + firstline)
+
+            blocks[i][b'admonitiontitle'] = admonitiontitle
+            del blocks[i][b'lines'][0]
+        i = i + 1
+    return blocks
+
+
+_admonitiontitles = {
+    b'attention': _(b'Attention:'),
+    b'caution': _(b'Caution:'),
+    b'danger': _(b'!Danger!'),
+    b'error': _(b'Error:'),
+    b'hint': _(b'Hint:'),
+    b'important': _(b'Important:'),
+    b'note': _(b'Note:'),
+    b'tip': _(b'Tip:'),
+    b'warning': _(b'Warning!'),
+}
+
+
+def formatoption(block, width):

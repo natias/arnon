@@ -1,0 +1,1000 @@
+    if opts.get('force_free_lock') or opts.get('force_free_wlock'):
+        return 0
+
+    locks = []
+    try:
+        if opts.get('set_wlock'):
+            try:
+                locks.append(repo.wlock(False))
+            except error.LockHeld:
+                raise error.Abort(_(b'wlock is already held'))
+        if opts.get('set_lock'):
+            try:
+                locks.append(repo.lock(False))
+            except error.LockHeld:
+                raise error.Abort(_(b'lock is already held'))
+        if len(locks):
+            try:
+                if ui.interactive():
+                    prompt = _(b"ready to release the lock (y)? $$ &Yes")
+                    ui.promptchoice(prompt)
+                else:
+                    msg = b"%d locks held, waiting for signal\n"
+                    msg %= len(locks)
+                    ui.status(msg)
+                    while True:  # XXX wait for a signal
+                        time.sleep(0.1)
+            except KeyboardInterrupt:
+                msg = b"signal-received releasing locks\n"
+                ui.status(msg)
+            return 0
+    finally:
+        release(*locks)
+
+    now = time.time()
+    held = 0
+
+    def report(vfs, name, method):
+        # this causes stale locks to get reaped for more accurate reporting
+        try:
+            l = method(False)
+        except error.LockHeld:
+            l = None
+
+        if l:
+            l.release()
+        else:
+            try:
+                st = vfs.lstat(name)
+                age = now - st[stat.ST_MTIME]
+                user = util.username(st.st_uid)
+                locker = vfs.readlock(name)
+                if b":" in locker:
+                    host, pid = locker.split(b':')
+                    if host == socket.gethostname():
+                        locker = b'user %s, process %s' % (user or b'None', pid)
+                    else:
+                        locker = b'user %s, process %s, host %s' % (
+                            user or b'None',
+                            pid,
+                            host,
+                        )
+                ui.writenoi18n(b"%-6s %s (%ds)\n" % (name + b":", locker, age))
+                return 1
+            except FileNotFoundError:
+                pass
+
+        ui.writenoi18n(b"%-6s free\n" % (name + b":"))
+        return 0
+
+    held += report(repo.svfs, b"lock", repo.lock)
+    held += report(repo.vfs, b"wlock", repo.wlock)
+
+    return held
+
+
+@command(
+    b'debugmanifestfulltextcache',
+    [
+        (b'', b'clear', False, _(b'clear the cache')),
+        (
+            b'a',
+            b'add',
+            [],
+            _(b'add the given manifest nodes to the cache'),
+            _(b'NODE'),
+        ),
+    ],
+    b'',
+)
+def debugmanifestfulltextcache(ui, repo, add=(), **opts):
+    """show, clear or amend the contents of the manifest fulltext cache"""
+
+    def getcache():
+        r = repo.manifestlog.getstorage(b'')
+        try:
+            return r._fulltextcache
+        except AttributeError:
+            msg = _(
+                b"Current revlog implementation doesn't appear to have a "
+                b"manifest fulltext cache\n"
+            )
+            raise error.Abort(msg)
+
+    if opts.get('clear'):
+        with repo.wlock():
+            cache = getcache()
+            cache.clear(clear_persisted_data=True)
+            return
+
+    if add:
+        with repo.wlock():
+            m = repo.manifestlog
+            store = m.getstorage(b'')
+            for n in add:
+                try:
+                    manifest = m[store.lookup(n)]
+                except error.LookupError as e:
+                    raise error.Abort(
+                        bytes(e), hint=b"Check your manifest node id"
+                    )
+                manifest.read()  # stores revisision in cache too
+            return
+
+    cache = getcache()
+    if not len(cache):
+        ui.write(_(b'cache empty\n'))
+    else:
+        ui.write(
+            _(
+                b'cache contains %d manifest entries, in order of most to '
+                b'least recent:\n'
+            )
+            % (len(cache),)
+        )
+        totalsize = 0
+        for nodeid in cache:
+            # Use cache.get to not update the LRU order
+            data = cache.peek(nodeid)
+            size = len(data)
+            totalsize += size + 24  # 20 bytes nodeid, 4 bytes size
+            ui.write(
+                _(b'id: %s, size %s\n') % (hex(nodeid), util.bytecount(size))
+            )
+        ondisk = cache._opener.stat(b'manifestfulltextcache').st_size
+        ui.write(
+            _(b'total cache data size %s, on-disk %s\n')
+            % (util.bytecount(totalsize), util.bytecount(ondisk))
+        )
+
+
+@command(b'debugmergestate', [] + cmdutil.templateopts, b'')
+def debugmergestate(ui, repo, *args, **opts):
+    """print merge state
+
+    Use --verbose to print out information about whether v1 or v2 merge state
+    was chosen."""
+
+    if ui.verbose:
+        ms = mergestatemod.mergestate(repo)
+
+        # sort so that reasonable information is on top
+        v1records = ms._readrecordsv1()
+        v2records = ms._readrecordsv2()
+
+        if not v1records and not v2records:
+            pass
+        elif not v2records:
+            ui.writenoi18n(b'no version 2 merge state\n')
+        elif ms._v1v2match(v1records, v2records):
+            ui.writenoi18n(b'v1 and v2 states match: using v2\n')
+        else:
+            ui.writenoi18n(b'v1 and v2 states mismatch: using v1\n')
+
+    opts = pycompat.byteskwargs(opts)
+    if not opts[b'template']:
+        opts[b'template'] = (
+            b'{if(commits, "", "no merge state found\n")}'
+            b'{commits % "{name}{if(label, " ({label})")}: {node}\n"}'
+            b'{files % "file: {path} (state \\"{state}\\")\n'
+            b'{if(local_path, "'
+            b'  local path: {local_path} (hash {local_key}, flags \\"{local_flags}\\")\n'
+            b'  ancestor path: {ancestor_path} (node {ancestor_node})\n'
+            b'  other path: {other_path} (node {other_node})\n'
+            b'")}'
+            b'{if(rename_side, "'
+            b'  rename side: {rename_side}\n'
+            b'  renamed path: {renamed_path}\n'
+            b'")}'
+            b'{extras % "  extra: {key} = {value}\n"}'
+            b'"}'
+            b'{extras % "extra: {file} ({key} = {value})\n"}'
+        )
+
+    ms = mergestatemod.mergestate.read(repo)
+
+    fm = ui.formatter(b'debugmergestate', opts)
+    fm.startitem()
+
+    fm_commits = fm.nested(b'commits')
+    if ms.active():
+        for name, node, label_index in (
+            (b'local', ms.local, 0),
+            (b'other', ms.other, 1),
+        ):
+            fm_commits.startitem()
+            fm_commits.data(name=name)
+            fm_commits.data(node=hex(node))
+            if ms._labels and len(ms._labels) > label_index:
+                fm_commits.data(label=ms._labels[label_index])
+    fm_commits.end()
+
+    fm_files = fm.nested(b'files')
+    if ms.active():
+        for f in ms:
+            fm_files.startitem()
+            fm_files.data(path=f)
+            state = ms._state[f]
+            fm_files.data(state=state[0])
+            if state[0] in (
+                mergestatemod.MERGE_RECORD_UNRESOLVED,
+                mergestatemod.MERGE_RECORD_RESOLVED,
+            ):
+                fm_files.data(local_key=state[1])
+                fm_files.data(local_path=state[2])
+                fm_files.data(ancestor_path=state[3])
+                fm_files.data(ancestor_node=state[4])
+                fm_files.data(other_path=state[5])
+                fm_files.data(other_node=state[6])
+                fm_files.data(local_flags=state[7])
+            elif state[0] in (
+                mergestatemod.MERGE_RECORD_UNRESOLVED_PATH,
+                mergestatemod.MERGE_RECORD_RESOLVED_PATH,
+            ):
+                fm_files.data(renamed_path=state[1])
+                fm_files.data(rename_side=state[2])
+            fm_extras = fm_files.nested(b'extras')
+            for k, v in sorted(ms.extras(f).items()):
+                fm_extras.startitem()
+                fm_extras.data(key=k)
+                fm_extras.data(value=v)
+            fm_extras.end()
+
+    fm_files.end()
+
+    fm_extras = fm.nested(b'extras')
+    for f, d in sorted(ms.allextras().items()):
+        if f in ms:
+            # If file is in mergestate, we have already processed it's extras
+            continue
+        for k, v in d.items():
+            fm_extras.startitem()
+            fm_extras.data(file=f)
+            fm_extras.data(key=k)
+            fm_extras.data(value=v)
+    fm_extras.end()
+
+    fm.end()
+
+
+@command(b'debugnamecomplete', [], _(b'NAME...'))
+def debugnamecomplete(ui, repo, *args):
+    '''complete "names" - tags, open branch names, bookmark names'''
+
+    names = set()
+    # since we previously only listed open branches, we will handle that
+    # specially (after this for loop)
+    for name, ns in repo.names.items():
+        if name != b'branches':
+            names.update(ns.listnames(repo))
+    names.update(
+        tag
+        for (tag, heads, tip, closed) in repo.branchmap().iterbranches()
+        if not closed
+    )
+    completions = set()
+    if not args:
+        args = [b'']
+    for a in args:
+        completions.update(n for n in names if n.startswith(a))
+    ui.write(b'\n'.join(sorted(completions)))
+    ui.write(b'\n')
+
+
+@command(
+    b'debugnodemap',
+    [
+        (
+            b'',
+            b'dump-new',
+            False,
+            _(b'write a (new) persistent binary nodemap on stdout'),
+        ),
+        (b'', b'dump-disk', False, _(b'dump on-disk data on stdout')),
+        (
+            b'',
+            b'check',
+            False,
+            _(b'check that the data on disk data are correct.'),
+        ),
+        (
+            b'',
+            b'metadata',
+            False,
+            _(b'display the on disk meta data for the nodemap'),
+        ),
+    ],
+)
+def debugnodemap(ui, repo, **opts):
+    """write and inspect on disk nodemap"""
+    if opts['dump_new']:
+        unfi = repo.unfiltered()
+        cl = unfi.changelog
+        if util.safehasattr(cl.index, "nodemap_data_all"):
+            data = cl.index.nodemap_data_all()
+        else:
+            data = nodemap.persistent_data(cl.index)
+        ui.write(data)
+    elif opts['dump_disk']:
+        unfi = repo.unfiltered()
+        cl = unfi.changelog
+        nm_data = nodemap.persisted_data(cl)
+        if nm_data is not None:
+            docket, data = nm_data
+            ui.write(data[:])
+    elif opts['check']:
+        unfi = repo.unfiltered()
+        cl = unfi.changelog
+        nm_data = nodemap.persisted_data(cl)
+        if nm_data is not None:
+            docket, data = nm_data
+            return nodemap.check_data(ui, cl.index, data)
+    elif opts['metadata']:
+        unfi = repo.unfiltered()
+        cl = unfi.changelog
+        nm_data = nodemap.persisted_data(cl)
+        if nm_data is not None:
+            docket, data = nm_data
+            ui.write((b"uid: %s\n") % docket.uid)
+            ui.write((b"tip-rev: %d\n") % docket.tip_rev)
+            ui.write((b"tip-node: %s\n") % hex(docket.tip_node))
+            ui.write((b"data-length: %d\n") % docket.data_length)
+            ui.write((b"data-unused: %d\n") % docket.data_unused)
+            unused_perc = docket.data_unused * 100.0 / docket.data_length
+            ui.write((b"data-unused: %2.3f%%\n") % unused_perc)
+
+
+@command(
+    b'debugobsolete',
+    [
+        (b'', b'flags', 0, _(b'markers flag')),
+        (
+            b'',
+            b'record-parents',
+            False,
+            _(b'record parent information for the precursor'),
+        ),
+        (b'r', b'rev', [], _(b'display markers relevant to REV')),
+        (
+            b'',
+            b'exclusive',
+            False,
+            _(b'restrict display to markers only relevant to REV'),
+        ),
+        (b'', b'index', False, _(b'display index of the marker')),
+        (b'', b'delete', [], _(b'delete markers specified by indices')),
+    ]
+    + cmdutil.commitopts2
+    + cmdutil.formatteropts,
+    _(b'[OBSOLETED [REPLACEMENT ...]]'),
+)
+def debugobsolete(ui, repo, precursor=None, *successors, **opts):
+    """create arbitrary obsolete marker
+
+    With no arguments, displays the list of obsolescence markers."""
+
+    opts = pycompat.byteskwargs(opts)
+
+    def parsenodeid(s):
+        try:
+            # We do not use revsingle/revrange functions here to accept
+            # arbitrary node identifiers, possibly not present in the
+            # local repository.
+            n = bin(s)
+            if len(n) != repo.nodeconstants.nodelen:
+                raise ValueError
+            return n
+        except ValueError:
+            raise error.InputError(
+                b'changeset references must be full hexadecimal '
+                b'node identifiers'
+            )
+
+    if opts.get(b'delete'):
+        indices = []
+        for v in opts.get(b'delete'):
+            try:
+                indices.append(int(v))
+            except ValueError:
+                raise error.InputError(
+                    _(b'invalid index value: %r') % v,
+                    hint=_(b'use integers for indices'),
+                )
+
+        if repo.currenttransaction():
+            raise error.Abort(
+                _(b'cannot delete obsmarkers in the middle of transaction.')
+            )
+
+        with repo.lock():
+            n = repair.deleteobsmarkers(repo.obsstore, indices)
+            ui.write(_(b'deleted %i obsolescence markers\n') % n)
+
+        return
+
+    if precursor is not None:
+        if opts[b'rev']:
+            raise error.InputError(
+                b'cannot select revision when creating marker'
+            )
+        metadata = {}
+        metadata[b'user'] = encoding.fromlocal(opts[b'user'] or ui.username())
+        succs = tuple(parsenodeid(succ) for succ in successors)
+        l = repo.lock()
+        try:
+            tr = repo.transaction(b'debugobsolete')
+            try:
+                date = opts.get(b'date')
+                if date:
+                    date = dateutil.parsedate(date)
+                else:
+                    date = None
+                prec = parsenodeid(precursor)
+                parents = None
+                if opts[b'record_parents']:
+                    if prec not in repo.unfiltered():
+                        raise error.Abort(
+                            b'cannot used --record-parents on '
+                            b'unknown changesets'
+                        )
+                    parents = repo.unfiltered()[prec].parents()
+                    parents = tuple(p.node() for p in parents)
+                repo.obsstore.create(
+                    tr,
+                    prec,
+                    succs,
+                    opts[b'flags'],
+                    parents=parents,
+                    date=date,
+                    metadata=metadata,
+                    ui=ui,
+                )
+                tr.close()
+            except ValueError as exc:
+                raise error.Abort(
+                    _(b'bad obsmarker input: %s') % stringutil.forcebytestr(exc)
+                )
+            finally:
+                tr.release()
+        finally:
+            l.release()
+    else:
+        if opts[b'rev']:
+            revs = logcmdutil.revrange(repo, opts[b'rev'])
+            nodes = [repo[r].node() for r in revs]
+            markers = list(
+                obsutil.getmarkers(
+                    repo, nodes=nodes, exclusive=opts[b'exclusive']
+                )
+            )
+            markers.sort(key=lambda x: x._data)
+        else:
+            markers = obsutil.getmarkers(repo)
+
+        markerstoiter = markers
+        isrelevant = lambda m: True
+        if opts.get(b'rev') and opts.get(b'index'):
+            markerstoiter = obsutil.getmarkers(repo)
+            markerset = set(markers)
+            isrelevant = lambda m: m in markerset
+
+        fm = ui.formatter(b'debugobsolete', opts)
+        for i, m in enumerate(markerstoiter):
+            if not isrelevant(m):
+                # marker can be irrelevant when we're iterating over a set
+                # of markers (markerstoiter) which is bigger than the set
+                # of markers we want to display (markers)
+                # this can happen if both --index and --rev options are
+                # provided and thus we need to iterate over all of the markers
+                # to get the correct indices, but only display the ones that
+                # are relevant to --rev value
+                continue
+            fm.startitem()
+            ind = i if opts.get(b'index') else None
+            cmdutil.showmarker(fm, m, index=ind)
+        fm.end()
+
+
+@command(
+    b'debugp1copies',
+    [(b'r', b'rev', b'', _(b'revision to debug'), _(b'REV'))],
+    _(b'[-r REV]'),
+)
+def debugp1copies(ui, repo, **opts):
+    """dump copy information compared to p1"""
+
+    opts = pycompat.byteskwargs(opts)
+    ctx = scmutil.revsingle(repo, opts.get(b'rev'), default=None)
+    for dst, src in ctx.p1copies().items():
+        ui.write(b'%s -> %s\n' % (src, dst))
+
+
+@command(
+    b'debugp2copies',
+    [(b'r', b'rev', b'', _(b'revision to debug'), _(b'REV'))],
+    _(b'[-r REV]'),
+)
+def debugp2copies(ui, repo, **opts):
+    """dump copy information compared to p2"""
+
+    opts = pycompat.byteskwargs(opts)
+    ctx = scmutil.revsingle(repo, opts.get(b'rev'), default=None)
+    for dst, src in ctx.p2copies().items():
+        ui.write(b'%s -> %s\n' % (src, dst))
+
+
+@command(
+    b'debugpathcomplete',
+    [
+        (b'f', b'full', None, _(b'complete an entire path')),
+        (b'n', b'normal', None, _(b'show only normal files')),
+        (b'a', b'added', None, _(b'show only added files')),
+        (b'r', b'removed', None, _(b'show only removed files')),
+    ],
+    _(b'FILESPEC...'),
+)
+def debugpathcomplete(ui, repo, *specs, **opts):
+    """complete part or all of a tracked path
+
+    This command supports shells that offer path name completion. It
+    currently completes only files already known to the dirstate.
+
+    Completion extends only to the next path segment unless
+    --full is specified, in which case entire paths are used."""
+
+    def complete(path, acceptable):
+        dirstate = repo.dirstate
+        spec = os.path.normpath(os.path.join(encoding.getcwd(), path))
+        rootdir = repo.root + pycompat.ossep
+        if spec != repo.root and not spec.startswith(rootdir):
+            return [], []
+        if os.path.isdir(spec):
+            spec += b'/'
+        spec = spec[len(rootdir) :]
+        fixpaths = pycompat.ossep != b'/'
+        if fixpaths:
+            spec = spec.replace(pycompat.ossep, b'/')
+        speclen = len(spec)
+        fullpaths = opts['full']
+        files, dirs = set(), set()
+        adddir, addfile = dirs.add, files.add
+        for f, st in dirstate.items():
+            if f.startswith(spec) and st.state in acceptable:
+                if fixpaths:
+                    f = f.replace(b'/', pycompat.ossep)
+                if fullpaths:
+                    addfile(f)
+                    continue
+                s = f.find(pycompat.ossep, speclen)
+                if s >= 0:
+                    adddir(f[:s])
+                else:
+                    addfile(f)
+        return files, dirs
+
+    acceptable = b''
+    if opts['normal']:
+        acceptable += b'nm'
+    if opts['added']:
+        acceptable += b'a'
+    if opts['removed']:
+        acceptable += b'r'
+    cwd = repo.getcwd()
+    if not specs:
+        specs = [b'.']
+
+    files, dirs = set(), set()
+    for spec in specs:
+        f, d = complete(spec, acceptable or b'nmar')
+        files.update(f)
+        dirs.update(d)
+    files.update(dirs)
+    ui.write(b'\n'.join(repo.pathto(p, cwd) for p in sorted(files)))
+    ui.write(b'\n')
+
+
+@command(
+    b'debugpathcopies',
+    cmdutil.walkopts,
+    b'hg debugpathcopies REV1 REV2 [FILE]',
+    inferrepo=True,
+)
+def debugpathcopies(ui, repo, rev1, rev2, *pats, **opts):
+    """show copies between two revisions"""
+    ctx1 = scmutil.revsingle(repo, rev1)
+    ctx2 = scmutil.revsingle(repo, rev2)
+    m = scmutil.match(ctx1, pats, opts)
+    for dst, src in sorted(copies.pathcopies(ctx1, ctx2, m).items()):
+        ui.write(b'%s -> %s\n' % (src, dst))
+
+
+@command(b'debugpeer', [], _(b'PATH'), norepo=True)
+def debugpeer(ui, path):
+    """establish a connection to a peer repository"""
+    # Always enable peer request logging. Requires --debug to display
+    # though.
+    overrides = {
+        (b'devel', b'debug.peer-request'): True,
+    }
+
+    with ui.configoverride(overrides):
+        peer = hg.peer(ui, {}, path)
+
+        try:
+            local = peer.local() is not None
+            canpush = peer.canpush()
+
+            ui.write(_(b'url: %s\n') % peer.url())
+            ui.write(_(b'local: %s\n') % (_(b'yes') if local else _(b'no')))
+            ui.write(
+                _(b'pushable: %s\n') % (_(b'yes') if canpush else _(b'no'))
+            )
+        finally:
+            peer.close()
+
+
+@command(
+    b'debugpickmergetool',
+    [
+        (b'r', b'rev', b'', _(b'check for files in this revision'), _(b'REV')),
+        (b'', b'changedelete', None, _(b'emulate merging change and delete')),
+    ]
+    + cmdutil.walkopts
+    + cmdutil.mergetoolopts,
+    _(b'[PATTERN]...'),
+    inferrepo=True,
+)
+def debugpickmergetool(ui, repo, *pats, **opts):
+    """examine which merge tool is chosen for specified file
+
+    As described in :hg:`help merge-tools`, Mercurial examines
+    configurations below in this order to decide which merge tool is
+    chosen for specified file.
+
+    1. ``--tool`` option
+    2. ``HGMERGE`` environment variable
+    3. configurations in ``merge-patterns`` section
+    4. configuration of ``ui.merge``
+    5. configurations in ``merge-tools`` section
+    6. ``hgmerge`` tool (for historical reason only)
+    7. default tool for fallback (``:merge`` or ``:prompt``)
+
+    This command writes out examination result in the style below::
+
+        FILE = MERGETOOL
+
+    By default, all files known in the first parent context of the
+    working directory are examined. Use file patterns and/or -I/-X
+    options to limit target files. -r/--rev is also useful to examine
+    files in another context without actual updating to it.
+
+    With --debug, this command shows warning messages while matching
+    against ``merge-patterns`` and so on, too. It is recommended to
+    use this option with explicit file patterns and/or -I/-X options,
+    because this option increases amount of output per file according
+    to configurations in hgrc.
+
+    With -v/--verbose, this command shows configurations below at
+    first (only if specified).
+
+    - ``--tool`` option
+    - ``HGMERGE`` environment variable
+    - configuration of ``ui.merge``
+
+    If merge tool is chosen before matching against
+    ``merge-patterns``, this command can't show any helpful
+    information, even with --debug. In such case, information above is
+    useful to know why a merge tool is chosen.
+    """
+    opts = pycompat.byteskwargs(opts)
+    overrides = {}
+    if opts[b'tool']:
+        overrides[(b'ui', b'forcemerge')] = opts[b'tool']
+        ui.notenoi18n(b'with --tool %r\n' % (pycompat.bytestr(opts[b'tool'])))
+
+    with ui.configoverride(overrides, b'debugmergepatterns'):
+        hgmerge = encoding.environ.get(b"HGMERGE")
+        if hgmerge is not None:
+            ui.notenoi18n(b'with HGMERGE=%r\n' % (pycompat.bytestr(hgmerge)))
+        uimerge = ui.config(b"ui", b"merge")
+        if uimerge:
+            ui.notenoi18n(b'with ui.merge=%r\n' % (pycompat.bytestr(uimerge)))
+
+        ctx = scmutil.revsingle(repo, opts.get(b'rev'))
+        m = scmutil.match(ctx, pats, opts)
+        changedelete = opts[b'changedelete']
+        for path in ctx.walk(m):
+            fctx = ctx[path]
+            with ui.silent(
+                error=True
+            ) if not ui.debugflag else util.nullcontextmanager():
+                tool, toolpath = filemerge._picktool(
+                    repo,
+                    ui,
+                    path,
+                    fctx.isbinary(),
+                    b'l' in fctx.flags(),
+                    changedelete,
+                )
+            ui.write(b'%s = %s\n' % (path, tool))
+
+
+@command(b'debugpushkey', [], _(b'REPO NAMESPACE [KEY OLD NEW]'), norepo=True)
+def debugpushkey(ui, repopath, namespace, *keyinfo, **opts):
+    """access the pushkey key/value protocol
+
+    With two args, list the keys in the given namespace.
+
+    With five args, set a key to new if it currently is set to old.
+    Reports success or failure.
+    """
+
+    target = hg.peer(ui, {}, repopath)
+    try:
+        if keyinfo:
+            key, old, new = keyinfo
+            with target.commandexecutor() as e:
+                r = e.callcommand(
+                    b'pushkey',
+                    {
+                        b'namespace': namespace,
+                        b'key': key,
+                        b'old': old,
+                        b'new': new,
+                    },
+                ).result()
+
+            ui.status(pycompat.bytestr(r) + b'\n')
+            return not r
+        else:
+            for k, v in sorted(target.listkeys(namespace).items()):
+                ui.write(
+                    b"%s\t%s\n"
+                    % (stringutil.escapestr(k), stringutil.escapestr(v))
+                )
+    finally:
+        target.close()
+
+
+@command(b'debugpvec', [], _(b'A B'))
+def debugpvec(ui, repo, a, b=None):
+    ca = scmutil.revsingle(repo, a)
+    cb = scmutil.revsingle(repo, b)
+    pa = pvec.ctxpvec(ca)
+    pb = pvec.ctxpvec(cb)
+    if pa == pb:
+        rel = b"="
+    elif pa > pb:
+        rel = b">"
+    elif pa < pb:
+        rel = b"<"
+    elif pa | pb:
+        rel = b"|"
+    ui.write(_(b"a: %s\n") % pa)
+    ui.write(_(b"b: %s\n") % pb)
+    ui.write(_(b"depth(a): %d depth(b): %d\n") % (pa._depth, pb._depth))
+    ui.write(
+        _(b"delta: %d hdist: %d distance: %d relation: %s\n")
+        % (
+            abs(pa._depth - pb._depth),
+            pvec._hamming(pa._vec, pb._vec),
+            pa.distance(pb),
+            rel,
+        )
+    )
+
+
+@command(
+    b'debugrebuilddirstate|debugrebuildstate',
+    [
+        (b'r', b'rev', b'', _(b'revision to rebuild to'), _(b'REV')),
+        (
+            b'',
+            b'minimal',
+            None,
+            _(
+                b'only rebuild files that are inconsistent with '
+                b'the working copy parent'
+            ),
+        ),
+    ],
+    _(b'[-r REV]'),
+)
+def debugrebuilddirstate(ui, repo, rev, **opts):
+    """rebuild the dirstate as it would look like for the given revision
+
+    If no revision is specified the first current parent will be used.
+
+    The dirstate will be set to the files of the given revision.
+    The actual working directory content or existing dirstate
+    information such as adds or removes is not considered.
+
+    ``minimal`` will only rebuild the dirstate status for files that claim to be
+    tracked but are not in the parent manifest, or that exist in the parent
+    manifest but are not in the dirstate. It will not change adds, removes, or
+    modified files that are in the working copy parent.
+
+    One use of this command is to make the next :hg:`status` invocation
+    check the actual file content.
+    """
+    ctx = scmutil.revsingle(repo, rev)
+    with repo.wlock():
+        dirstate = repo.dirstate
+        changedfiles = None
+        # See command doc for what minimal does.
+        if opts.get('minimal'):
+            manifestfiles = set(ctx.manifest().keys())
+            dirstatefiles = set(dirstate)
+            manifestonly = manifestfiles - dirstatefiles
+            dsonly = dirstatefiles - manifestfiles
+            dsnotadded = {f for f in dsonly if not dirstate.get_entry(f).added}
+            changedfiles = manifestonly | dsnotadded
+
+        dirstate.rebuild(ctx.node(), ctx.manifest(), changedfiles)
+
+
+@command(
+    b'debugrebuildfncache',
+    [
+        (
+            b'',
+            b'only-data',
+            False,
+            _(b'only look for wrong .d files (much faster)'),
+        )
+    ],
+    b'',
+)
+def debugrebuildfncache(ui, repo, **opts):
+    """rebuild the fncache file"""
+    opts = pycompat.byteskwargs(opts)
+    repair.rebuildfncache(ui, repo, opts.get(b"only_data"))
+
+
+@command(
+    b'debugrename',
+    [(b'r', b'rev', b'', _(b'revision to debug'), _(b'REV'))],
+    _(b'[-r REV] [FILE]...'),
+)
+def debugrename(ui, repo, *pats, **opts):
+    """dump rename information"""
+
+    opts = pycompat.byteskwargs(opts)
+    ctx = scmutil.revsingle(repo, opts.get(b'rev'))
+    m = scmutil.match(ctx, pats, opts)
+    for abs in ctx.walk(m):
+        fctx = ctx[abs]
+        o = fctx.filelog().renamed(fctx.filenode())
+        rel = repo.pathto(abs)
+        if o:
+            ui.write(_(b"%s renamed from %s:%s\n") % (rel, o[0], hex(o[1])))
+        else:
+            ui.write(_(b"%s not renamed\n") % rel)
+
+
+@command(b'debugrequires|debugrequirements', [], b'')
+def debugrequirements(ui, repo):
+    """print the current repo requirements"""
+    for r in sorted(repo.requirements):
+        ui.write(b"%s\n" % r)
+
+
+@command(
+    b'debugrevlog',
+    cmdutil.debugrevlogopts + [(b'd', b'dump', False, _(b'dump index data'))],
+    _(b'-c|-m|FILE'),
+    optionalrepo=True,
+)
+def debugrevlog(ui, repo, file_=None, **opts):
+    """show data and statistics about a revlog"""
+    opts = pycompat.byteskwargs(opts)
+    r = cmdutil.openrevlog(repo, b'debugrevlog', file_, opts)
+
+    if opts.get(b"dump"):
+        numrevs = len(r)
+        ui.write(
+            (
+                b"# rev p1rev p2rev start   end deltastart base   p1   p2"
+                b" rawsize totalsize compression heads chainlen\n"
+            )
+        )
+        ts = 0
+        heads = set()
+
+        for rev in range(numrevs):
+            dbase = r.deltaparent(rev)
+            if dbase == -1:
+                dbase = rev
+            cbase = r.chainbase(rev)
+            clen = r.chainlen(rev)
+            p1, p2 = r.parentrevs(rev)
+            rs = r.rawsize(rev)
+            ts = ts + rs
+            heads -= set(r.parentrevs(rev))
+            heads.add(rev)
+            try:
+                compression = ts / r.end(rev)
+            except ZeroDivisionError:
+                compression = 0
+            ui.write(
+                b"%5d %5d %5d %5d %5d %10d %4d %4d %4d %7d %9d "
+                b"%11d %5d %8d\n"
+                % (
+                    rev,
+                    p1,
+                    p2,
+                    r.start(rev),
+                    r.end(rev),
+                    r.start(dbase),
+                    r.start(cbase),
+                    r.start(p1),
+                    r.start(p2),
+                    rs,
+                    ts,
+                    compression,
+                    len(heads),
+                    clen,
+                )
+            )
+        return 0
+
+    format = r._format_version
+    v = r._format_flags
+    flags = []
+    gdelta = False
+    if v & revlog.FLAG_INLINE_DATA:
+        flags.append(b'inline')
+    if v & revlog.FLAG_GENERALDELTA:
+        gdelta = True
+        flags.append(b'generaldelta')
+    if not flags:
+        flags = [b'(none)']
+
+    ### tracks merge vs single parent
+    nummerges = 0
+
+    ### tracks ways the "delta" are build
+    # nodelta
+    numempty = 0
+    numemptytext = 0
+    numemptydelta = 0
+    # full file content
+    numfull = 0
+    # intermediate snapshot against a prior snapshot
+    numsemi = 0
+    # snapshot count per depth
+    numsnapdepth = collections.defaultdict(lambda: 0)
+    # delta against previous revision
+    numprev = 0
+    # delta against first or second parent (not prev)
+    nump1 = 0
+    nump2 = 0
+    # delta against neither prev nor parents
+    numother = 0
+    # delta against prev that are also first or second parent
+    # (details of `numprev`)
+    nump1prev = 0
+    nump2prev = 0
+
+    # data about delta chain of each revs
+    chainlengths = []
+    chainbases = []
+    chainspans = []
+
+    # data about each revision
+    datasize = [None, 0, 0]
+    fullsize = [None, 0, 0]
+    semisize = [None, 0, 0]
+    # snapshot count per depth
+    snapsizedepth = collections.defaultdict(lambda: [None, 0, 0])
+    deltasize = [None, 0, 0]
+    chunktypecounts = {}
+    chunktypesizes = {}
+
+    def addsize(size, l):
+        if l[0] is None or size < l[0]:
+            l[0] = size
+        if size > l[1]:
+            l[1] = size
+        l[2] += size
+

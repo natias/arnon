@@ -1,0 +1,1000 @@
+        self._ui = ui
+        self._checkperm = checkperm
+        self._protocaps = None
+
+    @property
+    def name(self):
+        return b'http-v1'
+
+    def getargs(self, args):
+        knownargs = self._args()
+        data = {}
+        keys = args.split()
+        for k in keys:
+            if k == b'*':
+                star = {}
+                for key in knownargs.keys():
+                    if key != b'cmd' and key not in keys:
+                        star[key] = knownargs[key][0]
+                data[b'*'] = star
+            else:
+                data[k] = knownargs[k][0]
+        return [data[k] for k in keys]
+
+    def _args(self):
+        args = self._req.qsparams.asdictoflists()
+        postlen = int(self._req.headers.get(b'X-HgArgs-Post', 0))
+        if postlen:
+            args.update(
+                urlreq.parseqs(
+                    self._req.bodyfh.read(postlen), keep_blank_values=True
+                )
+            )
+            return args
+
+        argvalue = decodevaluefromheaders(self._req, b'X-HgArg')
+        args.update(urlreq.parseqs(argvalue, keep_blank_values=True))
+        return args
+
+    def getprotocaps(self):
+        if self._protocaps is None:
+            value = decodevaluefromheaders(self._req, b'X-HgProto')
+            self._protocaps = set(value.split(b' '))
+        return self._protocaps
+
+    def getpayload(self):
+        # Existing clients *always* send Content-Length.
+        length = int(self._req.headers[b'Content-Length'])
+
+        # If httppostargs is used, we need to read Content-Length
+        # minus the amount that was consumed by args.
+        length -= int(self._req.headers.get(b'X-HgArgs-Post', 0))
+        return util.filechunkiter(self._req.bodyfh, limit=length)
+
+    @contextlib.contextmanager
+    def mayberedirectstdio(self):
+        oldout = self._ui.fout
+        olderr = self._ui.ferr
+
+        out = util.stringio()
+
+        try:
+            self._ui.fout = out
+            self._ui.ferr = out
+            yield out
+        finally:
+            self._ui.fout = oldout
+            self._ui.ferr = olderr
+
+    def client(self):
+        return b'remote:%s:%s:%s' % (
+            self._req.urlscheme,
+            urlreq.quote(self._req.remotehost or b''),
+            urlreq.quote(self._req.remoteuser or b''),
+        )
+
+    def addcapabilities(self, repo, caps):
+        caps.append(b'batch')
+
+        caps.append(
+            b'httpheader=%d' % repo.ui.configint(b'server', b'maxhttpheaderlen')
+        )
+        if repo.ui.configbool(b'experimental', b'httppostargs'):
+            caps.append(b'httppostargs')
+
+        # FUTURE advertise 0.2rx once support is implemented
+        # FUTURE advertise minrx and mintx after consulting config option
+        caps.append(b'httpmediatype=0.1rx,0.1tx,0.2tx')
+
+        compengines = wireprototypes.supportedcompengines(
+            repo.ui, compression.SERVERROLE
+        )
+        if compengines:
+            comptypes = b','.join(
+                urlreq.quote(e.wireprotosupport().name) for e in compengines
+            )
+            caps.append(b'compression=%s' % comptypes)
+
+        return caps
+
+    def checkperm(self, perm):
+        return self._checkperm(perm)
+
+
+# This method exists mostly so that extensions like remotefilelog can
+# disable a kludgey legacy method only over http. As of early 2018,
+# there are no other known users, so with any luck we can discard this
+# hook if remotefilelog becomes a first-party extension.
+def iscmd(cmd):
+    return cmd in wireprotov1server.commands
+
+
+def handlewsgirequest(rctx, req, res, checkperm):
+    """Possibly process a wire protocol request.
+
+    If the current request is a wire protocol request, the request is
+    processed by this function.
+
+    ``req`` is a ``parsedrequest`` instance.
+    ``res`` is a ``wsgiresponse`` instance.
+
+    Returns a bool indicating if the request was serviced. If set, the caller
+    should stop processing the request, as a response has already been issued.
+    """
+    # Avoid cycle involving hg module.
+    from .hgweb import common as hgwebcommon
+
+    repo = rctx.repo
+
+    # HTTP version 1 wire protocol requests are denoted by a "cmd" query
+    # string parameter. If it isn't present, this isn't a wire protocol
+    # request.
+    if b'cmd' not in req.qsparams:
+        return False
+
+    cmd = req.qsparams[b'cmd']
+
+    # The "cmd" request parameter is used by both the wire protocol and hgweb.
+    # While not all wire protocol commands are available for all transports,
+    # if we see a "cmd" value that resembles a known wire protocol command, we
+    # route it to a protocol handler. This is better than routing possible
+    # wire protocol requests to hgweb because it prevents hgweb from using
+    # known wire protocol commands and it is less confusing for machine
+    # clients.
+    if not iscmd(cmd):
+        return False
+
+    # The "cmd" query string argument is only valid on the root path of the
+    # repo. e.g. ``/?cmd=foo``, ``/repo?cmd=foo``. URL paths within the repo
+    # like ``/blah?cmd=foo`` are not allowed. So don't recognize the request
+    # in this case. We send an HTTP 404 for backwards compatibility reasons.
+    if req.dispatchpath:
+        res.status = hgwebcommon.statusmessage(404)
+        res.headers[b'Content-Type'] = HGTYPE
+        # TODO This is not a good response to issue for this request. This
+        # is mostly for BC for now.
+        res.setbodybytes(b'0\n%s\n' % b'Not Found')
+        return True
+
+    proto = httpv1protocolhandler(
+        req, repo.ui, lambda perm: checkperm(rctx, req, perm)
+    )
+
+    # The permissions checker should be the only thing that can raise an
+    # ErrorResponse. It is kind of a layer violation to catch an hgweb
+    # exception here. So consider refactoring into a exception type that
+    # is associated with the wire protocol.
+    try:
+        _callhttp(repo, req, res, proto, cmd)
+    except hgwebcommon.ErrorResponse as e:
+        for k, v in e.headers:
+            res.headers[k] = v
+        res.status = hgwebcommon.statusmessage(
+            e.code, stringutil.forcebytestr(e)
+        )
+        # TODO This response body assumes the failed command was
+        # "unbundle." That assumption is not always valid.
+        res.setbodybytes(b'0\n%s\n' % stringutil.forcebytestr(e))
+
+    return True
+
+
+def _httpresponsetype(ui, proto, prefer_uncompressed):
+    """Determine the appropriate response type and compression settings.
+
+    Returns a tuple of (mediatype, compengine, engineopts).
+    """
+    # Determine the response media type and compression engine based
+    # on the request parameters.
+
+    if b'0.2' in proto.getprotocaps():
+        # All clients are expected to support uncompressed data.
+        if prefer_uncompressed:
+            return HGTYPE2, compression._noopengine(), {}
+
+        # Now find an agreed upon compression format.
+        compformats = wireprotov1server.clientcompressionsupport(proto)
+        for engine in wireprototypes.supportedcompengines(
+            ui, compression.SERVERROLE
+        ):
+            if engine.wireprotosupport().name in compformats:
+                opts = {}
+                level = ui.configint(b'server', b'%slevel' % engine.name())
+                if level is not None:
+                    opts[b'level'] = level
+
+                return HGTYPE2, engine, opts
+
+        # No mutually supported compression format. Fall back to the
+        # legacy protocol.
+
+    # Don't allow untrusted settings because disabling compression or
+    # setting a very high compression level could lead to flooding
+    # the server's network or CPU.
+    opts = {b'level': ui.configint(b'server', b'zliblevel')}
+    return HGTYPE, util.compengines[b'zlib'], opts
+
+
+def _callhttp(repo, req, res, proto, cmd):
+    # Avoid cycle involving hg module.
+    from .hgweb import common as hgwebcommon
+
+    def genversion2(gen, engine, engineopts):
+        # application/mercurial-0.2 always sends a payload header
+        # identifying the compression engine.
+        name = engine.wireprotosupport().name
+        assert 0 < len(name) < 256
+        yield struct.pack(b'B', len(name))
+        yield name
+
+        for chunk in gen:
+            yield chunk
+
+    def setresponse(code, contenttype, bodybytes=None, bodygen=None):
+        if code == HTTP_OK:
+            res.status = b'200 Script output follows'
+        else:
+            res.status = hgwebcommon.statusmessage(code)
+
+        res.headers[b'Content-Type'] = contenttype
+
+        if bodybytes is not None:
+            res.setbodybytes(bodybytes)
+        if bodygen is not None:
+            res.setbodygen(bodygen)
+
+    if not wireprotov1server.commands.commandavailable(cmd, proto):
+        setresponse(
+            HTTP_OK,
+            HGERRTYPE,
+            _(
+                b'requested wire protocol command is not available over '
+                b'HTTP'
+            ),
+        )
+        return
+
+    proto.checkperm(wireprotov1server.commands[cmd].permission)
+
+    rsp = wireprotov1server.dispatch(repo, proto, cmd)
+
+    if isinstance(rsp, bytes):
+        setresponse(HTTP_OK, HGTYPE, bodybytes=rsp)
+    elif isinstance(rsp, wireprototypes.bytesresponse):
+        setresponse(HTTP_OK, HGTYPE, bodybytes=rsp.data)
+    elif isinstance(rsp, wireprototypes.streamreslegacy):
+        setresponse(HTTP_OK, HGTYPE, bodygen=rsp.gen)
+    elif isinstance(rsp, wireprototypes.streamres):
+        gen = rsp.gen
+
+        # This code for compression should not be streamres specific. It
+        # is here because we only compress streamres at the moment.
+        mediatype, engine, engineopts = _httpresponsetype(
+            repo.ui, proto, rsp.prefer_uncompressed
+        )
+        gen = engine.compressstream(gen, engineopts)
+
+        if mediatype == HGTYPE2:
+            gen = genversion2(gen, engine, engineopts)
+
+        setresponse(HTTP_OK, mediatype, bodygen=gen)
+    elif isinstance(rsp, wireprototypes.pushres):
+        rsp = b'%d\n%s' % (rsp.res, rsp.output)
+        setresponse(HTTP_OK, HGTYPE, bodybytes=rsp)
+    elif isinstance(rsp, wireprototypes.pusherr):
+        rsp = b'0\n%s\n' % rsp.res
+        res.drain = True
+        setresponse(HTTP_OK, HGTYPE, bodybytes=rsp)
+    elif isinstance(rsp, wireprototypes.ooberror):
+        setresponse(HTTP_OK, HGERRTYPE, bodybytes=rsp.message)
+    else:
+        raise error.ProgrammingError(b'hgweb.protocol internal failure', rsp)
+
+
+def _sshv1respondbytes(fout, value):
+    """Send a bytes response for protocol version 1."""
+    fout.write(b'%d\n' % len(value))
+    fout.write(value)
+    fout.flush()
+
+
+def _sshv1respondstream(fout, source):
+    write = fout.write
+    for chunk in source.gen:
+        write(chunk)
+    fout.flush()
+
+
+def _sshv1respondooberror(fout, ferr, rsp):
+    ferr.write(b'%s\n-\n' % rsp)
+    ferr.flush()
+    fout.write(b'\n')
+    fout.flush()
+
+
+@interfaceutil.implementer(wireprototypes.baseprotocolhandler)
+class sshv1protocolhandler:
+    """Handler for requests services via version 1 of SSH protocol."""
+
+    def __init__(self, ui, fin, fout):
+        self._ui = ui
+        self._fin = fin
+        self._fout = fout
+        self._protocaps = set()
+
+    @property
+    def name(self):
+        return wireprototypes.SSHV1
+
+    def getargs(self, args):
+        data = {}
+        keys = args.split()
+        for n in range(len(keys)):
+            argline = self._fin.readline()[:-1]
+            arg, l = argline.split()
+            if arg not in keys:
+                raise error.Abort(_(b"unexpected parameter %r") % arg)
+            if arg == b'*':
+                star = {}
+                for k in range(int(l)):
+                    argline = self._fin.readline()[:-1]
+                    arg, l = argline.split()
+                    val = self._fin.read(int(l))
+                    star[arg] = val
+                data[b'*'] = star
+            else:
+                val = self._fin.read(int(l))
+                data[arg] = val
+        return [data[k] for k in keys]
+
+    def getprotocaps(self):
+        return self._protocaps
+
+    def getpayload(self):
+        # We initially send an empty response. This tells the client it is
+        # OK to start sending data. If a client sees any other response, it
+        # interprets it as an error.
+        _sshv1respondbytes(self._fout, b'')
+
+        # The file is in the form:
+        #
+        # <chunk size>\n<chunk>
+        # ...
+        # 0\n
+        count = int(self._fin.readline())
+        while count:
+            yield self._fin.read(count)
+            count = int(self._fin.readline())
+
+    @contextlib.contextmanager
+    def mayberedirectstdio(self):
+        yield None
+
+    def client(self):
+        client = encoding.environ.get(b'SSH_CLIENT', b'').split(b' ', 1)[0]
+        return b'remote:ssh:' + client
+
+    def addcapabilities(self, repo, caps):
+        if self.name == wireprototypes.SSHV1:
+            caps.append(b'protocaps')
+        caps.append(b'batch')
+        return caps
+
+    def checkperm(self, perm):
+        pass
+
+
+def _runsshserver(ui, repo, fin, fout, ev):
+    # This function operates like a state machine of sorts. The following
+    # states are defined:
+    #
+    # protov1-serving
+    #    Server is in protocol version 1 serving mode. Commands arrive on
+    #    new lines. These commands are processed in this state, one command
+    #    after the other.
+    #
+    # shutdown
+    #    The server is shutting down, possibly in reaction to a client event.
+    #
+    # And here are their transitions:
+    #
+    # protov1-serving -> shutdown
+    #    When server receives an empty request or encounters another
+    #    error.
+
+    state = b'protov1-serving'
+    proto = sshv1protocolhandler(ui, fin, fout)
+
+    while not ev.is_set():
+        if state == b'protov1-serving':
+            # Commands are issued on new lines.
+            request = fin.readline()[:-1]
+
+            # Empty lines signal to terminate the connection.
+            if not request:
+                state = b'shutdown'
+                continue
+
+            available = wireprotov1server.commands.commandavailable(
+                request, proto
+            )
+
+            # This command isn't available. Send an empty response and go
+            # back to waiting for a new command.
+            if not available:
+                _sshv1respondbytes(fout, b'')
+                continue
+
+            rsp = wireprotov1server.dispatch(repo, proto, request)
+            repo.ui.fout.flush()
+            repo.ui.ferr.flush()
+
+            if isinstance(rsp, bytes):
+                _sshv1respondbytes(fout, rsp)
+            elif isinstance(rsp, wireprototypes.bytesresponse):
+                _sshv1respondbytes(fout, rsp.data)
+            elif isinstance(rsp, wireprototypes.streamres):
+                _sshv1respondstream(fout, rsp)
+            elif isinstance(rsp, wireprototypes.streamreslegacy):
+                _sshv1respondstream(fout, rsp)
+            elif isinstance(rsp, wireprototypes.pushres):
+                _sshv1respondbytes(fout, b'')
+                _sshv1respondbytes(fout, b'%d' % rsp.res)
+            elif isinstance(rsp, wireprototypes.pusherr):
+                _sshv1respondbytes(fout, rsp.res)
+            elif isinstance(rsp, wireprototypes.ooberror):
+                _sshv1respondooberror(fout, ui.ferr, rsp.message)
+            else:
+                raise error.ProgrammingError(
+                    b'unhandled response type from '
+                    b'wire protocol command: %s' % rsp
+                )
+
+        elif state == b'shutdown':
+            break
+
+        else:
+            raise error.ProgrammingError(
+                b'unhandled ssh server state: %s' % state
+            )
+
+
+class sshserver:
+    def __init__(self, ui, repo, logfh=None):
+        self._ui = ui
+        self._repo = repo
+        self._fin, self._fout = ui.protectfinout()
+
+        # Log write I/O to stdout and stderr if configured.
+        if logfh:
+            self._fout = util.makeloggingfileobject(
+                logfh, self._fout, b'o', logdata=True
+            )
+            ui.ferr = util.makeloggingfileobject(
+                logfh, ui.ferr, b'e', logdata=True
+            )
+
+    def serve_forever(self):
+        self.serveuntil(threading.Event())
+        self._ui.restorefinout(self._fin, self._fout)
+
+    def serveuntil(self, ev):
+        """Serve until a threading.Event is set."""
+        _runsshserver(self._ui, self._repo, self._fin, self._fout, ev)
+                                                                                                                                                                                                             usr/lib/python3/dist-packages/mercurial/wireprototypes.py                                           0000644 0000000 0000000 00000031715 14355257011 022434  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        # Copyright 2018 Gregory Szorc <gregory.szorc@gmail.com>
+#
+# This software may be used and distributed according to the terms of the
+# GNU General Public License version 2 or any later version.
+
+
+from .node import (
+    bin,
+    hex,
+)
+from .i18n import _
+from .pycompat import getattr
+from .thirdparty import attr
+from . import (
+    error,
+    util,
+)
+from .interfaces import util as interfaceutil
+from .utils import compression
+
+# Names of the SSH protocol implementations.
+SSHV1 = b'ssh-v1'
+
+NARROWCAP = b'exp-narrow-1'
+ELLIPSESCAP1 = b'exp-ellipses-1'
+ELLIPSESCAP = b'exp-ellipses-2'
+SUPPORTED_ELLIPSESCAP = (ELLIPSESCAP1, ELLIPSESCAP)
+
+# All available wire protocol transports.
+TRANSPORTS = {
+    SSHV1: {
+        b'transport': b'ssh',
+        b'version': 1,
+    },
+    b'http-v1': {
+        b'transport': b'http',
+        b'version': 1,
+    },
+}
+
+
+class bytesresponse:
+    """A wire protocol response consisting of raw bytes."""
+
+    def __init__(self, data):
+        self.data = data
+
+
+class ooberror:
+    """wireproto reply: failure of a batch of operation
+
+    Something failed during a batch call. The error message is stored in
+    `self.message`.
+    """
+
+    def __init__(self, message):
+        self.message = message
+
+
+class pushres:
+    """wireproto reply: success with simple integer return
+
+    The call was successful and returned an integer contained in `self.res`.
+    """
+
+    def __init__(self, res, output):
+        self.res = res
+        self.output = output
+
+
+class pusherr:
+    """wireproto reply: failure
+
+    The call failed. The `self.res` attribute contains the error message.
+    """
+
+    def __init__(self, res, output):
+        self.res = res
+        self.output = output
+
+
+class streamres:
+    """wireproto reply: binary stream
+
+    The call was successful and the result is a stream.
+
+    Accepts a generator containing chunks of data to be sent to the client.
+
+    ``prefer_uncompressed`` indicates that the data is expected to be
+    uncompressable and that the stream should therefore use the ``none``
+    engine.
+    """
+
+    def __init__(self, gen=None, prefer_uncompressed=False):
+        self.gen = gen
+        self.prefer_uncompressed = prefer_uncompressed
+
+
+class streamreslegacy:
+    """wireproto reply: uncompressed binary stream
+
+    The call was successful and the result is a stream.
+
+    Accepts a generator containing chunks of data to be sent to the client.
+
+    Like ``streamres``, but sends an uncompressed data for "version 1" clients
+    using the application/mercurial-0.1 media type.
+    """
+
+    def __init__(self, gen=None):
+        self.gen = gen
+
+
+# list of nodes encoding / decoding
+def decodelist(l, sep=b' '):
+    if l:
+        return [bin(v) for v in l.split(sep)]
+    return []
+
+
+def encodelist(l, sep=b' '):
+    try:
+        return sep.join(map(hex, l))
+    except TypeError:
+        raise
+
+
+# batched call argument encoding
+
+
+def escapebatcharg(plain):
+    return (
+        plain.replace(b':', b':c')
+        .replace(b',', b':o')
+        .replace(b';', b':s')
+        .replace(b'=', b':e')
+    )
+
+
+def unescapebatcharg(escaped):
+    return (
+        escaped.replace(b':e', b'=')
+        .replace(b':s', b';')
+        .replace(b':o', b',')
+        .replace(b':c', b':')
+    )
+
+
+# mapping of options accepted by getbundle and their types
+#
+# Meant to be extended by extensions. It is the extension's responsibility to
+# ensure such options are properly processed in exchange.getbundle.
+#
+# supported types are:
+#
+# :nodes: list of binary nodes, transmitted as space-separated hex nodes
+# :csv:   list of values, transmitted as comma-separated values
+# :scsv:  set of values, transmitted as comma-separated values
+# :plain: string with no transformation needed.
+GETBUNDLE_ARGUMENTS = {
+    b'heads': b'nodes',
+    b'bookmarks': b'boolean',
+    b'common': b'nodes',
+    b'obsmarkers': b'boolean',
+    b'phases': b'boolean',
+    b'bundlecaps': b'scsv',
+    b'listkeys': b'csv',
+    b'cg': b'boolean',
+    b'cbattempted': b'boolean',
+    b'stream': b'boolean',
+    b'includepats': b'csv',
+    b'excludepats': b'csv',
+}
+
+
+class baseprotocolhandler(interfaceutil.Interface):
+    """Abstract base class for wire protocol handlers.
+
+    A wire protocol handler serves as an interface between protocol command
+    handlers and the wire protocol transport layer. Protocol handlers provide
+    methods to read command arguments, redirect stdio for the duration of
+    the request, handle response types, etc.
+    """
+
+    name = interfaceutil.Attribute(
+        """The name of the protocol implementation.
+
+        Used for uniquely identifying the transport type.
+        """
+    )
+
+    def getargs(args):
+        """return the value for arguments in <args>
+
+        For version 1 transports, returns a list of values in the same
+        order they appear in ``args``. For version 2 transports, returns
+        a dict mapping argument name to value.
+        """
+
+    def getprotocaps():
+        """Returns the list of protocol-level capabilities of client
+
+        Returns a list of capabilities as declared by the client for
+        the current request (or connection for stateful protocol handlers)."""
+
+    def getpayload():
+        """Provide a generator for the raw payload.
+
+        The caller is responsible for ensuring that the full payload is
+        processed.
+        """
+
+    def mayberedirectstdio():
+        """Context manager to possibly redirect stdio.
+
+        The context manager yields a file-object like object that receives
+        stdout and stderr output when the context manager is active. Or it
+        yields ``None`` if no I/O redirection occurs.
+
+        The intent of this context manager is to capture stdio output
+        so it may be sent in the response. Some transports support streaming
+        stdio to the client in real time. For these transports, stdio output
+        won't be captured.
+        """
+
+    def client():
+        """Returns a string representation of this client (as bytes)."""
+
+    def addcapabilities(repo, caps):
+        """Adds advertised capabilities specific to this protocol.
+
+        Receives the list of capabilities collected so far.
+
+        Returns a list of capabilities. The passed in argument can be returned.
+        """
+
+    def checkperm(perm):
+        """Validate that the client has permissions to perform a request.
+
+        The argument is the permission required to proceed. If the client
+        doesn't have that permission, the exception should raise or abort
+        in a protocol specific manner.
+        """
+
+
+class commandentry:
+    """Represents a declared wire protocol command."""
+
+    def __init__(
+        self,
+        func,
+        args=b'',
+        transports=None,
+        permission=b'push',
+        cachekeyfn=None,
+        extracapabilitiesfn=None,
+    ):
+        self.func = func
+        self.args = args
+        self.transports = transports or set()
+        self.permission = permission
+        self.cachekeyfn = cachekeyfn
+        self.extracapabilitiesfn = extracapabilitiesfn
+
+    def _merge(self, func, args):
+        """Merge this instance with an incoming 2-tuple.
+
+        This is called when a caller using the old 2-tuple API attempts
+        to replace an instance. The incoming values are merged with
+        data not captured by the 2-tuple and a new instance containing
+        the union of the two objects is returned.
+        """
+        return commandentry(
+            func,
+            args=args,
+            transports=set(self.transports),
+            permission=self.permission,
+        )
+
+    # Old code treats instances as 2-tuples. So expose that interface.
+    def __iter__(self):
+        yield self.func
+        yield self.args
+
+    def __getitem__(self, i):
+        if i == 0:
+            return self.func
+        elif i == 1:
+            return self.args
+        else:
+            raise IndexError(b'can only access elements 0 and 1')
+
+
+class commanddict(dict):
+    """Container for registered wire protocol commands.
+
+    It behaves like a dict. But __setitem__ is overwritten to allow silent
+    coercion of values from 2-tuples for API compatibility.
+    """
+
+    def __setitem__(self, k, v):
+        if isinstance(v, commandentry):
+            pass
+        # Cast 2-tuples to commandentry instances.
+        elif isinstance(v, tuple):
+            if len(v) != 2:
+                raise ValueError(b'command tuples must have exactly 2 elements')
+
+            # It is common for extensions to wrap wire protocol commands via
+            # e.g. ``wireproto.commands[x] = (newfn, args)``. Because callers
+            # doing this aren't aware of the new API that uses objects to store
+            # command entries, we automatically merge old state with new.
+            if k in self:
+                v = self[k]._merge(v[0], v[1])
+            else:
+                # Use default values from @wireprotocommand.
+                v = commandentry(
+                    v[0],
+                    args=v[1],
+                    transports=set(TRANSPORTS),
+                    permission=b'push',
+                )
+        else:
+            raise ValueError(
+                b'command entries must be commandentry instances '
+                b'or 2-tuples'
+            )
+
+        return super(commanddict, self).__setitem__(k, v)
+
+    def commandavailable(self, command, proto):
+        """Determine if a command is available for the requested protocol."""
+        assert proto.name in TRANSPORTS
+
+        entry = self.get(command)
+
+        if not entry:
+            return False
+
+        if proto.name not in entry.transports:
+            return False
+
+        return True
+
+
+def supportedcompengines(ui, role):
+    """Obtain the list of supported compression engines for a request."""
+    assert role in (compression.CLIENTROLE, compression.SERVERROLE)
+
+    compengines = compression.compengines.supportedwireengines(role)
+
+    # Allow config to override default list and ordering.
+    if role == compression.SERVERROLE:
+        configengines = ui.configlist(b'server', b'compressionengines')
+        config = b'server.compressionengines'
+    else:
+        # This is currently implemented mainly to facilitate testing. In most
+        # cases, the server should be in charge of choosing a compression engine
+        # because a server has the most to lose from a sub-optimal choice. (e.g.
+        # CPU DoS due to an expensive engine or a network DoS due to poor
+        # compression ratio).
+        configengines = ui.configlist(
+            b'experimental', b'clientcompressionengines'
+        )
+        config = b'experimental.clientcompressionengines'
+
+    # No explicit config. Filter out the ones that aren't supposed to be
+    # advertised and return default ordering.
+    if not configengines:
+        attr = (
+            b'serverpriority' if role == util.SERVERROLE else b'clientpriority'
+        )
+        return [
+            e for e in compengines if getattr(e.wireprotosupport(), attr) > 0
+        ]
+
+    # If compression engines are listed in the config, assume there is a good
+    # reason for it (like server operators wanting to achieve specific
+    # performance characteristics). So fail fast if the config references
+    # unusable compression engines.
+    validnames = {e.name() for e in compengines}
+    invalidnames = {e for e in configengines if e not in validnames}
+    if invalidnames:
+        raise error.Abort(
+            _(b'invalid compression engine defined in %s: %s')
+            % (config, b', '.join(sorted(invalidnames)))
+        )
+
+    compengines = [e for e in compengines if e.name() in configengines]
+    compengines = sorted(
+        compengines, key=lambda e: configengines.index(e.name())
+    )
+
+    if not compengines:
+        raise error.Abort(
+            _(
+                b'%s config option does not specify any known '
+                b'compression engines'
+            )
+            % config,
+            hint=_(b'usable compression engines: %s')
+            % b', '.sorted(validnames),  # pytype: disable=attribute-error
+        )
+
+    return compengines
+
+
+@attr.s
+class encodedresponse:
+    """Represents response data that is already content encoded.
+
+    Wire protocol version 2 only.
+
+    Commands typically emit Python objects that are encoded and sent over the
+    wire. If commands emit an object of this type, the encoding step is bypassed
+    and the content from this object is used instead.
+    """
+
+    data = attr.ib()
+
+
+@attr.s
+class alternatelocationresponse:
+    """Represents a response available at an alternate location.
+
+    Instances are sent in place of actual response objects when the server
+    is sending a "content redirect" response.
+
+    Only compatible with wire protocol version 2.
+    """
+
+    url = attr.ib()
+    mediatype = attr.ib()
+    size = attr.ib(default=None)
+    fullhashes = attr.ib(default=None)
+    fullhashseed = attr.ib(default=None)
+    serverdercerts = attr.ib(default=None)
+    servercadercerts = attr.ib(default=None)
+
+
+@attr.s
+class indefinitebytestringresponse:
+    """Represents an object to be encoded to an indefinite length bytestring.
+
+    Instances are initialized from an iterable of chunks, with each chunk being
+    a bytes instance.
+    """
+
+    chunks = attr.ib()
+                                                   usr/lib/python3/dist-packages/mercurial/wireprotov1peer.py                                          0000644 0000000 0000000 00000052643 14355257011 022475  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        # wireprotov1peer.py - Client-side functionality for wire protocol version 1.
+#
+# Copyright 2005-2010 Olivia Mackall <olivia@selenic.com>
+#
+# This software may be used and distributed according to the terms of the
+# GNU General Public License version 2 or any later version.
+
+
+import sys
+import weakref
+
+from concurrent import futures
+from .i18n import _
+from .node import bin
+from .pycompat import (
+    getattr,
+    setattr,
+)
+from . import (
+    bundle2,
+    changegroup as changegroupmod,
+    encoding,
+    error,
+    pushkey as pushkeymod,
+    pycompat,
+    util,
+    wireprototypes,
+)
+from .interfaces import (
+    repository,
+    util as interfaceutil,
+)
+from .utils import hashutil
+
+urlreq = util.urlreq
+
+
+def batchable(f):
+    """annotation for batchable methods
+
+    Such methods must implement a coroutine as follows:
+
+    @batchable
+    def sample(self, one, two=None):
+        # Build list of encoded arguments suitable for your wire protocol:
+        encoded_args = [('one', encode(one),), ('two', encode(two),)]
+        # Return it, along with a function that will receive the result
+        # from the batched request.
+        return encoded_args, decode
+
+    The decorator returns a function which wraps this coroutine as a plain
+    method, but adds the original method as an attribute called "batchable",
+    which is used by remotebatch to split the call into separate encoding and
+    decoding phases.
+    """
+
+    def plain(*args, **opts):
+        encoded_args_or_res, decode = f(*args, **opts)
+        if not decode:
+            return encoded_args_or_res  # a local result in this case
+        self = args[0]
+        cmd = pycompat.bytesurl(f.__name__)  # ensure cmd is ascii bytestr
+        encoded_res = self._submitone(cmd, encoded_args_or_res)
+        return decode(encoded_res)
+
+    setattr(plain, 'batchable', f)
+    setattr(plain, '__name__', f.__name__)
+    return plain

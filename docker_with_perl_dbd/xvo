@@ -1,0 +1,1000 @@
+    """Duplicate streams and redirect original if (uin, uout) are stdio
+
+    If uin is stdin, it's redirected to /dev/null. If uout is stdout, it's
+    redirected to stderr so the output is still readable.
+
+    Returns (fin, fout) which point to the original (uin, uout) fds, but
+    may be copy of (uin, uout). The returned streams can be considered
+    "owned" in that print(), exec(), etc. never reach to them.
+    """
+    uout.flush()
+    fin, fout = uin, uout
+    if _testfileno(uin, stdin):
+        newfd = os.dup(uin.fileno())
+        nullfd = os.open(os.devnull, os.O_RDONLY)
+        os.dup2(nullfd, uin.fileno())
+        os.close(nullfd)
+        fin = os.fdopen(newfd, 'rb')
+    if _testfileno(uout, stdout):
+        newfd = os.dup(uout.fileno())
+        os.dup2(stderr.fileno(), uout.fileno())
+        fout = os.fdopen(newfd, 'wb')
+    return fin, fout
+
+
+def restorestdio(uin, uout, fin, fout):
+    """Restore (uin, uout) streams from possibly duplicated (fin, fout)"""
+    uout.flush()
+    for f, uif in [(fin, uin), (fout, uout)]:
+        if f is not uif:
+            os.dup2(f.fileno(), uif.fileno())
+            f.close()
+
+
+def shellenviron(environ=None):
+    """return environ with optional override, useful for shelling out"""
+
+    def py2shell(val):
+        """convert python object into string that is useful to shell"""
+        if val is None or val is False:
+            return b'0'
+        if val is True:
+            return b'1'
+        return pycompat.bytestr(val)
+
+    env = dict(encoding.environ)
+    if environ:
+        env.update((k, py2shell(v)) for k, v in environ.items())
+    env[b'HG'] = hgexecutable()
+    return env
+
+
+if pycompat.iswindows:
+
+    def shelltonative(cmd, env):
+        return platform.shelltocmdexe(  # pytype: disable=module-attr
+            cmd, shellenviron(env)
+        )
+
+    tonativestr = encoding.strfromlocal
+else:
+
+    def shelltonative(cmd, env):
+        return cmd
+
+    tonativestr = pycompat.identity
+
+
+def tonativeenv(env):
+    """convert the environment from bytes to strings suitable for Popen(), etc."""
+    return pycompat.rapply(tonativestr, env)
+
+
+def system(cmd, environ=None, cwd=None, out=None):
+    """enhanced shell command execution.
+    run with environment maybe modified, maybe in different dir.
+
+    if out is specified, it is assumed to be a file-like object that has a
+    write() method. stdout and stderr will be redirected to out."""
+    try:
+        stdout.flush()
+    except Exception:
+        pass
+    env = shellenviron(environ)
+    if out is None or isstdout(out):
+        rc = subprocess.call(
+            tonativestr(cmd),
+            shell=True,
+            close_fds=closefds,
+            env=tonativeenv(env),
+            cwd=pycompat.rapply(tonativestr, cwd),
+        )
+    else:
+        proc = subprocess.Popen(
+            tonativestr(cmd),
+            shell=True,
+            close_fds=closefds,
+            env=tonativeenv(env),
+            cwd=pycompat.rapply(tonativestr, cwd),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+        for line in iter(proc.stdout.readline, b''):
+            out.write(line)
+        proc.wait()
+        rc = proc.returncode
+    if pycompat.sysplatform == b'OpenVMS' and rc & 1:
+        rc = 0
+    return rc
+
+
+_is_gui = None
+
+
+def _gui():
+    '''Are we running in a GUI?'''
+    if pycompat.isdarwin:
+        if b'SSH_CONNECTION' in encoding.environ:
+            # handle SSH access to a box where the user is logged in
+            return False
+        elif getattr(osutil, 'isgui', None):
+            # check if a CoreGraphics session is available
+            return osutil.isgui()
+        else:
+            # pure build; use a safe default
+            return True
+    else:
+        return (
+            pycompat.iswindows
+            or encoding.environ.get(b"DISPLAY")
+            or encoding.environ.get(b"WAYLAND_DISPLAY")
+        )
+
+
+def gui():
+    global _is_gui
+    if _is_gui is None:
+        _is_gui = _gui()
+    return _is_gui
+
+
+def hgcmd():
+    """Return the command used to execute current hg
+
+    This is different from hgexecutable() because on Windows we want
+    to avoid things opening new shell windows like batch files, so we
+    get either the python call or current executable.
+    """
+    if resourceutil.mainfrozen():
+        if getattr(sys, 'frozen', None) == 'macosx_app':
+            # Env variable set by py2app
+            return [encoding.environ[b'EXECUTABLEPATH']]
+        else:
+            return [pycompat.sysexecutable]
+    return _gethgcmd()
+
+
+def rundetached(args, condfn):
+    """Execute the argument list in a detached process.
+
+    condfn is a callable which is called repeatedly and should return
+    True once the child process is known to have started successfully.
+    At this point, the child process PID is returned. If the child
+    process fails to start or finishes before condfn() evaluates to
+    True, return -1.
+    """
+    # Windows case is easier because the child process is either
+    # successfully starting and validating the condition or exiting
+    # on failure. We just poll on its PID. On Unix, if the child
+    # process fails to start, it will be left in a zombie state until
+    # the parent wait on it, which we cannot do since we expect a long
+    # running process on success. Instead we listen for SIGCHLD telling
+    # us our child process terminated.
+    terminated = set()
+
+    def handler(signum, frame):
+        terminated.add(os.wait())
+
+    prevhandler = None
+    SIGCHLD = getattr(signal, 'SIGCHLD', None)
+    if SIGCHLD is not None:
+        prevhandler = signal.signal(SIGCHLD, handler)
+    try:
+        pid = spawndetached(args)
+        while not condfn():
+            if (pid in terminated or not testpid(pid)) and not condfn():
+                return -1
+            time.sleep(0.1)
+        return pid
+    finally:
+        if prevhandler is not None:
+            signal.signal(signal.SIGCHLD, prevhandler)
+
+
+@contextlib.contextmanager
+def uninterruptible(warn):
+    """Inhibit SIGINT handling on a region of code.
+
+    Note that if this is called in a non-main thread, it turns into a no-op.
+
+    Args:
+      warn: A callable which takes no arguments, and returns True if the
+            previous signal handling should be restored.
+    """
+
+    oldsiginthandler = [signal.getsignal(signal.SIGINT)]
+    shouldbail = []
+
+    def disabledsiginthandler(*args):
+        if warn():
+            signal.signal(signal.SIGINT, oldsiginthandler[0])
+            del oldsiginthandler[0]
+        shouldbail.append(True)
+
+    try:
+        try:
+            signal.signal(signal.SIGINT, disabledsiginthandler)
+        except ValueError:
+            # wrong thread, oh well, we tried
+            del oldsiginthandler[0]
+        yield
+    finally:
+        if oldsiginthandler:
+            signal.signal(signal.SIGINT, oldsiginthandler[0])
+        if shouldbail:
+            raise KeyboardInterrupt
+
+
+if pycompat.iswindows:
+    # no fork on Windows, but we can create a detached process
+    # https://msdn.microsoft.com/en-us/library/windows/desktop/ms684863.aspx
+    # No stdlib constant exists for this value
+    DETACHED_PROCESS = 0x00000008
+    # Following creation flags might create a console GUI window.
+    # Using subprocess.CREATE_NEW_CONSOLE might helps.
+    # See https://phab.mercurial-scm.org/D1701 for discussion
+    _creationflags = (
+        DETACHED_PROCESS
+        | subprocess.CREATE_NEW_PROCESS_GROUP  # pytype: disable=module-attr
+    )
+
+    def runbgcommand(
+        script,
+        env,
+        shell=False,
+        stdout=None,
+        stderr=None,
+        ensurestart=True,
+        record_wait=None,
+        stdin_bytes=None,
+    ):
+        '''Spawn a command without waiting for it to finish.'''
+        # we can't use close_fds *and* redirect stdin. I'm not sure that we
+        # need to because the detached process has no console connection.
+
+        try:
+            stdin = None
+            if stdin_bytes is not None:
+                stdin = pycompat.unnamedtempfile()
+                stdin.write(stdin_bytes)
+                stdin.flush()
+                stdin.seek(0)
+
+            p = subprocess.Popen(
+                pycompat.rapply(tonativestr, script),
+                shell=shell,
+                env=tonativeenv(env),
+                close_fds=True,
+                creationflags=_creationflags,
+                stdin=stdin,
+                stdout=stdout,
+                stderr=stderr,
+            )
+            if record_wait is not None:
+                record_wait(p.wait)
+        finally:
+            if stdin is not None:
+                stdin.close()
+
+
+else:
+
+    def runbgcommand(
+        cmd,
+        env,
+        shell=False,
+        stdout=None,
+        stderr=None,
+        ensurestart=True,
+        record_wait=None,
+        stdin_bytes=None,
+    ):
+        """Spawn a command without waiting for it to finish.
+
+
+        When `record_wait` is not None, the spawned process will not be fully
+        detached and the `record_wait` argument will be called with a the
+        `Subprocess.wait` function for the spawned process.  This is mostly
+        useful for developers that need to make sure the spawned process
+        finished before a certain point. (eg: writing test)"""
+        if pycompat.isdarwin:
+            # avoid crash in CoreFoundation in case another thread
+            # calls gui() while we're calling fork().
+            gui()
+
+        if shell:
+            script = cmd
+        else:
+            if isinstance(cmd, bytes):
+                cmd = [cmd]
+            script = b' '.join(shellquote(x) for x in cmd)
+        if record_wait is None:
+            # double-fork to completely detach from the parent process
+            script = b'( %s ) &' % script
+            start_new_session = True
+        else:
+            start_new_session = False
+            ensurestart = True
+
+        stdin = None
+
+        try:
+            if stdin_bytes is None:
+                stdin = subprocess.DEVNULL
+            else:
+                stdin = pycompat.unnamedtempfile()
+                stdin.write(stdin_bytes)
+                stdin.flush()
+                stdin.seek(0)
+            if stdout is None:
+                stdout = subprocess.DEVNULL
+            if stderr is None:
+                stderr = subprocess.DEVNULL
+
+            p = subprocess.Popen(
+                script,
+                shell=True,
+                env=env,
+                close_fds=True,
+                stdin=stdin,
+                stdout=stdout,
+                stderr=stderr,
+                start_new_session=start_new_session,
+            )
+        except Exception:
+            if record_wait is not None:
+                record_wait(255)
+            raise
+        finally:
+            if stdin_bytes is not None and stdin is not None:
+                assert not isinstance(stdin, int)
+                stdin.close()
+        if not ensurestart:
+            # Even though we're not waiting on the child process,
+            # we still must call waitpid() on it at some point so
+            # it's not a zombie/defunct. This is especially relevant for
+            # chg since the parent process won't die anytime soon.
+            # We use a thread to make the overhead tiny.
+            t = threading.Thread(target=lambda: p.wait)
+            t.daemon = True
+            t.start()
+        else:
+            returncode = p.wait
+            if record_wait is not None:
+                record_wait(returncode)
+                                                                                                                                                                                                                                                                                                                                                                                                                                                 usr/lib/python3/dist-packages/mercurial/utils/repoviewutil.py                                       0000644 0000000 0000000 00000001365 14355257011 023211  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        # repoviewutil.py - constaints data relevant to repoview.py and other module
+#
+# Copyright 2012 Pierre-Yves David <pierre-yves.david@ens-lyon.org>
+#                Logilab SA        <contact@logilab.fr>
+#
+# This software may be used and distributed according to the terms of the
+# GNU General Public License version 2 or any later version.
+
+
+### Nearest subset relation
+# Nearest subset of filter X is a filter Y so that:
+# * Y is included in X,
+# * X - Y is as small as possible.
+# This create and ordering used for branchmap purpose.
+# the ordering may be partial
+subsettable = {
+    None: b'visible',
+    b'visible-hidden': b'visible',
+    b'visible': b'served',
+    b'served.hidden': b'served',
+    b'served': b'immutable',
+    b'immutable': b'base',
+}
+                                                                                                                                                                                                                                                                           usr/lib/python3/dist-packages/mercurial/utils/resourceutil.py                                       0000644 0000000 0000000 00000007434 14374730616 023213  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        # resourceutil.py - utility for looking up resources
+#
+#  Copyright 2005 K. Thananchayan <thananck@yahoo.com>
+#  Copyright 2005-2007 Olivia Mackall <olivia@selenic.com>
+#  Copyright 2006 Vadim Gelfer <vadim.gelfer@gmail.com>
+#
+# This software may be used and distributed according to the terms of the
+# GNU General Public License version 2 or any later version.
+
+
+import imp
+import os
+import sys
+
+from .. import pycompat
+
+
+def mainfrozen():
+    """return True if we are a frozen executable.
+
+    The code supports py2exe (most common, Windows only) and tools/freeze
+    (portable, not much used).
+    """
+    return (
+        pycompat.safehasattr(sys, "frozen")  # new py2exe
+        or pycompat.safehasattr(sys, "importers")  # old py2exe
+        or imp.is_frozen("__main__")  # tools/freeze
+    )
+
+
+# the location of data files matching the source code
+if mainfrozen() and getattr(sys, "frozen", None) != "macosx_app":
+    # executable version (py2exe) doesn't support __file__
+    datapath = os.path.dirname(pycompat.sysexecutable)
+    _rootpath = datapath
+
+    # The installers store the files outside of library.zip, like
+    # C:\Program Files\Mercurial\defaultrc\*.rc.  This strips the
+    # leading "mercurial." off of the package name, so that these
+    # pseudo resources are found in their directory next to the
+    # executable.
+    def _package_path(package):
+        dirs = package.split(b".")
+        assert dirs[0] == b"mercurial"
+        return os.path.join(_rootpath, *dirs[1:])
+
+
+else:
+    datapath = os.path.dirname(os.path.dirname(pycompat.fsencode(__file__)))
+    _rootpath = os.path.dirname(datapath)
+
+    def _package_path(package):
+        return os.path.join(_rootpath, *package.split(b"."))
+
+
+try:
+    # importlib.resources exists from Python 3.7; see fallback in except clause
+    # further down
+    from importlib import resources  # pytype: disable=import-error
+
+    # Force loading of the resources module
+    if pycompat.safehasattr(resources, 'files'):
+        resources.files  # pytype: disable=module-attr
+    else:
+        resources.open_binary  # pytype: disable=module-attr
+
+    # py2exe raises an AssertionError if uses importlib.resources
+    if getattr(sys, "frozen", None) in ("console_exe", "windows_exe"):
+        raise ImportError
+
+except (ImportError, AttributeError):
+    # importlib.resources was not found (almost definitely because we're on a
+    # Python version before 3.7)
+
+    def open_resource(package, name):
+        path = os.path.join(_package_path(package), name)
+        return open(path, "rb")
+
+    def is_resource(package, name):
+        path = os.path.join(_package_path(package), name)
+
+        try:
+            return os.path.isfile(pycompat.fsdecode(path))
+        except (IOError, OSError):
+            return False
+
+    def contents(package):
+        path = pycompat.fsdecode(_package_path(package))
+
+        for p in os.listdir(path):
+            yield pycompat.fsencode(p)
+
+
+else:
+    from .. import encoding
+
+    def open_resource(package, name):
+        if pycompat.safehasattr(resources, 'files'):
+            return (
+                resources.files(  # pytype: disable=module-attr
+                    pycompat.sysstr(package)
+                )
+                .joinpath(pycompat.sysstr(name))
+                .open('rb')
+            )
+        else:
+            return resources.open_binary(  # pytype: disable=module-attr
+                pycompat.sysstr(package), pycompat.sysstr(name)
+            )
+
+    def is_resource(package, name):
+        return resources.is_resource(  # pytype: disable=module-attr
+            pycompat.sysstr(package), encoding.strfromlocal(name)
+        )
+
+    def contents(package):
+        # pytype: disable=module-attr
+        for r in resources.contents(pycompat.sysstr(package)):
+            # pytype: enable=module-attr
+            yield encoding.strtolocal(r)
+                                                                                                                                                                                                                                    usr/lib/python3/dist-packages/mercurial/utils/storageutil.py                                        0000644 0000000 0000000 00000042216 14355257011 023015  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        # storageutil.py - Storage functionality agnostic of backend implementation.
+#
+# Copyright 2018 Gregory Szorc <gregory.szorc@gmail.com>
+#
+# This software may be used and distributed according to the terms of the
+# GNU General Public License version 2 or any later version.
+
+
+import re
+import struct
+
+from ..i18n import _
+from ..node import (
+    bin,
+    nullrev,
+    sha1nodeconstants,
+)
+from .. import (
+    dagop,
+    error,
+    mdiff,
+)
+from ..interfaces import repository
+from ..revlogutils import sidedata as sidedatamod
+from ..utils import hashutil
+
+_nullhash = hashutil.sha1(sha1nodeconstants.nullid)
+
+# revision data contains extra metadata not part of the official digest
+# Only used in changegroup >= v4.
+CG_FLAG_SIDEDATA = 1
+
+
+def hashrevisionsha1(text, p1, p2):
+    """Compute the SHA-1 for revision data and its parents.
+
+    This hash combines both the current file contents and its history
+    in a manner that makes it easy to distinguish nodes with the same
+    content in the revision graph.
+    """
+    # As of now, if one of the parent node is null, p2 is null
+    if p2 == sha1nodeconstants.nullid:
+        # deep copy of a hash is faster than creating one
+        s = _nullhash.copy()
+        s.update(p1)
+    else:
+        # none of the parent nodes are nullid
+        if p1 < p2:
+            a = p1
+            b = p2
+        else:
+            a = p2
+            b = p1
+        s = hashutil.sha1(a)
+        s.update(b)
+    s.update(text)
+    return s.digest()
+
+
+METADATA_RE = re.compile(b'\x01\n')
+
+
+def parsemeta(text):
+    """Parse metadata header from revision data.
+
+    Returns a 2-tuple of (metadata, offset), where both can be None if there
+    is no metadata.
+    """
+    # text can be buffer, so we can't use .startswith or .index
+    if text[:2] != b'\x01\n':
+        return None, None
+    s = METADATA_RE.search(text, 2).start()
+    mtext = text[2:s]
+    meta = {}
+    for l in mtext.splitlines():
+        k, v = l.split(b': ', 1)
+        meta[k] = v
+    return meta, s + 2
+
+
+def packmeta(meta, text):
+    """Add metadata to fulltext to produce revision text."""
+    keys = sorted(meta)
+    metatext = b''.join(b'%s: %s\n' % (k, meta[k]) for k in keys)
+    return b'\x01\n%s\x01\n%s' % (metatext, text)
+
+
+def iscensoredtext(text):
+    meta = parsemeta(text)[0]
+    return meta and b'censored' in meta
+
+
+def filtermetadata(text):
+    """Extract just the revision data from source text.
+
+    Returns ``text`` unless it has a metadata header, in which case we return
+    a new buffer without hte metadata.
+    """
+    if not text.startswith(b'\x01\n'):
+        return text
+
+    offset = text.index(b'\x01\n', 2)
+    return text[offset + 2 :]
+
+
+def filerevisioncopied(store, node):
+    """Resolve file revision copy metadata.
+
+    Returns ``False`` if the file has no copy metadata. Otherwise a
+    2-tuple of the source filename and node.
+    """
+    if store.parents(node)[0] != sha1nodeconstants.nullid:
+        # When creating a copy or move we set filelog parents to null,
+        # because contents are probably unrelated and making a delta
+        # would not be useful.
+        # Conversely, if filelog p1 is non-null we know
+        # there is no copy metadata.
+        # In the presence of merges, this reasoning becomes invalid
+        # if we reorder parents. See tests/test-issue6528.t.
+        return False
+
+    meta = parsemeta(store.revision(node))[0]
+
+    # copy and copyrev occur in pairs. In rare cases due to old bugs,
+    # one can occur without the other. So ensure both are present to flag
+    # as a copy.
+    if meta and b'copy' in meta and b'copyrev' in meta:
+        return meta[b'copy'], bin(meta[b'copyrev'])
+
+    return False
+
+
+def filedataequivalent(store, node, filedata):
+    """Determines whether file data is equivalent to a stored node.
+
+    Returns True if the passed file data would hash to the same value
+    as a stored revision and False otherwise.
+
+    When a stored revision is censored, filedata must be empty to have
+    equivalence.
+
+    When a stored revision has copy metadata, it is ignored as part
+    of the compare.
+    """
+
+    if filedata.startswith(b'\x01\n'):
+        revisiontext = b'\x01\n\x01\n' + filedata
+    else:
+        revisiontext = filedata
+
+    p1, p2 = store.parents(node)
+
+    computednode = hashrevisionsha1(revisiontext, p1, p2)
+
+    if computednode == node:
+        return True
+
+    # Censored files compare against the empty file.
+    if store.iscensored(store.rev(node)):
+        return filedata == b''
+
+    # Renaming a file produces a different hash, even if the data
+    # remains unchanged. Check if that's the case.
+    if store.renamed(node):
+        return store.read(node) == filedata
+
+    return False
+
+
+def iterrevs(storelen, start=0, stop=None):
+    """Iterate over revision numbers in a store."""
+    step = 1
+
+    if stop is not None:
+        if start > stop:
+            step = -1
+        stop += step
+        if stop > storelen:
+            stop = storelen
+    else:
+        stop = storelen
+
+    return range(start, stop, step)
+
+
+def fileidlookup(store, fileid, identifier):
+    """Resolve the file node for a value.
+
+    ``store`` is an object implementing the ``ifileindex`` interface.
+
+    ``fileid`` can be:
+
+    * A 20 or 32 byte binary node.
+    * An integer revision number
+    * A 40 or 64 byte hex node.
+    * A bytes that can be parsed as an integer representing a revision number.
+
+    ``identifier`` is used to populate ``error.LookupError`` with an identifier
+    for the store.
+
+    Raises ``error.LookupError`` on failure.
+    """
+    if isinstance(fileid, int):
+        try:
+            return store.node(fileid)
+        except IndexError:
+            raise error.LookupError(
+                b'%d' % fileid, identifier, _(b'no match found')
+            )
+
+    if len(fileid) in (20, 32):
+        try:
+            store.rev(fileid)
+            return fileid
+        except error.LookupError:
+            pass
+
+    if len(fileid) in (40, 64):
+        try:
+            rawnode = bin(fileid)
+            store.rev(rawnode)
+            return rawnode
+        except TypeError:
+            pass
+
+    try:
+        rev = int(fileid)
+
+        if b'%d' % rev != fileid:
+            raise ValueError
+
+        try:
+            return store.node(rev)
+        except (IndexError, TypeError):
+            pass
+    except (ValueError, OverflowError):
+        pass
+
+    raise error.LookupError(fileid, identifier, _(b'no match found'))
+
+
+def resolvestripinfo(minlinkrev, tiprev, headrevs, linkrevfn, parentrevsfn):
+    """Resolve information needed to strip revisions.
+
+    Finds the minimum revision number that must be stripped in order to
+    strip ``minlinkrev``.
+
+    Returns a 2-tuple of the minimum revision number to do that and a set
+    of all revision numbers that have linkrevs that would be broken
+    by that strip.
+
+    ``tiprev`` is the current tip-most revision. It is ``len(store) - 1``.
+    ``headrevs`` is an iterable of head revisions.
+    ``linkrevfn`` is a callable that receives a revision and returns a linked
+    revision.
+    ``parentrevsfn`` is a callable that receives a revision number and returns
+    an iterable of its parent revision numbers.
+    """
+    brokenrevs = set()
+    strippoint = tiprev + 1
+
+    heads = {}
+    futurelargelinkrevs = set()
+    for head in headrevs:
+        headlinkrev = linkrevfn(head)
+        heads[head] = headlinkrev
+        if headlinkrev >= minlinkrev:
+            futurelargelinkrevs.add(headlinkrev)
+
+    # This algorithm involves walking down the rev graph, starting at the
+    # heads. Since the revs are topologically sorted according to linkrev,
+    # once all head linkrevs are below the minlink, we know there are
+    # no more revs that could have a linkrev greater than minlink.
+    # So we can stop walking.
+    while futurelargelinkrevs:
+        strippoint -= 1
+        linkrev = heads.pop(strippoint)
+
+        if linkrev < minlinkrev:
+            brokenrevs.add(strippoint)
+        else:
+            futurelargelinkrevs.remove(linkrev)
+
+        for p in parentrevsfn(strippoint):
+            if p != nullrev:
+                plinkrev = linkrevfn(p)
+                heads[p] = plinkrev
+                if plinkrev >= minlinkrev:
+                    futurelargelinkrevs.add(plinkrev)
+
+    return strippoint, brokenrevs
+
+
+def emitrevisions(
+    store,
+    nodes,
+    nodesorder,
+    resultcls,
+    deltaparentfn=None,
+    candeltafn=None,
+    rawsizefn=None,
+    revdifffn=None,
+    flagsfn=None,
+    deltamode=repository.CG_DELTAMODE_STD,
+    revisiondata=False,
+    assumehaveparentrevisions=False,
+    sidedata_helpers=None,
+):
+    """Generic implementation of ifiledata.emitrevisions().
+
+    Emitting revision data is subtly complex. This function attempts to
+    encapsulate all the logic for doing so in a backend-agnostic way.
+
+    ``store``
+       Object conforming to ``ifilestorage`` interface.
+
+    ``nodes``
+       List of revision nodes whose data to emit.
+
+    ``resultcls``
+       A type implementing the ``irevisiondelta`` interface that will be
+       constructed and returned.
+
+    ``deltaparentfn`` (optional)
+       Callable receiving a revision number and returning the revision number
+       of a revision that the internal delta is stored against. This delta
+       will be preferred over computing a new arbitrary delta.
+
+       If not defined, a delta will always be computed from raw revision
+       data.
+
+    ``candeltafn`` (optional)
+       Callable receiving a pair of revision numbers that returns a bool
+       indicating whether a delta between them can be produced.
+
+       If not defined, it is assumed that any two revisions can delta with
+       each other.
+
+    ``rawsizefn`` (optional)
+       Callable receiving a revision number and returning the length of the
+       ``store.rawdata(rev)``.
+
+       If not defined, ``len(store.rawdata(rev))`` will be called.
+
+    ``revdifffn`` (optional)
+       Callable receiving a pair of revision numbers that returns a delta
+       between them.
+
+       If not defined, a delta will be computed by invoking mdiff code
+       on ``store.revision()`` results.
+
+       Defining this function allows a precomputed or stored delta to be
+       used without having to compute on.
+
+    ``flagsfn`` (optional)
+       Callable receiving a revision number and returns the integer flags
+       value for it. If not defined, flags value will be 0.
+
+    ``deltamode``
+       constaint on delta to be sent:
+       * CG_DELTAMODE_STD  - normal mode, try to reuse storage deltas,
+       * CG_DELTAMODE_PREV - only delta against "prev",
+       * CG_DELTAMODE_FULL - only issue full snapshot.
+
+       Whether to send fulltext revisions instead of deltas, if allowed.
+
+    ``nodesorder``
+    ``revisiondata``
+    ``assumehaveparentrevisions``
+    ``sidedata_helpers`` (optional)
+        If not None, means that sidedata should be included.
+        See `revlogutil.sidedata.get_sidedata_helpers`.
+    """
+
+    fnode = store.node
+    frev = store.rev
+    parents = store.parentrevs
+
+    if nodesorder == b'nodes':
+        revs = [frev(n) for n in nodes]
+    elif nodesorder == b'linear':
+        revs = {frev(n) for n in nodes}
+        revs = dagop.linearize(revs, store.parentrevs)
+    else:  # storage and default
+        revs = sorted(frev(n) for n in nodes)
+
+    prevrev = None
+
+    if deltamode == repository.CG_DELTAMODE_PREV or assumehaveparentrevisions:
+        prevrev = parents(revs[0])[0]
+
+    # Sets of revs available to delta against.
+    emitted = set()
+    available = set()
+    if assumehaveparentrevisions:
+        common_heads = set(p for r in revs for p in parents(r))
+        common_heads.difference_update(revs)
+        available = store.ancestors(common_heads, inclusive=True)
+
+    def is_usable_base(rev):
+        """Is a delta against this revision usable over the wire"""
+        if rev == nullrev:
+            return False
+        return rev in emitted or rev in available
+
+    for rev in revs:
+        if rev == nullrev:
+            continue
+
+        node = fnode(rev)
+        p1rev, p2rev = parents(rev)
+
+        if deltaparentfn:
+            deltaparentrev = deltaparentfn(rev)
+        else:
+            deltaparentrev = nullrev
+
+        # Forced delta against previous mode.
+        if deltamode == repository.CG_DELTAMODE_PREV:
+            baserev = prevrev
+
+        # We're instructed to send fulltext. Honor that.
+        elif deltamode == repository.CG_DELTAMODE_FULL:
+            baserev = nullrev
+        # We're instructed to use p1. Honor that
+        elif deltamode == repository.CG_DELTAMODE_P1:
+            baserev = p1rev
+
+        # There is a delta in storage. We try to use that because it
+        # amounts to effectively copying data from storage and is
+        # therefore the fastest.
+        elif is_usable_base(deltaparentrev):
+            baserev = deltaparentrev
+        else:
+            # No guarantee the receiver has the delta parent, or Storage has a
+            # fulltext revision.
+            #
+            # We compute a delta on the fly to send over the wire.
+            #
+            # We start with a try against p1, which in the common case should
+            # be close to this revision content.
+            #
+            # note: we could optimize between p1 and p2 in merges cases.
+            if is_usable_base(p1rev):
+                baserev = p1rev
+            # if p1 was not an option, try p2
+            elif is_usable_base(p2rev):
+                baserev = p2rev
+            # Send delta against prev in despair
+            #
+            # using the closest available ancestors first might be better?
+            elif prevrev is not None:
+                baserev = prevrev
+            else:
+                baserev = nullrev
+
+        # But we can't actually use our chosen delta base for whatever
+        # reason. Reset to fulltext.
+        if baserev != nullrev and (candeltafn and not candeltafn(baserev, rev)):
+            baserev = nullrev
+
+        revision = None
+        delta = None
+        baserevisionsize = None
+
+        if revisiondata:
+            if store.iscensored(baserev) or store.iscensored(rev):
+                try:
+                    revision = store.rawdata(node)
+                except error.CensoredNodeError as e:
+                    revision = e.tombstone
+
+                if baserev != nullrev:
+                    if rawsizefn:
+                        baserevisionsize = rawsizefn(baserev)
+                    else:
+                        baserevisionsize = len(store.rawdata(baserev))
+
+            elif (
+                baserev == nullrev and deltamode != repository.CG_DELTAMODE_PREV
+            ):
+                revision = store.rawdata(node)
+                emitted.add(rev)
+            else:
+                if revdifffn:
+                    delta = revdifffn(baserev, rev)
+                else:
+                    delta = mdiff.textdiff(
+                        store.rawdata(baserev), store.rawdata(rev)
+                    )
+
+                emitted.add(rev)
+

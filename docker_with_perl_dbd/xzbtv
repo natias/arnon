@@ -1,0 +1,1000 @@
+sub _exe_files {
+    my($self) = @_;
+    return unless $self->{writemakefile}  # no need to have succeeded
+                                          # but we must have run it
+        || $self->{modulebuild};
+    unless ($self->{build_dir}) {
+        return;
+    }
+    CPAN->debug(sprintf "writemakefile[%s]modulebuild[%s]",
+                $self->{writemakefile}||"",
+                $self->{modulebuild}||"",
+               ) if $CPAN::DEBUG;
+    my $build_dir;
+    unless ( $build_dir = $self->{build_dir} ) {
+        return;
+    }
+    my $makefile = File::Spec->catfile($build_dir,"Makefile");
+    my $fh;
+    my @exe_files;
+    if (-f $makefile
+        and
+        $fh = FileHandle->new("<$makefile\0")) {
+        CPAN->debug("Getting exefiles from Makefile") if $CPAN::DEBUG;
+        local($/) = "\n";
+        while (<$fh>) {
+            last if /MakeMaker post_initialize section/;
+            my($p) = m{^[\#]
+                       \s+EXE_FILES\s+=>\s+\[(.+)\]
+                  }x;
+            next unless $p;
+            # warn "Found exefiles expr[$p]";
+            my @p = split /,\s*/, $p;
+            for my $p2 (@p) {
+                if ($p2 =~ /^q\[(.+)\]/) {
+                    push @exe_files, $1;
+                }
+            }
+        }
+    }
+    return \@exe_files if @exe_files;
+    my $buildparams = File::Spec->catfile($build_dir,"_build","build_params");
+    if (-f $buildparams) {
+        CPAN->debug("Found '$buildparams'") if $CPAN::DEBUG;
+        my $x = do $buildparams;
+        for my $sf ($x->[2]{script_files}) {
+            if (my $reftype = ref $sf) {
+                if ($reftype eq "ARRAY") {
+                    push @exe_files, @$sf;
+                }
+                elsif ($reftype eq "HASH") {
+                    push @exe_files, keys %$sf;
+                }
+                else {
+                    $CPAN::Frontend->mywarn("Invalid reftype $reftype for Build.PL 'script_files'\n");
+                }
+            }
+            elsif (defined $sf) {
+                push @exe_files, $sf;
+            }
+        }
+    }
+    return \@exe_files;
+}
+
+#-> sub CPAN::Distribution::test ;
+sub test {
+    my($self) = @_;
+
+    $self->pre_test();
+
+    if (exists $self->{cleanup_after_install_done}) {
+        $self->post_test();
+        return $self->make;
+    }
+
+    $self->debug("checking goto id[$self->{ID}]") if $CPAN::DEBUG;
+    if (my $goto = $self->prefs->{goto}) {
+        $self->post_test();
+        return $self->goto($goto);
+    }
+
+    unless ($self->make){
+        $self->post_test();
+        return;
+    }
+
+    if ( defined( my $sc = $self->shortcut_test ) ) {
+        $self->post_test();
+        return $sc;
+    }
+
+    if ($CPAN::Signal) {
+        delete $self->{force_update};
+        $self->post_test();
+        return;
+    }
+    # warn "XDEBUG: checking for notest: $self->{notest} $self";
+    my $make = $self->{modulebuild} ? "Build" : "make";
+
+    local $ENV{PERL5LIB} = defined($ENV{PERL5LIB})
+                           ? $ENV{PERL5LIB}
+                           : ($ENV{PERLLIB} || "");
+
+    local $ENV{PERL5OPT} = defined $ENV{PERL5OPT} ? $ENV{PERL5OPT} : "";
+    local $ENV{PERL_USE_UNSAFE_INC} =
+        exists $ENV{PERL_USE_UNSAFE_INC} && defined $ENV{PERL_USE_UNSAFE_INC}
+        ? $ENV{PERL_USE_UNSAFE_INC} : 1; # test
+    $CPAN::META->set_perl5lib;
+    local $ENV{MAKEFLAGS}; # protect us from outer make calls
+    local $ENV{PERL_MM_USE_DEFAULT} = 1 if $CPAN::Config->{use_prompt_default};
+    local $ENV{NONINTERACTIVE_TESTING} = 1 if $CPAN::Config->{use_prompt_default};
+
+    if ($run_allow_installing_within_test) {
+        my($allow_installing, $why) = $self->_allow_installing;
+        if (! $allow_installing) {
+            $CPAN::Frontend->mywarn("Testing/Installation stopped: $why\n");
+            $self->introduce_myself;
+            $self->{make_test} = CPAN::Distrostatus->new("NO -- testing/installation stopped due $why");
+            $CPAN::Frontend->mywarn("  [testing] -- NOT OK\n");
+            delete $self->{force_update};
+            $self->post_test();
+            return;
+        }
+    }
+    $CPAN::Frontend->myprint(sprintf "Running %s test for %s\n", $make, $self->pretty_id);
+
+    my $builddir = $self->dir or
+        $CPAN::Frontend->mydie("PANIC: Cannot determine build directory\n");
+
+    unless (chdir $builddir) {
+        $CPAN::Frontend->mywarn("Couldn't chdir to '$builddir': $!");
+        $self->post_test();
+        return;
+    }
+
+    $self->debug("Changed directory to $self->{build_dir}")
+        if $CPAN::DEBUG;
+
+    if ($^O eq 'MacOS') {
+        Mac::BuildTools::make_test($self);
+        $self->post_test();
+        return;
+    }
+
+    if ($self->{modulebuild}) {
+        my $thm = CPAN::Shell->expand("Module","Test::Harness");
+        my $v = $thm->inst_version;
+        if (CPAN::Version->vlt($v,2.62)) {
+            # XXX Eric Wilhelm reported this as a bug: klapperl:
+            # Test::Harness 3.0 self-tests, so that should be 'unless
+            # installing Test::Harness'
+            unless ($self->id eq $thm->distribution->id) {
+                $CPAN::Frontend->mywarn(qq{The version of your Test::Harness is only
+  '$v', you need at least '2.62'. Please upgrade your Test::Harness.\n});
+                $self->{make_test} = CPAN::Distrostatus->new("NO Test::Harness too old");
+                $self->post_test();
+                return;
+            }
+        }
+    }
+
+    if ( ! $self->{force_update}  ) {
+        # bypass actual tests if "trust_test_report_history" and have a report
+        my $have_tested_fcn;
+        if (   $CPAN::Config->{trust_test_report_history}
+            && $CPAN::META->has_inst("CPAN::Reporter::History")
+            && ( $have_tested_fcn = CPAN::Reporter::History->can("have_tested" ))) {
+            if ( my @reports = $have_tested_fcn->( dist => $self->base_id ) ) {
+                # Do nothing if grade was DISCARD
+                if ( $reports[-1]->{grade} =~ /^(?:PASS|UNKNOWN)$/ ) {
+                    $self->{make_test} = CPAN::Distrostatus->new("YES");
+                    # if global "is_tested" has been cleared, we need to mark this to
+                    # be added to PERL5LIB if not already installed
+                    if ($self->tested_ok_but_not_installed) {
+                        $CPAN::META->is_tested($self->{build_dir},$self->{make_test}{TIME});
+                    }
+                    $CPAN::Frontend->myprint("Found prior test report -- OK\n");
+                    $self->post_test();
+                    return;
+                }
+                elsif ( $reports[-1]->{grade} =~ /^(?:FAIL|NA)$/ ) {
+                    $self->{make_test} = CPAN::Distrostatus->new("NO");
+                    $self->{badtestcnt}++;
+                    $CPAN::Frontend->mywarn("Found prior test report -- NOT OK\n");
+                    $self->post_test();
+                    return;
+                }
+            }
+        }
+    }
+
+    my $system;
+    my $prefs_test = $self->prefs->{test};
+    if (my $commandline
+        = exists $prefs_test->{commandline} ? $prefs_test->{commandline} : "") {
+        $system = $commandline;
+        $ENV{PERL} = CPAN::find_perl();
+    } elsif ($self->{modulebuild}) {
+        $system = sprintf "%s test", $self->_build_command();
+        unless (-e "Build" || ($^O eq 'VMS' && -e "Build.com")) {
+            my $id = $self->pretty_id;
+            $CPAN::Frontend->mywarn("Alert: no 'Build' file found while trying to test '$id'");
+        }
+    } else {
+        $system = join " ", $self->_make_command(), "test";
+    }
+    my $make_test_arg = $self->_make_phase_arg("test");
+    $system = sprintf("%s%s",
+                      $system,
+                      $make_test_arg ? " $make_test_arg" : "",
+                     );
+    my($tests_ok);
+    my $test_env;
+    if ($self->prefs->{test}) {
+        $test_env = $self->prefs->{test}{env};
+    }
+    local @ENV{keys %$test_env} = values %$test_env if $test_env;
+    my $expect_model = $self->_prefs_with_expect("test");
+    my $want_expect = 0;
+    if ( $expect_model && @{$expect_model->{talk}} ) {
+        my $can_expect = $CPAN::META->has_inst("Expect");
+        if ($can_expect) {
+            $want_expect = 1;
+        } else {
+            $CPAN::Frontend->mywarn("Expect not installed, falling back to ".
+                                    "testing without\n");
+        }
+    }
+
+ FORK: {
+        my $pid = fork;
+        if (! defined $pid) { # contention
+            warn "Contention '$!', sleeping 2";
+            sleep 2;
+            redo FORK;
+        } elsif ($pid) { # parent
+            if ($^O eq "MSWin32") {
+                wait;
+            } else {
+            SUPERVISE: while (waitpid($pid, WNOHANG) <= 0) {
+                    if ($CPAN::Signal) {
+                        kill 9, -$pid;
+                    }
+                    sleep 1;
+                }
+            }
+            $tests_ok = !$?;
+        } else { # child
+            POSIX::setsid() unless $^O eq "MSWin32";
+            my $c_ok;
+            $|=1;
+            if ($want_expect) {
+                if ($self->_should_report('test')) {
+                    $CPAN::Frontend->mywarn("Reporting via CPAN::Reporter is currently ".
+                        "not supported when distroprefs specify ".
+                        "an interactive test\n");
+                }
+                $c_ok = $self->_run_via_expect($system,'test',$expect_model) == 0;
+            } elsif ( $self->_should_report('test') ) {
+                $c_ok = CPAN::Reporter::test($self, $system);
+            } else {
+                $c_ok = system($system) == 0;
+            }
+            exit !$c_ok;
+        }
+    } # FORK
+
+    $self->introduce_myself;
+    my $but = $self->_make_test_illuminate_prereqs();
+    if ( $tests_ok ) {
+        if ($but) {
+            $CPAN::Frontend->mywarn("Tests succeeded but $but\n");
+            $self->{make_test} = CPAN::Distrostatus->new("NO $but");
+            $self->store_persistent_state;
+            $self->post_test();
+            return $self->goodbye("[dependencies] -- NA");
+        }
+        $CPAN::Frontend->myprint("  $system -- OK\n");
+        $self->{make_test} = CPAN::Distrostatus->new("YES");
+        $CPAN::META->is_tested($self->{build_dir},$self->{make_test}{TIME});
+        # probably impossible to need the next line because badtestcnt
+        # has a lifespan of one command
+        delete $self->{badtestcnt};
+    } else {
+        if ($but) {
+            $but .= "; additionally test harness failed";
+            $CPAN::Frontend->mywarn("$but\n");
+            $self->{make_test} = CPAN::Distrostatus->new("NO $but");
+        } elsif ( $self->{force_update} ) {
+            $self->{make_test} = CPAN::Distrostatus->new(
+                "NO but failure ignored because 'force' in effect"
+            );
+        } elsif ($CPAN::Signal) {
+            $self->{make_test} = CPAN::Distrostatus->new("NO -- Interrupted");
+        } else {
+            $self->{make_test} = CPAN::Distrostatus->new("NO");
+        }
+        $self->{badtestcnt}++;
+        $CPAN::Frontend->mywarn("  $system -- NOT OK\n");
+        CPAN::Shell->optprint
+              ("hint",
+               sprintf
+               ("//hint// to see the cpan-testers results for installing this module, try:
+  reports %s\n",
+                $self->pretty_id));
+    }
+    $self->store_persistent_state;
+
+    $self->post_test();
+
+    return $self->{force_update} ? 1 : !! $tests_ok;
+}
+
+sub _make_test_illuminate_prereqs {
+    my($self) = @_;
+    my @prereq;
+
+    # local $CPAN::DEBUG = 16; # Distribution
+    for my $m (sort keys %{$self->{sponsored_mods}}) {
+        next unless $self->{sponsored_mods}{$m} > 0;
+        my $m_obj = CPAN::Shell->expand("Module",$m) or next;
+        # XXX we need available_version which reflects
+        # $ENV{PERL5LIB} so that already tested but not yet
+        # installed modules are counted.
+        my $available_version = $m_obj->available_version;
+        my $available_file = $m_obj->available_file;
+        if ($available_version &&
+            !CPAN::Version->vlt($available_version,$self->{prereq_pm}{$m})
+           ) {
+            CPAN->debug("m[$m] good enough available_version[$available_version]")
+                if $CPAN::DEBUG;
+        } elsif ($available_file
+                 && (
+                     !$self->{prereq_pm}{$m}
+                     ||
+                     $self->{prereq_pm}{$m} == 0
+                    )
+                ) {
+            # lex Class::Accessor::Chained::Fast which has no $VERSION
+            CPAN->debug("m[$m] have available_file[$available_file]")
+                if $CPAN::DEBUG;
+        } else {
+            push @prereq, $m
+                unless $self->is_locally_optional(undef, $m);
+        }
+    }
+    my $but;
+    if (@prereq) {
+        my $cnt = @prereq;
+        my $which = join ",", @prereq;
+        $but = $cnt == 1 ? "one dependency not OK ($which)" :
+            "$cnt dependencies missing ($which)";
+    }
+    $but;
+}
+
+sub _prefs_with_expect {
+    my($self,$where) = @_;
+    return unless my $prefs = $self->prefs;
+    return unless my $where_prefs = $prefs->{$where};
+    if ($where_prefs->{expect}) {
+        return {
+                mode => "deterministic",
+                timeout => 15,
+                talk => $where_prefs->{expect},
+               };
+    } elsif ($where_prefs->{"eexpect"}) {
+        return $where_prefs->{"eexpect"};
+    }
+    return;
+}
+
+#-> sub CPAN::Distribution::clean ;
+sub clean {
+    my($self) = @_;
+    my $make = $self->{modulebuild} ? "Build" : "make";
+    $CPAN::Frontend->myprint(sprintf "Running %s clean for %s\n", $make, $self->pretty_id);
+    unless (exists $self->{archived}) {
+        $CPAN::Frontend->mywarn("Distribution seems to have never been unzipped".
+                                "/untarred, nothing done\n");
+        return 1;
+    }
+    unless (exists $self->{build_dir}) {
+        $CPAN::Frontend->mywarn("Distribution has no own directory, nothing to do.\n");
+        return 1;
+    }
+    if (exists $self->{writemakefile}
+        and $self->{writemakefile}->failed
+       ) {
+        $CPAN::Frontend->mywarn("No Makefile, don't know how to 'make clean'\n");
+        return 1;
+    }
+  EXCUSE: {
+        my @e;
+        exists $self->{make_clean} and $self->{make_clean} eq "YES" and
+            push @e, "make clean already called once";
+        $CPAN::Frontend->myprint(join "", map {"  $_\n"} @e) and return if @e;
+    }
+    chdir "$self->{build_dir}" or
+        Carp::confess("Couldn't chdir to $self->{build_dir}: $!");
+    $self->debug("Changed directory to $self->{build_dir}") if $CPAN::DEBUG;
+
+    if ($^O eq 'MacOS') {
+        Mac::BuildTools::make_clean($self);
+        return;
+    }
+
+    my $system;
+    if ($self->{modulebuild}) {
+        unless (-f "Build") {
+            my $cwd = CPAN::anycwd();
+            $CPAN::Frontend->mywarn("Alert: no Build file available for 'clean $self->{id}".
+                                    " in cwd[$cwd]. Danger, Will Robinson!");
+            $CPAN::Frontend->mysleep(5);
+        }
+        $system = sprintf "%s clean", $self->_build_command();
+    } else {
+        $system  = join " ", $self->_make_command(), "clean";
+    }
+    my $system_ok = system($system) == 0;
+    $self->introduce_myself;
+    if ( $system_ok ) {
+      $CPAN::Frontend->myprint("  $system -- OK\n");
+
+      # $self->force;
+
+      # Jost Krieger pointed out that this "force" was wrong because
+      # it has the effect that the next "install" on this distribution
+      # will untar everything again. Instead we should bring the
+      # object's state back to where it is after untarring.
+
+      for my $k (qw(
+                    force_update
+                    install
+                    writemakefile
+                    make
+                    make_test
+                   )) {
+          delete $self->{$k};
+      }
+      $self->{make_clean} = CPAN::Distrostatus->new("YES");
+
+    } else {
+      # Hmmm, what to do if make clean failed?
+
+      $self->{make_clean} = CPAN::Distrostatus->new("NO");
+      $CPAN::Frontend->mywarn(qq{  $system -- NOT OK\n});
+
+      # 2006-02-27: seems silly to me to force a make now
+      # $self->force("make"); # so that this directory won't be used again
+
+    }
+    $self->store_persistent_state;
+}
+
+#-> sub CPAN::Distribution::check_disabled ;
+sub check_disabled {
+    my ($self) = @_;
+    $self->debug("checking disabled id[$self->{ID}]") if $CPAN::DEBUG;
+    if ($self->prefs->{disabled} && ! $self->{force_update}) {
+        return sprintf(
+                            "Disabled via prefs file '%s' doc %d",
+                            $self->{prefs_file},
+                            $self->{prefs_file_doc},
+                            );
+    }
+    return;
+}
+
+#-> sub CPAN::Distribution::goto ;
+sub goto {
+    my($self,$goto) = @_;
+    $goto = $self->normalize($goto);
+    my $why = sprintf(
+                      "Goto '$goto' via prefs file '%s' doc %d",
+                      $self->{prefs_file},
+                      $self->{prefs_file_doc},
+                     );
+    $self->{unwrapped} = CPAN::Distrostatus->new("NO $why");
+    # 2007-07-16 akoenig : Better than NA would be if we could inherit
+    # the status of the $goto distro but given the exceptional nature
+    # of 'goto' I feel reluctant to implement it
+    my $goodbye_message = "[goto] -- NA $why";
+    $self->goodbye($goodbye_message);
+
+    # inject into the queue
+
+    CPAN::Queue->delete($self->id);
+    CPAN::Queue->jumpqueue({qmod => $goto, reqtype => $self->{reqtype}});
+
+    # and run where we left off
+
+    my($method) = (caller(1))[3];
+    my $goto_do = CPAN->instance("CPAN::Distribution",$goto);
+    $goto_do->called_for($self->called_for) unless $goto_do->called_for;
+    $goto_do->{mandatory} ||= $self->{mandatory};
+    $goto_do->{reqtype}   ||= $self->{reqtype};
+    $goto_do->{coming_from} = $self->pretty_id;
+    $goto_do->$method();
+    CPAN::Queue->delete_first($goto);
+    # XXX delete_first returns undef; is that what this should return
+    # up the call stack, eg. return $sefl->goto($goto) -- xdg, 2012-04-04
+}
+
+#-> sub CPAN::Distribution::shortcut_install ;
+# return values: undef means don't shortcut; 0 means shortcut as fail;
+# and 1 means shortcut as success
+sub shortcut_install {
+    my ($self) = @_;
+
+    $self->debug("checking previous install results[$self->{ID}]") if $CPAN::DEBUG;
+    if (exists $self->{install}) {
+        my $text = UNIVERSAL::can($self->{install},"text") ?
+            $self->{install}->text :
+                $self->{install};
+        if ($text =~ /^YES/) {
+            $CPAN::META->is_installed($self->{build_dir});
+            return $self->success("Already done");
+        } elsif ($text =~ /is only/) {
+            # e.g. 'is only build_requires': may be overruled later
+            return $self->goodbye($text);
+        } else {
+            # comment in Todo on 2006-02-11; maybe retry?
+            return $self->goodbye("Already tried without success");
+        }
+    }
+
+    for my $slot ( qw/later configure_requires_later/ ) {
+        return $self->success($self->{$slot})
+        if $self->{$slot};
+    }
+
+    return undef;
+}
+
+#-> sub CPAN::Distribution::is_being_sponsored ;
+
+# returns true if we find a distro object in the queue that has
+# sponsored this one
+sub is_being_sponsored {
+    my($self) = @_;
+    my $iterator = CPAN::Queue->iterator;
+ QITEM: while (my $q = $iterator->()) {
+        my $s = $q->as_string;
+        my $obj = CPAN::Shell->expandany($s) or next QITEM;
+        my $type = ref $obj;
+        if ( $type eq 'CPAN::Distribution' ){
+            for my $module (sort keys %{$obj->{sponsored_mods} || {}}) {
+                return 1 if grep { $_ eq $module } $self->containsmods;
+            }
+        }
+    }
+    return 0;
+}
+
+#-> sub CPAN::Distribution::install ;
+sub install {
+    my($self) = @_;
+
+    $self->pre_install();
+
+    if (exists $self->{cleanup_after_install_done}) {
+        return $self->test;
+    }
+
+    $self->debug("checking goto id[$self->{ID}]") if $CPAN::DEBUG;
+    if (my $goto = $self->prefs->{goto}) {
+        $self->goto($goto);
+        $self->post_install();
+        return;
+    }
+
+    unless ($self->test) {
+        $self->post_install();
+        return;
+    }
+
+    if ( defined( my $sc = $self->shortcut_install ) ) {
+        $self->post_install();
+        return $sc;
+    }
+
+    if ($CPAN::Signal) {
+        delete $self->{force_update};
+        $self->post_install();
+        return;
+    }
+
+    my $builddir = $self->dir or
+        $CPAN::Frontend->mydie("PANIC: Cannot determine build directory\n");
+
+    unless (chdir $builddir) {
+        $CPAN::Frontend->mywarn("Couldn't chdir to '$builddir': $!");
+        $self->post_install();
+        return;
+    }
+
+    $self->debug("Changed directory to $self->{build_dir}")
+        if $CPAN::DEBUG;
+
+    my $make = $self->{modulebuild} ? "Build" : "make";
+    $CPAN::Frontend->myprint(sprintf "Running %s install for %s\n", $make, $self->pretty_id);
+
+    if ($^O eq 'MacOS') {
+        Mac::BuildTools::make_install($self);
+        $self->post_install();
+        return;
+    }
+
+    my $system;
+    if (my $commandline = $self->prefs->{install}{commandline}) {
+        $system = $commandline;
+        $ENV{PERL} = CPAN::find_perl();
+    } elsif ($self->{modulebuild}) {
+        my($mbuild_install_build_command) =
+            exists $CPAN::HandleConfig::keys{mbuild_install_build_command} &&
+                $CPAN::Config->{mbuild_install_build_command} ?
+                    $CPAN::Config->{mbuild_install_build_command} :
+                        $self->_build_command();
+        my $install_directive = $^O eq 'VMS' ? '"install"' : 'install';
+        $system = sprintf("%s %s %s",
+                          $mbuild_install_build_command,
+                          $install_directive,
+                          $CPAN::Config->{mbuild_install_arg},
+                         );
+    } else {
+        my($make_install_make_command) = $self->_make_install_make_command();
+        $system = sprintf("%s install %s",
+                          $make_install_make_command,
+                          $CPAN::Config->{make_install_arg},
+                         );
+    }
+
+    my($stderr) = $^O eq "MSWin32" || $^O eq 'VMS' ? "" : " 2>&1 ";
+    my $brip = CPAN::HandleConfig->prefs_lookup($self,
+                                                q{build_requires_install_policy});
+    $brip ||="ask/yes";
+    my $id = $self->id;
+    my $reqtype = $self->{reqtype} ||= "c"; # in doubt it was a command
+    my $want_install = "yes";
+    if ($reqtype eq "b") {
+        if ($brip eq "no") {
+            $want_install = "no";
+        } elsif ($brip =~ m|^ask/(.+)|) {
+            my $default = $1;
+            $default = "yes" unless $default =~ /^(y|n)/i;
+            $want_install =
+                CPAN::Shell::colorable_makemaker_prompt
+                      ("$id is just needed temporarily during building or testing. ".
+                       "Do you want to install it permanently?",
+                       $default);
+        }
+    }
+    unless ($want_install =~ /^y/i) {
+        my $is_only = "is only 'build_requires'";
+        $self->{install} = CPAN::Distrostatus->new("NO -- $is_only");
+        delete $self->{force_update};
+        $self->goodbye("Not installing because $is_only");
+        $self->post_install();
+        return;
+    }
+    local $ENV{PERL5LIB} = defined($ENV{PERL5LIB})
+                           ? $ENV{PERL5LIB}
+                           : ($ENV{PERLLIB} || "");
+
+    local $ENV{PERL5OPT} = defined $ENV{PERL5OPT} ? $ENV{PERL5OPT} : "";
+    local $ENV{PERL_USE_UNSAFE_INC} =
+        exists $ENV{PERL_USE_UNSAFE_INC} && defined $ENV{PERL_USE_UNSAFE_INC}
+        ? $ENV{PERL_USE_UNSAFE_INC} : 1; # install
+    $CPAN::META->set_perl5lib;
+    local $ENV{PERL_MM_USE_DEFAULT} = 1 if $CPAN::Config->{use_prompt_default};
+    local $ENV{NONINTERACTIVE_TESTING} = 1 if $CPAN::Config->{use_prompt_default};
+
+    my $install_env;
+    if ($self->prefs->{install}) {
+        $install_env = $self->prefs->{install}{env};
+    }
+    local @ENV{keys %$install_env} = values %$install_env if $install_env;
+
+    if (! $run_allow_installing_within_test) {
+        my($allow_installing, $why) = $self->_allow_installing;
+        if (! $allow_installing) {
+            $CPAN::Frontend->mywarn("Installation stopped: $why\n");
+            $self->introduce_myself;
+            $self->{install} = CPAN::Distrostatus->new("NO -- installation stopped due $why");
+            $CPAN::Frontend->mywarn("  $system -- NOT OK\n");
+            delete $self->{force_update};
+            $self->post_install();
+            return;
+        }
+    }
+    my($pipe) = FileHandle->new("$system $stderr |");
+    unless ($pipe) {
+        $CPAN::Frontend->mywarn("Can't execute $system: $!");
+        $self->introduce_myself;
+        $self->{install} = CPAN::Distrostatus->new("NO");
+        $CPAN::Frontend->mywarn("  $system -- NOT OK\n");
+        delete $self->{force_update};
+        $self->post_install();
+        return;
+    }
+    my($makeout) = "";
+    while (<$pipe>) {
+        print $_; # intentionally NOT use Frontend->myprint because it
+                  # looks irritating when we markup in color what we
+                  # just pass through from an external program
+        $makeout .= $_;
+    }
+    $pipe->close;
+    my $close_ok = $? == 0;
+    $self->introduce_myself;
+    if ( $close_ok ) {
+        $CPAN::Frontend->myprint("  $system -- OK\n");
+        $CPAN::META->is_installed($self->{build_dir});
+        $self->{install} = CPAN::Distrostatus->new("YES");
+        if ($CPAN::Config->{'cleanup_after_install'}
+            && ! $self->is_dot_dist
+            && ! $self->is_being_sponsored) {
+            my $parent = File::Spec->catdir( $self->{build_dir}, File::Spec->updir );
+            chdir $parent or $CPAN::Frontend->mydie("Couldn't chdir to $parent: $!\n");
+            File::Path::rmtree($self->{build_dir});
+            my $yml = "$self->{build_dir}.yml";
+            if (-e $yml) {
+                unlink $yml or $CPAN::Frontend->mydie("Couldn't unlink $yml: $!\n");
+            }
+            $self->{cleanup_after_install_done}=1;
+        }
+    } else {
+        $self->{install} = CPAN::Distrostatus->new("NO");
+        $CPAN::Frontend->mywarn("  $system -- NOT OK\n");
+        my $mimc =
+            CPAN::HandleConfig->prefs_lookup($self,
+                                             q{make_install_make_command});
+        if (
+            $makeout =~ /permission/s
+            && $> > 0
+            && (
+                ! $mimc
+                || $mimc eq (CPAN::HandleConfig->prefs_lookup($self,
+                                                              q{make}))
+               )
+           ) {
+            $CPAN::Frontend->myprint(
+                                     qq{----\n}.
+                                     qq{  You may have to su }.
+                                     qq{to root to install the package\n}.
+                                     qq{  (Or you may want to run something like\n}.
+                                     qq{    o conf make_install_make_command 'sudo make'\n}.
+                                     qq{  to raise your permissions.}
+                                    );
+        }
+    }
+    delete $self->{force_update};
+    unless ($CPAN::Config->{'cleanup_after_install'}) {
+        $self->store_persistent_state;
+    }
+
+    $self->post_install();
+
+    return !! $close_ok;
+}
+
+sub blib_pm_walk {
+    my @queue = grep { -e $_ } File::Spec->catdir("blib","lib"), File::Spec->catdir("blib","arch");
+    return sub {
+    LOOP: {
+            if (@queue) {
+                my $file = shift @queue;
+                if (-d $file) {
+                    my $dh;
+                    opendir $dh, $file or next;
+                    my @newfiles = map {
+                        my @ret;
+                        my $maybedir = File::Spec->catdir($file, $_);
+                        if (-d $maybedir) {
+                            unless (File::Spec->catdir("blib","arch","auto") eq $maybedir) {
+                                # prune the blib/arch/auto directory, no pm files there
+                                @ret = $maybedir;
+                            }
+                        } elsif (/\.pm$/) {
+                            my $mustbefile = File::Spec->catfile($file, $_);
+                            if (-f $mustbefile) {
+                                @ret = $mustbefile;
+                            }
+                        }
+                        @ret;
+                    } grep {
+                        $_ ne "."
+                            && $_ ne ".."
+                        } readdir $dh;
+                    push @queue, @newfiles;
+                    redo LOOP;
+                } else {
+                    return $file;
+                }
+            } else {
+                return;
+            }
+        }
+    };
+}
+
+sub _allow_installing {
+    my($self) = @_;
+    my $id = my $pretty_id = $self->pretty_id;
+    if ($self->{CALLED_FOR}) {
+        $id .= " (called for $self->{CALLED_FOR})";
+    }
+    my $allow_down   = CPAN::HandleConfig->prefs_lookup($self,q{allow_installing_module_downgrades});
+    $allow_down      ||= "ask/yes";
+    my $allow_outdd  = CPAN::HandleConfig->prefs_lookup($self,q{allow_installing_outdated_dists});
+    $allow_outdd     ||= "ask/yes";
+    return 1 if
+           $allow_down  eq "yes"
+        && $allow_outdd eq "yes";
+    if (($allow_outdd ne "yes") && ! $CPAN::META->has_inst('CPAN::DistnameInfo')) {
+        return 1 if grep { $_ eq 'CPAN::DistnameInfo'} $self->containsmods;
+        if ($allow_outdd ne "yes") {
+            $CPAN::Frontend->mywarn("The current configuration of allow_installing_outdated_dists is '$allow_outdd', but for this option we would need 'CPAN::DistnameInfo' installed. Please install 'CPAN::DistnameInfo' as soon as possible. As long as we are not equipped with 'CPAN::DistnameInfo' this option does not take effect\n");
+            $allow_outdd = "yes";
+        }
+    }
+    return 1 if
+           $allow_down  eq "yes"
+        && $allow_outdd eq "yes";
+    my($dist_version, $dist_dist);
+    if ($allow_outdd ne "yes"){
+        my $dni = CPAN::DistnameInfo->new($pretty_id);
+        $dist_version = $dni->version;
+        $dist_dist    = $dni->dist;
+    }
+    my $iterator = blib_pm_walk();
+    my(@down,@outdd);
+    while (my $file = $iterator->()) {
+        my $version = CPAN::Module->parse_version($file);
+        my($volume, $directories, $pmfile) = File::Spec->splitpath( $file );
+        my @dirs = File::Spec->splitdir( $directories );
+        my(@blib_plus1) = splice @dirs, 0, 2;
+        my($pmpath) = File::Spec->catfile(grep { length($_) } @dirs, $pmfile);
+        unless ($allow_down eq "yes") {
+            if (my $inst_file = $self->_file_in_path($pmpath, \@INC)) {
+                my $inst_version = CPAN::Module->parse_version($inst_file);
+                my $cmp = CPAN::Version->vcmp($version, $inst_version);
+                if ($cmp) {
+                    if ($cmp < 0) {
+                        push @down, { pmpath => $pmpath, version => $version, inst_version => $inst_version };
+                    }
+                }
+                if (@down) {
+                    my $why = "allow_installing_module_downgrades: $id contains downgrading module(s) (e.g. '$down[0]{pmpath}' would downgrade installed '$down[0]{inst_version}' to '$down[0]{version}')";
+                    if (my($default) = $allow_down =~ m|^ask/(.+)|) {
+                        $default = "yes" unless $default =~ /^(y|n)/i;
+                        my $answer = CPAN::Shell::colorable_makemaker_prompt
+                                ("$why. Do you want to allow installing it?",
+                                 $default, "colorize_warn");
+                        $allow_down = $answer =~ /^\s*y/i ? "yes" : "no";
+                    }
+                    if ($allow_down eq "no") {
+                        return (0, $why);
+                    }
+                }
+            }
+        }
+        unless ($allow_outdd eq "yes") {
+            my @pmpath = (@dirs, $pmfile);
+            $pmpath[-1] =~ s/\.pm$//;
+            my $mo = CPAN::Shell->expand("Module",join "::", grep { length($_) } @pmpath);
+            if ($mo) {
+                my $cpan_version = $mo->cpan_version;
+                my $is_lower = CPAN::Version->vlt($version, $cpan_version);
+                my $other_dist;
+                if (my $mo_dist = $mo->distribution) {
+                    $other_dist = $mo_dist->pretty_id;
+                    my $dni = CPAN::DistnameInfo->new($other_dist);
+                    if ($dni->dist eq $dist_dist){
+                        if (CPAN::Version->vgt($dni->version, $dist_version)) {
+                            push @outdd, {
+                                pmpath       => $pmpath,
+                                cpan_path    => $dni->pathname,
+                                dist_version => $dni->version,
+                                dist_dist    => $dni->dist,
+                            };
+                        }
+                    }
+                }
+            }
+            if (@outdd && $allow_outdd ne "yes") {
+                my $why = "allow_installing_outdated_dists: $id contains module(s) that are indexed on the CPAN with a different distro: (e.g. '$outdd[0]{pmpath}' is indexed with '$outdd[0]{cpan_path}')";
+                if ($outdd[0]{dist_dist} eq $dist_dist) {
+                    $why .= ", and this has a higher distribution-version, i.e. version '$outdd[0]{dist_version}' is higher than '$dist_version')";
+                }
+                if (my($default) = $allow_outdd =~ m|^ask/(.+)|) {
+                    $default = "yes" unless $default =~ /^(y|n)/i;
+                    my $answer = CPAN::Shell::colorable_makemaker_prompt
+                        ("$why. Do you want to allow installing it?",
+                         $default, "colorize_warn");
+                    $allow_outdd = $answer =~ /^\s*y/i ? "yes" : "no";
+                }
+                if ($allow_outdd eq "no") {
+                    return (0, $why);
+                }
+            }
+        }
+    }
+    return 1;
+}
+
+sub _file_in_path { # similar to CPAN::Module::_file_in_path
+    my($self,$pmpath,$incpath) = @_;
+    my($dir,@packpath);
+    foreach $dir (@$incpath) {
+        my $pmfile = File::Spec->catfile($dir,$pmpath);
+        if (-f $pmfile) {
+            return $pmfile;
+        }
+    }
+    return;
+}
+sub introduce_myself {
+    my($self) = @_;
+    $CPAN::Frontend->myprint(sprintf("  %s\n",$self->pretty_id));
+}
+
+#-> sub CPAN::Distribution::dir ;
+sub dir {
+    shift->{build_dir};
+}
+
+#-> sub CPAN::Distribution::perldoc ;
+sub perldoc {
+    my($self) = @_;
+
+    my($dist) = $self->id;
+    my $package = $self->called_for;
+
+    if ($CPAN::META->has_inst("Pod::Perldocs")) {
+        my($perl) = $self->perl
+            or $CPAN::Frontend->mydie("Couldn't find executable perl\n");
+        my @args = ($perl, q{-MPod::Perldocs}, q{-e},
+                    q{Pod::Perldocs->run()}, $package);
+        my($wstatus);
+        unless ( ($wstatus = system(@args)) == 0 ) {
+            my $estatus = $wstatus >> 8;
+            $CPAN::Frontend->myprint(qq{
+    Function system("@args")
+    returned status $estatus (wstat $wstatus)
+    });
+        }
+    }
+    else {
+        $self->_display_url( $CPAN::Defaultdocs . $package );
+    }
+}
+
+#-> sub CPAN::Distribution::_check_binary ;
+sub _check_binary {
+    my ($dist,$shell,$binary) = @_;
+    my ($pid,$out);
+
+    $CPAN::Frontend->myprint(qq{ + _check_binary($binary)\n})
+      if $CPAN::DEBUG;
+
+    if ($CPAN::META->has_inst("File::Which")) {
+        return File::Which::which($binary);
+    } else {
+        local *README;
+        $pid = open README, "which $binary|"
+            or $CPAN::Frontend->mywarn(qq{Could not fork 'which $binary': $!\n});
+        return unless $pid;
+        while (<README>) {
+            $out .= $_;
+        }
+        close README
+            or $CPAN::Frontend->mywarn("Could not run 'which $binary': $!\n")
+                and return;
+    }
+
+    $CPAN::Frontend->myprint(qq{   + $out \n})
+      if $CPAN::DEBUG && $out;
+
+    return $out;
+}
+
+#-> sub CPAN::Distribution::_display_url ;
+sub _display_url {
+    my($self,$url) = @_;
+    my($res,$saved_file,$pid,$out);
+
+    $CPAN::Frontend->myprint(qq{ + _display_url($url)\n})
+      if $CPAN::DEBUG;
+
+    # should we define it in the config instead?
+    my $html_converter = "html2text";
+
+    my $web_browser = $CPAN::Config->{'lynx'} || undef;
+    my $web_browser_out = $web_browser
+        ? CPAN::Distribution->_check_binary($self,$web_browser)
+        : undef;
+
+    if ($web_browser_out) {

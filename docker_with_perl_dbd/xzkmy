@@ -1,0 +1,1000 @@
+            push @$continents, $continent;
+            $count += $self->mirrors( $self->countries($continent) );
+            last if $count >= $how_many;
+        }
+    }
+
+    return $self->default_mirror unless @$continents;
+    print "Scanning " . join(", ", @$continents) . " ...\n" if $verbose;
+
+    my $trial_mirrors = $self->get_n_random_mirrors_by_continents( 3 * $how_many, $continents->[0] );
+
+    my $timings = $self->get_mirrors_timings(
+        $trial_mirrors,
+        $seen,
+        $callback,
+        %args,
+    );
+    return $self->default_mirror unless @$timings;
+
+    $how_many = @$timings if $how_many > @$timings;
+
+    return wantarray ? @{$timings}[0 .. $how_many-1] : $timings->[0];
+}
+
+=item get_n_random_mirrors_by_continents( N, [CONTINENTS] )
+
+Returns up to N random mirrors for the specified continents. Specify the
+continents as an array reference.
+
+=cut
+
+sub get_n_random_mirrors_by_continents {
+    my( $self, $n, $continents ) = @_;
+    $n ||= 3;
+    $continents = [ $continents ] unless ref $continents;
+
+    if ( $n <= 0 ) {
+        return wantarray ? () : [];
+    }
+
+    my @long_list = $self->get_mirrors_by_continents( $continents );
+
+    if ( $n eq '*' or $n > @long_list ) {
+        return wantarray ? @long_list : \@long_list;
+    }
+
+    @long_list = map  {$_->[0]}
+                 sort {$a->[1] <=> $b->[1]}
+                 map  {[$_, rand]} @long_list;
+
+    splice @long_list, $n; # truncate
+
+    \@long_list;
+}
+
+=item get_mirrors_timings( MIRROR_LIST, SEEN, CALLBACK, %ARGS );
+
+Pings the listed mirrors and returns a list of mirrors sorted in
+ascending ping times.
+
+C<MIRROR_LIST> is an anonymous array of C<CPAN::Mirrored::By> objects to
+ping.
+
+The optional argument C<SEEN> is a hash reference used to track the
+mirrors you've already pinged.
+
+The optional argument C<CALLBACK> is a subroutine reference to call
+after each ping. It gets the C<CPAN::Mirrored::By> object after each
+ping.
+
+=cut
+
+sub get_mirrors_timings {
+    my( $self, $mirror_list, $seen, $callback, %args ) = @_;
+
+    $seen = {} unless defined $seen;
+    croak "The mirror list argument must be an array reference"
+        unless ref $mirror_list eq ref [];
+    croak "The seen argument must be a hash reference"
+        unless ref $seen eq ref {};
+    croak "callback must be a subroutine"
+        if( defined $callback and ref $callback ne ref sub {} );
+
+    my $timings = [];
+    for my $m ( @$mirror_list ) {
+        $seen->{$m->hostname} = $m;
+        next unless eval{ $m->http };
+
+        if( $self->_try_a_ping( $seen, $m, ) ) {
+            my $ping = $m->ping(%args);
+            next unless defined $ping;
+            # printf "m %s ping %s\n", $m, $ping;
+            push @$timings, $m;
+            $callback->( $m ) if $callback;
+        }
+        else {
+            push @$timings, $seen->{$m->hostname}
+                if defined $seen->{$m->hostname}->rtt;
+        }
+    }
+
+    my @best = sort {
+           if( defined $a->rtt and defined $b->rtt )     {
+            $a->rtt <=> $b->rtt
+            }
+        elsif( defined $a->rtt and ! defined $b->rtt )   {
+            return -1;
+            }
+        elsif( ! defined $a->rtt and defined $b->rtt )   {
+            return 1;
+            }
+        elsif( ! defined $a->rtt and ! defined $b->rtt ) {
+            return 0;
+            }
+
+        } @$timings;
+
+    return wantarray ? @best : \@best;
+}
+
+=item find_best_continents( HASH_REF );
+
+C<find_best_continents> goes through each continent and pings C<N>
+random mirrors on that continent. It then orders the continents by
+ascending median ping time. In list context, it returns the ordered list
+of continent. In scalar context, it returns the same list as an
+anonymous array.
+
+Arguments:
+
+    n        - the number of hosts to ping for each continent. Default: 3
+    seen     - a hashref of cached hostname ping times
+    verbose  - true or false for noisy or quiet. Default: false
+    callback - a subroutine to run after each ping.
+    ping_cache_limit - how long, in seconds, to reuse previous ping times.
+        Default: 1 day
+
+The C<seen> hash has hostnames as keys and anonymous arrays as values.
+The anonymous array is a triplet of a C<CPAN::Mirrored::By> object, a
+ping time, and the epoch time for the measurement.
+
+The callback subroutine gets the C<CPAN::Mirrored::By> object, the ping
+time, and measurement time (the same things in the C<seen> hashref) as
+arguments. C<find_best_continents> doesn't care what the callback does
+and ignores the return value.
+
+With a low value for C<N>, a single mirror might skew the results enough
+to choose a worse continent. If you have that problem, try a larger
+value.
+
+=cut
+
+sub find_best_continents {
+    my ($self, %args) = @_;
+
+    $args{n}     ||= 3;
+    $args{verbose} = 0 unless defined $args{verbose};
+    $args{seen}    = {} unless defined $args{seen};
+    croak "The seen argument must be a hash reference"
+        unless ref $args{seen} eq ref {};
+    $args{ping_cache_limit} = 24 * 60 * 60
+        unless defined $args{ping_cache_limit};
+    croak "callback must be a subroutine"
+        if( defined $args{callback} and ref $args{callback} ne ref sub {} );
+
+    my %medians;
+    CONT: for my $c ( $self->continents ) {
+        my @mirrors = $self->mirrors( $self->countries($c) );
+        printf "Testing %s (%d mirrors)\n", $c, scalar @mirrors
+            if $args{verbose};
+
+        next CONT unless @mirrors;
+        my $n = (@mirrors < $args{n}) ? @mirrors : $args{n};
+
+        my @tests;
+        my $tries = 0;
+        RANDOM: while ( @mirrors && @tests < $n && $tries++ < 15 ) {
+            my $m = splice( @mirrors, int(rand(@mirrors)), 1 );
+            if( $self->_try_a_ping(
+                    $args{seen}, $m, $args{ping_cache_limit}
+                )) {
+                $self->get_mirrors_timings(
+                    [ $m ],
+                    $args{seen},
+                    $args{callback},
+                    %args,
+                );
+                next RANDOM unless defined $args{seen}{$m->hostname}->rtt;
+            }
+            printf "(%s -> %0.2f ms)",
+                $m->hostname,
+                join ' ', 1000 * $args{seen}{$m->hostname}->rtt
+                    if $args{verbose};
+
+            push @tests, $args{seen}{$m->hostname}->rtt;
+        }
+
+        my $median = $self->_get_median_ping_time( \@tests, $args{verbose} );
+        $medians{$c} = $median if defined $median;
+    }
+
+    my @best_cont = sort { $medians{$a} <=> $medians{$b} } keys %medians;
+
+    if ( $args{verbose} ) {
+        print "Median result by continent:\n";
+        if ( @best_cont ) {
+            for my $c ( @best_cont ) {
+                printf( "  %7.2f ms  %s\n", $medians{$c}*1000, $c );
+            }
+        } else {
+            print "  **** No results found ****\n"
+        }
+    }
+
+    return wantarray ? @best_cont : $best_cont[0];
+}
+
+# retry if
+sub _try_a_ping {
+    my ($self, $seen, $mirror, $ping_cache_limit ) = @_;
+
+    ( ! exists $seen->{$mirror->hostname}
+        or
+    ! defined $seen->{$mirror->hostname}->rtt
+      or
+    ! defined $ping_cache_limit
+      or
+      time - $seen->{$mirror->hostname}->ping_time
+        > $ping_cache_limit
+    )
+}
+
+sub _get_median_ping_time {
+    my ($self, $tests, $verbose ) = @_;
+
+    my @sorted = sort { $a <=> $b } @$tests;
+
+    my $median = do {
+           if ( @sorted == 0 ) { undef }
+        elsif ( @sorted == 1 ) { $sorted[0] }
+        elsif ( @sorted % 2 )  { $sorted[ int(@sorted / 2) ] }
+        else {
+            my $mid_high = int(@sorted/2);
+            ($sorted[$mid_high-1] + $sorted[$mid_high])/2;
+        }
+    };
+
+    if ($verbose){
+        if ($median) {
+            printf " => median time: %.2f ms\n", $median * 1000
+        } else {
+            printf " => **** no median time ****\n";
+        }
+    }
+
+    return $median;
+}
+
+# Adapted from Parse::CPAN::MirroredBy by Adam Kennedy
+sub _parse {
+    my ($self, $file, $handle) = @_;
+    my $output = $self->{mirrors};
+    my $geo    = $self->{geography};
+
+    local $/ = "\012";
+    my $line = 0;
+    my $mirror = undef;
+    while ( 1 ) {
+        # Next line
+        my $string = <$handle>;
+        last if ! defined $string;
+        $line = $line + 1;
+
+        # Remove the useless lines
+        chomp( $string );
+        next if $string =~ /^\s*$/;
+        next if $string =~ /^\s*#/;
+
+        # Hostname or property?
+        if ( $string =~ /^\s/ ) {
+            # Property
+            unless ( $string =~ /^\s+(\w+)\s+=\s+\"(.*)\"$/ ) {
+                croak("Invalid property on line $line");
+            }
+            my ($prop, $value) = ($1,$2);
+            $mirror ||= {};
+            if ( $prop eq 'dst_location' ) {
+                my (@location,$continent,$country);
+                @location = (split /\s*,\s*/, $value)
+                    and ($continent, $country) = @location[-1,-2];
+                $continent =~ s/\s\(.*//;
+                $continent =~ s/\W+$//; # if Jarkko doesn't know latitude/longitude
+                $geo->{$continent}{$country} = 1 if $continent && $country;
+                $mirror->{continent} = $continent || "unknown";
+                $mirror->{country} = $country || "unknown";
+            }
+            elsif ( $prop eq 'dst_http' ) {
+                $mirror->{http} = $value;
+            }
+            elsif ( $prop eq 'dst_ftp' ) {
+                $mirror->{ftp} = $value;
+            }
+            elsif ( $prop eq 'dst_rsync' ) {
+                $mirror->{rsync} = $value;
+            }
+            else {
+                $prop =~ s/^dst_//;
+                $mirror->{$prop} = $value;
+            }
+        } else {
+            # Hostname
+            unless ( $string =~ /^([\w\.-]+)\:\s*$/ ) {
+                croak("Invalid host name on line $line");
+            }
+            my $current = $mirror;
+            $mirror     = { hostname => "$1" };
+            if ( $current ) {
+                push @$output, CPAN::Mirrored::By->new($current);
+            }
+        }
+    }
+    if ( $mirror ) {
+        push @$output, CPAN::Mirrored::By->new($mirror);
+    }
+
+    return;
+}
+
+#--------------------------------------------------------------------------#
+
+package CPAN::Mirrored::By;
+use strict;
+use Net::Ping   ();
+
+sub new {
+    my($self,$arg) = @_;
+    $arg ||= {};
+    bless $arg, $self;
+}
+sub hostname  { shift->{hostname}    }
+sub continent { shift->{continent}   }
+sub country   { shift->{country}     }
+sub http      { shift->{http}  || '' }
+sub ftp       { shift->{ftp}   || '' }
+sub rsync     { shift->{rsync} || '' }
+sub rtt       { shift->{rtt}         }
+sub ping_time { shift->{ping_time}   }
+
+sub url {
+    my $self = shift;
+    return $self->{http} || $self->{ftp};
+}
+
+sub ping {
+    my($self, %args) = @_;
+
+    my $external_ping = $args{external_ping};
+    if ($external_ping) {
+        eval { require Net::Ping::External }
+            or die "Net::Ping::External required to use external ping command";
+    }
+    my $ping = Net::Ping->new(
+        $external_ping ? 'external' : $^O eq 'VMS' ? 'icmp' : 'tcp',
+        1
+    );
+    my ($proto) = $self->url =~ m{^([^:]+)};
+    my $port = $proto eq 'http' ? 80 : 21;
+    return unless $port;
+
+    if ( $ping->can('port_number') ) {
+        $ping->port_number($port);
+    }
+    else {
+        $ping->{'port_num'} = $port;
+    }
+
+    $ping->hires(1) if $ping->can('hires');
+    my ($alive,$rtt) = eval { $ping->ping($self->hostname); };
+    my $verbose = $args{verbose};
+    if ($verbose && !$alive) {
+        printf "(host %s not alive)", $self->hostname;
+    }
+
+    $self->{rtt} = $alive ? $rtt : undef;
+    $self->{ping_time} = time;
+
+    $self->rtt;
+}
+
+
+1;
+
+=back
+
+=head1 AUTHOR
+
+Andreas Koenig C<< <andk@cpan.org> >>, David Golden C<< <dagolden@cpan.org> >>,
+brian d foy C<< <bdfoy@cpan.org> >>
+
+=head1 LICENSE
+
+This program is free software; you can redistribute it and/or
+modify it under the same terms as Perl itself.
+
+See L<http://www.perl.com/perl/misc/Artistic.html>
+
+=cut
+                                                                                                                                                                                      usr/local/lib/perl5/5.40.0/CPAN/Module.pm                                                           0000444 0000000 0000000 00000053566 14714567415 016027  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        # -*- Mode: cperl; coding: utf-8; cperl-indent-level: 4 -*-
+# vim: ts=4 sts=4 sw=4:
+package CPAN::Module;
+use strict;
+@CPAN::Module::ISA = qw(CPAN::InfoObj);
+
+use vars qw(
+            $VERSION
+);
+$VERSION = "5.5003";
+
+BEGIN {
+    # alarm() is not implemented in perl 5.6.x and earlier under Windows
+    *ALARM_IMPLEMENTED = sub () { $] >= 5.007 || $^O !~ /MSWin/ };
+}
+
+# Accessors
+#-> sub CPAN::Module::userid
+sub userid {
+    my $self = shift;
+    my $ro = $self->ro;
+    return unless $ro;
+    return $ro->{userid} || $ro->{CPAN_USERID};
+}
+#-> sub CPAN::Module::description
+sub description {
+    my $self = shift;
+    my $ro = $self->ro or return "";
+    $ro->{description}
+}
+
+#-> sub CPAN::Module::distribution
+sub distribution {
+    my($self) = @_;
+    CPAN::Shell->expand("Distribution",$self->cpan_file);
+}
+
+#-> sub CPAN::Module::_is_representative_module
+sub _is_representative_module {
+    my($self) = @_;
+    return $self->{_is_representative_module} if defined $self->{_is_representative_module};
+    my $pm = $self->cpan_file or return $self->{_is_representative_module} = 0;
+    $pm =~ s|.+/||;
+    $pm =~ s{\.(?:tar\.(bz2|gz|Z)|t(?:gz|bz)|zip)$}{}i; # see base_id
+    $pm =~ s|-\d+\.\d+.+$||;
+    $pm =~ s|-[\d\.]+$||;
+    $pm =~ s/-/::/g;
+    $self->{_is_representative_module} = $pm eq $self->{ID} ? 1 : 0;
+    # warn "DEBUG: $pm eq $self->{ID} => $self->{_is_representative_module}";
+    $self->{_is_representative_module};
+}
+
+#-> sub CPAN::Module::undelay
+sub undelay {
+    my $self = shift;
+    delete $self->{later};
+    if ( my $dist = CPAN::Shell->expand("Distribution", $self->cpan_file) ) {
+        $dist->undelay;
+    }
+}
+
+# mark as dirty/clean
+#-> sub CPAN::Module::color_cmd_tmps ;
+sub color_cmd_tmps {
+    my($self) = shift;
+    my($depth) = shift || 0;
+    my($color) = shift || 0;
+    my($ancestors) = shift || [];
+    # a module needs to recurse to its cpan_file
+
+    return if exists $self->{incommandcolor}
+        && $color==1
+        && $self->{incommandcolor}==$color;
+    return if $color==0 && !$self->{incommandcolor};
+    if ($color>=1) {
+        if ( $self->uptodate ) {
+            $self->{incommandcolor} = $color;
+            return;
+        } elsif (my $have_version = $self->available_version) {
+            # maybe what we have is good enough
+            if (@$ancestors) {
+                my $who_asked_for_me = $ancestors->[-1];
+                my $obj = CPAN::Shell->expandany($who_asked_for_me);
+                if (0) {
+                } elsif ($obj->isa("CPAN::Bundle")) {
+                    # bundles cannot specify a minimum version
+                    return;
+                } elsif ($obj->isa("CPAN::Distribution")) {
+                    if (my $prereq_pm = $obj->prereq_pm) {
+                        for my $k (keys %$prereq_pm) {
+                            if (my $want_version = $prereq_pm->{$k}{$self->id}) {
+                                if (CPAN::Version->vcmp($have_version,$want_version) >= 0) {
+                                    $self->{incommandcolor} = $color;
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    } else {
+        $self->{incommandcolor} = $color; # set me before recursion,
+                                          # so we can break it
+    }
+    if ($depth>=$CPAN::MAX_RECURSION) {
+        my $e = CPAN::Exception::RecursiveDependency->new($ancestors);
+        if ($e->is_resolvable) {
+            return $self->{incommandcolor}=2;
+        } else {
+            die $e;
+        }
+    }
+    # warn "color_cmd_tmps $depth $color " . $self->id; # sleep 1;
+
+    if ( my $dist = CPAN::Shell->expand("Distribution", $self->cpan_file) ) {
+        $dist->color_cmd_tmps($depth+1,$color,[@$ancestors, $self->id]);
+    }
+    # unreached code?
+    # if ($color==0) {
+    #    delete $self->{badtestcnt};
+    # }
+    $self->{incommandcolor} = $color;
+}
+
+#-> sub CPAN::Module::as_glimpse ;
+sub as_glimpse {
+    my($self) = @_;
+    my(@m);
+    my $class = ref($self);
+    $class =~ s/^CPAN:://;
+    my $color_on = "";
+    my $color_off = "";
+    if (
+        $CPAN::Shell::COLOR_REGISTERED
+        &&
+        $CPAN::META->has_inst("Term::ANSIColor")
+        &&
+        $self->description
+       ) {
+        $color_on = Term::ANSIColor::color("green");
+        $color_off = Term::ANSIColor::color("reset");
+    }
+    my $uptodateness = " ";
+    unless ($class eq "Bundle") {
+        my $u = $self->uptodate;
+        $uptodateness = $u ? "=" : "<" if defined $u;
+    };
+    my $id = do {
+        my $d = $self->distribution;
+        $d ? $d -> pretty_id : $self->cpan_userid;
+    };
+    push @m, sprintf("%-7s %1s %s%-22s%s (%s)\n",
+                     $class,
+                     $uptodateness,
+                     $color_on,
+                     $self->id,
+                     $color_off,
+                     $id,
+                    );
+    join "", @m;
+}
+
+#-> sub CPAN::Module::dslip_status
+sub dslip_status {
+    my($self) = @_;
+    my($stat);
+    # development status
+    @{$stat->{D}}{qw,i c a b R M S,}     = qw,idea
+                                              pre-alpha alpha beta released
+                                              mature standard,;
+    # support level
+    @{$stat->{S}}{qw,m d u n a,}         = qw,mailing-list
+                                              developer comp.lang.perl.*
+                                              none abandoned,;
+    # language
+    @{$stat->{L}}{qw,p c + o h,}         = qw,perl C C++ other hybrid,;
+    # interface
+    @{$stat->{I}}{qw,f r O p h n,}       = qw,functions
+                                              references+ties
+                                              object-oriented pragma
+                                              hybrid none,;
+    # public licence
+    @{$stat->{P}}{qw,p g l b a 2 o d r n,} = qw,Standard-Perl
+                                              GPL LGPL
+                                              BSD Artistic Artistic_2
+                                              open-source
+                                              distribution_allowed
+                                              restricted_distribution
+                                              no_licence,;
+    for my $x (qw(d s l i p)) {
+        $stat->{$x}{' '} = 'unknown';
+        $stat->{$x}{'?'} = 'unknown';
+    }
+    my $ro = $self->ro;
+    return +{} unless $ro && $ro->{statd};
+    return {
+            D  => $ro->{statd},
+            S  => $ro->{stats},
+            L  => $ro->{statl},
+            I  => $ro->{stati},
+            P  => $ro->{statp},
+            DV => $stat->{D}{$ro->{statd}},
+            SV => $stat->{S}{$ro->{stats}},
+            LV => $stat->{L}{$ro->{statl}},
+            IV => $stat->{I}{$ro->{stati}},
+            PV => $stat->{P}{$ro->{statp}},
+           };
+}
+
+#-> sub CPAN::Module::as_string ;
+sub as_string {
+    my($self) = @_;
+    my(@m);
+    CPAN->debug("$self entering as_string") if $CPAN::DEBUG;
+    my $class = ref($self);
+    $class =~ s/^CPAN:://;
+    local($^W) = 0;
+    push @m, $class, " id = $self->{ID}\n";
+    my $sprintf = "    %-12s %s\n";
+    push @m, sprintf($sprintf, 'DESCRIPTION', $self->description)
+        if $self->description;
+    my $sprintf2 = "    %-12s %s (%s)\n";
+    my($userid);
+    $userid = $self->userid;
+    if ( $userid ) {
+        my $author;
+        if ($author = CPAN::Shell->expand('Author',$userid)) {
+            my $email = "";
+            my $m; # old perls
+            if ($m = $author->email) {
+                $email = " <$m>";
+            }
+            push @m, sprintf(
+                             $sprintf2,
+                             'CPAN_USERID',
+                             $userid,
+                             $author->fullname . $email
+                            );
+        }
+    }
+    push @m, sprintf($sprintf, 'CPAN_VERSION', $self->cpan_version)
+        if $self->cpan_version;
+    if (my $cpan_file = $self->cpan_file) {
+        push @m, sprintf($sprintf, 'CPAN_FILE', $cpan_file);
+        if (my $dist = CPAN::Shell->expand("Distribution",$cpan_file)) {
+            my $upload_date = $dist->upload_date;
+            if ($upload_date) {
+                push @m, sprintf($sprintf, 'UPLOAD_DATE', $upload_date);
+            }
+        }
+    }
+    my $sprintf3 = "    %-12s %1s%1s%1s%1s%1s (%s,%s,%s,%s,%s)\n";
+    my $dslip = $self->dslip_status;
+    push @m, sprintf(
+                     $sprintf3,
+                     'DSLIP_STATUS',
+                     @{$dslip}{qw(D S L I P DV SV LV IV PV)},
+                    ) if $dslip->{D};
+    my $local_file = $self->inst_file;
+    unless ($self->{MANPAGE}) {
+        my $manpage;
+        if ($local_file) {
+            $manpage = $self->manpage_headline($local_file);
+        } else {
+            # If we have already untarred it, we should look there
+            my $dist = $CPAN::META->instance('CPAN::Distribution',
+                                             $self->cpan_file);
+            # warn "dist[$dist]";
+            # mff=manifest file; mfh=manifest handle
+            my($mff,$mfh);
+            if (
+                $dist->{build_dir}
+                and
+                (-f  ($mff = File::Spec->catfile($dist->{build_dir}, "MANIFEST")))
+                and
+                $mfh = FileHandle->new($mff)
+               ) {
+                CPAN->debug("mff[$mff]") if $CPAN::DEBUG;
+                my $lfre = $self->id; # local file RE
+                $lfre =~ s/::/./g;
+                $lfre .= "\\.pm\$";
+                my($lfl); # local file file
+                local $/ = "\n";
+                my(@mflines) = <$mfh>;
+                for (@mflines) {
+                    s/^\s+//;
+                    s/\s.*//s;
+                }
+                while (length($lfre)>5 and !$lfl) {
+                    ($lfl) = grep /$lfre/, @mflines;
+                    CPAN->debug("lfl[$lfl]lfre[$lfre]") if $CPAN::DEBUG;
+                    $lfre =~ s/.+?\.//;
+                }
+                $lfl =~ s/\s.*//; # remove comments
+                $lfl =~ s/\s+//g; # chomp would maybe be too system-specific
+                my $lfl_abs = File::Spec->catfile($dist->{build_dir},$lfl);
+                # warn "lfl_abs[$lfl_abs]";
+                if (-f $lfl_abs) {
+                    $manpage = $self->manpage_headline($lfl_abs);
+                }
+            }
+        }
+        $self->{MANPAGE} = $manpage if $manpage;
+    }
+    my($item);
+    for $item (qw/MANPAGE/) {
+        push @m, sprintf($sprintf, $item, $self->{$item})
+            if exists $self->{$item};
+    }
+    for $item (qw/CONTAINS/) {
+        push @m, sprintf($sprintf, $item, join(" ",@{$self->{$item}}))
+            if exists $self->{$item} && @{$self->{$item}};
+    }
+    push @m, sprintf($sprintf, 'INST_FILE',
+                     $local_file || "(not installed)");
+    push @m, sprintf($sprintf, 'INST_VERSION',
+                     $self->inst_version) if $local_file;
+    if (%{$CPAN::META->{is_tested}||{}}) { # XXX needs to be methodified somehow
+        my $available_file = $self->available_file;
+        if ($available_file && $available_file ne $local_file) {
+            push @m, sprintf($sprintf, 'AVAILABLE_FILE', $available_file);
+            push @m, sprintf($sprintf, 'AVAILABLE_VERSION', $self->available_version);
+        }
+    }
+    join "", @m, "\n";
+}
+
+#-> sub CPAN::Module::manpage_headline
+sub manpage_headline {
+    my($self,$local_file) = @_;
+    my(@local_file) = $local_file;
+    $local_file =~ s/\.pm(?!\n)\Z/.pod/;
+    push @local_file, $local_file;
+    my(@result,$locf);
+    for $locf (@local_file) {
+        next unless -f $locf;
+        my $fh = FileHandle->new($locf)
+            or $Carp::Frontend->mydie("Couldn't open $locf: $!");
+        my $inpod = 0;
+        local $/ = "\n";
+        while (<$fh>) {
+            $inpod = m/^=(?!head1\s+NAME\s*$)/ ? 0 :
+                m/^=head1\s+NAME\s*$/ ? 1 : $inpod;
+            next unless $inpod;
+            next if /^=/;
+            next if /^\s+$/;
+            chomp;
+            push @result, $_;
+        }
+        close $fh;
+        last if @result;
+    }
+    for (@result) {
+        s/^\s+//;
+        s/\s+$//;
+    }
+    join " ", @result;
+}
+
+#-> sub CPAN::Module::cpan_file ;
+# Note: also inherited by CPAN::Bundle
+sub cpan_file {
+    my $self = shift;
+    # CPAN->debug(sprintf "id[%s]", $self->id) if $CPAN::DEBUG;
+    unless ($self->ro) {
+        CPAN::Index->reload;
+    }
+    my $ro = $self->ro;
+    if ($ro && defined $ro->{CPAN_FILE}) {
+        return $ro->{CPAN_FILE};
+    } else {
+        my $userid = $self->userid;
+        if ( $userid ) {
+            if ($CPAN::META->exists("CPAN::Author",$userid)) {
+                my $author = $CPAN::META->instance("CPAN::Author",
+                                                   $userid);
+                my $fullname = $author->fullname;
+                my $email = $author->email;
+                unless (defined $fullname && defined $email) {
+                    return sprintf("Contact Author %s",
+                                   $userid,
+                                  );
+                }
+                return "Contact Author $fullname <$email>";
+            } else {
+                return "Contact Author $userid (Email address not available)";
+            }
+        } else {
+            return "N/A";
+        }
+    }
+}
+
+#-> sub CPAN::Module::cpan_version ;
+sub cpan_version {
+    my $self = shift;
+
+    my $ro = $self->ro;
+    unless ($ro) {
+        # Can happen with modules that are not on CPAN
+        $ro = {};
+    }
+    $ro->{CPAN_VERSION} = 'undef'
+        unless defined $ro->{CPAN_VERSION};
+    $ro->{CPAN_VERSION};
+}
+
+#-> sub CPAN::Module::force ;
+sub force {
+    my($self) = @_;
+    $self->{force_update} = 1;
+}
+
+#-> sub CPAN::Module::fforce ;
+sub fforce {
+    my($self) = @_;
+    $self->{force_update} = 2;
+}
+
+#-> sub CPAN::Module::notest ;
+sub notest {
+    my($self) = @_;
+    # $CPAN::Frontend->mywarn("XDEBUG: set notest for Module");
+    $self->{notest}++;
+}
+
+#-> sub CPAN::Module::rematein ;
+sub rematein {
+    my($self,$meth) = @_;
+    $CPAN::Frontend->myprint(sprintf("Running %s for module '%s'\n",
+                                     $meth,
+                                     $self->id));
+    my $cpan_file = $self->cpan_file;
+    if ($cpan_file eq "N/A" || $cpan_file =~ /^Contact Author/) {
+        $CPAN::Frontend->mywarn(sprintf qq{
+  The module %s isn\'t available on CPAN.
+
+  Either the module has not yet been uploaded to CPAN, or it is
+  temporary unavailable. Please contact the author to find out
+  more about the status. Try 'i %s'.
+},
+                                $self->id,
+                                $self->id,
+                               );
+        return;
+    }
+    my $pack = $CPAN::META->instance('CPAN::Distribution',$cpan_file);
+    $pack->called_for($self->id);
+    if (exists $self->{force_update}) {
+        if ($self->{force_update} == 2) {
+            $pack->fforce($meth);
+        } else {
+            $pack->force($meth);
+        }
+    }
+    $pack->notest($meth) if exists $self->{notest} && $self->{notest};
+
+    $pack->{reqtype} ||= "";
+    CPAN->debug("dist-reqtype[$pack->{reqtype}]".
+                "self-reqtype[$self->{reqtype}]") if $CPAN::DEBUG;
+        if ($pack->{reqtype}) {
+            if ($pack->{reqtype} eq "b" && $self->{reqtype} =~ /^[rc]$/) {
+                $pack->{reqtype} = $self->{reqtype};
+                if (
+                    exists $pack->{install}
+                    &&
+                    (
+                     UNIVERSAL::can($pack->{install},"failed") ?
+                     $pack->{install}->failed :
+                     $pack->{install} =~ /^NO/
+                    )
+                   ) {
+                    delete $pack->{install};
+                    $CPAN::Frontend->mywarn
+                        ("Promoting $pack->{ID} from 'build_requires' to 'requires'");
+                }
+            }
+        } else {
+            $pack->{reqtype} = $self->{reqtype};
+        }
+
+    my $success = eval {
+        $pack->$meth();
+    };
+    my $err = $@;
+    $pack->unforce if $pack->can("unforce") && exists $self->{force_update};
+    $pack->unnotest if $pack->can("unnotest") && exists $self->{notest};
+    delete $self->{force_update};
+    delete $self->{notest};
+    if ($err) {
+        die $err;
+    }
+    return $success;
+}
+
+#-> sub CPAN::Module::perldoc ;
+sub perldoc { shift->rematein('perldoc') }
+#-> sub CPAN::Module::readme ;
+sub readme  { shift->rematein('readme') }
+#-> sub CPAN::Module::look ;
+sub look    { shift->rematein('look') }
+#-> sub CPAN::Module::cvs_import ;
+sub cvs_import { shift->rematein('cvs_import') }
+#-> sub CPAN::Module::get ;
+sub get     { shift->rematein('get',@_) }
+#-> sub CPAN::Module::make ;
+sub make    { shift->rematein('make') }
+#-> sub CPAN::Module::test ;
+sub test   {
+    my $self = shift;
+    # $self->{badtestcnt} ||= 0;
+    $self->rematein('test',@_);
+}
+
+#-> sub CPAN::Module::deprecated_in_core ;
+sub deprecated_in_core {
+    my ($self) = @_;
+    return unless $CPAN::META->has_inst('Module::CoreList') && Module::CoreList->can('is_deprecated');
+    return Module::CoreList::is_deprecated($self->{ID});
+}
+
+#-> sub CPAN::Module::inst_deprecated;
+# Indicates whether the *installed* version of the module is a deprecated *and*
+# installed as part of the Perl core library path
+sub inst_deprecated {
+    my ($self) = @_;
+    my $inst_file = $self->inst_file or return;
+    return $self->deprecated_in_core && $self->_in_priv_or_arch($inst_file);
+}
+
+#-> sub CPAN::Module::uptodate ;
+sub uptodate {
+    my ($self) = @_;
+    local ($_);
+    my $inst = $self->inst_version or return 0;
+    my $cpan = $self->cpan_version;
+    return 0 if CPAN::Version->vgt($cpan,$inst) || $self->inst_deprecated;
+    CPAN->debug
+        (join
+         ("",
+          "returning uptodate. ",
+          "cpan[$cpan]inst[$inst]",
+         )) if $CPAN::DEBUG;
+    return 1;
+}
+
+# returns true if installed in privlib or archlib
+sub _in_priv_or_arch {
+    my($self,$inst_file) = @_;
+    foreach my $pair (
+        [qw(sitearchexp archlibexp)],
+        [qw(sitelibexp privlibexp)]
+    ) {
+        my ($site, $priv) = @Config::Config{@$pair};
+        if ($^O eq 'VMS') {
+            for my $d ($site, $priv) { $d = VMS::Filespec::unixify($d) };
+        }
+        s!/*$!!g foreach $site, $priv;
+        next if $site eq $priv;
+
+        if ($priv eq substr($inst_file,0,length($priv))) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+#-> sub CPAN::Module::install ;
+sub install {
+    my($self) = @_;
+    my($doit) = 0;
+    if ($self->uptodate
+        &&
+        not exists $self->{force_update}
+       ) {
+        $CPAN::Frontend->myprint(sprintf("%s is up to date (%s).\n",
+                                         $self->id,
+                                         $self->inst_version,
+                                        ));
+    } else {
+        $doit = 1;
+    }
+    my $ro = $self->ro;
+    if ($ro && $ro->{stats} && $ro->{stats} eq "a") {
+        $CPAN::Frontend->mywarn(qq{
+\n\n\n     ***WARNING***
+     The module $self->{ID} has no active maintainer (CPAN support level flag 'abandoned').\n\n\n
+});
+        $CPAN::Frontend->mysleep(5);
+    }
+    return $doit ? $self->rematein('install') : 1;
+}

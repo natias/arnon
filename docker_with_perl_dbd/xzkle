@@ -1,0 +1,1000 @@
+
+    myRead($b1, 2);
+    my ($verHi, $verLow) = unpack ("CC", $b1);
+
+    out $b1, "LZMA Version", sprintf("%02X%02X", $verHi, $verLow) . " '$verHi.$verLow'";
+    my $LzmaPropertiesSize = out_v "LZMA Properties Size";
+    $len += 4;
+
+    my $LzmaInfo = out_C "LZMA Info",  sub { $_[0] == 93 ? "(Default)" : ""};
+
+    my $PosStateBits = 0;
+    my $LiteralPosStateBits = 0;
+    my $LiteralContextBits = 0;
+    $PosStateBits = int($LzmaInfo / (9 * 5));
+	$LzmaInfo -= $PosStateBits * 9 * 5;
+	$LiteralPosStateBits = int($LzmaInfo / 9);
+	$LiteralContextBits = $LzmaInfo - $LiteralPosStateBits * 9;
+
+    out1 "  PosStateBits",        $PosStateBits;
+    out1 "  LiteralPosStateBits", $LiteralPosStateBits;
+    out1 "  LiteralContextBits",  $LiteralContextBits;
+
+    out_V "LZMA Dictionary Size";
+
+    # TODO - assumption that this is 5
+    $len += $LzmaPropertiesSize;
+
+    skip($FH, $LzmaPropertiesSize - 5)
+        if  $LzmaPropertiesSize != 5 ;
+
+    return $len;
+}
+
+sub peekAtOffset
+{
+    # my $fh = shift;
+    my $offset = shift;
+    my $len = shift;
+
+    my $here = $FH->tell();
+
+    seekTo($offset) ;
+
+    my $buffer;
+    myRead($buffer, $len);
+    seekTo($here);
+
+    length $buffer == $len
+        or return '';
+
+    return $buffer;
+}
+
+sub readFromOffset
+{
+    # my $fh = shift;
+    my $offset = shift;
+    my $len = shift;
+
+    seekTo($offset) ;
+
+    my $buffer;
+    myRead($buffer, $len);
+
+    length $buffer == $len
+        or return '';
+
+    return $buffer;
+}
+
+sub readSignatureFromOffset
+{
+    my $offset = shift ;
+
+    # catch use case where attempting to read past EOF
+    # sub is expecting to return a 32-bit value so return 54-bit out-of-bound value
+    return MAX64
+        if $offset + 4 > $FILELEN ;
+
+    my $here = $FH->tell();
+    my $buffer = readFromOffset($offset, 4);
+    my $gotSig = unpack("V", $buffer) ;
+    seekTo($here);
+
+    return $gotSig;
+}
+
+
+sub chckForAPKSigningBlock
+{
+    my $fh = shift;
+    my $cdOffset = shift;
+    my $cdSize = shift;
+
+    # APK Signing Block comes directy before the Central directory
+    # See https://source.android.com/security/apksigning/v2
+
+    # If offset available is less than 44, it isn't an APK signing block
+    #
+    #   len1     8
+    #   id       4
+    #   kv with zero len 8
+    #   len1     8
+    #   magic   16
+    #   ----------
+    #           44
+
+    return (0, 0, '')
+        if $cdOffset < 44 || $FILELEN - $cdSize < 44 ;
+
+    # Step 1 - 16 bytes before CD is literal string "APK Sig Block 42"
+    my $magicOffset = $cdOffset - 16;
+    my $buffer = readFromOffset($magicOffset, 16);
+
+    return (0, 0, '')
+        if $buffer ne "APK Sig Block 42" ;
+
+    # Step 2 - read the second length field
+    #          and check that it looks ok
+    $buffer = readFromOffset($cdOffset - 16 - 8, 8);
+    my $len2 = unpack("Q<", $buffer);
+
+    return (0, 0, '')
+        if $len2 == 0 || $len2 > $FILELEN;
+
+    # Step 3 - read the first length field.
+    #          It should be identical to the second one.
+
+    my $startApkOffset = $cdOffset -  8 - $len2 ;
+
+    $buffer = readFromOffset($startApkOffset, 8);
+    my $len1 = unpack("Q<", $buffer);
+
+    return (0, 0, '')
+        if $len1 != $len2;
+
+    return ($startApkOffset, $cdOffset - 16 - 8, $buffer);
+}
+
+sub scanApkBlock
+{
+    state $IDs = {
+            0x7109871a  => "APK Signature v2",
+            0xf05368c0  => "APK Signature v3",
+            0x42726577  => "Verity Padding Block", # from https://android.googlesource.com/platform/tools/apksig/+/master/src/main/java/com/android/apksig/internal/apk/ApkSigningBlockUtils.java
+            0x6dff800d  => "Source Stamp",
+            0x504b4453  => "Dependency Info",
+            0x71777777  => "APK Channel Block",
+            0xff3b5998  => "Zero Block",
+            0x2146444e  => "Play Metadata",
+    } ;
+
+
+    seekTo($FH->tell() - 4) ;
+    print "\n";
+    out "", "APK SIGNING BLOCK";
+
+    scanApkPadding();
+    out_Q "Block Length Copy #1";
+    my $ix = 1;
+
+    while ($FH->tell() < $APK - 8)
+    {
+         my ($bytes, $id, $len);
+        ($bytes, $len) = read_Q ;
+        out $bytes, "ID/Value Length #" . sprintf("%X", $ix), Value_Q($len);
+
+        ($bytes, $id) = read_V;
+
+        out $bytes, "  ID", Value_V($id) . " '" . ($IDs->{$id} // 'Unknown ID') . "'";
+
+        outSomeData($len-4, "  Value");
+        ++ $ix;
+    }
+
+    out_Q "Block Length Copy #2";
+
+    my $magic ;
+    myRead($magic, 16);
+
+    out $magic, "Magic", qq['$magic'];
+}
+
+sub scanApkPadding
+{
+    my $here = $FH->tell();
+
+    return
+        if $here == $START_APK;
+
+    # found some padding
+
+    my $delta = $START_APK - $here;
+    my $padding = peekAtOffset($here, $delta);
+
+    if ($padding =~ /^\x00+$/)
+    {
+        outSomeData($delta, "Null Padding");
+    }
+    else
+    {
+        outHexdump($delta, "Unexpected Padding");
+    }
+}
+
+sub scanCentralDirectory
+{
+    my $fh = shift;
+
+    my $here = $fh->tell();
+
+    # Use cases
+    # 1 32-bit CD
+    # 2 64-bit CD
+
+    my ($offset, $size) = findCentralDirectoryOffset($fh);
+    $CentralDirectory->{CentralDirectoryOffset} = $offset;
+    $CentralDirectory->{CentralDirectorySize} = $size;
+
+    return ()
+        if ! defined $offset;
+
+    $fh->seek($offset, SEEK_SET) ;
+
+    # Now walk the Central Directory Records
+    my $buffer ;
+    my $cdIndex = 0;
+    my $cdEntryOffset = 0;
+
+    while ($fh->read($buffer, ZIP_CD_FILENAME_OFFSET) == ZIP_CD_FILENAME_OFFSET  &&
+           unpack("V", $buffer) == ZIP_CENTRAL_HDR_SIG) {
+
+        my $startHeader = $fh->tell() - ZIP_CD_FILENAME_OFFSET;
+
+        my $cdEntryOffset = $fh->tell() - ZIP_CD_FILENAME_OFFSET;
+        $HeaderOffsetIndex->addOffsetNoPrefix($cdEntryOffset, ZIP_CENTRAL_HDR_SIG) ;
+
+        ++ $cdIndex ;
+
+        my $extractVer         = unpack("v", substr($buffer,  6, 1));
+        my $gpFlag             = unpack("v", substr($buffer,  8, 2));
+        my $lastMod            = unpack("V", substr($buffer, 10, 4));
+        my $crc                = unpack("V", substr($buffer, 16, 4));
+        my $compressedSize   = unpack("V", substr($buffer, 20, 4));
+        my $uncompressedSize = unpack("V", substr($buffer, 24, 4));
+        my $filename_length    = unpack("v", substr($buffer, 28, 2));
+        my $extra_length       = unpack("v", substr($buffer, 30, 2));
+        my $comment_length     = unpack("v", substr($buffer, 32, 2));
+        my $diskNumber         = unpack("v", substr($buffer, 34, 2));
+        my $locHeaderOffset    = unpack("V", substr($buffer, 42, 4));
+
+        my $cdZip64 = 0;
+        my $zip64Sizes = 0;
+
+        if (! full32 $locHeaderOffset)
+        {
+            # Check for corrupt offset
+            # 1. ponting paset EOF
+            # 2. offset points forward in the file
+            # 3. value at offset is not a CD record signature
+
+            my $commonMessage = "'Local Header Offset' field in '" . Signatures::name(ZIP_CENTRAL_HDR_SIG) . "' is invalid";
+            checkOffsetValue($locHeaderOffset, $startHeader, 0, $commonMessage,
+                $startHeader + CentralDirectoryEntry::Offset_RelativeOffsetToLocal(),
+                ZIP_LOCAL_HDR_SIG, 1) ;
+        }
+
+        $fh->read(my $filename, $filename_length) ;
+
+        my $cdEntry = CentralDirectoryEntry->new();
+
+        $cdEntry->centralHeaderOffset($startHeader) ;
+        $cdEntry->localHeaderOffset($locHeaderOffset) ;
+        $cdEntry->compressedSize($compressedSize) ;
+        $cdEntry->uncompressedSize($uncompressedSize) ;
+        $cdEntry->extractVersion($extractVer);
+        $cdEntry->generalPurposeFlags($gpFlag);
+        $cdEntry->filename($filename) ;
+        $cdEntry->lastModDateTime($lastMod);
+        $cdEntry->languageEncodingFlag($gpFlag & ZIP_GP_FLAG_LANGUAGE_ENCODING) ;
+        $cdEntry->diskNumber($diskNumber) ;
+        $cdEntry->crc32($crc) ;
+        $cdEntry->zip64ExtraPresent($cdZip64) ;
+
+        $cdEntry->std_localHeaderOffset($locHeaderOffset) ;
+        $cdEntry->std_compressedSize($compressedSize) ;
+        $cdEntry->std_uncompressedSize($uncompressedSize) ;
+        $cdEntry->std_diskNumber($diskNumber) ;
+
+
+        if ($extra_length)
+        {
+            $fh->read(my $extraField, $extra_length) ;
+
+            # Check for Zip64
+            my $zip64Extended = findID(0x0001, $extraField);
+
+            if ($zip64Extended)
+            {
+                $cdZip64 = 1;
+                walk_Zip64_in_CD(1, $zip64Extended, $cdEntry, 0);
+            }
+        }
+
+        $cdEntry->offsetStart($startHeader) ;
+        $cdEntry->offsetEnd($FH->tell() - 1);
+
+        # don't call addEntry until after the extra fields have been scanned
+        # the localheader offset value may be updated in th ezip64 extra field.
+        $CentralDirectory->addEntry($cdEntry);
+        $HeaderOffsetIndex->addOffset($cdEntry->localHeaderOffset, ZIP_LOCAL_HDR_SIG) ;
+
+        skip($fh, $comment_length ) ;
+    }
+
+    $FH->seek($fh->tell() - ZIP_CD_FILENAME_OFFSET, SEEK_SET);
+
+    # Check for Digital Signature
+    $HeaderOffsetIndex->addOffset($fh->tell() - 4, ZIP_DIGITAL_SIGNATURE_SIG)
+        if $fh->read($buffer, 4) == 4  &&
+            unpack("V", $buffer) == ZIP_DIGITAL_SIGNATURE_SIG ;
+
+    $CentralDirectory->sortByLocalOffset();
+    $HeaderOffsetIndex->sortOffsets();
+
+    $fh->seek($here, SEEK_SET) ;
+
+}
+
+use constant ZIP64_END_CENTRAL_LOC_HDR_SIZE     => 20;
+use constant ZIP64_END_CENTRAL_REC_HDR_MIN_SIZE => 56;
+
+sub offsetFromZip64
+{
+    my $fh = shift ;
+    my $here = shift;
+    my $eocdSize = shift;
+
+    #### Zip64 end of central directory locator
+
+    # check enough bytes available for zip64 locator record
+    fatal_tryWalk undef, "Cannot find signature for " .  Signatures::nameAndHex(ZIP64_END_CENTRAL_LOC_HDR_SIG), # 'Zip64 end of central directory locator': 0x07064b50"
+                         "Possible truncated or corrupt zip file"
+        if $here < ZIP64_END_CENTRAL_LOC_HDR_SIZE ;
+
+    $fh->seek($here - ZIP64_END_CENTRAL_LOC_HDR_SIZE, SEEK_SET) ;
+    $here = $FH->tell();
+
+    my $buffer;
+    my $got = 0;
+    $fh->read($buffer, ZIP64_END_CENTRAL_LOC_HDR_SIZE);
+
+    my $gotSig = unpack("V", $buffer);
+    fatal_tryWalk $here - 4, sprintf("Expected signature for " . Signatures::nameAndHex(ZIP64_END_CENTRAL_LOC_HDR_SIG) . " not found, got 0x%X", $gotSig)
+        if $gotSig != ZIP64_END_CENTRAL_LOC_HDR_SIG ;
+
+    $HeaderOffsetIndex->addOffset($fh->tell() - ZIP64_END_CENTRAL_LOC_HDR_SIZE, ZIP64_END_CENTRAL_LOC_HDR_SIG) ;
+
+
+    my $cd64 = unpack "Q<", substr($buffer,  8, 8);
+    my $totalDisks = unpack "V", substr($buffer,  16, 4);
+
+    testPossiblePrefix($cd64, ZIP64_END_CENTRAL_REC_HDR_SIG);
+
+    if ($totalDisks > 0)
+    {
+        my $commonMessage = "'Offset to Zip64 End of Central Directory Record' field in '" . Signatures::name(ZIP64_END_CENTRAL_LOC_HDR_SIG) . "' is invalid";
+        $cd64 = checkOffsetValue($cd64, $here, 0, $commonMessage, $here + 8, ZIP64_END_CENTRAL_REC_HDR_SIG, 1) ;
+    }
+
+    my $delta = $here - $cd64;
+
+    #### Zip64 end of central directory record
+
+    my $zip64eocd_name = "'" . Signatures::name(ZIP64_END_CENTRAL_REC_HDR_SIG) . "'";
+    my $zip64eocd_name_value = Signatures::nameAndHex(ZIP64_END_CENTRAL_REC_HDR_SIG);
+    my $zip64eocd_value = Signatures::hexValue(ZIP64_END_CENTRAL_REC_HDR_SIG);
+
+    # check enough bytes available
+    # fatal_tryWalk sprintf "Size of 'Zip64 End of Central Directory Record' 0x%X too small", $cd64
+    fatal_tryWalk undef, sprintf "Size of $zip64eocd_name 0x%X too small", $cd64
+        if $delta < ZIP64_END_CENTRAL_REC_HDR_MIN_SIZE;
+
+    # Seek to Zip64 End of Central Directory Record
+    $fh->seek($cd64, SEEK_SET) ;
+    $HeaderOffsetIndex->addOffsetNoPrefix($fh->tell(), ZIP64_END_CENTRAL_REC_HDR_SIG) ;
+
+    $fh->read($buffer, ZIP64_END_CENTRAL_REC_HDR_MIN_SIZE) ;
+
+    my $sig = unpack("V", substr($buffer, 0, 4)) ;
+    fatal_tryWalk undef, sprintf "Cannot find $zip64eocd_name: expected $zip64eocd_value but got 0x%X", $sig
+        if $sig != ZIP64_END_CENTRAL_REC_HDR_SIG ;
+
+    # pkzip sets the extract zip spec to 6.2 (0x3E) to signal a v2 record
+    # See APPNOTE 6.3.10, section, 7.3.3
+
+    # Version 1 header is 44 bytes (assuming no extensible data sector)
+    # Version 2 header (see APPNOTE 6.3.7, section) is > 44 bytes
+
+    my $extractSpec         = unpack "C",  substr($buffer, 14, 1);
+    my $diskNumber          = unpack "V",  substr($buffer, 16, 4);
+    my $cdDiskNumber        = unpack "V",  substr($buffer, 20, 4);
+    my $entriesOnThisDisk   = unpack "Q<", substr($buffer, 24, 8);
+    my $totalEntries        = unpack "Q<", substr($buffer, 32, 8);
+    my $centralDirSize      = unpack "Q<", substr($buffer, 40, 8);
+    my $centralDirOffset    = unpack "Q<", substr($buffer, 48, 8);
+
+    if ($extractSpec >= 0x3E)
+    {
+        $opt_walk = 1;
+        $CentralDirectory->setPkEncryptedCD();
+    }
+
+    if (! emptyArchive($here, $diskNumber, $cdDiskNumber, $entriesOnThisDisk, $totalEntries,  $centralDirSize, $centralDirOffset))
+    {
+        my $commonMessage = "'Offset to Central Directory' field in $zip64eocd_name is invalid";
+        $centralDirOffset = checkOffsetValue($centralDirOffset, $here, 0, $commonMessage, $here + 48, ZIP_CENTRAL_HDR_SIG, 1, $extractSpec < 0x3E) ;
+    }
+
+    # TODO - APPNOTE allows an extensible data sector here (see APPNOTE 6.3.10, section 4.3.14.2) -- need to take this into account
+
+    return ($centralDirOffset, $centralDirSize) ;
+}
+
+use constant Pack_ZIP_END_CENTRAL_HDR_SIG => pack("V", ZIP_END_CENTRAL_HDR_SIG);
+
+sub findCentralDirectoryOffset
+{
+    my $fh = shift ;
+
+    # Most common use-case is where there is no comment, so
+    # know exactly where the end of central directory record
+    # should be.
+
+    need ZIP_EOCD_MIN_SIZE, Signatures::name(ZIP_END_CENTRAL_HDR_SIG);
+
+    $fh->seek(-ZIP_EOCD_MIN_SIZE(), SEEK_END) ;
+    my $here = $fh->tell();
+
+    my $is64bit = $here > MAX32;
+    my $over64bit = $here  & (~ MAX32);
+
+    my $buffer;
+    $fh->read($buffer, ZIP_EOCD_MIN_SIZE);
+
+    my $zip64 = 0;
+    my $diskNumber ;
+    my $cdDiskNumber ;
+    my $entriesOnThisDisk ;
+    my $totalEntries ;
+    my $centralDirSize ;
+    my $centralDirOffset ;
+    my $commentLength = 0;
+    my $trailingBytes = 0;
+
+    if ( unpack("V", $buffer) == ZIP_END_CENTRAL_HDR_SIG ) {
+
+        $HeaderOffsetIndex->addOffset($here + $PREFIX_DELTA, ZIP_END_CENTRAL_HDR_SIG) ;
+
+        $diskNumber       = unpack("v", substr($buffer, 4,   2));
+        $cdDiskNumber     = unpack("v", substr($buffer, 6,   2));
+        $entriesOnThisDisk= unpack("v", substr($buffer, 8,   2));
+        $totalEntries     = unpack("v", substr($buffer, 10,  2));
+        $centralDirSize   = unpack("V", substr($buffer, 12,  4));
+        $centralDirOffset = unpack("V", substr($buffer, 16,  4));
+        $commentLength    = unpack("v", substr($buffer, 20,  2));
+    }
+    else {
+        $fh->seek(0, SEEK_END) ;
+
+        my $fileLen = $fh->tell();
+        my $want = 0 ;
+
+        while(1) {
+            $want += 1024 * 32;
+            my $seekTo = $fileLen - $want;
+            if ($seekTo < 0 ) {
+                $seekTo = 0;
+                $want = $fileLen ;
+            }
+            $fh->seek( $seekTo, SEEK_SET);
+            $fh->read($buffer, $want) ;
+            my $pos = rindex( $buffer, Pack_ZIP_END_CENTRAL_HDR_SIG);
+
+            if ($pos >= 0 && $want - $pos > ZIP_EOCD_MIN_SIZE) {
+                $here = $seekTo + $pos ;
+                $HeaderOffsetIndex->addOffset($here + $PREFIX_DELTA, ZIP_END_CENTRAL_HDR_SIG) ;
+
+                $diskNumber       = unpack("v", substr($buffer, $pos + 4,   2));
+                $cdDiskNumber     = unpack("v", substr($buffer, $pos + 6,   2));
+                $entriesOnThisDisk= unpack("v", substr($buffer, $pos + 8,   2));
+                $totalEntries     = unpack("v", substr($buffer, $pos + 10,  2));
+                $centralDirSize   = unpack("V", substr($buffer, $pos + 12,  4));
+                $centralDirOffset = unpack("V", substr($buffer, $pos + 16,  4));
+                $commentLength    = unpack("v", substr($buffer, $pos + 20,  2)) // 0;
+
+                my $expectedEof = $fileLen - $want + $pos + ZIP_EOCD_MIN_SIZE + $commentLength  ;
+                # check for trailing data after end of zip
+                if ($expectedEof < $fileLen ) {
+                    $TRAILING = $expectedEof ;
+                    $trailingBytes = $FILELEN - $expectedEof ;
+                }
+                last ;
+            }
+
+            return undef
+                if $want == $fileLen;
+
+        }
+    }
+
+    $EOCD_Present = 1;
+
+    # Empty zip file can just contain an EOCD record
+    return (0, 0)
+        if ZIP_EOCD_MIN_SIZE + $commentLength + $trailingBytes  == $FILELEN ;
+
+    if (needZip64EOCDLocator($diskNumber, $cdDiskNumber, $entriesOnThisDisk, $totalEntries, $centralDirOffset, $centralDirSize) &&
+        ! emptyArchive($here, $diskNumber, $cdDiskNumber, $entriesOnThisDisk, $totalEntries, $centralDirOffset, $centralDirSize))
+    {
+        ($centralDirOffset, $centralDirSize) = offsetFromZip64($fh, $here, ZIP_EOCD_MIN_SIZE + $commentLength + $trailingBytes)
+    }
+    elsif ($is64bit)
+    {
+        # use-case is where a 64-bit zip file doesn't use the 64-bit
+        # extensions.
+        # print "EOCD not 64-bit $centralDirOffset ($here)\n" ;
+
+        fatal_tryWalk $here, "Zip file > 4Gig. Expected 'Offset to Central Dir' to be 0xFFFFFFFF, got " . hexValue($centralDirOffset);
+
+        $centralDirOffset += $over64bit;
+        $is64In32 = 1;
+    }
+    else
+    {
+        if ($centralDirSize)
+        {
+            my $commonMessage = "'Offset to Central Directory' field in '" . Signatures::name(ZIP_END_CENTRAL_HDR_SIG) . "' is invalid";
+            $centralDirOffset = checkOffsetValue($centralDirOffset, $here, $centralDirSize, $commonMessage, $here + 16, ZIP_CENTRAL_HDR_SIG, 1) ;
+        }
+    }
+
+    return (0, 0)
+        if  $totalEntries == 0 && $entriesOnThisDisk == 0;
+
+    # APK Signing Block is directly before the first CD entry
+    # Check if it is present
+    ($START_APK, $APK, $APK_LEN) = chckForAPKSigningBlock($fh, $centralDirOffset, ZIP_EOCD_MIN_SIZE + $commentLength);
+
+    return ($centralDirOffset, $centralDirSize) ;
+}
+
+sub findID
+{
+    my $id_want = shift ;
+    my $data    = shift;
+
+    my $XLEN = length $data ;
+
+    my $offset = 0 ;
+    while ($offset < $XLEN) {
+
+        return undef
+            if $offset + ZIP_EXTRA_SUBFIELD_HEADER_SIZE  > $XLEN ;
+
+        my $id = substr($data, $offset, ZIP_EXTRA_SUBFIELD_ID_SIZE);
+        $id = unpack("v", $id);
+        $offset += ZIP_EXTRA_SUBFIELD_ID_SIZE;
+
+        my $subLen =  unpack("v", substr($data, $offset,
+                                            ZIP_EXTRA_SUBFIELD_LEN_SIZE));
+        $offset += ZIP_EXTRA_SUBFIELD_LEN_SIZE ;
+
+        return undef
+            if $offset + $subLen > $XLEN ;
+
+        return substr($data, $offset, $subLen)
+            if $id eq $id_want ;
+
+        $offset += $subLen ;
+    }
+
+    return undef ;
+}
+
+
+sub nibbles
+{
+    my @nibbles = (
+        [ 16 => 0x1000000000000000 ],
+        [ 15 => 0x100000000000000 ],
+        [ 14 => 0x10000000000000 ],
+        [ 13 => 0x1000000000000 ],
+        [ 12 => 0x100000000000 ],
+        [ 11 => 0x10000000000 ],
+        [ 10 => 0x1000000000 ],
+        [  9 => 0x100000000 ],
+        [  8 => 0x10000000 ],
+        [  7 => 0x1000000 ],
+        [  6 => 0x100000 ],
+        [  5 => 0x10000 ],
+        [  4 => 0x1000 ],
+        [  4 => 0x100 ],
+        [  4 => 0x10 ],
+        [  4 => 0x1 ],
+    );
+    my $value = shift ;
+
+    for my $pair (@nibbles)
+    {
+        my ($count, $limit) = @{ $pair };
+
+        return $count
+            if $value >= $limit ;
+    }
+}
+
+{
+    package HeaderOffsetEntry;
+
+    sub new
+    {
+        my $class = shift ;
+        my $offset = shift ;
+        my $signature = shift;
+
+        bless [ $offset, $signature, Signatures::name($signature)] , $class;
+
+    }
+
+    sub offset
+    {
+        my $self = shift;
+        return $self->[0];
+    }
+
+    sub signature
+    {
+        my $self = shift;
+        return $self->[1];
+    }
+
+    sub name
+    {
+        my $self = shift;
+        return $self->[2];
+    }
+
+}
+
+{
+    package HeaderOffsetIndex;
+
+    # Store a list of header offsets recorded when scannning the central directory
+
+    sub new
+    {
+        my $class = shift ;
+
+        my %object = (
+                        'offsetIndex'       => [],
+                        'offset2Index'      => {},
+                        'offset2Signature'  => {},
+                        'currentIndex'      => -1,
+                        'currentSignature'  => 0,
+                        # 'sigNames'          => $sigNames,
+                     ) ;
+
+        bless \%object, $class;
+    }
+
+    sub sortOffsets
+    {
+        my $self = shift ;
+
+        @{ $self->{offsetIndex} } = sort { $a->[0] <=> $b->[0] }
+                                    @{ $self->{offsetIndex} };
+        my $ix = 0;
+        $self->{offset2Index}{$_} = $ix++
+            for @{ $self->{offsetIndex} } ;
+    }
+
+    sub addOffset
+    {
+        my $self = shift ;
+        my $offset = shift ;
+        my $signature = shift ;
+
+        $offset += $PREFIX_DELTA ;
+        $self->addOffsetNoPrefix($offset, $signature);
+    }
+
+    sub addOffsetNoPrefix
+    {
+        my $self = shift ;
+        my $offset = shift ;
+        my $signature = shift ;
+
+        my $name = Signatures::name($signature);
+
+        if (! defined $self->{offset2Signature}{$offset})
+        {
+            push @{ $self->{offsetIndex} }, HeaderOffsetEntry->new($offset, $signature) ;
+            $self->{offset2Signature}{$offset} = $signature;
+        }
+    }
+
+    sub getNextIndex
+    {
+        my $self = shift ;
+        my $offset = shift ;
+
+        $self->{currentIndex} ++;
+
+        return ${ $self->{offsetIndex} }[$self->{currentIndex}] // undef
+    }
+
+    sub rewindIndex
+    {
+        my $self = shift ;
+        my $offset = shift ;
+
+        $self->{currentIndex} --;
+    }
+
+    sub dump
+    {
+        my $self = shift;
+
+        say "### HeaderOffsetIndex";
+        say "###   Offset\tSignature";
+        for my $x ( @{ $self->{offsetIndex} } )
+        {
+            my ($offset, $sig) = @$x;
+            printf "###   %X %d\t\t" . $x->name() . "\n", $x->offset(), $x->offset();
+        }
+    }
+
+    sub checkForOverlap
+    {
+        my $self = shift ;
+        my $need = shift;
+
+        my $needOffset = $FH->tell() + $need;
+
+        for my $hdrOffset (@{ $self->{offsetIndex} })
+        {
+            my $delta = $hdrOffset - $needOffset;
+            return [$self->{offsetIndex}{$hdrOffset}, $needOffset - $hdrOffset]
+                if $delta <= 0 ;
+        }
+
+        return [undef, undef];
+    }
+
+}
+
+{
+    package FieldsAndAccessors;
+
+    sub Add
+    {
+        use Data::Dumper ;
+
+        my $classname = shift;
+        my $object = shift;
+        my $fields = shift ;
+        my $no_handler = shift // {};
+
+        state $done = {};
+
+
+        while (my ($name, $value) =  each %$fields)
+        {
+            my $method = "${classname}::$name";
+
+            $object->{$name} = $value;
+
+            # don't auto-create a handler
+            next
+                if $no_handler->{$name};
+
+            no strict 'refs';
+
+            # Don't use lvalue sub for now - vscode debugger breaks with it enabled.
+            # https://github.com/richterger/Perl-LanguageServer/issues/194
+            # *$method = sub : lvalue {
+            #     $_[0]->{$name} ;
+            # }
+            # unless defined $done->{$method};
+
+            # Auto-generate getter/setter
+            *$method = sub  {
+                $_[0]->{$name} = $_[1]
+                    if @_ == 2;
+                return $_[0]->{$name} ;
+            }
+            unless defined $done->{$method};
+
+            ++ $done->{$method};
+
+
+        }
+    }
+}
+
+{
+    package BaseEntry ;
+
+    sub new
+    {
+        my $class = shift ;
+
+        state $index = 0;
+
+        my %fields = (
+                        'index'                 => $index ++,
+                        'zip64'                 => 0,
+                        'offsetStart'           => 0,
+                        'offsetEnd'             => 0,
+                        'inCentralDir'          => 0,
+                        'encapsulated'          => 0, # enclosed in outer zip
+                        'childrenCount'         => 0, # this entry is a zip with enclosed children
+                        'streamed'              => 0,
+                        'languageEncodingFlag'  => 0,
+                        'entryType'             => 0,
+                     ) ;
+
+        my $self = bless {}, $class;
+
+        FieldsAndAccessors::Add($class, $self, \%fields) ;
+
+        return $self;
+    }
+
+    sub increment_childrenCount
+    {
+        my $self = shift;
+        $self->{childrenCount} ++;
+    }
+}
+
+{
+    package LocalCentralEntryBase ;
+
+    use parent -norequire , 'BaseEntry' ;
+
+    sub new
+    {
+        my $class = shift ;
+
+        my $self = $class->SUPER::new();
+
+
+        my %fields = (
+                        # fields from the header
+                        'centralHeaderOffset'   => 0,
+                        'localHeaderOffset'     => 0,
+
+                        'extractVersion'        => 0,
+                        'generalPurposeFlags'   => 0,
+                        'compressedMethod'      => 0,
+                        'lastModDateTime'       => 0,
+                        'crc32'                 => 0,
+                        'compressedSize'        => 0,
+                        'uncompressedSize'      => 0,
+                        'filename'              => '',
+                        'outputFilename'        => '',
+                        # inferred data
+                        # 'InCentralDir'          => 0,
+                        # 'zip64'                 => 0,
+
+                        'zip64ExtraPresent'     => 0,
+                        'zip64SizesPresent'     => 0,
+                        'payloadOffset'         => 0,
+
+                        # zip64 extra
+                        'zip64_compressedSize'    => undef,
+                        'zip64_uncompressedSize'  => undef,
+                        'zip64_localHeaderOffset' => undef,
+                        'zip64_diskNumber'        => undef,
+                        'zip64_diskNumberPresent' => 0,
+
+                        # Values direct from the header before merging any Zip64 values
+                        'std_compressedSize'    => undef,
+                        'std_uncompressedSize'  => undef,
+                        'std_localHeaderOffset' => undef,
+                        'std_diskNumber'        => undef,
+
+                        # AES
+                        'aesStrength'             => 0,
+                        'aesValid'                => 0,
+
+                        # Minizip CD encryption
+                        'minizip_secure'          => 0,
+
+                     ) ;
+
+        FieldsAndAccessors::Add($class, $self, \%fields) ;
+
+        return $self;
+    }
+}
+
+{
+    package Zip64EndCentralHeaderEntry ;
+
+    use parent -norequire , 'LocalCentralEntryBase' ;
+
+    sub new
+    {
+        my $class = shift ;
+
+        my $self = $class->SUPER::new();
+
+
+        my %fields = (
+                        'inCentralDir'          => 1,
+                     ) ;
+
+        FieldsAndAccessors::Add($class, $self, \%fields) ;
+
+        return $self;
+    }
+
+}
+
+{
+    package CentralDirectoryEntry;
+
+    use parent -norequire , 'LocalCentralEntryBase' ;
+
+    use constant Offset_VersionMadeBy           => 4;
+    use constant Offset_VersionNeededToExtract  => 6;
+    use constant Offset_GeneralPurposeFlags     => 8;
+    use constant Offset_CompressionMethod       => 10;
+    use constant Offset_ModificationTime        => 12;
+    use constant Offset_ModificationDate        => 14;
+    use constant Offset_CRC32                   => 16;
+    use constant Offset_CompressedSize          => 20;
+    use constant Offset_UncompressedSize        => 24;
+    use constant Offset_FilenameLength          => 28;
+    use constant Offset_ExtraFieldLength        => 30;
+    use constant Offset_FileCommentLength       => 32;
+    use constant Offset_DiskNumber              => 34;
+    use constant Offset_InternalAttributes      => 36;
+    use constant Offset_ExternalAttributes      => 38;
+    use constant Offset_RelativeOffsetToLocal   => 42;
+    use constant Offset_Filename                => 46;
+
+    sub new
+    {
+        my $class = shift ;
+        my $offset = shift;
+
+        # check for existing entry
+        return $CentralDirectory->{byCentralOffset}{$offset}
+            if defined $offset && defined $CentralDirectory->{byCentralOffset}{$offset} ;
+
+        my $self = $class->SUPER::new();
+
+        my %fields = (
+                        'diskNumber'                => 0,
+                        'comment'                   => "",
+                        'ldEntry'                   => undef,
+                     ) ;
+
+        FieldsAndAccessors::Add($class, $self, \%fields) ;
+
+        $self->inCentralDir(1) ;
+        $self->entryType(::ZIP_CENTRAL_HDR_SIG) ;
+
+        return $self;
+    }
+}
+
+{
+    package CentralDirectory;
+
+    sub new
+    {
+        my $class = shift ;
+
+        my %object = (
+                        'entries'       => [],
+                        'count'         => 0,
+                        'byLocalOffset' => {},
+                        'byCentralOffset' => {},
+                        'byName'        => {},
+                        'offset2Index' => {},
+                        'normalized_filenames' => {},
+                        'CentralDirectoryOffset'      => 0,
+                        'CentralDirectorySize'      => 0,
+                        'zip64'         => 0,
+                        'encryptedCD'   => 0,
+                        'minizip_secure' => 0,
+                        'alreadyScanned' => 0,
+                     ) ;
+
+        bless \%object, $class;

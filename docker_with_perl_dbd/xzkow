@@ -1,0 +1,1000 @@
+    my $subinputmap = $typemaps->get_inputmap(xstype => $subtypemap->xstype);
+    if (not $subinputmap) {
+      $self->blurt("Error: No INPUT definition for type '$subtype', typekind '" . $subtypemap->xstype . "' found");
+      return;
+    }
+
+    my $subexpr = $subinputmap->cleaned_code;
+    $subexpr =~ s/\$type/\$subtype/g;
+    $subexpr =~ s/ntype/subtype/g;
+    $subexpr =~ s/\$arg/ST(ix_$var)/g;
+    $subexpr =~ s/\n\t/\n\t\t/g;
+    $subexpr =~ s/is not of (.*\")/[arg %d] is not of $1, ix_$var + 1/g;
+    $subexpr =~ s/\$var/${var}\[ix_$var - $argoff]/;
+    $expr =~ s/DO_ARRAY_ELEM/$subexpr/;
+  }
+  if ($expr =~ m#/\*.*scope.*\*/#i) {  # "scope" in C comments
+    $self->{ScopeThisXSUB} = 1;
+  }
+
+  my $eval_vars = {
+    var           => $var,
+    printed_name  => $printed_name,
+    type          => $type,
+    ntype         => $ntype,
+    subtype       => $subtype,
+    num           => $num,
+    arg           => $arg,
+    argoff        => $argoff,
+  };
+
+  if (defined($self->{defaults}->{$var})) {
+    $expr =~ s/(\t+)/$1    /g;
+    $expr =~ s/        /\t/g;
+    if ($printed_name) {
+      print ";\n";
+    }
+    else {
+      $self->eval_input_typemap_code(qq/print "\\t$var;\\n"/, $eval_vars);
+    }
+    if ($self->{defaults}->{$var} eq 'NO_INIT') {
+      $self->{deferred} .= $self->eval_input_typemap_code(
+        qq/"\\n\\tif (items >= $num) {\\n$expr;\\n\\t}\\n"/,
+        $eval_vars
+      );
+    }
+    else {
+      $self->{deferred} .= $self->eval_input_typemap_code(
+        qq/"\\n\\tif (items < $num)\\n\\t    $var = $self->{defaults}->{$var};\\n\\telse {\\n$expr;\\n\\t}\\n"/,
+        $eval_vars
+      );
+    }
+  }
+  elsif ($self->{ScopeThisXSUB} or $expr !~ /^\s*\$var =/) {
+    if ($printed_name) {
+      print ";\n";
+    }
+    else {
+      $self->eval_input_typemap_code(qq/print "\\t$var;\\n"/, $eval_vars);
+    }
+    $self->{deferred}
+      .= $self->eval_input_typemap_code(qq/"\\n$expr;\\n"/, $eval_vars);
+  }
+  else {
+    die "panic: do not know how to handle this branch for function pointers"
+      if $printed_name;
+    $self->eval_input_typemap_code(qq/print "$expr;\\n"/, $eval_vars);
+  }
+}
+
+sub generate_output {
+  my $self = shift;
+  my $argsref = shift;
+  my ($type, $num, $var, $do_setmagic, $do_push)
+    = @{$argsref}{qw(type num var do_setmagic do_push)};
+
+  my $arg = "ST(" . ($num - ($num != 0)) . ")";
+
+  my $typemaps = $self->{typemap};
+
+  $type = ExtUtils::Typemaps::tidy_type($type);
+  local $argsref->{type} = $type;
+
+  if ($type =~ /^array\(([^,]*),(.*)\)/) {
+    print "\t$arg = sv_newmortal();\n";
+    print "\tsv_setpvn($arg, (char *)$var, $2 * sizeof($1));\n";
+    print "\tSvSETMAGIC($arg);\n" if $do_setmagic;
+  }
+  else {
+    my $typemap = $typemaps->get_typemap(ctype => $type);
+    if (not $typemap) {
+      $self->report_typemap_failure($typemaps, $type);
+      return;
+    }
+
+    my $outputmap = $typemaps->get_outputmap(xstype => $typemap->xstype);
+    if (not $outputmap) {
+      $self->blurt("Error: No OUTPUT definition for type '$type', typekind '" . $typemap->xstype . "' found");
+      return;
+    }
+
+    (my $ntype = $type) =~ s/\s*\*/Ptr/g;
+    $ntype =~ s/\(\)//g;
+    (my $subtype = $ntype) =~ s/(?:Array)?(?:Ptr)?$//;
+    $type =~ tr/:/_/ unless $self->{RetainCplusplusHierarchicalTypes};
+
+    my $eval_vars = {%$argsref, subtype => $subtype, ntype => $ntype, arg => $arg, type => $type };
+    my $expr = $outputmap->cleaned_code;
+    if ($expr =~ /DO_ARRAY_ELEM/) {
+      my $subtypemap = $typemaps->get_typemap(ctype => $subtype);
+      if (not $subtypemap) {
+        $self->report_typemap_failure($typemaps, $subtype);
+        return;
+      }
+
+      my $suboutputmap = $typemaps->get_outputmap(xstype => $subtypemap->xstype);
+      if (not $suboutputmap) {
+        $self->blurt("Error: No OUTPUT definition for type '$subtype', typekind '" . $subtypemap->xstype . "' found");
+        return;
+      }
+
+      my $subexpr = $suboutputmap->cleaned_code;
+      $subexpr =~ s/ntype/subtype/g;
+      $subexpr =~ s/\$arg/ST(ix_$var)/g;
+      $subexpr =~ s/\$var/${var}\[ix_$var]/g;
+      $subexpr =~ s/\n\t/\n\t\t/g;
+      $expr =~ s/DO_ARRAY_ELEM\n/$subexpr/;
+      $self->eval_output_typemap_code("print qq\a$expr\a", $eval_vars);
+      print "\t\tSvSETMAGIC(ST(ix_$var));\n" if $do_setmagic;
+    }
+    elsif ($var eq 'RETVAL') {
+      my $orig_arg = $arg;
+      my $indent;
+      my $use_RETVALSV = 1;
+      my $do_mortal = 0;
+      my $do_copy_tmp = 1;
+      my $pre_expr;
+      local $eval_vars->{arg} = $arg = 'RETVALSV';
+      my $evalexpr = $self->eval_output_typemap_code("qq\a$expr\a", $eval_vars);
+
+      if ($expr =~ /^\t\Q$arg\E = new/) {
+        # We expect that $arg has refcnt 1, so we need to
+        # mortalize it.
+        $do_mortal = 1;
+      }
+      # If RETVAL is immortal, don't mortalize it. This code is not perfect:
+      # It won't detect a func or expression that only returns immortals, for
+      # example, this RE must be tried before next elsif.
+      elsif ($evalexpr =~ /^\t\Q$arg\E\s*=\s*(boolSV\(|(&PL_sv_yes|&PL_sv_no|&PL_sv_undef)\s*;)/) {
+        $do_copy_tmp = 0; #$arg will be a ST(X), no SV* RETVAL, no RETVALSV
+        $use_RETVALSV = 0;
+      }
+      elsif ($evalexpr =~ /^\s*\Q$arg\E\s*=/) {
+        # We expect that $arg has refcnt >=1, so we need
+        # to mortalize it!
+        $use_RETVALSV = 0 if $ntype eq "SVPtr";#reuse SV* RETVAL vs open new block
+        $do_mortal = 1;
+      }
+      else {
+        # Just hope that the entry would safely write it
+        # over an already mortalized value. By
+        # coincidence, something like $arg = &PL_sv_undef
+        # works too, but should be caught above.
+        $pre_expr = "RETVALSV = sv_newmortal();\n";
+        # new mortals don't have set magic
+        $do_setmagic = 0;
+      }
+      if($use_RETVALSV) {
+        print "\t{\n\t    SV * RETVALSV;\n";
+        $indent = "\t    ";
+      } else {
+        $indent = "\t";
+      }
+      print $indent.$pre_expr if $pre_expr;
+
+      if($use_RETVALSV) {
+        #take control of 1 layer of indent, may or may not indent more
+        $evalexpr =~ s/^(\t|        )/$indent/gm;
+        #"\t    \t" doesn't draw right in some IDEs
+        #break down all \t into spaces
+        $evalexpr =~ s/\t/        /g;
+        #rebuild back into \t'es, \t==8 spaces, indent==4 spaces
+        $evalexpr =~ s/        /\t/g;
+      }
+      else {
+        if($do_mortal || $do_setmagic) {
+        #typemap entry evaled with RETVALSV, if we aren't using RETVALSV replace
+          $evalexpr =~ s/RETVALSV/RETVAL/g; #all uses with RETVAL for prettier code
+        }
+        else { #if no extra boilerplate (no mortal, no set magic) is needed
+            #after $evalexport, get rid of RETVALSV's visual cluter and change
+          $evalexpr =~ s/RETVALSV/$orig_arg/g;#the lvalue to ST(X)
+        }
+      }
+      #stop "	RETVAL = RETVAL;" for SVPtr type
+      print $evalexpr if $evalexpr !~ /^\s*RETVAL = RETVAL;$/;
+      print $indent.'RETVAL'.($use_RETVALSV ? 'SV':'')
+            .' = sv_2mortal(RETVAL'.($use_RETVALSV ? 'SV':'').");\n" if $do_mortal;
+      print $indent.'SvSETMAGIC(RETVAL'.($use_RETVALSV ? 'SV':'').");\n" if $do_setmagic;
+      #dont do "RETVALSV = boolSV(RETVAL); ST(0) = RETVALSV;", it is visual clutter
+      print $indent."$orig_arg = RETVAL".($use_RETVALSV ? 'SV':'').";\n"
+        if $do_mortal || $do_setmagic || $do_copy_tmp;
+      print "\t}\n" if $use_RETVALSV;
+    }
+    elsif ($do_push) {
+      print "\tPUSHs(sv_newmortal());\n";
+      local $eval_vars->{arg} = "ST($num)";
+      $self->eval_output_typemap_code("print qq\a$expr\a", $eval_vars);
+      print "\tSvSETMAGIC($arg);\n" if $do_setmagic;
+    }
+    elsif ($arg =~ /^ST\(\d+\)$/) {
+      $self->eval_output_typemap_code("print qq\a$expr\a", $eval_vars);
+      print "\tSvSETMAGIC($arg);\n" if $do_setmagic;
+    }
+  }
+}
+
+
+# Just delegates to a clean package.
+# Shim to evaluate Perl code in the right variable context
+# for typemap code (having things such as $ALIAS set up).
+sub eval_output_typemap_code {
+  my ($self, $code, $other) = @_;
+  return ExtUtils::ParseXS::Eval::eval_output_typemap_code($self, $code, $other);
+}
+
+sub eval_input_typemap_code {
+  my ($self, $code, $other) = @_;
+  return ExtUtils::ParseXS::Eval::eval_input_typemap_code($self, $code, $other);
+}
+
+1;
+
+# vim: ts=2 sw=2 et:
+                                                                                                                                                                                                                                                                                                               usr/local/lib/perl5/5.40.0/ExtUtils/ParseXS.pod                                                     0000444 0000000 0000000 00000011421 14714567415 017315  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        =head1 NAME
+
+ExtUtils::ParseXS - converts Perl XS code into C code
+
+=head1 SYNOPSIS
+
+  use ExtUtils::ParseXS;
+
+  my $pxs = ExtUtils::ParseXS->new;
+  $pxs->process_file( filename => 'foo.xs' );
+
+  $pxs->process_file( filename => 'foo.xs',
+                      output => 'bar.c',
+                      'C++' => 1,
+                      typemap => 'path/to/typemap',
+                      hiertype => 1,
+                      except => 1,
+                      versioncheck => 1,
+                      linenumbers => 1,
+                      optimize => 1,
+                      prototypes => 1,
+                      die_on_error => 0,
+                    );
+
+  # Legacy non-OO interface using a singleton:
+  use ExtUtils::ParseXS qw(process_file);
+  process_file( filename => 'foo.xs' );
+
+=head1 DESCRIPTION
+
+C<ExtUtils::ParseXS> will compile XS code into C code by embedding the constructs
+necessary to let C functions manipulate Perl values and creates the glue
+necessary to let Perl access those functions.  The compiler uses typemaps to
+determine how to map C function parameters and variables to Perl values.
+
+The compiler will search for typemap files called I<typemap>.  It will use
+the following search path to find default typemaps, with the rightmost
+typemap taking precedence.
+
+    ../../../typemap:../../typemap:../typemap:typemap
+
+=head1 EXPORT
+
+None by default.  C<process_file()> and/or C<report_error_count()>
+may be exported upon request. Using the functional interface is
+discouraged.
+
+=head1 METHODS
+
+=over 4
+
+=item $pxs->new()
+
+Returns a new, empty XS parser/compiler object.
+
+=item $pxs->process_file()
+
+This method processes an XS file and sends output to a C file.
+The method may be called as a function (this is the legacy
+interface) and will then use a singleton as invocant.
+
+Named parameters control how the processing is done.
+The following parameters are accepted:
+
+=over 4
+
+=item B<C++>
+
+Adds C<extern "C"> to the C code.  Default is false.
+
+=item B<hiertype>
+
+Retains C<::> in type names so that C++ hierarchical types can be
+mapped.  Default is false.
+
+=item B<except>
+
+Adds exception handling stubs to the C code.  Default is false.
+
+=item B<typemap>
+
+Indicates that a user-supplied typemap should take precedence over the
+default typemaps.  A single typemap may be specified as a string, or
+multiple typemaps can be specified in an array reference, with the
+last typemap having the highest precedence.
+
+=item B<prototypes>
+
+Generates prototype code for all xsubs.  Default is false.
+
+=item B<versioncheck>
+
+Makes sure at run time that the object file (derived from the C<.xs>
+file) and the C<.pm> files have the same version number.  Default is
+true.
+
+=item B<linenumbers>
+
+Adds C<#line> directives to the C output so error messages will look
+like they came from the original XS file.  Default is true.
+
+=item B<optimize>
+
+Enables certain optimizations.  The only optimization that is currently
+affected is the use of I<target>s by the output C code (see L<perlguts>).
+Not optimizing may significantly slow down the generated code, but this is the way
+B<xsubpp> of 5.005 and earlier operated.  Default is to optimize.
+
+=item B<inout>
+
+Enable recognition of C<IN>, C<OUT_LIST> and C<INOUT_LIST>
+declarations.  Default is true.
+
+=item B<argtypes>
+
+Enable recognition of ANSI-like descriptions of function signature.
+Default is true.
+
+=item B<s>
+
+I<Maintainer note:> I have no clue what this does.  Strips function prefixes?
+
+=item B<die_on_error>
+
+Normally ExtUtils::ParseXS will terminate the program with an C<exit(1)> after
+printing the details of the exception to STDERR via (warn). This can be awkward
+when it is used programmatically and not via xsubpp, so this option can be used
+to cause it to die instead by providing a true value. When not provided this
+defaults to the value of C<$ExtUtils::ParseXS::DIE_ON_ERROR> which in turn
+defaults to false.
+
+=back
+
+=item $pxs->report_error_count()
+
+This method returns the number of [a certain kind of] errors
+encountered during processing of the XS file.
+
+The method may be called as a function (this is the legacy
+interface) and will then use a singleton as invocant.
+
+=back
+
+=head1 AUTHOR
+
+Based on xsubpp code, written by Larry Wall.
+
+Maintained by:
+
+=over 4
+
+=item *
+
+Ken Williams, <ken@mathforum.org>
+
+=item *
+
+David Golden, <dagolden@cpan.org>
+
+=item *
+
+James Keenan, <jkeenan@cpan.org>
+
+=item *
+
+Steffen Mueller, <smueller@cpan.org>
+
+=back
+
+=head1 COPYRIGHT
+
+Copyright 2002-2014 by Ken Williams, David Golden and other contributors.  All
+rights reserved.
+
+This library is free software; you can redistribute it and/or
+modify it under the same terms as Perl itself.
+
+Based on the C<ExtUtils::xsubpp> code by Larry Wall and the Perl 5
+Porters, which was released under the same license terms.
+
+=head1 SEE ALSO
+
+L<perl>, ExtUtils::xsubpp, ExtUtils::MakeMaker, L<perlxs>, L<perlxstut>.
+
+=cut
+
+
+                                                                                                                                                                                                                                               usr/local/lib/perl5/5.40.0/ExtUtils/Typemaps/                                                       0000755 0000000 0000000 00000000000 14714567415 017071  5                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        usr/local/lib/perl5/5.40.0/ExtUtils/Typemaps/Cmd.pm                                                 0000444 0000000 0000000 00000010045 14714567415 020130  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        package ExtUtils::Typemaps::Cmd;
+use 5.006001;
+use strict;
+use warnings;
+our $VERSION = '3.51';
+
+use ExtUtils::Typemaps;
+
+require Exporter;
+
+our @ISA = qw(Exporter);
+our @EXPORT = qw(embeddable_typemap);
+our %EXPORT_TAGS = (all => \@EXPORT);
+
+sub embeddable_typemap {
+  my @tms = @_;
+
+  # Get typemap objects
+  my @tm_objs = map [$_, _intuit_typemap_source($_)], @tms;
+
+  # merge or short-circuit
+  my $final_tm;
+  if (@tm_objs == 1) {
+    # just one, merge would be pointless
+    $final_tm = shift(@tm_objs)->[1];
+  }
+  else {
+    # multiple, need merge
+    $final_tm = ExtUtils::Typemaps->new;
+    foreach my $other_tm (@tm_objs) {
+      my ($tm_ident, $tm_obj) = @$other_tm;
+      eval {
+        $final_tm->merge(typemap => $tm_obj);
+        1
+      } or do {
+        my $err = $@ || 'Zombie error';
+        die "Failed to merge typ";
+      }
+    }
+  }
+
+  # stringify for embedding
+  return $final_tm->as_embedded_typemap();
+}
+
+sub _load_module {
+  my $name = shift;
+  return eval "require $name; 1";
+}
+
+SCOPE: {
+  my %sources = (
+    module => sub {
+      my $ident = shift;
+      my $tm;
+      if (/::/) { # looks like FQ module name, try that first
+        foreach my $module ($ident, "ExtUtils::Typemaps::$ident") {
+          if (_load_module($module)) {
+            eval { $tm = $module->new }
+              and return $tm;
+          }
+        }
+      }
+      else {
+        foreach my $module ("ExtUtils::Typemaps::$ident", "$ident") {
+          if (_load_module($module)) {
+            eval { $tm = $module->new }
+              and return $tm;
+          }
+        }
+      }
+      return();
+    },
+    file => sub {
+      my $ident = shift;
+      return unless -e $ident and -r _;
+      return ExtUtils::Typemaps->new(file => $ident);
+    },
+  );
+  # Try to find typemap either from module or file
+  sub _intuit_typemap_source {
+    my $identifier = shift;
+
+    my @locate_attempts;
+    if ($identifier =~ /::/ || $identifier !~ /[^\w_]/) {
+      @locate_attempts = qw(module file);
+    }
+    else {
+      @locate_attempts = qw(file module);
+    }
+
+    foreach my $source (@locate_attempts) {
+      my $tm = $sources{$source}->($identifier);
+      return $tm if defined $tm;
+    }
+
+    die "Unable to find typemap for '$identifier': "
+        . "Tried to load both as file or module and failed.\n";
+  }
+} # end SCOPE
+
+=head1 NAME
+
+ExtUtils::Typemaps::Cmd - Quick commands for handling typemaps
+
+=head1 SYNOPSIS
+
+From XS:
+
+  INCLUDE_COMMAND: $^X -MExtUtils::Typemaps::Cmd \
+                   -e "print embeddable_typemap(q{Excommunicated})"
+
+Loads C<ExtUtils::Typemaps::Excommunicated>, instantiates an object,
+and dumps it as an embeddable typemap for use directly in your XS file.
+
+=head1 DESCRIPTION
+
+This is a helper module for L<ExtUtils::Typemaps> for quick
+one-liners, specifically for inclusion of shared typemaps
+that live on CPAN into an XS file (see SYNOPSIS).
+
+For this reason, the following functions are exported by default:
+
+=head1 EXPORTED FUNCTIONS
+
+=head2 embeddable_typemap
+
+Given a list of identifiers, C<embeddable_typemap>
+tries to load typemaps from a file of the given name(s),
+or from a module that is an C<ExtUtils::Typemaps> subclass.
+
+Returns a string representation of the merged typemaps that can
+be included verbatim into XS. Example:
+
+  print embeddable_typemap(
+    "Excommunicated", "ExtUtils::Typemaps::Basic", "./typemap"
+  );
+
+This will try to load a module C<ExtUtils::Typemaps::Excommunicated>
+and use it as an C<ExtUtils::Typemaps> subclass. If that fails, it'll
+try loading C<Excommunicated> as a module, if that fails, it'll try to
+read a file called F<Excommunicated>. It'll work similarly for the
+second argument, but the third will be loaded as a file first.
+
+After loading all typemap files or modules, it will merge them in the
+specified order and dump the result as an embeddable typemap.
+
+=head1 SEE ALSO
+
+L<ExtUtils::Typemaps>
+
+L<perlxs>
+
+=head1 AUTHOR
+
+Steffen Mueller C<<smueller@cpan.org>>
+
+=head1 COPYRIGHT & LICENSE
+
+Copyright 2012 Steffen Mueller
+
+This program is free software; you can redistribute it and/or
+modify it under the same terms as Perl itself.
+
+=cut
+
+1;
+
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           usr/local/lib/perl5/5.40.0/ExtUtils/Typemaps/InputMap.pm                                            0000444 0000000 0000000 00000003642 14714567415 021167  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        package ExtUtils::Typemaps::InputMap;
+use 5.006001;
+use strict;
+use warnings;
+our $VERSION = '3.51';
+
+=head1 NAME
+
+ExtUtils::Typemaps::InputMap - Entry in the INPUT section of a typemap
+
+=head1 SYNOPSIS
+
+  use ExtUtils::Typemaps;
+  ...
+  my $input = $typemap->get_input_map('T_NV');
+  my $code = $input->code();
+  $input->code("...");
+
+=head1 DESCRIPTION
+
+Refer to L<ExtUtils::Typemaps> for details.
+
+=head1 METHODS
+
+=cut
+
+=head2 new
+
+Requires C<xstype> and C<code> parameters.
+
+=cut
+
+sub new {
+  my $prot = shift;
+  my $class = ref($prot)||$prot;
+  my %args = @_;
+
+  if (!ref($prot)) {
+    if (not defined $args{xstype} or not defined $args{code}) {
+      die("Need xstype and code parameters");
+    }
+  }
+
+  my $self = bless(
+    (ref($prot) ? {%$prot} : {})
+    => $class
+  );
+
+  $self->{xstype} = $args{xstype} if defined $args{xstype};
+  $self->{code} = $args{code} if defined $args{code};
+  $self->{code} =~ s/^(?=\S)/\t/mg;
+
+  return $self;
+}
+
+=head2 code
+
+Returns or sets the INPUT mapping code for this entry.
+
+=cut
+
+sub code {
+  $_[0]->{code} = $_[1] if @_ > 1;
+  return $_[0]->{code};
+}
+
+=head2 xstype
+
+Returns the name of the XS type of the INPUT map.
+
+=cut
+
+sub xstype {
+  return $_[0]->{xstype};
+}
+
+=head2 cleaned_code
+
+Returns a cleaned-up copy of the code to which certain transformations
+have been applied to make it more ANSI compliant.
+
+=cut
+
+sub cleaned_code {
+  my $self = shift;
+  my $code = $self->code;
+
+  $code =~ s/(?:;+\s*|;*\s+)\z//s;
+
+  # Move C pre-processor instructions to column 1 to be strictly ANSI
+  # conformant. Some pre-processors are fussy about this.
+  $code =~ s/^\s+#/#/mg;
+  $code =~ s/\s*\z/\n/;
+
+  return $code;
+}
+
+=head1 SEE ALSO
+
+L<ExtUtils::Typemaps>
+
+=head1 AUTHOR
+
+Steffen Mueller C<<smueller@cpan.org>>
+
+=head1 COPYRIGHT & LICENSE
+
+Copyright 2009, 2010, 2011, 2012 Steffen Mueller
+
+This program is free software; you can redistribute it and/or
+modify it under the same terms as Perl itself.
+
+=cut
+
+1;
+
+                                                                                              usr/local/lib/perl5/5.40.0/ExtUtils/Typemaps/OutputMap.pm                                           0000444 0000000 0000000 00000010514 14714567415 021364  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        package ExtUtils::Typemaps::OutputMap;
+use 5.006001;
+use strict;
+use warnings;
+our $VERSION = '3.51';
+
+=head1 NAME
+
+ExtUtils::Typemaps::OutputMap - Entry in the OUTPUT section of a typemap
+
+=head1 SYNOPSIS
+
+  use ExtUtils::Typemaps;
+  ...
+  my $output = $typemap->get_output_map('T_NV');
+  my $code = $output->code();
+  $output->code("...");
+
+=head1 DESCRIPTION
+
+Refer to L<ExtUtils::Typemaps> for details.
+
+=head1 METHODS
+
+=cut
+
+=head2 new
+
+Requires C<xstype> and C<code> parameters.
+
+=cut
+
+sub new {
+  my $prot = shift;
+  my $class = ref($prot)||$prot;
+  my %args = @_;
+
+  if (!ref($prot)) {
+    if (not defined $args{xstype} or not defined $args{code}) {
+      die("Need xstype and code parameters");
+    }
+  }
+
+  my $self = bless(
+    (ref($prot) ? {%$prot} : {})
+    => $class
+  );
+
+  $self->{xstype} = $args{xstype} if defined $args{xstype};
+  $self->{code} = $args{code} if defined $args{code};
+  $self->{code} =~ s/^(?=\S)/\t/mg;
+
+  return $self;
+}
+
+=head2 code
+
+Returns or sets the OUTPUT mapping code for this entry.
+
+=cut
+
+sub code {
+  $_[0]->{code} = $_[1] if @_ > 1;
+  return $_[0]->{code};
+}
+
+=head2 xstype
+
+Returns the name of the XS type of the OUTPUT map.
+
+=cut
+
+sub xstype {
+  return $_[0]->{xstype};
+}
+
+=head2 cleaned_code
+
+Returns a cleaned-up copy of the code to which certain transformations
+have been applied to make it more ANSI compliant.
+
+=cut
+
+sub cleaned_code {
+  my $self = shift;
+  my $code = $self->code;
+
+  # Move C pre-processor instructions to column 1 to be strictly ANSI
+  # conformant. Some pre-processors are fussy about this.
+  $code =~ s/^\s+#/#/mg;
+  $code =~ s/\s*\z/\n/;
+
+  return $code;
+}
+
+=head2 targetable
+
+This is an obscure but effective optimization that used to
+live in C<ExtUtils::ParseXS> directly. Not implementing it
+should never result in incorrect use of typemaps, just less
+efficient code.
+
+In a nutshell, this will check whether the output code
+involves calling C<sv_setiv>, C<sv_setuv>, C<sv_setnv>, C<sv_setpv> or
+C<sv_setpvn> to set the special C<$arg> placeholder to a new value
+B<AT THE END OF THE OUTPUT CODE>. If that is the case, the code is
+eligible for using the C<TARG>-related macros to optimize this.
+Thus the name of the method: C<targetable>.
+
+If this optimization is applicable, C<ExtUtils::ParseXS> will
+emit a C<dXSTARG;> definition at the start of the generated XSUB code,
+and type (see below) dependent code to set C<TARG> and push it on
+the stack at the end of the generated XSUB code.
+
+If the optimization can not be applied, this returns undef.
+If it can be applied, this method returns a hash reference containing
+the following information:
+
+  type:      Any of the characters i, u, n, p
+  with_size: Bool indicating whether this is the sv_setpvn variant
+  what:      The code that actually evaluates to the output scalar
+  what_size: If "with_size", this has the string length (as code,
+             not constant, including leading comma)
+
+=cut
+
+sub targetable {
+  my $self = shift;
+  return $self->{targetable} if exists $self->{targetable};
+
+  our $bal; # ()-balanced
+  $bal = qr[
+    (?:
+      (?>[^()]+)
+      |
+      \( (??{ $bal }) \)
+    )*
+  ]x;
+  my $bal_no_comma = qr[
+    (?:
+      (?>[^(),]+)
+      |
+      \( (??{ $bal }) \)
+    )+
+  ]x;
+
+  # matches variations on (SV*)
+  my $sv_cast = qr[
+    (?:
+      \( \s* SV \s* \* \s* \) \s*
+    )?
+  ]x;
+
+  my $size = qr[ # Third arg (to setpvn)
+    , \s* (??{ $bal })
+  ]xo;
+
+  my $code = $self->code;
+
+  # We can still bootstrap compile 're', because in code re.pm is
+  # available to miniperl, and does not attempt to load the XS code.
+  use re 'eval';
+
+  my ($type, $with_size, $arg, $sarg) =
+    ($code =~
+      m[^
+        \s+
+        sv_set([iunp])v(n)?    # Type, is_setpvn
+        \s*
+        \( \s*
+          $sv_cast \$arg \s* , \s*
+          ( $bal_no_comma )    # Set from
+          ( $size )?           # Possible sizeof set-from
+        \s* \) \s* ; \s* $
+      ]xo
+  );
+
+  my $rv = undef;
+  if ($type) {
+    $rv = {
+      type      => $type,
+      with_size => $with_size,
+      what      => $arg,
+      what_size => $sarg,
+    };
+  }
+  $self->{targetable} = $rv;
+  return $rv;
+}
+
+=head1 SEE ALSO
+
+L<ExtUtils::Typemaps>
+
+=head1 AUTHOR
+
+Steffen Mueller C<<smueller@cpan.org>>
+
+=head1 COPYRIGHT & LICENSE
+
+Copyright 2009, 2010, 2011, 2012 Steffen Mueller
+
+This program is free software; you can redistribute it and/or
+modify it under the same terms as Perl itself.
+
+=cut
+
+1;
+
+                                                                                                                                                                                    usr/local/lib/perl5/5.40.0/ExtUtils/Typemaps/Type.pm                                                0000444 0000000 0000000 00000004045 14714567415 020351  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        package ExtUtils::Typemaps::Type;
+use 5.006001;
+use strict;
+use warnings;
+require ExtUtils::Typemaps;
+
+our $VERSION = '3.51';
+
+=head1 NAME
+
+ExtUtils::Typemaps::Type - Entry in the TYPEMAP section of a typemap
+
+=head1 SYNOPSIS
+
+  use ExtUtils::Typemaps;
+  ...
+  my $type = $typemap->get_type_map('char*');
+  my $input = $typemap->get_input_map($type->xstype);
+
+=head1 DESCRIPTION
+
+Refer to L<ExtUtils::Typemaps> for details.
+Object associates C<ctype> with C<xstype>, which is the index
+into the in- and output mapping tables.
+
+=head1 METHODS
+
+=cut
+
+=head2 new
+
+Requires C<xstype> and C<ctype> parameters.
+
+Optionally takes C<prototype> parameter.
+
+=cut
+
+sub new {
+  my $prot = shift;
+  my $class = ref($prot)||$prot;
+  my %args = @_;
+
+  if (!ref($prot)) {
+    if (not defined $args{xstype} or not defined $args{ctype}) {
+      die("Need xstype and ctype parameters");
+    }
+  }
+
+  my $self = bless(
+    (ref($prot) ? {%$prot} : {proto => ''})
+    => $class
+  );
+
+  $self->{xstype} = $args{xstype} if defined $args{xstype};
+  $self->{ctype} = $args{ctype} if defined $args{ctype};
+  $self->{tidy_ctype} = ExtUtils::Typemaps::tidy_type($self->{ctype});
+  $self->{proto} = $args{'prototype'} if defined $args{'prototype'};
+
+  return $self;
+}
+
+=head2 proto
+
+Returns or sets the prototype.
+
+=cut
+
+sub proto {
+  $_[0]->{proto} = $_[1] if @_ > 1;
+  return $_[0]->{proto};
+}
+
+=head2 xstype
+
+Returns the name of the XS type that this C type is associated to.
+
+=cut
+
+sub xstype {
+  return $_[0]->{xstype};
+}
+
+=head2 ctype
+
+Returns the name of the C type as it was set on construction.
+
+=cut

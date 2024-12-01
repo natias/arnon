@@ -1,0 +1,1000 @@
+    }
+    $findtypemenu entryconf 1 -state $state
+    $findtypemenu entryconf 2 -state $state
+}
+
+proc stopfindproc {{done 0}} {
+    global findprocpid findprocfile findids
+    global ctext findoldcursor phase maincursor textcursor
+    global findinprogress
+
+    catch {unset findids}
+    if {[info exists findprocpid]} {
+	if {!$done} {
+	    catch {exec kill $findprocpid}
+	}
+	catch {close $findprocfile}
+	unset findprocpid
+    }
+    if {[info exists findinprogress]} {
+	unset findinprogress
+	if {$phase != "incrdraw"} {
+	    . config -cursor $maincursor
+	    settextcursor $textcursor
+	}
+    }
+}
+
+proc findpatches {} {
+    global findstring selectedline numcommits
+    global findprocpid findprocfile
+    global finddidsel ctext lineid findinprogress
+    global findinsertpos
+    global env
+
+    if {$numcommits == 0} return
+
+    # make a list of all the ids to search, starting at the one
+    # after the selected line (if any)
+    if {[info exists selectedline]} {
+	set l $selectedline
+    } else {
+	set l -1
+    }
+    set inputids {}
+    for {set i 0} {$i < $numcommits} {incr i} {
+	if {[incr l] >= $numcommits} {
+	    set l 0
+	}
+	append inputids $lineid($l) "\n"
+    }
+
+    if {[catch {
+	set f [open [list | $env(HG) --config ui.report_untrusted=false debug-diff-tree --stdin -s -r -S$findstring << $inputids] r]
+    } err]} {
+	error_popup "Error starting search process: $err"
+	return
+    }
+
+    set findinsertpos end
+    set findprocfile $f
+    set findprocpid [pid $f]
+    fconfigure $f -blocking 0
+    fileevent $f readable readfindproc
+    set finddidsel 0
+    . config -cursor watch
+    settextcursor watch
+    set findinprogress 1
+}
+
+proc readfindproc {} {
+    global findprocfile finddidsel
+    global idline matchinglines findinsertpos
+
+    set n [gets $findprocfile line]
+    if {$n < 0} {
+	if {[eof $findprocfile]} {
+	    stopfindproc 1
+	    if {!$finddidsel} {
+		bell
+	    }
+	}
+	return
+    }
+    if {![regexp {^[0-9a-f]{12}} $line id]} {
+	error_popup "Can't parse git-diff-tree output: $line"
+	stopfindproc
+	return
+    }
+    if {![info exists idline($id)]} {
+	puts stderr "spurious id: $id"
+	return
+    }
+    set l $idline($id)
+    insertmatch $l $id
+}
+
+proc insertmatch {l id} {
+    global matchinglines findinsertpos finddidsel
+
+    if {$findinsertpos == "end"} {
+	if {$matchinglines != {} && $l < [lindex $matchinglines 0]} {
+	    set matchinglines [linsert $matchinglines 0 $l]
+	    set findinsertpos 1
+	} else {
+	    lappend matchinglines $l
+	}
+    } else {
+	set matchinglines [linsert $matchinglines $findinsertpos $l]
+	incr findinsertpos
+    }
+    markheadline $l $id
+    if {!$finddidsel} {
+	findselectline $l
+	set finddidsel 1
+    }
+}
+
+proc findfiles {} {
+    global selectedline numcommits lineid ctext
+    global ffileline finddidsel parents nparents
+    global findinprogress findstartline findinsertpos
+    global treediffs fdiffids fdiffsneeded fdiffpos
+    global findmergefiles
+    global env
+
+    if {$numcommits == 0} return
+
+    if {[info exists selectedline]} {
+	set l [expr {$selectedline + 1}]
+    } else {
+	set l 0
+    }
+    set ffileline $l
+    set findstartline $l
+    set diffsneeded {}
+    set fdiffsneeded {}
+    while 1 {
+	set id $lineid($l)
+	if {$findmergefiles || $nparents($id) == 1} {
+	    foreach p $parents($id) {
+		if {![info exists treediffs([list $id $p])]} {
+		    append diffsneeded "$id $p\n"
+		    lappend fdiffsneeded [list $id $p]
+		}
+	    }
+	}
+	if {[incr l] >= $numcommits} {
+	    set l 0
+	}
+	if {$l == $findstartline} break
+    }
+
+    # start off a git-diff-tree process if needed
+    if {$diffsneeded ne {}} {
+	if {[catch {
+	    set df [open [list | $env(HG) --config ui.report_untrusted=false debug-diff-tree -r --stdin << $diffsneeded] r]
+	} err ]} {
+	    error_popup "Error starting search process: $err"
+	    return
+	}
+	catch {unset fdiffids}
+	set fdiffpos 0
+	fconfigure $df -blocking 0
+	fileevent $df readable [list readfilediffs $df]
+    }
+
+    set finddidsel 0
+    set findinsertpos end
+    set id $lineid($l)
+    set p [lindex $parents($id) 0]
+    . config -cursor watch
+    settextcursor watch
+    set findinprogress 1
+    findcont [list $id $p]
+    update
+}
+
+proc readfilediffs {df} {
+    global findids fdiffids fdiffs
+
+    set n [gets $df line]
+    if {$n < 0} {
+	if {[eof $df]} {
+	    donefilediff
+	    if {[catch {close $df} err]} {
+		stopfindproc
+		bell
+		error_popup "Error in hg debug-diff-tree: $err"
+	    } elseif {[info exists findids]} {
+		set ids $findids
+		stopfindproc
+		bell
+		error_popup "Couldn't find diffs for {$ids}"
+	    }
+	}
+	return
+    }
+    if {[regexp {^([0-9a-f]{12}) \(from ([0-9a-f]{12})\)} $line match id p]} {
+	# start of a new string of diffs
+	donefilediff
+	set fdiffids [list $id $p]
+	set fdiffs {}
+    } elseif {[string match ":*" $line]} {
+	lappend fdiffs [lindex $line 5]
+    }
+}
+
+proc donefilediff {} {
+    global fdiffids fdiffs treediffs findids
+    global fdiffsneeded fdiffpos
+
+    if {[info exists fdiffids]} {
+	while {[lindex $fdiffsneeded $fdiffpos] ne $fdiffids
+	       && $fdiffpos < [llength $fdiffsneeded]} {
+	    # git-diff-tree doesn't output anything for a commit
+	    # which doesn't change anything
+	    set nullids [lindex $fdiffsneeded $fdiffpos]
+	    set treediffs($nullids) {}
+	    if {[info exists findids] && $nullids eq $findids} {
+		unset findids
+		findcont $nullids
+	    }
+	    incr fdiffpos
+	}
+	incr fdiffpos
+
+	if {![info exists treediffs($fdiffids)]} {
+	    set treediffs($fdiffids) $fdiffs
+	}
+	if {[info exists findids] && $fdiffids eq $findids} {
+	    unset findids
+	    findcont $fdiffids
+	}
+    }
+}
+
+proc findcont {ids} {
+    global findids treediffs parents nparents
+    global ffileline findstartline finddidsel
+    global lineid numcommits matchinglines findinprogress
+    global findmergefiles
+
+    set id [lindex $ids 0]
+    set p [lindex $ids 1]
+    set pi [lsearch -exact $parents($id) $p]
+    set l $ffileline
+    while 1 {
+	if {$findmergefiles || $nparents($id) == 1} {
+	    if {![info exists treediffs($ids)]} {
+		set findids $ids
+		set ffileline $l
+		return
+	    }
+	    set doesmatch 0
+	    foreach f $treediffs($ids) {
+		set x [findmatches $f]
+		if {$x != {}} {
+		    set doesmatch 1
+		    break
+		}
+	    }
+	    if {$doesmatch} {
+		insertmatch $l $id
+		set pi $nparents($id)
+	    }
+	} else {
+	    set pi $nparents($id)
+	}
+	if {[incr pi] >= $nparents($id)} {
+	    set pi 0
+	    if {[incr l] >= $numcommits} {
+		set l 0
+	    }
+	    if {$l == $findstartline} break
+	    set id $lineid($l)
+	}
+	set p [lindex $parents($id) $pi]
+	set ids [list $id $p]
+    }
+    stopfindproc
+    if {!$finddidsel} {
+	bell
+    }
+}
+
+# mark a commit as matching by putting a yellow background
+# behind the headline
+proc markheadline {l id} {
+    global canv mainfont linehtag commitinfo
+
+    set bbox [$canv bbox $linehtag($l)]
+    set t [$canv create rect $bbox -outline {} -tags matches -fill yellow]
+    $canv lower $t
+}
+
+# mark the bits of a headline, author or date that match a find string
+proc markmatches {canv l str tag matches font} {
+    set bbox [$canv bbox $tag]
+    set x0 [lindex $bbox 0]
+    set y0 [lindex $bbox 1]
+    set y1 [lindex $bbox 3]
+    foreach match $matches {
+	set start [lindex $match 0]
+	set end [lindex $match 1]
+	if {$start > $end} continue
+	set xoff [font measure $font [string range $str 0 [expr $start-1]]]
+	set xlen [font measure $font [string range $str 0 [expr $end]]]
+	set t [$canv create rect [expr $x0+$xoff] $y0 [expr $x0+$xlen+2] $y1 \
+		   -outline {} -tags matches -fill yellow]
+	$canv lower $t
+    }
+}
+
+proc unmarkmatches {} {
+    global matchinglines findids
+    allcanvs delete matches
+    catch {unset matchinglines}
+    catch {unset findids}
+}
+
+proc selcanvline {w x y} {
+    global canv canvy0 ctext linespc
+    global lineid linehtag linentag linedtag rowtextx
+    set ymax [lindex [$canv cget -scrollregion] 3]
+    if {$ymax == {}} return
+    set yfrac [lindex [$canv yview] 0]
+    set y [expr {$y + $yfrac * $ymax}]
+    set l [expr {int(($y - $canvy0) / $linespc + 0.5)}]
+    if {$l < 0} {
+	set l 0
+    }
+    if {$w eq $canv} {
+	if {![info exists rowtextx($l)] || $x < $rowtextx($l)} return
+    }
+    unmarkmatches
+    selectline $l 1
+}
+
+proc commit_descriptor {p} {
+    global commitinfo
+    set l "..."
+    if {[info exists commitinfo($p)]} {
+	set l [lindex $commitinfo($p) 0]
+	set r [lindex $commitinfo($p) 6]
+    }
+    return "$r:$p ($l)"
+}
+
+# append some text to the ctext widget, and make any SHA1 ID
+# that we know about be a clickable link.
+proc appendwithlinks {text} {
+    global ctext idline linknum
+
+    set start [$ctext index "end - 1c"]
+    $ctext insert end $text
+    $ctext insert end "\n"
+    set links [regexp -indices -all -inline {[0-9a-f]{12}} $text]
+    foreach l $links {
+	set s [lindex $l 0]
+	set e [lindex $l 1]
+	set linkid [string range $text $s $e]
+	if {![info exists idline($linkid)]} continue
+	incr e
+	$ctext tag add link "$start + $s c" "$start + $e c"
+	$ctext tag add link$linknum "$start + $s c" "$start + $e c"
+	$ctext tag bind link$linknum <1> [list selectline $idline($linkid) 1]
+	incr linknum
+    }
+    $ctext tag conf link -foreground blue -underline 1
+    $ctext tag bind link <Enter> { %W configure -cursor hand2 }
+    $ctext tag bind link <Leave> { %W configure -cursor $curtextcursor }
+}
+
+proc selectline {l isnew} {
+    global canv canv2 canv3 ctext commitinfo selectedline
+    global lineid linehtag linentag linedtag
+    global canvy0 linespc parents nparents children
+    global cflist currentid sha1entry
+    global commentend idtags idbookmarks idline linknum
+
+    $canv delete hover
+    normalline
+    if {![info exists lineid($l)] || ![info exists linehtag($l)]} return
+    $canv delete secsel
+    set t [eval $canv create rect [$canv bbox $linehtag($l)] -outline {{}} \
+	       -tags secsel -fill [$canv cget -selectbackground]]
+    $canv lower $t
+    $canv2 delete secsel
+    set t [eval $canv2 create rect [$canv2 bbox $linentag($l)] -outline {{}} \
+	       -tags secsel -fill [$canv2 cget -selectbackground]]
+    $canv2 lower $t
+    $canv3 delete secsel
+    set t [eval $canv3 create rect [$canv3 bbox $linedtag($l)] -outline {{}} \
+	       -tags secsel -fill [$canv3 cget -selectbackground]]
+    $canv3 lower $t
+    set y [expr {$canvy0 + $l * $linespc}]
+    set ymax [lindex [$canv cget -scrollregion] 3]
+    set ytop [expr {$y - $linespc - 1}]
+    set ybot [expr {$y + $linespc + 1}]
+    set wnow [$canv yview]
+    set wtop [expr [lindex $wnow 0] * $ymax]
+    set wbot [expr [lindex $wnow 1] * $ymax]
+    set wh [expr {$wbot - $wtop}]
+    set newtop $wtop
+    if {$ytop < $wtop} {
+	if {$ybot < $wtop} {
+	    set newtop [expr {$y - $wh / 2.0}]
+	} else {
+	    set newtop $ytop
+	    if {$newtop > $wtop - $linespc} {
+		set newtop [expr {$wtop - $linespc}]
+	    }
+	}
+    } elseif {$ybot > $wbot} {
+	if {$ytop > $wbot} {
+	    set newtop [expr {$y - $wh / 2.0}]
+	} else {
+	    set newtop [expr {$ybot - $wh}]
+	    if {$newtop < $wtop + $linespc} {
+		set newtop [expr {$wtop + $linespc}]
+	    }
+	}
+    }
+    if {$newtop != $wtop} {
+	if {$newtop < 0} {
+	    set newtop 0
+	}
+	allcanvs yview moveto [expr $newtop * 1.0 / $ymax]
+    }
+
+    if {$isnew} {
+	addtohistory [list selectline $l 0]
+    }
+
+    set selectedline $l
+
+    set id $lineid($l)
+    set currentid $id
+    $sha1entry delete 0 end
+    $sha1entry insert 0 $id
+    $sha1entry selection range 0 end
+
+    $ctext conf -state normal
+    $ctext delete 0.0 end
+    set linknum 0
+    $ctext mark set fmark.0 0.0
+    $ctext mark gravity fmark.0 left
+    set info $commitinfo($id)
+    $ctext insert end "Changeset: [lindex $info 6]\n"
+    if {[llength [lindex $info 7]] > 0} {
+        $ctext insert end "Branch: [lindex $info 7]\n"
+    }
+    $ctext insert end "User: [lindex $info 1]\n"
+    $ctext insert end "Date: [lindex $info 2]\n"
+    if {[lindex $info 3] ne ""} {
+	$ctext insert end "Committer: [lindex $info 3]\n"
+    }
+    if {[info exists idbookmarks($id)]} {
+	$ctext insert end "Bookmarks:"
+	foreach bookmark $idbookmarks($id) {
+	    $ctext insert end " $bookmark"
+	}
+	$ctext insert end "\n"
+    }
+
+    if {[info exists idtags($id)]} {
+	$ctext insert end "Tags:"
+	foreach tag $idtags($id) {
+	    $ctext insert end " $tag"
+	}
+	$ctext insert end "\n"
+    }
+
+    set comment {}
+    if {[info exists parents($id)]} {
+	foreach p $parents($id) {
+	    append comment "Parent: [commit_descriptor $p]\n"
+	}
+    }
+    if {[info exists children($id)]} {
+	foreach c $children($id) {
+	    append comment "Child:  [commit_descriptor $c]\n"
+	}
+    }
+
+    if {[lindex $info 9] eq "secret"} {
+	# for now, display phase for secret changesets only
+	append comment "Phase: [lindex $info 9]\n"
+    }
+
+    append comment "\n"
+    append comment [lindex $info 5]
+
+    # make anything that looks like a SHA1 ID be a clickable link
+    appendwithlinks $comment
+
+    $ctext tag delete Comments
+    $ctext tag remove found 1.0 end
+    $ctext conf -state disabled
+    set commentend [$ctext index "end - 1c"]
+
+    $cflist delete 0 end
+    $cflist insert end "Comments"
+    if {$nparents($id) <= 1} {
+    set parent "null"
+    if {$nparents($id) == 1} {
+        set parent $parents($id)
+    }
+	startdiff [concat $id $parent]
+    } elseif {$nparents($id) > 1} {
+	mergediff $id
+    }
+}
+
+proc selnextline {dir} {
+    global selectedline
+    focus .
+    if {![info exists selectedline]} return
+    set l [expr $selectedline + $dir]
+    unmarkmatches
+    selectline $l 1
+}
+
+proc unselectline {} {
+    global selectedline
+
+    catch {unset selectedline}
+    allcanvs delete secsel
+}
+
+proc addtohistory {cmd} {
+    global history historyindex
+
+    if {$historyindex > 0
+	&& [lindex $history [expr {$historyindex - 1}]] == $cmd} {
+	return
+    }
+
+    if {$historyindex < [llength $history]} {
+	set history [lreplace $history $historyindex end $cmd]
+    } else {
+	lappend history $cmd
+    }
+    incr historyindex
+    if {$historyindex > 1} {
+	.ctop.top.bar.leftbut conf -state normal
+    } else {
+	.ctop.top.bar.leftbut conf -state disabled
+    }
+    .ctop.top.bar.rightbut conf -state disabled
+}
+
+proc goback {} {
+    global history historyindex
+    focus .
+
+    if {$historyindex > 1} {
+	incr historyindex -1
+	set cmd [lindex $history [expr {$historyindex - 1}]]
+	eval $cmd
+	.ctop.top.bar.rightbut conf -state normal
+    }
+    if {$historyindex <= 1} {
+	.ctop.top.bar.leftbut conf -state disabled
+    }
+}
+
+proc goforw {} {
+    global history historyindex
+    focus .
+
+    if {$historyindex < [llength $history]} {
+	set cmd [lindex $history $historyindex]
+	incr historyindex
+	eval $cmd
+	.ctop.top.bar.leftbut conf -state normal
+    }
+    if {$historyindex >= [llength $history]} {
+	.ctop.top.bar.rightbut conf -state disabled
+    }
+}
+
+proc mergediff {id} {
+    global parents diffmergeid diffmergegca mergefilelist diffpindex
+
+    set diffmergeid $id
+    set diffpindex -1
+    set diffmergegca [findgca $parents($id)]
+    if {[info exists mergefilelist($id)]} {
+	if {$mergefilelist($id) ne {}} {
+	    showmergediff
+	}
+    } else {
+	contmergediff {}
+    }
+}
+
+proc findgca {ids} {
+    global env
+    set gca {}
+    foreach id $ids {
+	if {$gca eq {}} {
+	    set gca $id
+	} else {
+	    if {[catch {
+		set gca [exec $env(HG) --config ui.report_untrusted=false debug-merge-base $gca $id]
+	    } err]} {
+		return {}
+	    }
+	}
+    }
+    return $gca
+}
+
+proc contmergediff {ids} {
+    global diffmergeid diffpindex parents nparents diffmergegca
+    global treediffs mergefilelist diffids treepending
+
+    # diff the child against each of the parents, and diff
+    # each of the parents against the GCA.
+    while 1 {
+	if {[lindex $ids 0] == $diffmergeid && $diffmergegca ne {}} {
+	    set ids [list [lindex $ids 1] $diffmergegca]
+	} else {
+	    if {[incr diffpindex] >= $nparents($diffmergeid)} break
+	    set p [lindex $parents($diffmergeid) $diffpindex]
+	    set ids [list $diffmergeid $p]
+	}
+	if {![info exists treediffs($ids)]} {
+	    set diffids $ids
+	    if {![info exists treepending]} {
+		gettreediffs $ids
+	    }
+	    return
+	}
+    }
+
+    # If a file in some parent is different from the child and also
+    # different from the GCA, then it's interesting.
+    # If we don't have a GCA, then a file is interesting if it is
+    # different from the child in all the parents.
+    if {$diffmergegca ne {}} {
+	set files {}
+	foreach p $parents($diffmergeid) {
+	    set gcadiffs $treediffs([list $p $diffmergegca])
+	    foreach f $treediffs([list $diffmergeid $p]) {
+		if {[lsearch -exact $files $f] < 0
+		    && [lsearch -exact $gcadiffs $f] >= 0} {
+		    lappend files $f
+		}
+	    }
+	}
+	set files [lsort $files]
+    } else {
+	set p [lindex $parents($diffmergeid) 0]
+	set files $treediffs([list $diffmergeid $p])
+	for {set i 1} {$i < $nparents($diffmergeid) && $files ne {}} {incr i} {
+	    set p [lindex $parents($diffmergeid) $i]
+	    set df $treediffs([list $diffmergeid $p])
+	    set nf {}
+	    foreach f $files {
+		if {[lsearch -exact $df $f] >= 0} {
+		    lappend nf $f
+		}
+	    }
+	    set files $nf
+	}
+    }
+
+    set mergefilelist($diffmergeid) $files
+    if {$files ne {}} {
+	showmergediff
+    }
+}
+
+proc showmergediff {} {
+    global cflist diffmergeid mergefilelist parents
+    global diffopts diffinhunk currentfile currenthunk filelines
+    global diffblocked groupfilelast mergefds groupfilenum grouphunks
+    global env
+
+    set files $mergefilelist($diffmergeid)
+    foreach f $files {
+	$cflist insert end $f
+    }
+    set env(GIT_DIFF_OPTS) $diffopts
+    set flist {}
+    catch {unset currentfile}
+    catch {unset currenthunk}
+    catch {unset filelines}
+    catch {unset groupfilenum}
+    catch {unset grouphunks}
+    set groupfilelast -1
+    foreach p $parents($diffmergeid) {
+	set cmd [list | $env(HG) --config ui.report_untrusted=false debug-diff-tree -p $p $diffmergeid]
+	set cmd [concat $cmd $mergefilelist($diffmergeid)]
+	if {[catch {set f [open $cmd r]} err]} {
+	    error_popup "Error getting diffs: $err"
+	    foreach f $flist {
+		catch {close $f}
+	    }
+	    return
+	}
+	lappend flist $f
+	set ids [list $diffmergeid $p]
+	set mergefds($ids) $f
+	set diffinhunk($ids) 0
+	set diffblocked($ids) 0
+	fconfigure $f -blocking 0
+	fileevent $f readable [list getmergediffline $f $ids $diffmergeid]
+    }
+}
+
+proc getmergediffline {f ids id} {
+    global diffmergeid diffinhunk diffoldlines diffnewlines
+    global currentfile currenthunk
+    global diffoldstart diffnewstart diffoldlno diffnewlno
+    global diffblocked mergefilelist
+    global noldlines nnewlines difflcounts filelines
+
+    set n [gets $f line]
+    if {$n < 0} {
+	if {![eof $f]} return
+    }
+
+    if {!([info exists diffmergeid] && $diffmergeid == $id)} {
+	if {$n < 0} {
+	    close $f
+	}
+	return
+    }
+
+    if {$diffinhunk($ids) != 0} {
+	set fi $currentfile($ids)
+	if {$n > 0 && [regexp {^[-+ \\]} $line match]} {
+	    # continuing an existing hunk
+	    set line [string range $line 1 end]
+	    set p [lindex $ids 1]
+	    if {$match eq "-" || $match eq " "} {
+		set filelines($p,$fi,$diffoldlno($ids)) $line
+		incr diffoldlno($ids)
+	    }
+	    if {$match eq "+" || $match eq " "} {
+		set filelines($id,$fi,$diffnewlno($ids)) $line
+		incr diffnewlno($ids)
+	    }
+	    if {$match eq " "} {
+		if {$diffinhunk($ids) == 2} {
+		    lappend difflcounts($ids) \
+			[list $noldlines($ids) $nnewlines($ids)]
+		    set noldlines($ids) 0
+		    set diffinhunk($ids) 1
+		}
+		incr noldlines($ids)
+	    } elseif {$match eq "-" || $match eq "+"} {
+		if {$diffinhunk($ids) == 1} {
+		    lappend difflcounts($ids) [list $noldlines($ids)]
+		    set noldlines($ids) 0
+		    set nnewlines($ids) 0
+		    set diffinhunk($ids) 2
+		}
+		if {$match eq "-"} {
+		    incr noldlines($ids)
+		} else {
+		    incr nnewlines($ids)
+		}
+	    }
+	    # and if it's \ No newline at end of line, then what?
+	    return
+	}
+	# end of a hunk
+	if {$diffinhunk($ids) == 1 && $noldlines($ids) != 0} {
+	    lappend difflcounts($ids) [list $noldlines($ids)]
+	} elseif {$diffinhunk($ids) == 2
+		  && ($noldlines($ids) != 0 || $nnewlines($ids) != 0)} {
+	    lappend difflcounts($ids) [list $noldlines($ids) $nnewlines($ids)]
+	}
+	set currenthunk($ids) [list $currentfile($ids) \
+				   $diffoldstart($ids) $diffnewstart($ids) \
+				   $diffoldlno($ids) $diffnewlno($ids) \
+				   $difflcounts($ids)]
+	set diffinhunk($ids) 0
+	# -1 = need to block, 0 = unblocked, 1 = is blocked
+	set diffblocked($ids) -1
+	processhunks
+	if {$diffblocked($ids) == -1} {
+	    fileevent $f readable {}
+	    set diffblocked($ids) 1
+	}
+    }
+
+    if {$n < 0} {
+	# eof
+	if {!$diffblocked($ids)} {
+	    close $f
+	    set currentfile($ids) [llength $mergefilelist($diffmergeid)]
+	    set currenthunk($ids) [list $currentfile($ids) 0 0 0 0 {}]
+	    processhunks
+	}
+    } elseif {[regexp {^diff --git a/(.*) b/} $line match fname]} {
+	# start of a new file
+	set currentfile($ids) \
+	    [lsearch -exact $mergefilelist($diffmergeid) $fname]
+    } elseif {[regexp {^@@ -([0-9]+),([0-9]+) \+([0-9]+),([0-9]+) @@(.*)} \
+		   $line match f1l f1c f2l f2c rest]} {
+	if {[info exists currentfile($ids)] && $currentfile($ids) >= 0} {
+	    # start of a new hunk
+	    if {$f1l == 0 && $f1c == 0} {
+		set f1l 1
+	    }
+	    if {$f2l == 0 && $f2c == 0} {
+		set f2l 1
+	    }
+	    set diffinhunk($ids) 1
+	    set diffoldstart($ids) $f1l
+	    set diffnewstart($ids) $f2l
+	    set diffoldlno($ids) $f1l
+	    set diffnewlno($ids) $f2l
+	    set difflcounts($ids) {}
+	    set noldlines($ids) 0
+	    set nnewlines($ids) 0
+	}
+    }
+}
+
+proc processhunks {} {
+    global diffmergeid parents nparents currenthunk
+    global mergefilelist diffblocked mergefds
+    global grouphunks grouplinestart grouplineend groupfilenum
+
+    set nfiles [llength $mergefilelist($diffmergeid)]
+    while 1 {
+	set fi $nfiles
+	set lno 0
+	# look for the earliest hunk
+	foreach p $parents($diffmergeid) {
+	    set ids [list $diffmergeid $p]
+	    if {![info exists currenthunk($ids)]} return
+	    set i [lindex $currenthunk($ids) 0]
+	    set l [lindex $currenthunk($ids) 2]
+	    if {$i < $fi || ($i == $fi && $l < $lno)} {
+		set fi $i
+		set lno $l
+		set pi $p
+	    }
+	}
+
+	if {$fi < $nfiles} {
+	    set ids [list $diffmergeid $pi]
+	    set hunk $currenthunk($ids)
+	    unset currenthunk($ids)
+	    if {$diffblocked($ids) > 0} {
+		fileevent $mergefds($ids) readable \
+		    [list getmergediffline $mergefds($ids) $ids $diffmergeid]
+	    }
+	    set diffblocked($ids) 0
+
+	    if {[info exists groupfilenum] && $groupfilenum == $fi
+		&& $lno <= $grouplineend} {
+		# add this hunk to the pending group
+		lappend grouphunks($pi) $hunk
+		set endln [lindex $hunk 4]
+		if {$endln > $grouplineend} {
+		    set grouplineend $endln
+		}
+		continue
+	    }
+	}
+
+	# succeeding stuff doesn't belong in this group, so
+	# process the group now
+	if {[info exists groupfilenum]} {
+	    processgroup
+	    unset groupfilenum
+	    unset grouphunks
+	}
+
+	if {$fi >= $nfiles} break
+
+	# start a new group
+	set groupfilenum $fi
+	set grouphunks($pi) [list $hunk]
+	set grouplinestart $lno
+	set grouplineend [lindex $hunk 4]
+    }
+}
+
+proc processgroup {} {
+    global groupfilelast groupfilenum difffilestart
+    global mergefilelist diffmergeid ctext filelines
+    global parents diffmergeid diffoffset
+    global grouphunks grouplinestart grouplineend nparents
+    global mergemax
+
+    $ctext conf -state normal
+    set id $diffmergeid
+    set f $groupfilenum
+    if {$groupfilelast != $f} {
+	$ctext insert end "\n"
+	set here [$ctext index "end - 1c"]
+	set difffilestart($f) $here
+	set mark fmark.[expr {$f + 1}]
+	$ctext mark set $mark $here
+	$ctext mark gravity $mark left
+	set header [lindex $mergefilelist($id) $f]
+	set l [expr {(78 - [string length $header]) / 2}]
+	set pad [string range "----------------------------------------" 1 $l]
+	$ctext insert end "$pad $header $pad\n" filesep
+	set groupfilelast $f
+	foreach p $parents($id) {
+	    set diffoffset($p) 0
+	}
+    }
+
+    $ctext insert end "@@" msep
+    set nlines [expr {$grouplineend - $grouplinestart}]
+    set events {}
+    set pnum 0
+    foreach p $parents($id) {
+	set startline [expr {$grouplinestart + $diffoffset($p)}]
+	set ol $startline
+	set nl $grouplinestart
+	if {[info exists grouphunks($p)]} {
+	    foreach h $grouphunks($p) {
+		set l [lindex $h 2]
+		if {$nl < $l} {
+		    for {} {$nl < $l} {incr nl} {
+			set filelines($p,$f,$ol) $filelines($id,$f,$nl)
+			incr ol
+		    }
+		}
+		foreach chunk [lindex $h 5] {
+		    if {[llength $chunk] == 2} {
+			set olc [lindex $chunk 0]
+			set nlc [lindex $chunk 1]
+			set nnl [expr {$nl + $nlc}]
+			lappend events [list $nl $nnl $pnum $olc $nlc]
+			incr ol $olc
+			set nl $nnl
+		    } else {
+			incr ol [lindex $chunk 0]
+			incr nl [lindex $chunk 0]
+		    }
+		}
+	    }
+	}
+	if {$nl < $grouplineend} {
+	    for {} {$nl < $grouplineend} {incr nl} {
+		set filelines($p,$f,$ol) $filelines($id,$f,$nl)
+		incr ol
+	    }
+	}
+	set nlines [expr {$ol - $startline}]
+	$ctext insert end " -$startline,$nlines" msep
+	incr pnum
+    }
+
+    set nlines [expr {$grouplineend - $grouplinestart}]
+    $ctext insert end " +$grouplinestart,$nlines @@\n" msep
+
+    set events [lsort -integer -index 0 $events]
+    set nevents [llength $events]
+    set nmerge $nparents($diffmergeid)
+    set l $grouplinestart
+    for {set i 0} {$i < $nevents} {set i $j} {
+	set nl [lindex $events $i 0]
+	while {$l < $nl} {
+	    $ctext insert end " $filelines($id,$f,$l)\n"
+	    incr l
+	}
+	set e [lindex $events $i]
+	set enl [lindex $e 1]
+	set j $i
+	set active {}
+	while 1 {
+	    set pnum [lindex $e 2]
+	    set olc [lindex $e 3]
+	    set nlc [lindex $e 4]
+	    if {![info exists delta($pnum)]} {
+		set delta($pnum) [expr {$olc - $nlc}]
+		lappend active $pnum
+	    } else {
+		incr delta($pnum) [expr {$olc - $nlc}]
+	    }
+	    if {[incr j] >= $nevents} break
+	    set e [lindex $events $j]
+	    if {[lindex $e 0] >= $enl} break
+	    if {[lindex $e 1] > $enl} {
+		set enl [lindex $e 1]
+	    }
+	}
+	set nlc [expr {$enl - $l}]
+	set ncol mresult
+	set bestpn -1
+	if {[llength $active] == $nmerge - 1} {
+	    # no diff for one of the parents, i.e. it's identical
+	    for {set pnum 0} {$pnum < $nmerge} {incr pnum} {
+		if {![info exists delta($pnum)]} {
+		    if {$pnum < $mergemax} {
+			lappend ncol m$pnum

@@ -1,0 +1,1000 @@
+still supported.
+
+=item ($self|class)->can_idn
+
+Returns true if IDN support is available.
+
+=back
+
+=head1 FILES
+
+http://publicsuffix.org/list/effective_tld_names.dat
+
+=head1 SEE ALSO
+
+Domain::PublicSuffix, Mozilla::PublicSuffix
+
+=head1 BUGS
+
+ Q: Why yet another module, we already have L<Domain::PublicSuffix> and
+    L<Mozilla::PublicSuffix>.
+ A: Because the public suffix data change more often than these modules do,
+    IO::Socket::SSL needs this list and it is more easy this way to keep it
+    up-to-date.
+
+
+=head1 AUTHOR
+
+Steffen Ullrich
+
+=cut
+
+
+BEGIN {
+    if ( eval {
+	require URI::_idna;
+	defined &URI::_idna::encode && defined &URI::_idna::decode
+    }) {
+	*idn_to_ascii   = \&URI::_idna::encode;
+	*idn_to_unicode = \&URI::_idna::decode;
+	*can_idn = sub { 1 };
+    } elsif ( eval { require Net::IDN::Encode } ) {
+	*idn_to_ascii   = \&Net::IDN::Encode::domain_to_ascii;
+	*idn_to_unicode = \&Net::IDN::Encode::domain_to_unicode;
+	*can_idn = sub { 1 };
+    } elsif ( eval { require Net::LibIDN; require Encode } ) {
+	# Net::LibIDN does not use utf-8 flag and expects raw data
+	*idn_to_ascii   = sub { 
+	    Net::LibIDN::idn_to_ascii(Encode::encode('utf-8',$_[0]),'utf-8');
+	},
+	*idn_to_unicode = sub { 
+	    Encode::decode('utf-8',Net::LibIDN::idn_to_unicode($_[0],'utf-8'));
+	},
+	*can_idn = sub { 1 };
+    } else {
+	*idn_to_ascii   = sub { croak "idn_to_ascii(@_) - no IDNA library installed" };
+	*idn_to_unicode = sub { croak "idn_to_unicode(@_) - no IDNA library installed" };
+	*can_idn = sub { 0 };
+    }
+}
+
+{
+    my %default;
+    sub default {
+	my (undef,%args) = @_;
+	my $min_suffix = delete $args{min_suffix};
+	$min_suffix = 1 if ! defined $min_suffix;
+	%args and die "unknown args: ".join(" ",sort keys %args);
+	return $default{$min_suffix} ||= shift->from_string(_default_data(),
+	    min_suffix => $min_suffix);
+    }
+}
+
+sub from_string {
+    my $class = shift;
+    my $data  = shift;
+    open( my $fh,'<', \$data );
+    return $class->from_file($fh,@_);
+}
+
+sub from_file {
+    my ($class,$file,%args) = @_;
+    my $min_suffix = delete $args{min_suffix};
+    $min_suffix = 1 if ! defined $min_suffix;
+    %args and die "unknown args: ".join(" ",sort keys %args);
+
+    my $fh;
+    if ( ref($file)) {
+	$fh = $file
+    } elsif ( ! open($fh,'<',$file)) {
+	die "failed to open $file: $!";
+    }
+    my %tree;
+    local $/ = "\n";
+    while ( my $line = <$fh>) {
+	$line =~s{//.*}{};
+	$line =~s{\s+$}{};
+	$line eq '' and next;
+	my $p = \%tree;
+	$line = idn_to_ascii($line) if $line !~m{\A[\x00-\x7f]*\Z};
+	my $not = $line =~s{^!}{};
+	my @path = split(m{\.},$line);
+	for(reverse @path) {
+	    $p = $p->{$_} ||= {}
+	}
+	$p->{'\0'} = $not ? -1:1;
+    }
+    return bless { 
+	tree => \%tree, 
+	min_suffix => $min_suffix 
+    },$class;
+}
+
+
+sub public_suffix {
+    my ($self,$name,$add) = @_;
+    my $want; # [a]rray, [s]tring, [u]nicode-string
+    if ( ref($name)) {
+	$want = 'a';
+	$name = [ @$name ]; # don't change input
+    } else {
+	return if ! defined $name;
+	if ( $name !~m{\A[\x00-\x7f]*\Z} ) {
+	    $name = idn_to_ascii($name);
+	    $want = 'u';
+	} else {
+	    $want = 's';
+	}
+	$name = lc($name);
+	$name =~s{\.$}{};
+	$name = [ $name =~m{([^.]+)}g ];
+    }
+    @$name or return;
+    $_ = lc($_) for(@$name);
+
+    my (%wild,%host,%xcept,@stack,$choices);
+    my $p = $self->{tree};
+    for( my $i=0; $i<@$name; $i++ ) {
+	$choices = [];
+	if ( my $px = $p->{ $name->[$#$name-$i] } ) {
+	    # name match, continue with next path element
+	    push @$choices,$px;
+	    if ( my $end = $px->{'\0'} ) {
+		( $end>0 ? \%host : \%xcept )->{$i+1} = $end;
+	    }
+	}
+	if ( my $px = $p->{'*'} ) {
+	    # wildcard match, continue with next path element
+	    push @$choices,$px;
+	    if ( my $end = $px->{'\0'} ) {
+		( $end>0 ? \%wild : \%xcept )->{$i+1} = $end;
+	    }
+	}
+
+
+	next_choice:
+	if ( @$choices ) {
+	    $p = shift(@$choices);
+	    push @stack, [ $choices, $i ] if @$choices;
+	    next; # go deeper
+	}
+
+	# backtrack
+	@stack or last;
+	($choices,$i) = @{ pop(@stack) };
+	goto next_choice;
+    }
+
+    #warn Dumper([\%wild,\%host,\%xcept]); use Data::Dumper;
+
+
+    # remove all exceptions from wildcards
+    delete @wild{ keys %xcept } if %xcept;
+    # get longest match
+    my ($len) = sort { $b <=> $a } (
+	keys(%wild), keys(%host), map { $_-1 } keys(%xcept));
+    # if we have no matches use a minimum of min_suffix
+    $len = $self->{min_suffix} if ! defined $len;
+    $len += $add if $add;
+    my $suffix;
+    if ( $len < @$name ) {
+	$suffix = [ splice( @$name, -$len, $len ) ];
+    } elsif ( $len > 0 ) {
+	$suffix = $name;
+	$name = []
+    } else {
+	$suffix = []
+    }
+
+    if ( $want ne 'a' ) {
+	$suffix = join('.',@$suffix);
+	$name = join('.',@$name);
+	if ( $want eq 'u' ) {
+	    $suffix = idn_to_unicode($suffix);
+	    $name   = idn_to_unicode($name);
+	}
+    }
+
+    return wantarray ? ($name,$suffix):$suffix;
+}
+
+
+{
+    my $data;
+    sub _default_data {
+	if ( ! defined $data ) {
+	    $data = _builtin_data();
+	    $data =~s{^// ===END ICANN DOMAINS.*}{}ms
+		or die "cannot find END ICANN DOMAINS";
+	}
+	return $data;
+    }
+}
+
+sub update_self_from_url {
+    my $url = shift || URL();
+    my $dst = __FILE__;
+    -w $dst or die "cannot write $dst";
+    open( my $fh,'<',$dst ) or die "open $dst: $!";
+    my $code = '';
+    local $/ = "\n";
+    while (<$fh>) {
+	$code .= $_;
+	m{<<\'END_BUILTIN_DATA\'} and last;
+    }
+    my $tail;
+    while (<$fh>) {
+	m{\AEND_BUILTIN_DATA\r?\n} or next;
+	$tail = $_;
+	last;
+    }
+    $tail .= do { local $/; <$fh> };
+    close($fh);
+
+    require LWP::UserAgent;
+    my $resp = LWP::UserAgent->new->get($url)
+	or die "no response from $url";
+    die "no success url=$url code=".$resp->code." ".$resp->message 
+	if ! $resp->is_success;
+    my $content = $resp->decoded_content;
+    while ( $content =~m{(.*\n)}g ) {
+	my $line = $1;
+	if ( $line =~m{\S} && $line !~m{\A\s*//} ) {
+	    $line =~s{//.*}{};
+	    $line =~s{\s+$}{};
+	    $line eq '' and next;
+	    if ( $line !~m{\A[\x00-\x7f]+\Z} ) {
+		$line = idn_to_ascii($line);
+	    }
+	    $code .= "$line\n";
+	} else {
+	    $code .= "$line";
+	}
+    }
+
+    open( $fh,'>:utf8',$dst ) or die "open $dst: $!";
+    print $fh $code.$tail;
+}
+
+sub _builtin_data { return <<'END_BUILTIN_DATA' }
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
+// Please pull this list from, and only from https://publicsuffix.org/list/public_suffix_list.dat,
+// rather than any other VCS sites. Pulling from any other URL is not guaranteed to be supported.
+
+// Instructions on pulling and using this list can be found at https://publicsuffix.org/list/.
+
+// ===BEGIN ICANN DOMAINS===
+
+// ac : http://nic.ac/rules.htm
+ac
+com.ac
+edu.ac
+gov.ac
+net.ac
+mil.ac
+org.ac
+
+// ad : https://en.wikipedia.org/wiki/.ad
+ad
+nom.ad
+
+// ae : https://tdra.gov.ae/en/aeda/ae-policies
+ae
+co.ae
+net.ae
+org.ae
+sch.ae
+ac.ae
+gov.ae
+mil.ae
+
+// aero : see https://www.information.aero/index.php?id=66
+aero
+accident-investigation.aero
+accident-prevention.aero
+aerobatic.aero
+aeroclub.aero
+aerodrome.aero
+agents.aero
+aircraft.aero
+airline.aero
+airport.aero
+air-surveillance.aero
+airtraffic.aero
+air-traffic-control.aero
+ambulance.aero
+amusement.aero
+association.aero
+author.aero
+ballooning.aero
+broker.aero
+caa.aero
+cargo.aero
+catering.aero
+certification.aero
+championship.aero
+charter.aero
+civilaviation.aero
+club.aero
+conference.aero
+consultant.aero
+consulting.aero
+control.aero
+council.aero
+crew.aero
+design.aero
+dgca.aero
+educator.aero
+emergency.aero
+engine.aero
+engineer.aero
+entertainment.aero
+equipment.aero
+exchange.aero
+express.aero
+federation.aero
+flight.aero
+fuel.aero
+gliding.aero
+government.aero
+groundhandling.aero
+group.aero
+hanggliding.aero
+homebuilt.aero
+insurance.aero
+journal.aero
+journalist.aero
+leasing.aero
+logistics.aero
+magazine.aero
+maintenance.aero
+media.aero
+microlight.aero
+modelling.aero
+navigation.aero
+parachuting.aero
+paragliding.aero
+passenger-association.aero
+pilot.aero
+press.aero
+production.aero
+recreation.aero
+repbody.aero
+res.aero
+research.aero
+rotorcraft.aero
+safety.aero
+scientist.aero
+services.aero
+show.aero
+skydiving.aero
+software.aero
+student.aero
+trader.aero
+trading.aero
+trainer.aero
+union.aero
+workinggroup.aero
+works.aero
+
+// af : http://www.nic.af/help.jsp
+af
+gov.af
+com.af
+org.af
+net.af
+edu.af
+
+// ag : http://www.nic.ag/prices.htm
+ag
+com.ag
+org.ag
+net.ag
+co.ag
+nom.ag
+
+// ai : http://nic.com.ai/
+ai
+off.ai
+com.ai
+net.ai
+org.ai
+
+// al : http://www.ert.gov.al/ert_alb/faq_det.html?Id=31
+al
+com.al
+edu.al
+gov.al
+mil.al
+net.al
+org.al
+
+// am : https://www.amnic.net/policy/en/Policy_EN.pdf
+am
+co.am
+com.am
+commune.am
+net.am
+org.am
+
+// ao : https://en.wikipedia.org/wiki/.ao
+// http://www.dns.ao/REGISTR.DOC
+ao
+ed.ao
+gv.ao
+og.ao
+co.ao
+pb.ao
+it.ao
+
+// aq : https://en.wikipedia.org/wiki/.aq
+aq
+
+// ar : https://nic.ar/es/nic-argentina/normativa
+ar
+bet.ar
+com.ar
+coop.ar
+edu.ar
+gob.ar
+gov.ar
+int.ar
+mil.ar
+musica.ar
+mutual.ar
+net.ar
+org.ar
+senasa.ar
+tur.ar
+
+// arpa : https://en.wikipedia.org/wiki/.arpa
+// Confirmed by registry <iana-questions@icann.org> 2008-06-18
+arpa
+e164.arpa
+in-addr.arpa
+ip6.arpa
+iris.arpa
+uri.arpa
+urn.arpa
+
+// as : https://en.wikipedia.org/wiki/.as
+as
+gov.as
+
+// asia : https://en.wikipedia.org/wiki/.asia
+asia
+
+// at : https://en.wikipedia.org/wiki/.at
+// Confirmed by registry <it@nic.at> 2008-06-17
+at
+ac.at
+co.at
+gv.at
+or.at
+sth.ac.at
+
+// au : https://en.wikipedia.org/wiki/.au
+// http://www.auda.org.au/
+au
+// 2LDs
+com.au
+net.au
+org.au
+edu.au
+gov.au
+asn.au
+id.au
+// Historic 2LDs (closed to new registration, but sites still exist)
+info.au
+conf.au
+oz.au
+// CGDNs - http://www.cgdn.org.au/
+act.au
+nsw.au
+nt.au
+qld.au
+sa.au
+tas.au
+vic.au
+wa.au
+// 3LDs
+act.edu.au
+catholic.edu.au
+// eq.edu.au - Removed at the request of the Queensland Department of Education
+nsw.edu.au
+nt.edu.au
+qld.edu.au
+sa.edu.au
+tas.edu.au
+vic.edu.au
+wa.edu.au
+// act.gov.au  Bug 984824 - Removed at request of Greg Tankard
+// nsw.gov.au  Bug 547985 - Removed at request of <Shae.Donelan@services.nsw.gov.au>
+// nt.gov.au  Bug 940478 - Removed at request of Greg Connors <Greg.Connors@nt.gov.au>
+qld.gov.au
+sa.gov.au
+tas.gov.au
+vic.gov.au
+wa.gov.au
+// 4LDs
+// education.tas.edu.au - Removed at the request of the Department of Education Tasmania
+schools.nsw.edu.au
+
+// aw : https://en.wikipedia.org/wiki/.aw
+aw
+com.aw
+
+// ax : https://en.wikipedia.org/wiki/.ax
+ax
+
+// az : https://en.wikipedia.org/wiki/.az
+az
+com.az
+net.az
+int.az
+gov.az
+org.az
+edu.az
+info.az
+pp.az
+mil.az
+name.az
+pro.az
+biz.az
+
+// ba : http://nic.ba/users_data/files/pravilnik_o_registraciji.pdf
+ba
+com.ba
+edu.ba
+gov.ba
+mil.ba
+net.ba
+org.ba
+
+// bb : https://en.wikipedia.org/wiki/.bb
+bb
+biz.bb
+co.bb
+com.bb
+edu.bb
+gov.bb
+info.bb
+net.bb
+org.bb
+store.bb
+tv.bb
+
+// bd : https://en.wikipedia.org/wiki/.bd
+*.bd
+
+// be : https://en.wikipedia.org/wiki/.be
+// Confirmed by registry <tech@dns.be> 2008-06-08
+be
+ac.be
+
+// bf : https://en.wikipedia.org/wiki/.bf
+bf
+gov.bf
+
+// bg : https://en.wikipedia.org/wiki/.bg
+// https://www.register.bg/user/static/rules/en/index.html
+bg
+a.bg
+b.bg
+c.bg
+d.bg
+e.bg
+f.bg
+g.bg
+h.bg
+i.bg
+j.bg
+k.bg
+l.bg
+m.bg
+n.bg
+o.bg
+p.bg
+q.bg
+r.bg
+s.bg
+t.bg
+u.bg
+v.bg
+w.bg
+x.bg
+y.bg
+z.bg
+0.bg
+1.bg
+2.bg
+3.bg
+4.bg
+5.bg
+6.bg
+7.bg
+8.bg
+9.bg
+
+// bh : https://en.wikipedia.org/wiki/.bh
+bh
+com.bh
+edu.bh
+net.bh
+org.bh
+gov.bh
+
+// bi : https://en.wikipedia.org/wiki/.bi
+// http://whois.nic.bi/
+bi
+co.bi
+com.bi
+edu.bi
+or.bi
+org.bi
+
+// biz : https://en.wikipedia.org/wiki/.biz
+biz
+
+// bj : https://nic.bj/bj-suffixes.txt
+// submitted by registry <contact@nic.bj>
+bj
+africa.bj
+agro.bj
+architectes.bj
+assur.bj
+avocats.bj
+co.bj
+com.bj
+eco.bj
+econo.bj
+edu.bj
+info.bj
+loisirs.bj
+money.bj
+net.bj
+org.bj
+ote.bj
+resto.bj
+restaurant.bj
+tourism.bj
+univ.bj
+
+// bm : http://www.bermudanic.bm/dnr-text.txt
+bm
+com.bm
+edu.bm
+gov.bm
+net.bm
+org.bm
+
+// bn : http://www.bnnic.bn/faqs
+bn
+com.bn
+edu.bn
+gov.bn
+net.bn
+org.bn
+
+// bo : https://nic.bo/delegacion2015.php#h-1.10
+bo
+com.bo
+edu.bo
+gob.bo
+int.bo
+org.bo
+net.bo
+mil.bo
+tv.bo
+web.bo
+// Social Domains
+academia.bo
+agro.bo
+arte.bo
+blog.bo
+bolivia.bo
+ciencia.bo
+cooperativa.bo
+democracia.bo
+deporte.bo
+ecologia.bo
+economia.bo
+empresa.bo
+indigena.bo
+industria.bo
+info.bo
+medicina.bo
+movimiento.bo
+musica.bo
+natural.bo
+nombre.bo
+noticias.bo
+patria.bo
+politica.bo
+profesional.bo
+plurinacional.bo
+pueblo.bo
+revista.bo
+salud.bo
+tecnologia.bo
+tksat.bo
+transporte.bo
+wiki.bo
+
+// br : http://registro.br/dominio/categoria.html
+// Submitted by registry <fneves@registro.br>
+br
+9guacu.br
+abc.br
+adm.br
+adv.br
+agr.br
+aju.br
+am.br
+anani.br
+aparecida.br
+app.br
+arq.br
+art.br
+ato.br
+b.br
+barueri.br
+belem.br
+bhz.br
+bib.br
+bio.br
+blog.br
+bmd.br
+boavista.br
+bsb.br
+campinagrande.br
+campinas.br
+caxias.br
+cim.br
+cng.br
+cnt.br
+com.br
+contagem.br
+coop.br
+coz.br
+cri.br
+cuiaba.br
+curitiba.br
+def.br
+des.br
+det.br
+dev.br
+ecn.br
+eco.br
+edu.br
+emp.br
+enf.br
+eng.br
+esp.br
+etc.br
+eti.br
+far.br
+feira.br
+flog.br
+floripa.br
+fm.br
+fnd.br
+fortal.br
+fot.br
+foz.br
+fst.br
+g12.br
+geo.br
+ggf.br
+goiania.br
+gov.br
+// gov.br 26 states + df https://en.wikipedia.org/wiki/States_of_Brazil
+ac.gov.br
+al.gov.br
+am.gov.br
+ap.gov.br
+ba.gov.br
+ce.gov.br
+df.gov.br
+es.gov.br
+go.gov.br
+ma.gov.br
+mg.gov.br
+ms.gov.br
+mt.gov.br
+pa.gov.br
+pb.gov.br
+pe.gov.br
+pi.gov.br
+pr.gov.br
+rj.gov.br
+rn.gov.br
+ro.gov.br
+rr.gov.br
+rs.gov.br
+sc.gov.br
+se.gov.br
+sp.gov.br
+to.gov.br
+gru.br
+imb.br
+ind.br
+inf.br
+jab.br
+jampa.br
+jdf.br
+joinville.br
+jor.br
+jus.br
+leg.br
+lel.br
+log.br
+londrina.br
+macapa.br
+maceio.br
+manaus.br
+maringa.br
+mat.br
+med.br
+mil.br
+morena.br
+mp.br
+mus.br
+natal.br
+net.br
+niteroi.br
+*.nom.br
+not.br
+ntr.br
+odo.br
+ong.br
+org.br
+osasco.br
+palmas.br
+poa.br
+ppg.br
+pro.br
+psc.br
+psi.br
+pvh.br
+qsl.br
+radio.br
+rec.br
+recife.br
+rep.br
+ribeirao.br
+rio.br
+riobranco.br
+riopreto.br
+salvador.br
+sampa.br
+santamaria.br
+santoandre.br
+saobernardo.br
+saogonca.br
+seg.br
+sjc.br
+slg.br
+slz.br
+sorocaba.br
+srv.br
+taxi.br
+tc.br
+tec.br
+teo.br
+the.br
+tmp.br
+trd.br
+tur.br
+tv.br
+udi.br
+vet.br
+vix.br
+vlog.br
+wiki.br
+zlg.br
+
+// bs : http://www.nic.bs/rules.html
+bs
+com.bs
+net.bs
+org.bs
+edu.bs
+gov.bs
+
+// bt : https://en.wikipedia.org/wiki/.bt
+bt
+com.bt
+edu.bt
+gov.bt
+net.bt
+org.bt
+
+// bv : No registrations at this time.
+// Submitted by registry <jarle@uninett.no>
+bv
+
+// bw : https://en.wikipedia.org/wiki/.bw
+// http://www.gobin.info/domainname/bw.doc
+// list of other 2nd level tlds ?
+bw
+co.bw
+org.bw
+
+// by : https://en.wikipedia.org/wiki/.by
+// http://tld.by/rules_2006_en.html
+// list of other 2nd level tlds ?
+by
+gov.by
+mil.by
+// Official information does not indicate that com.by is a reserved
+// second-level domain, but it's being used as one (see www.google.com.by and
+// www.yahoo.com.by, for example), so we list it here for safety's sake.
+com.by
+
+// http://hoster.by/
+of.by
+
+// bz : https://en.wikipedia.org/wiki/.bz
+// http://www.belizenic.bz/
+bz
+com.bz
+net.bz
+org.bz
+edu.bz
+gov.bz
+
+// ca : https://en.wikipedia.org/wiki/.ca
+ca
+// ca geographical names
+ab.ca
+bc.ca
+mb.ca
+nb.ca
+nf.ca
+nl.ca
+ns.ca
+nt.ca
+nu.ca
+on.ca
+pe.ca
+qc.ca
+sk.ca
+yk.ca
+// gc.ca: https://en.wikipedia.org/wiki/.gc.ca
+// see also: http://registry.gc.ca/en/SubdomainFAQ
+gc.ca
+
+// cat : https://en.wikipedia.org/wiki/.cat
+cat
+
+// cc : https://en.wikipedia.org/wiki/.cc
+cc
+
+// cd : https://en.wikipedia.org/wiki/.cd
+// see also: https://www.nic.cd/domain/insertDomain_2.jsp?act=1
+cd
+gov.cd
+
+// cf : https://en.wikipedia.org/wiki/.cf
+cf
+
+// cg : https://en.wikipedia.org/wiki/.cg
+cg
+
+// ch : https://en.wikipedia.org/wiki/.ch
+ch
+
+// ci : https://en.wikipedia.org/wiki/.ci
+// http://www.nic.ci/index.php?page=charte
+ci
+org.ci
+or.ci
+com.ci
+co.ci
+edu.ci
+ed.ci
+ac.ci

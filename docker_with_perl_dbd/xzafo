@@ -1,0 +1,1000 @@
+    connection.send_bytes(CHALLENGE + message)
+    digest = hmac.new(authkey, message, 'md5').digest()
+    response = connection.recv_bytes(256)        # reject large message
+    if response == digest:
+        connection.send_bytes(WELCOME)
+    else:
+        connection.send_bytes(FAILURE)
+        raise AuthenticationError('digest received was wrong')
+
+def answer_challenge(connection, authkey):
+    import hmac
+    if not isinstance(authkey, bytes):
+        raise ValueError(
+            "Authkey must be bytes, not {0!s}".format(type(authkey)))
+    message = connection.recv_bytes(256)         # reject large message
+    assert message[:len(CHALLENGE)] == CHALLENGE, 'message = %r' % message
+    message = message[len(CHALLENGE):]
+    digest = hmac.new(authkey, message, 'md5').digest()
+    connection.send_bytes(digest)
+    response = connection.recv_bytes(256)        # reject large message
+    if response != WELCOME:
+        raise AuthenticationError('digest sent was rejected')
+
+#
+# Support for using xmlrpclib for serialization
+#
+
+class ConnectionWrapper(object):
+    def __init__(self, conn, dumps, loads):
+        self._conn = conn
+        self._dumps = dumps
+        self._loads = loads
+        for attr in ('fileno', 'close', 'poll', 'recv_bytes', 'send_bytes'):
+            obj = getattr(conn, attr)
+            setattr(self, attr, obj)
+    def send(self, obj):
+        s = self._dumps(obj)
+        self._conn.send_bytes(s)
+    def recv(self):
+        s = self._conn.recv_bytes()
+        return self._loads(s)
+
+def _xml_dumps(obj):
+    return xmlrpclib.dumps((obj,), None, None, None, 1).encode('utf-8')
+
+def _xml_loads(s):
+    (obj,), method = xmlrpclib.loads(s.decode('utf-8'))
+    return obj
+
+class XmlListener(Listener):
+    def accept(self):
+        global xmlrpclib
+        import xmlrpc.client as xmlrpclib
+        obj = Listener.accept(self)
+        return ConnectionWrapper(obj, _xml_dumps, _xml_loads)
+
+def XmlClient(*args, **kwds):
+    global xmlrpclib
+    import xmlrpc.client as xmlrpclib
+    return ConnectionWrapper(Client(*args, **kwds), _xml_dumps, _xml_loads)
+
+#
+# Wait
+#
+
+if sys.platform == 'win32':
+
+    def _exhaustive_wait(handles, timeout):
+        # Return ALL handles which are currently signalled.  (Only
+        # returning the first signalled might create starvation issues.)
+        L = list(handles)
+        ready = []
+        while L:
+            res = _winapi.WaitForMultipleObjects(L, False, timeout)
+            if res == WAIT_TIMEOUT:
+                break
+            elif WAIT_OBJECT_0 <= res < WAIT_OBJECT_0 + len(L):
+                res -= WAIT_OBJECT_0
+            elif WAIT_ABANDONED_0 <= res < WAIT_ABANDONED_0 + len(L):
+                res -= WAIT_ABANDONED_0
+            else:
+                raise RuntimeError('Should not get here')
+            ready.append(L[res])
+            L = L[res+1:]
+            timeout = 0
+        return ready
+
+    _ready_errors = {_winapi.ERROR_BROKEN_PIPE, _winapi.ERROR_NETNAME_DELETED}
+
+    def wait(object_list, timeout=None):
+        '''
+        Wait till an object in object_list is ready/readable.
+
+        Returns list of those objects in object_list which are ready/readable.
+        '''
+        if timeout is None:
+            timeout = INFINITE
+        elif timeout < 0:
+            timeout = 0
+        else:
+            timeout = int(timeout * 1000 + 0.5)
+
+        object_list = list(object_list)
+        waithandle_to_obj = {}
+        ov_list = []
+        ready_objects = set()
+        ready_handles = set()
+
+        try:
+            for o in object_list:
+                try:
+                    fileno = getattr(o, 'fileno')
+                except AttributeError:
+                    waithandle_to_obj[o.__index__()] = o
+                else:
+                    # start an overlapped read of length zero
+                    try:
+                        ov, err = _winapi.ReadFile(fileno(), 0, True)
+                    except OSError as e:
+                        ov, err = None, e.winerror
+                        if err not in _ready_errors:
+                            raise
+                    if err == _winapi.ERROR_IO_PENDING:
+                        ov_list.append(ov)
+                        waithandle_to_obj[ov.event] = o
+                    else:
+                        # If o.fileno() is an overlapped pipe handle and
+                        # err == 0 then there is a zero length message
+                        # in the pipe, but it HAS NOT been consumed...
+                        if ov and sys.getwindowsversion()[:2] >= (6, 2):
+                            # ... except on Windows 8 and later, where
+                            # the message HAS been consumed.
+                            try:
+                                _, err = ov.GetOverlappedResult(False)
+                            except OSError as e:
+                                err = e.winerror
+                            if not err and hasattr(o, '_got_empty_message'):
+                                o._got_empty_message = True
+                        ready_objects.add(o)
+                        timeout = 0
+
+            ready_handles = _exhaustive_wait(waithandle_to_obj.keys(), timeout)
+        finally:
+            # request that overlapped reads stop
+            for ov in ov_list:
+                ov.cancel()
+
+            # wait for all overlapped reads to stop
+            for ov in ov_list:
+                try:
+                    _, err = ov.GetOverlappedResult(True)
+                except OSError as e:
+                    err = e.winerror
+                    if err not in _ready_errors:
+                        raise
+                if err != _winapi.ERROR_OPERATION_ABORTED:
+                    o = waithandle_to_obj[ov.event]
+                    ready_objects.add(o)
+                    if err == 0:
+                        # If o.fileno() is an overlapped pipe handle then
+                        # a zero length message HAS been consumed.
+                        if hasattr(o, '_got_empty_message'):
+                            o._got_empty_message = True
+
+        ready_objects.update(waithandle_to_obj[h] for h in ready_handles)
+        return [o for o in object_list if o in ready_objects]
+
+else:
+
+    import selectors
+
+    # poll/select have the advantage of not requiring any extra file
+    # descriptor, contrarily to epoll/kqueue (also, they require a single
+    # syscall).
+    if hasattr(selectors, 'PollSelector'):
+        _WaitSelector = selectors.PollSelector
+    else:
+        _WaitSelector = selectors.SelectSelector
+
+    def wait(object_list, timeout=None):
+        '''
+        Wait till an object in object_list is ready/readable.
+
+        Returns list of those objects in object_list which are ready/readable.
+        '''
+        with _WaitSelector() as selector:
+            for obj in object_list:
+                selector.register(obj, selectors.EVENT_READ)
+
+            if timeout is not None:
+                deadline = time.monotonic() + timeout
+
+            while True:
+                ready = selector.select(timeout)
+                if ready:
+                    return [key.fileobj for (key, events) in ready]
+                else:
+                    if timeout is not None:
+                        timeout = deadline - time.monotonic()
+                        if timeout < 0:
+                            return ready
+
+#
+# Make connection and socket objects shareable if possible
+#
+
+if sys.platform == 'win32':
+    def reduce_connection(conn):
+        handle = conn.fileno()
+        with socket.fromfd(handle, socket.AF_INET, socket.SOCK_STREAM) as s:
+            from . import resource_sharer
+            ds = resource_sharer.DupSocket(s)
+            return rebuild_connection, (ds, conn.readable, conn.writable)
+    def rebuild_connection(ds, readable, writable):
+        sock = ds.detach()
+        return Connection(sock.detach(), readable, writable)
+    reduction.register(Connection, reduce_connection)
+
+    def reduce_pipe_connection(conn):
+        access = ((_winapi.FILE_GENERIC_READ if conn.readable else 0) |
+                  (_winapi.FILE_GENERIC_WRITE if conn.writable else 0))
+        dh = reduction.DupHandle(conn.fileno(), access)
+        return rebuild_pipe_connection, (dh, conn.readable, conn.writable)
+    def rebuild_pipe_connection(dh, readable, writable):
+        handle = dh.detach()
+        return PipeConnection(handle, readable, writable)
+    reduction.register(PipeConnection, reduce_pipe_connection)
+
+else:
+    def reduce_connection(conn):
+        df = reduction.DupFd(conn.fileno())
+        return rebuild_connection, (df, conn.readable, conn.writable)
+    def rebuild_connection(df, readable, writable):
+        fd = df.detach()
+        return Connection(fd, readable, writable)
+    reduction.register(Connection, reduce_connection)
+                                                                                                                                             usr/lib/python3.11/multiprocessing/context.py                                                       0000644 0000000 0000000 00000026515 14671176116 017757  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        import os
+import sys
+import threading
+
+from . import process
+from . import reduction
+
+__all__ = ()
+
+#
+# Exceptions
+#
+
+class ProcessError(Exception):
+    pass
+
+class BufferTooShort(ProcessError):
+    pass
+
+class TimeoutError(ProcessError):
+    pass
+
+class AuthenticationError(ProcessError):
+    pass
+
+#
+# Base type for contexts. Bound methods of an instance of this type are included in __all__ of __init__.py
+#
+
+class BaseContext(object):
+
+    ProcessError = ProcessError
+    BufferTooShort = BufferTooShort
+    TimeoutError = TimeoutError
+    AuthenticationError = AuthenticationError
+
+    current_process = staticmethod(process.current_process)
+    parent_process = staticmethod(process.parent_process)
+    active_children = staticmethod(process.active_children)
+
+    def cpu_count(self):
+        '''Returns the number of CPUs in the system'''
+        num = os.cpu_count()
+        if num is None:
+            raise NotImplementedError('cannot determine number of cpus')
+        else:
+            return num
+
+    def Manager(self):
+        '''Returns a manager associated with a running server process
+
+        The managers methods such as `Lock()`, `Condition()` and `Queue()`
+        can be used to create shared objects.
+        '''
+        from .managers import SyncManager
+        m = SyncManager(ctx=self.get_context())
+        m.start()
+        return m
+
+    def Pipe(self, duplex=True):
+        '''Returns two connection object connected by a pipe'''
+        from .connection import Pipe
+        return Pipe(duplex)
+
+    def Lock(self):
+        '''Returns a non-recursive lock object'''
+        from .synchronize import Lock
+        return Lock(ctx=self.get_context())
+
+    def RLock(self):
+        '''Returns a recursive lock object'''
+        from .synchronize import RLock
+        return RLock(ctx=self.get_context())
+
+    def Condition(self, lock=None):
+        '''Returns a condition object'''
+        from .synchronize import Condition
+        return Condition(lock, ctx=self.get_context())
+
+    def Semaphore(self, value=1):
+        '''Returns a semaphore object'''
+        from .synchronize import Semaphore
+        return Semaphore(value, ctx=self.get_context())
+
+    def BoundedSemaphore(self, value=1):
+        '''Returns a bounded semaphore object'''
+        from .synchronize import BoundedSemaphore
+        return BoundedSemaphore(value, ctx=self.get_context())
+
+    def Event(self):
+        '''Returns an event object'''
+        from .synchronize import Event
+        return Event(ctx=self.get_context())
+
+    def Barrier(self, parties, action=None, timeout=None):
+        '''Returns a barrier object'''
+        from .synchronize import Barrier
+        return Barrier(parties, action, timeout, ctx=self.get_context())
+
+    def Queue(self, maxsize=0):
+        '''Returns a queue object'''
+        from .queues import Queue
+        return Queue(maxsize, ctx=self.get_context())
+
+    def JoinableQueue(self, maxsize=0):
+        '''Returns a queue object'''
+        from .queues import JoinableQueue
+        return JoinableQueue(maxsize, ctx=self.get_context())
+
+    def SimpleQueue(self):
+        '''Returns a queue object'''
+        from .queues import SimpleQueue
+        return SimpleQueue(ctx=self.get_context())
+
+    def Pool(self, processes=None, initializer=None, initargs=(),
+             maxtasksperchild=None):
+        '''Returns a process pool object'''
+        from .pool import Pool
+        return Pool(processes, initializer, initargs, maxtasksperchild,
+                    context=self.get_context())
+
+    def RawValue(self, typecode_or_type, *args):
+        '''Returns a shared object'''
+        from .sharedctypes import RawValue
+        return RawValue(typecode_or_type, *args)
+
+    def RawArray(self, typecode_or_type, size_or_initializer):
+        '''Returns a shared array'''
+        from .sharedctypes import RawArray
+        return RawArray(typecode_or_type, size_or_initializer)
+
+    def Value(self, typecode_or_type, *args, lock=True):
+        '''Returns a synchronized shared object'''
+        from .sharedctypes import Value
+        return Value(typecode_or_type, *args, lock=lock,
+                     ctx=self.get_context())
+
+    def Array(self, typecode_or_type, size_or_initializer, *, lock=True):
+        '''Returns a synchronized shared array'''
+        from .sharedctypes import Array
+        return Array(typecode_or_type, size_or_initializer, lock=lock,
+                     ctx=self.get_context())
+
+    def freeze_support(self):
+        '''Check whether this is a fake forked process in a frozen executable.
+        If so then run code specified by commandline and exit.
+        '''
+        if sys.platform == 'win32' and getattr(sys, 'frozen', False):
+            from .spawn import freeze_support
+            freeze_support()
+
+    def get_logger(self):
+        '''Return package logger -- if it does not already exist then
+        it is created.
+        '''
+        from .util import get_logger
+        return get_logger()
+
+    def log_to_stderr(self, level=None):
+        '''Turn on logging and add a handler which prints to stderr'''
+        from .util import log_to_stderr
+        return log_to_stderr(level)
+
+    def allow_connection_pickling(self):
+        '''Install support for sending connections and sockets
+        between processes
+        '''
+        # This is undocumented.  In previous versions of multiprocessing
+        # its only effect was to make socket objects inheritable on Windows.
+        from . import connection
+
+    def set_executable(self, executable):
+        '''Sets the path to a python.exe or pythonw.exe binary used to run
+        child processes instead of sys.executable when using the 'spawn'
+        start method.  Useful for people embedding Python.
+        '''
+        from .spawn import set_executable
+        set_executable(executable)
+
+    def set_forkserver_preload(self, module_names):
+        '''Set list of module names to try to load in forkserver process.
+        This is really just a hint.
+        '''
+        from .forkserver import set_forkserver_preload
+        set_forkserver_preload(module_names)
+
+    def get_context(self, method=None):
+        if method is None:
+            return self
+        try:
+            ctx = _concrete_contexts[method]
+        except KeyError:
+            raise ValueError('cannot find context for %r' % method) from None
+        ctx._check_available()
+        return ctx
+
+    def get_start_method(self, allow_none=False):
+        return self._name
+
+    def set_start_method(self, method, force=False):
+        raise ValueError('cannot set start method of concrete context')
+
+    @property
+    def reducer(self):
+        '''Controls how objects will be reduced to a form that can be
+        shared with other processes.'''
+        return globals().get('reduction')
+
+    @reducer.setter
+    def reducer(self, reduction):
+        globals()['reduction'] = reduction
+
+    def _check_available(self):
+        pass
+
+#
+# Type of default context -- underlying context can be set at most once
+#
+
+class Process(process.BaseProcess):
+    _start_method = None
+    @staticmethod
+    def _Popen(process_obj):
+        return _default_context.get_context().Process._Popen(process_obj)
+
+    @staticmethod
+    def _after_fork():
+        return _default_context.get_context().Process._after_fork()
+
+class DefaultContext(BaseContext):
+    Process = Process
+
+    def __init__(self, context):
+        self._default_context = context
+        self._actual_context = None
+
+    def get_context(self, method=None):
+        if method is None:
+            if self._actual_context is None:
+                self._actual_context = self._default_context
+            return self._actual_context
+        else:
+            return super().get_context(method)
+
+    def set_start_method(self, method, force=False):
+        if self._actual_context is not None and not force:
+            raise RuntimeError('context has already been set')
+        if method is None and force:
+            self._actual_context = None
+            return
+        self._actual_context = self.get_context(method)
+
+    def get_start_method(self, allow_none=False):
+        if self._actual_context is None:
+            if allow_none:
+                return None
+            self._actual_context = self._default_context
+        return self._actual_context._name
+
+    def get_all_start_methods(self):
+        if sys.platform == 'win32':
+            return ['spawn']
+        else:
+            methods = ['spawn', 'fork'] if sys.platform == 'darwin' else ['fork', 'spawn']
+            if reduction.HAVE_SEND_HANDLE:
+                methods.append('forkserver')
+            return methods
+
+
+#
+# Context types for fixed start method
+#
+
+if sys.platform != 'win32':
+
+    class ForkProcess(process.BaseProcess):
+        _start_method = 'fork'
+        @staticmethod
+        def _Popen(process_obj):
+            from .popen_fork import Popen
+            return Popen(process_obj)
+
+    class SpawnProcess(process.BaseProcess):
+        _start_method = 'spawn'
+        @staticmethod
+        def _Popen(process_obj):
+            from .popen_spawn_posix import Popen
+            return Popen(process_obj)
+
+        @staticmethod
+        def _after_fork():
+            # process is spawned, nothing to do
+            pass
+
+    class ForkServerProcess(process.BaseProcess):
+        _start_method = 'forkserver'
+        @staticmethod
+        def _Popen(process_obj):
+            from .popen_forkserver import Popen
+            return Popen(process_obj)
+
+    class ForkContext(BaseContext):
+        _name = 'fork'
+        Process = ForkProcess
+
+    class SpawnContext(BaseContext):
+        _name = 'spawn'
+        Process = SpawnProcess
+
+    class ForkServerContext(BaseContext):
+        _name = 'forkserver'
+        Process = ForkServerProcess
+        def _check_available(self):
+            if not reduction.HAVE_SEND_HANDLE:
+                raise ValueError('forkserver start method not available')
+
+    _concrete_contexts = {
+        'fork': ForkContext(),
+        'spawn': SpawnContext(),
+        'forkserver': ForkServerContext(),
+    }
+    if sys.platform == 'darwin':
+        # bpo-33725: running arbitrary code after fork() is no longer reliable
+        # on macOS since macOS 10.14 (Mojave). Use spawn by default instead.
+        _default_context = DefaultContext(_concrete_contexts['spawn'])
+    else:
+        _default_context = DefaultContext(_concrete_contexts['fork'])
+
+else:
+
+    class SpawnProcess(process.BaseProcess):
+        _start_method = 'spawn'
+        @staticmethod
+        def _Popen(process_obj):
+            from .popen_spawn_win32 import Popen
+            return Popen(process_obj)
+
+        @staticmethod
+        def _after_fork():
+            # process is spawned, nothing to do
+            pass
+
+    class SpawnContext(BaseContext):
+        _name = 'spawn'
+        Process = SpawnProcess
+
+    _concrete_contexts = {
+        'spawn': SpawnContext(),
+    }
+    _default_context = DefaultContext(_concrete_contexts['spawn'])
+
+#
+# Force the start method
+#
+
+def _force_start_method(method):
+    _default_context._actual_context = _concrete_contexts[method]
+
+#
+# Check that the current thread is spawning a child process
+#
+
+_tls = threading.local()
+
+def get_spawning_popen():
+    return getattr(_tls, 'spawning_popen', None)
+
+def set_spawning_popen(popen):
+    _tls.spawning_popen = popen
+
+def assert_spawning(obj):
+    if get_spawning_popen() is None:
+        raise RuntimeError(
+            '%s objects should only be shared between processes'
+            ' through inheritance' % type(obj).__name__
+            )
+                                                                                                                                                                                   usr/lib/python3.11/multiprocessing/dummy/                                                           0000755 0000000 0000000 00000000000 14714551121 017032  5                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        usr/lib/python3.11/multiprocessing/dummy/__init__.py                                                0000644 0000000 0000000 00000005765 14671176116 021171  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        #
+# Support for the API of the multiprocessing package using threads
+#
+# multiprocessing/dummy/__init__.py
+#
+# Copyright (c) 2006-2008, R Oudkerk
+# Licensed to PSF under a Contributor Agreement.
+#
+
+__all__ = [
+    'Process', 'current_process', 'active_children', 'freeze_support',
+    'Lock', 'RLock', 'Semaphore', 'BoundedSemaphore', 'Condition',
+    'Event', 'Barrier', 'Queue', 'Manager', 'Pipe', 'Pool', 'JoinableQueue'
+    ]
+
+#
+# Imports
+#
+
+import threading
+import sys
+import weakref
+import array
+
+from .connection import Pipe
+from threading import Lock, RLock, Semaphore, BoundedSemaphore
+from threading import Event, Condition, Barrier
+from queue import Queue
+
+#
+#
+#
+
+class DummyProcess(threading.Thread):
+
+    def __init__(self, group=None, target=None, name=None, args=(), kwargs={}):
+        threading.Thread.__init__(self, group, target, name, args, kwargs)
+        self._pid = None
+        self._children = weakref.WeakKeyDictionary()
+        self._start_called = False
+        self._parent = current_process()
+
+    def start(self):
+        if self._parent is not current_process():
+            raise RuntimeError(
+                "Parent is {0!r} but current_process is {1!r}".format(
+                    self._parent, current_process()))
+        self._start_called = True
+        if hasattr(self._parent, '_children'):
+            self._parent._children[self] = None
+        threading.Thread.start(self)
+
+    @property
+    def exitcode(self):
+        if self._start_called and not self.is_alive():
+            return 0
+        else:
+            return None
+
+#
+#
+#
+
+Process = DummyProcess
+current_process = threading.current_thread
+current_process()._children = weakref.WeakKeyDictionary()
+
+def active_children():
+    children = current_process()._children
+    for p in list(children):
+        if not p.is_alive():
+            children.pop(p, None)
+    return list(children)
+
+def freeze_support():
+    pass
+
+#
+#
+#
+
+class Namespace(object):
+    def __init__(self, /, **kwds):
+        self.__dict__.update(kwds)
+    def __repr__(self):
+        items = list(self.__dict__.items())
+        temp = []
+        for name, value in items:
+            if not name.startswith('_'):
+                temp.append('%s=%r' % (name, value))
+        temp.sort()
+        return '%s(%s)' % (self.__class__.__name__, ', '.join(temp))
+
+dict = dict
+list = list
+
+def Array(typecode, sequence, lock=True):
+    return array.array(typecode, sequence)
+
+class Value(object):
+    def __init__(self, typecode, value, lock=True):
+        self._typecode = typecode
+        self._value = value
+
+    @property
+    def value(self):
+        return self._value
+
+    @value.setter
+    def value(self, value):
+        self._value = value
+
+    def __repr__(self):
+        return '<%s(%r, %r)>'%(type(self).__name__,self._typecode,self._value)
+
+def Manager():
+    return sys.modules[__name__]
+
+def shutdown():
+    pass
+
+def Pool(processes=None, initializer=None, initargs=()):
+    from ..pool import ThreadPool
+    return ThreadPool(processes, initializer, initargs)
+
+JoinableQueue = Queue
+           usr/lib/python3.11/multiprocessing/dummy/__pycache__/                                               0000755 0000000 0000000 00000000000 14714551121 021242  5                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        usr/lib/python3.11/multiprocessing/dummy/__pycache__/__init__.cpython-311.pyc                       0000644 0000000 0000000 00000014136 14714551121 025510  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        §
+    Nüäfõ  ã                   óN  — g d ¢Z ddlZddlZddlZddlZddlmZ ddlmZmZm	Z	m
+Z
+ ddlmZmZmZ ddlmZ  G d„ d	ej        ¦  «        ZeZej        Z ej        ¦   «          e¦   «         _        d
+„ Zd„ Z G d„ de¦  «        ZeZeZdd„Z G d„ de¦  «        Zd„ Zd„ Z dd„Z!eZ"dS ))ÚProcessÚcurrent_processÚactive_childrenÚfreeze_supportÚLockÚRLockÚ	SemaphoreÚBoundedSemaphoreÚ	ConditionÚEventÚBarrierÚQueueÚManagerÚPipeÚPoolÚJoinableQueueé    Né   )r   )r   r   r   r	   )r   r
+   r   )r   c                   ó<   — e Zd Zddddi fd„Zd„ Zed„ ¦   «         ZdS )ÚDummyProcessN© c                 óÀ   — t           j                             | |||||¦  «         d | _        t	          j        ¦   «         | _        d| _        t          ¦   «         | _	        d S )NF)
+Ú	threadingÚThreadÚ__init__Ú_pidÚweakrefÚWeakKeyDictionaryÚ	_childrenÚ_start_calledr   Ú_parent)ÚselfÚgroupÚtargetÚnameÚargsÚkwargss         ú5/usr/lib/python3.11/multiprocessing/dummy/__init__.pyr   zDummyProcess.__init__$   sS   € İÔ×!Ò! $¨¨v°t¸TÀ6ÑJÔJĞJØˆŒ	İ Ô2Ñ4Ô4ˆŒØ"ˆÔİ&Ñ(Ô(ˆŒˆˆó    c                 ó,  — | j         t          ¦   «         ur4t          d                     | j         t          ¦   «         ¦  «        ¦  «        ‚d| _        t          | j         d¦  «        rd | j         j        | <   t          j         	                    | ¦  «         d S )Nz,Parent is {0!r} but current_process is {1!r}Tr   )
+r    r   ÚRuntimeErrorÚformatr   Úhasattrr   r   r   Ústart©r!   s    r'   r-   zDummyProcess.start+   s‘   € ØŒ<Ñ0Ô0Ğ0Ğ0İØ>×EÒEØ”L¥/Ñ"3Ô"3ñ5ô 5ñ6ô 6ğ 6ğ "ˆÔİ4”< Ñ-Ô-ğ 	0Ø+/ˆDŒLÔ" 4Ñ(İÔ×Ò˜tÑ$Ô$Ğ$Ğ$Ğ$r(   c                 ó@   — | j         r|                      ¦   «         sdS d S )Nr   )r   Úis_aliver.   s    r'   ÚexitcodezDummyProcess.exitcode5   s&   € àÔğ 	 d§m¢m¡o¤oğ 	Ø1à4r(   )Ú__name__Ú
+__module__Ú__qualname__r   r-   Úpropertyr1   r   r(   r'   r   r   "   s]   € € € € € à!¨$°TÀÈ2ğ )ğ )ğ )ğ )ğ%ğ %ğ %ğ ğğ ñ „Xğğ ğ r(   r   c                  ó¾   — t          ¦   «         j        } t          | ¦  «        D ],}|                     ¦   «         s|                      |d ¦  «         Œ-t          | ¦  «        S ©N)r   r   Úlistr0   Úpop)ÚchildrenÚps     r'   r   r   D   sV   € İÑ Ô Ô*€Hİ(‰^Œ^ğ "ğ "ˆØzŠz‰|Œ|ğ 	"ØLŠL˜˜DÑ!Ô!Ğ!øİ‰>Œ>Ğr(   c                  ó   — d S r7   r   r   r(   r'   r   r   K   ó   € Ø€Dr(   c                   ó   — e Zd Zd„ Zd„ ZdS )Ú	Namespacec                ó:   — | j                              |¦  «         d S r7   )Ú__dict__Úupdate)r!   Úkwdss     r'   r   zNamespace.__init__S   s   € ØŒ×Ò˜TÑ"Ô"Ğ"Ğ"Ğ"r(   c                 ó2  — t          | j                             ¦   «         ¦  «        }g }|D ]4\  }}|                     d¦  «        s|                     |›d|›¦  «         Œ5|                     ¦   «          | j        j        ›dd                     |¦  «        ›dS )NÚ_ú=ú(ú, ú))	r8   rA   ÚitemsÚ
+startswithÚappendÚsortÚ	__class__r2   Újoin)r!   rJ   Útempr$   Úvalues        r'   Ú__repr__zNamespace.__repr__U   s˜   € İT”]×(Ò(Ñ*Ô*Ñ+Ô+ˆØˆØ ğ 	5ğ 	5‰KˆD%Ø—?’? 3Ñ'Ô'ğ 5Ø—’ t t t¨U¨UĞ3Ñ4Ô4Ğ4øØ	Š	‰ŒˆØœ>Ô2Ğ2Ğ2°D·I²I¸d±O´O°O°OĞDĞDr(   N)r2   r3   r4   r   rR   r   r(   r'   r?   r?   R   s7   € € € € € ğ#ğ #ğ #ğEğ Eğ Eğ Eğ Er(   r?   Tc                 ó,   — t          j         | |¦  «        S r7   )Úarray)ÚtypecodeÚsequenceÚlocks      r'   ÚArrayrX   a   s   € İŒ;x Ñ*Ô*Ğ*r(   c                   óR   — e Zd Zdd„Zed„ ¦   «         Zej        d„ ¦   «         Zd„ ZdS )ÚValueTc                 ó"   — || _         || _        d S r7   )Ú	_typecodeÚ_value)r!   rU   rQ   rW   s       r'   r   zValue.__init__e   s   € Ø!ˆŒØˆŒˆˆr(   c                 ó   — | j         S r7   ©r]   r.   s    r'   rQ   zValue.valuei   s
+   € àŒ{Ğr(   c                 ó   — || _         d S r7   r_   )r!   rQ   s     r'   rQ   zValue.valuem   s   € àˆŒˆˆr(   c                 óR   — dt          | ¦  «        j        ›d| j        ›d| j        ›dS )Nú<rG   rH   z)>)Útyper2   r\   r]   r.   s    r'   rR   zValue.__repr__q   s,   € € İ# D™zœzÔ2Ğ2Ğ2°4´>°>°>À$Ä+À+À+ĞNĞNr(   N©T)r2   r3   r4   r   r5   rQ   ÚsetterrR   r   r(   r'   rZ   rZ   d   st   € € € € € ğğ ğ ğ ğ ğğ ñ „Xğğ „\ğğ ñ „\ğğOğ Oğ Oğ Oğ Or(   rZ   c                  ó0   — t           j        t                   S r7   )ÚsysÚmodulesr2   r   r(   r'   r   r   t   s   € İŒ;•xÔ Ğ r(   c                  ó   — d S r7   r   r   r(   r'   Úshutdownrj   w   r=   r(   r   c                 ó(   — ddl m}  || ||¦  «        S )Né   )Ú
+ThreadPool)Úpoolrm   )Ú	processesÚinitializerÚinitargsrm   s       r'   r   r   z   s(   € Ø!Ğ!Ğ!Ğ!Ğ!Ğ!Øˆ:i ¨hÑ7Ô7Ğ7r(   rd   )NNr   )#Ú__all__r   rg   r   rT   Ú
+connectionr   r   r   r   r	   r   r
+   r   Úqueuer   r   r   r   Úcurrent_threadr   r   r   r   r   Úobjectr?   Údictr8   rX   rZ   r   rj   r   r   r   r(   r'   ú<module>rx      sÛ  ğğğ ğ €ğ Ğ Ğ Ğ Ø 
+€
+€
+€
+Ø €€€Ø €€€à Ğ Ğ Ğ Ğ Ğ Ø >Ğ >Ğ >Ğ >Ğ >Ğ >Ğ >Ğ >Ğ >Ğ >Ğ >Ğ >Ø /Ğ /Ğ /Ğ /Ğ /Ğ /Ğ /Ğ /Ğ /Ğ /Ø Ğ Ğ Ğ Ğ Ğ ğğ ğ ğ ğ 9Ô#ñ ô ğ ğ< €ØÔ*€Ø7˜gÔ7Ñ9Ô9€€Ñ Ô Ô ğğ ğ ğ	ğ 	ğ 	ğ
+Eğ 
+Eğ 
+Eğ 
+Eğ 
+Eñ 
+Eô 
+Eğ 
+Eğ €Ø€ğ+ğ +ğ +ğ +ğOğ Oğ Oğ Oğ OˆFñ Oô Oğ Oğ !ğ !ğ !ğ	ğ 	ğ 	ğ8ğ 8ğ 8ğ 8ğ €€€r(                                                                                                                                                                                                                                                                                                                                                                                                                                     usr/lib/python3.11/multiprocessing/dummy/__pycache__/connection.cpython-311.pyc                     0000644 0000000 0000000 00000007605 14714551121 026113  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        §
+    Nüäf>  ã                   óf   — g d ¢Z ddlmZ dgZ G d„ de¦  «        Zd„ Zdd„Z G d	„ d
+e¦  «        ZdS ))ÚClientÚListenerÚPipeé    )ÚQueueNc                   óD   — e Zd Zd	d„Zd„ Zd„ Zed„ ¦   «         Zd„ Zd„ Z	dS )
+r   Né   c                 ó.   — t          |¦  «        | _        d S ©N)r   Ú_backlog_queue)ÚselfÚaddressÚfamilyÚbacklogs       ú7/usr/lib/python3.11/multiprocessing/dummy/connection.pyÚ__init__zListener.__init__   s   € İ# G™nœnˆÔĞĞó    c                 óB   — t          | j                             ¦   «          S r
+   )Ú
+Connectionr   Úget©r   s    r   ÚacceptzListener.accept   s   € İ˜4Ô.×2Ò2Ñ4Ô4Ğ5Ğ5r   c                 ó   — d | _         d S r
+   ©r   r   s    r   ÚclosezListener.close   s   € Ø"ˆÔĞĞr   c                 ó   — | j         S r
+   r   r   s    r   r   zListener.address   s   € àÔ"Ğ"r   c                 ó   — | S r
+   © r   s    r   Ú	__enter__zListener.__enter__!   ó   € Øˆr   c                 ó.   — |                       ¦   «          d S r
+   ©r   ©r   Úexc_typeÚ	exc_valueÚexc_tbs       r   Ú__exit__zListener.__exit__$   ó   € Ø
+Š
+‰Œˆˆˆr   )NNr   )
+Ú__name__Ú
+__module__Ú__qualname__r   r   r   Úpropertyr   r   r&   r   r   r   r   r      s   € € € € € ğ-ğ -ğ -ğ -ğ6ğ 6ğ 6ğ#ğ #ğ #ğ ğ#ğ #ñ „Xğ#ğğ ğ ğğ ğ ğ ğ r   r   c                 óˆ   — t          ¦   «         t          ¦   «         }}|                      ||f¦  «         t          ||¦  «        S r
+   )r   Úputr   )r   Ú_inÚ_outs      r   r   r   (   s9   € İ‘”™œˆ€CØ‡K‚KsÑÔĞİc˜4Ñ Ô Ğ r   Tc                 óz   — t          ¦   «         t          ¦   «         }}t          ||¦  «        t          ||¦  «        fS r
+   )r   r   )ÚduplexÚaÚbs      r   r   r   .   s2   € İ‰7Œ7•E‘G”G€q€Aİa˜ÑÔZ¨¨1Ñ-Ô-Ğ-Ğ-r   c                   ó.   — e Zd Zd„ Zdd„Zd„ Zd„ Zd„ ZdS )	r   c                 ón   — || _         || _        |j        x| _        | _        |j        x| _        | _        d S r
+   )r/   r.   r-   ÚsendÚ
+send_bytesr   ÚrecvÚ
+recv_bytes)r   r.   r/   s      r   r   zConnection.__init__5   s4   € ØˆŒ	ØˆŒØ&*¤hĞ.ˆŒ	D”OØ&)¤gĞ-ˆŒ	D”OOOr   ç        c                 ó  — | j                              ¦   «         dk    rdS |dk    rdS | j         j        5  | j         j                             |¦  «         d d d ¦  «         n# 1 swxY w Y   | j                              ¦   «         dk    S )Nr   Tr:   F)r.   ÚqsizeÚ	not_emptyÚwait)r   Útimeouts     r   ÚpollzConnection.poll;   s¼   € ØŒ8>Š>ÑÔ˜aÒĞØ4ØcŠ>ˆ>Ø5ØŒXÔğ 	-ğ 	-ØŒHÔ×#Ò# GÑ,Ô,Ğ,ğ	-ğ 	-ğ 	-ñ 	-ô 	-ğ 	-ğ 	-ğ 	-ğ 	-ğ 	-ğ 	-øøøğ 	-ğ 	-ğ 	-ğ 	-àŒx~Š~ÑÔ !Ò#Ğ#s   ´ A Á A$Á'A$c                 ó   — d S r
+   r   r   s    r   r   zConnection.closeD   s   € Øˆr   c                 ó   — | S r
+   r   r   s    r   r   zConnection.__enter__G   r   r   c                 ó.   — |                       ¦   «          d S r
+   r!   r"   s       r   r&   zConnection.__exit__J   r'   r   N)r:   )r(   r)   r*   r   r@   r   r   r&   r   r   r   r   r   3   sd   € € € € € ğ.ğ .ğ .ğ$ğ $ğ $ğ $ğğ ğ ğğ ğ ğğ ğ ğ ğ r   r   )T)	Ú__all__Úqueuer   ÚfamiliesÚobjectr   r   r   r   r   r   r   ú<module>rH      s®   ğğ +Ğ
+*Ğ
+*€à Ğ Ğ Ğ Ğ Ğ ğ ˆ6€ğğ ğ ğ ğ ˆvñ ô ğ ğ,!ğ !ğ !ğ.ğ .ğ .ğ .ğ
+ğ ğ ğ ğ ñ ô ğ ğ ğ r                                                                                                                              usr/lib/python3.11/multiprocessing/dummy/connection.py                                              0000644 0000000 0000000 00000003076 14671176116 021562  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        #
+# Analogue of `multiprocessing.connection` which uses queues instead of sockets
+#
+# multiprocessing/dummy/connection.py
+#
+# Copyright (c) 2006-2008, R Oudkerk
+# Licensed to PSF under a Contributor Agreement.
+#
+
+__all__ = [ 'Client', 'Listener', 'Pipe' ]
+
+from queue import Queue
+
+
+families = [None]
+
+
+class Listener(object):
+
+    def __init__(self, address=None, family=None, backlog=1):
+        self._backlog_queue = Queue(backlog)
+
+    def accept(self):
+        return Connection(*self._backlog_queue.get())
+
+    def close(self):
+        self._backlog_queue = None
+
+    @property
+    def address(self):
+        return self._backlog_queue
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, exc_tb):
+        self.close()
+
+
+def Client(address):
+    _in, _out = Queue(), Queue()
+    address.put((_out, _in))
+    return Connection(_in, _out)
+
+
+def Pipe(duplex=True):
+    a, b = Queue(), Queue()
+    return Connection(a, b), Connection(b, a)
+
+
+class Connection(object):
+
+    def __init__(self, _in, _out):
+        self._out = _out
+        self._in = _in
+        self.send = self.send_bytes = _out.put
+        self.recv = self.recv_bytes = _in.get
+
+    def poll(self, timeout=0.0):
+        if self._in.qsize() > 0:
+            return True
+        if timeout <= 0.0:
+            return False
+        with self._in.not_empty:
+            self._in.not_empty.wait(timeout)
+        return self._in.qsize() > 0
+
+    def close(self):
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, exc_tb):
+        self.close()
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                  usr/lib/python3.11/multiprocessing/forkserver.py                                                    0000644 0000000 0000000 00000027556 14671176116 020471  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        import errno
+import os
+import selectors
+import signal
+import socket
+import struct
+import sys
+import threading
+import warnings
+
+from . import connection
+from . import process
+from .context import reduction
+from . import resource_tracker
+from . import spawn
+from . import util
+
+__all__ = ['ensure_running', 'get_inherited_fds', 'connect_to_new_process',
+           'set_forkserver_preload']
+
+#
+#
+#
+
+MAXFDS_TO_SEND = 256
+SIGNED_STRUCT = struct.Struct('q')     # large enough for pid_t
+
+#
+# Forkserver class
+#
+
+class ForkServer(object):
+
+    def __init__(self):
+        self._forkserver_address = None
+        self._forkserver_alive_fd = None
+        self._forkserver_pid = None
+        self._inherited_fds = None
+        self._lock = threading.Lock()
+        self._preload_modules = ['__main__']
+
+    def _stop(self):
+        # Method used by unit tests to stop the server
+        with self._lock:
+            self._stop_unlocked()
+
+    def _stop_unlocked(self):
+        if self._forkserver_pid is None:
+            return
+
+        # close the "alive" file descriptor asks the server to stop
+        os.close(self._forkserver_alive_fd)
+        self._forkserver_alive_fd = None
+
+        os.waitpid(self._forkserver_pid, 0)
+        self._forkserver_pid = None
+
+        if not util.is_abstract_socket_namespace(self._forkserver_address):
+            os.unlink(self._forkserver_address)
+        self._forkserver_address = None
+
+    def set_forkserver_preload(self, modules_names):
+        '''Set list of module names to try to load in forkserver process.'''
+        if not all(type(mod) is str for mod in self._preload_modules):
+            raise TypeError('module_names must be a list of strings')
+        self._preload_modules = modules_names
+
+    def get_inherited_fds(self):
+        '''Return list of fds inherited from parent process.
+
+        This returns None if the current process was not started by fork
+        server.
+        '''
+        return self._inherited_fds
+
+    def connect_to_new_process(self, fds):
+        '''Request forkserver to create a child process.
+
+        Returns a pair of fds (status_r, data_w).  The calling process can read
+        the child process's pid and (eventually) its returncode from status_r.
+        The calling process should write to data_w the pickled preparation and
+        process data.
+        '''
+        self.ensure_running()
+        if len(fds) + 4 >= MAXFDS_TO_SEND:
+            raise ValueError('too many fds')
+        with socket.socket(socket.AF_UNIX) as client:
+            client.connect(self._forkserver_address)
+            parent_r, child_w = os.pipe()
+            child_r, parent_w = os.pipe()
+            allfds = [child_r, child_w, self._forkserver_alive_fd,
+                      resource_tracker.getfd()]
+            allfds += fds
+            try:
+                reduction.sendfds(client, allfds)
+                return parent_r, parent_w
+            except:
+                os.close(parent_r)
+                os.close(parent_w)
+                raise
+            finally:
+                os.close(child_r)
+                os.close(child_w)
+
+    def ensure_running(self):
+        '''Make sure that a fork server is running.
+
+        This can be called from any process.  Note that usually a child
+        process will just reuse the forkserver started by its parent, so
+        ensure_running() will do nothing.
+        '''
+        with self._lock:
+            resource_tracker.ensure_running()
+            if self._forkserver_pid is not None:
+                # forkserver was launched before, is it still running?
+                pid, status = os.waitpid(self._forkserver_pid, os.WNOHANG)
+                if not pid:
+                    # still alive
+                    return
+                # dead, launch it again
+                os.close(self._forkserver_alive_fd)
+                self._forkserver_address = None
+                self._forkserver_alive_fd = None
+                self._forkserver_pid = None
+
+            cmd = ('from multiprocessing.forkserver import main; ' +
+                   'main(%d, %d, %r, **%r)')
+
+            if self._preload_modules:
+                desired_keys = {'main_path', 'sys_path'}
+                data = spawn.get_preparation_data('ignore')
+                data = {x: y for x, y in data.items() if x in desired_keys}
+            else:
+                data = {}
+
+            with socket.socket(socket.AF_UNIX) as listener:
+                address = connection.arbitrary_address('AF_UNIX')
+                listener.bind(address)

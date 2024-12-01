@@ -1,0 +1,1000 @@
+    except crecordmod.fallbackerror as e:
+        ui.warn(b'%s\n' % e)
+        ui.warn(_(b'falling back to text mode\n'))
+
+    return patch.filterpatch(ui, originalhunks, match, operation)
+
+
+def recordfilter(ui, originalhunks, match, operation=None):
+    """Prompts the user to filter the originalhunks and return a list of
+    selected hunks.
+    *operation* is used for to build ui messages to indicate the user what
+    kind of filtering they are doing: reverting, committing, shelving, etc.
+    (see patch.filterpatch).
+    """
+    usecurses = crecordmod.checkcurses(ui)
+    testfile = ui.config(b'experimental', b'crecordtest')
+    oldwrite = setupwrapcolorwrite(ui)
+    try:
+        newchunks, newopts = filterchunks(
+            ui, originalhunks, usecurses, testfile, match, operation
+        )
+    finally:
+        ui.write = oldwrite
+    return newchunks, newopts
+
+
+def dorecord(
+    ui, repo, commitfunc, cmdsuggest, backupall, filterfn, *pats, **opts
+):
+    opts = pycompat.byteskwargs(opts)
+    if not ui.interactive():
+        if cmdsuggest:
+            msg = _(b'running non-interactively, use %s instead') % cmdsuggest
+        else:
+            msg = _(b'running non-interactively')
+        raise error.InputError(msg)
+
+    # make sure username is set before going interactive
+    if not opts.get(b'user'):
+        ui.username()  # raise exception, username not provided
+
+    def recordfunc(ui, repo, message, match, opts):
+        """This is generic record driver.
+
+        Its job is to interactively filter local changes, and
+        accordingly prepare working directory into a state in which the
+        job can be delegated to a non-interactive commit command such as
+        'commit' or 'qrefresh'.
+
+        After the actual job is done by non-interactive command, the
+        working directory is restored to its original state.
+
+        In the end we'll record interesting changes, and everything else
+        will be left in place, so the user can continue working.
+        """
+        if not opts.get(b'interactive-unshelve'):
+            checkunfinished(repo, commit=True)
+        wctx = repo[None]
+        merge = len(wctx.parents()) > 1
+        if merge:
+            raise error.InputError(
+                _(
+                    b'cannot partially commit a merge '
+                    b'(use "hg commit" instead)'
+                )
+            )
+
+        def fail(f, msg):
+            raise error.InputError(b'%s: %s' % (f, msg))
+
+        force = opts.get(b'force')
+        if not force:
+            match = matchmod.badmatch(match, fail)
+
+        status = repo.status(match=match)
+
+        overrides = {(b'ui', b'commitsubrepos'): True}
+
+        with repo.ui.configoverride(overrides, b'record'):
+            # subrepoutil.precommit() modifies the status
+            tmpstatus = scmutil.status(
+                copymod.copy(status.modified),
+                copymod.copy(status.added),
+                copymod.copy(status.removed),
+                copymod.copy(status.deleted),
+                copymod.copy(status.unknown),
+                copymod.copy(status.ignored),
+                copymod.copy(status.clean),  # pytype: disable=wrong-arg-count
+            )
+
+            # Force allows -X subrepo to skip the subrepo.
+            subs, commitsubs, newstate = subrepoutil.precommit(
+                repo.ui, wctx, tmpstatus, match, force=True
+            )
+            for s in subs:
+                if s in commitsubs:
+                    dirtyreason = wctx.sub(s).dirtyreason(True)
+                    raise error.Abort(dirtyreason)
+
+        if not force:
+            repo.checkcommitpatterns(wctx, match, status, fail)
+        diffopts = patch.difffeatureopts(
+            ui,
+            opts=opts,
+            whitespace=True,
+            section=b'commands',
+            configprefix=b'commit.interactive.',
+        )
+        diffopts.nodates = True
+        diffopts.git = True
+        diffopts.showfunc = True
+        originaldiff = patch.diff(repo, changes=status, opts=diffopts)
+        original_headers = patch.parsepatch(originaldiff)
+        match = scmutil.match(repo[None], pats)
+
+        # 1. filter patch, since we are intending to apply subset of it
+        try:
+            chunks, newopts = filterfn(ui, original_headers, match)
+        except error.PatchParseError as err:
+            raise error.InputError(_(b'error parsing patch: %s') % err)
+        except error.PatchApplicationError as err:
+            raise error.StateError(_(b'error applying patch: %s') % err)
+        opts.update(newopts)
+
+        # We need to keep a backup of files that have been newly added and
+        # modified during the recording process because there is a previous
+        # version without the edit in the workdir. We also will need to restore
+        # files that were the sources of renames so that the patch application
+        # works.
+        newlyaddedandmodifiedfiles, alsorestore = newandmodified(chunks)
+        contenders = set()
+        for h in chunks:
+            if isheader(h):
+                contenders.update(set(h.files()))
+
+        changed = status.modified + status.added + status.removed
+        newfiles = [f for f in changed if f in contenders]
+        if not newfiles:
+            ui.status(_(b'no changes to record\n'))
+            return 0
+
+        modified = set(status.modified)
+
+        # 2. backup changed files, so we can restore them in the end
+
+        if backupall:
+            tobackup = changed
+        else:
+            tobackup = [
+                f
+                for f in newfiles
+                if f in modified or f in newlyaddedandmodifiedfiles
+            ]
+        backups = {}
+        if tobackup:
+            backupdir = repo.vfs.join(b'record-backups')
+            try:
+                os.mkdir(backupdir)
+            except FileExistsError:
+                pass
+        try:
+            # backup continues
+            for f in tobackup:
+                fd, tmpname = pycompat.mkstemp(
+                    prefix=os.path.basename(f) + b'.', dir=backupdir
+                )
+                os.close(fd)
+                ui.debug(b'backup %r as %r\n' % (f, tmpname))
+                util.copyfile(repo.wjoin(f), tmpname, copystat=True)
+                backups[f] = tmpname
+
+            fp = stringio()
+            for c in chunks:
+                fname = c.filename()
+                if fname in backups:
+                    c.write(fp)
+            dopatch = fp.tell()
+            fp.seek(0)
+
+            # 2.5 optionally review / modify patch in text editor
+            if opts.get(b'review', False):
+                patchtext = (
+                    crecordmod.diffhelptext
+                    + crecordmod.patchhelptext
+                    + fp.read()
+                )
+                reviewedpatch = ui.edit(
+                    patchtext, b"", action=b"diff", repopath=repo.path
+                )
+                fp.truncate(0)
+                fp.write(reviewedpatch)
+                fp.seek(0)
+
+            [os.unlink(repo.wjoin(c)) for c in newlyaddedandmodifiedfiles]
+            # 3a. apply filtered patch to clean repo  (clean)
+            if backups:
+                m = scmutil.matchfiles(repo, set(backups.keys()) | alsorestore)
+                mergemod.revert_to(repo[b'.'], matcher=m)
+
+            # 3b. (apply)
+            if dopatch:
+                try:
+                    ui.debug(b'applying patch\n')
+                    ui.debug(fp.getvalue())
+                    patch.internalpatch(ui, repo, fp, 1, eolmode=None)
+                except error.PatchParseError as err:
+                    raise error.InputError(pycompat.bytestr(err))
+                except error.PatchApplicationError as err:
+                    raise error.StateError(pycompat.bytestr(err))
+            del fp
+
+            # 4. We prepared working directory according to filtered
+            #    patch. Now is the time to delegate the job to
+            #    commit/qrefresh or the like!
+
+            # Make all of the pathnames absolute.
+            newfiles = [repo.wjoin(nf) for nf in newfiles]
+            return commitfunc(ui, repo, *newfiles, **pycompat.strkwargs(opts))
+        finally:
+            # 5. finally restore backed-up files
+            try:
+                dirstate = repo.dirstate
+                for realname, tmpname in backups.items():
+                    ui.debug(b'restoring %r to %r\n' % (tmpname, realname))
+
+                    if dirstate.get_entry(realname).maybe_clean:
+                        # without normallookup, restoring timestamp
+                        # may cause partially committed files
+                        # to be treated as unmodified
+
+                        # XXX-PENDINGCHANGE: We should clarify the context in
+                        # which this function is called  to make sure it
+                        # already called within a `pendingchange`, However we
+                        # are taking a shortcut here in order to be able to
+                        # quickly deprecated the older API.
+                        with dirstate.parentchange():
+                            dirstate.update_file(
+                                realname,
+                                p1_tracked=True,
+                                wc_tracked=True,
+                                possibly_dirty=True,
+                            )
+
+                    # copystat=True here and above are a hack to trick any
+                    # editors that have f open that we haven't modified them.
+                    #
+                    # Also note that this racy as an editor could notice the
+                    # file's mtime before we've finished writing it.
+                    util.copyfile(tmpname, repo.wjoin(realname), copystat=True)
+                    os.unlink(tmpname)
+                if tobackup:
+                    os.rmdir(backupdir)
+            except OSError:
+                pass
+
+    def recordinwlock(ui, repo, message, match, opts):
+        with repo.wlock():
+            return recordfunc(ui, repo, message, match, opts)
+
+    return commit(ui, repo, recordinwlock, pats, opts)
+
+
+class dirnode:
+    """
+    Represent a directory in user working copy with information required for
+    the purpose of tersing its status.
+
+    path is the path to the directory, without a trailing '/'
+
+    statuses is a set of statuses of all files in this directory (this includes
+    all the files in all the subdirectories too)
+
+    files is a list of files which are direct child of this directory
+
+    subdirs is a dictionary of sub-directory name as the key and it's own
+    dirnode object as the value
+    """
+
+    def __init__(self, dirpath):
+        self.path = dirpath
+        self.statuses = set()
+        self.files = []
+        self.subdirs = {}
+
+    def _addfileindir(self, filename, status):
+        """Add a file in this directory as a direct child."""
+        self.files.append((filename, status))
+
+    def addfile(self, filename, status):
+        """
+        Add a file to this directory or to its direct parent directory.
+
+        If the file is not direct child of this directory, we traverse to the
+        directory of which this file is a direct child of and add the file
+        there.
+        """
+
+        # the filename contains a path separator, it means it's not the direct
+        # child of this directory
+        if b'/' in filename:
+            subdir, filep = filename.split(b'/', 1)
+
+            # does the dirnode object for subdir exists
+            if subdir not in self.subdirs:
+                subdirpath = pathutil.join(self.path, subdir)
+                self.subdirs[subdir] = dirnode(subdirpath)
+
+            # try adding the file in subdir
+            self.subdirs[subdir].addfile(filep, status)
+
+        else:
+            self._addfileindir(filename, status)
+
+        if status not in self.statuses:
+            self.statuses.add(status)
+
+    def iterfilepaths(self):
+        """Yield (status, path) for files directly under this directory."""
+        for f, st in self.files:
+            yield st, pathutil.join(self.path, f)
+
+    def tersewalk(self, terseargs):
+        """
+        Yield (status, path) obtained by processing the status of this
+        dirnode.
+
+        terseargs is the string of arguments passed by the user with `--terse`
+        flag.
+
+        Following are the cases which can happen:
+
+        1) All the files in the directory (including all the files in its
+        subdirectories) share the same status and the user has asked us to terse
+        that status. -> yield (status, dirpath).  dirpath will end in '/'.
+
+        2) Otherwise, we do following:
+
+                a) Yield (status, filepath)  for all the files which are in this
+                    directory (only the ones in this directory, not the subdirs)
+
+                b) Recurse the function on all the subdirectories of this
+                   directory
+        """
+
+        if len(self.statuses) == 1:
+            onlyst = self.statuses.pop()
+
+            # Making sure we terse only when the status abbreviation is
+            # passed as terse argument
+            if onlyst in terseargs:
+                yield onlyst, self.path + b'/'
+                return
+
+        # add the files to status list
+        for st, fpath in self.iterfilepaths():
+            yield st, fpath
+
+        # recurse on the subdirs
+        for dirobj in self.subdirs.values():
+            for st, fpath in dirobj.tersewalk(terseargs):
+                yield st, fpath
+
+
+def tersedir(statuslist, terseargs):
+    """
+    Terse the status if all the files in a directory shares the same status.
+
+    statuslist is scmutil.status() object which contains a list of files for
+    each status.
+    terseargs is string which is passed by the user as the argument to `--terse`
+    flag.
+
+    The function makes a tree of objects of dirnode class, and at each node it
+    stores the information required to know whether we can terse a certain
+    directory or not.
+    """
+    # the order matters here as that is used to produce final list
+    allst = (b'm', b'a', b'r', b'd', b'u', b'i', b'c')
+
+    # checking the argument validity
+    for s in pycompat.bytestr(terseargs):
+        if s not in allst:
+            raise error.InputError(_(b"'%s' not recognized") % s)
+
+    # creating a dirnode object for the root of the repo
+    rootobj = dirnode(b'')
+    pstatus = (
+        b'modified',
+        b'added',
+        b'deleted',
+        b'clean',
+        b'unknown',
+        b'ignored',
+        b'removed',
+    )
+
+    tersedict = {}
+    for attrname in pstatus:
+        statuschar = attrname[0:1]
+        for f in getattr(statuslist, attrname):
+            rootobj.addfile(f, statuschar)
+        tersedict[statuschar] = []
+
+    # we won't be tersing the root dir, so add files in it
+    for st, fpath in rootobj.iterfilepaths():
+        tersedict[st].append(fpath)
+
+    # process each sub-directory and build tersedict
+    for subdir in rootobj.subdirs.values():
+        for st, f in subdir.tersewalk(terseargs):
+            tersedict[st].append(f)
+
+    tersedlist = []
+    for st in allst:
+        tersedict[st].sort()
+        tersedlist.append(tersedict[st])
+
+    return scmutil.status(*tersedlist)
+
+
+def _commentlines(raw):
+    '''Surround lineswith a comment char and a new line'''
+    lines = raw.splitlines()
+    commentedlines = [b'# %s' % line for line in lines]
+    return b'\n'.join(commentedlines) + b'\n'
+
+
+@attr.s(frozen=True)
+class morestatus:
+    repo = attr.ib()
+    unfinishedop = attr.ib()
+    unfinishedmsg = attr.ib()
+    activemerge = attr.ib()
+    unresolvedpaths = attr.ib()
+    _formattedpaths = attr.ib(init=False, default=set())
+    _label = b'status.morestatus'
+
+    def formatfile(self, path, fm):
+        self._formattedpaths.add(path)
+        if self.activemerge and path in self.unresolvedpaths:
+            fm.data(unresolved=True)
+
+    def formatfooter(self, fm):
+        if self.unfinishedop or self.unfinishedmsg:
+            fm.startitem()
+            fm.data(itemtype=b'morestatus')
+
+        if self.unfinishedop:
+            fm.data(unfinished=self.unfinishedop)
+            statemsg = (
+                _(b'The repository is in an unfinished *%s* state.')
+                % self.unfinishedop
+            )
+            fm.plain(b'%s\n' % _commentlines(statemsg), label=self._label)
+        if self.unfinishedmsg:
+            fm.data(unfinishedmsg=self.unfinishedmsg)
+
+        # May also start new data items.
+        self._formatconflicts(fm)
+
+        if self.unfinishedmsg:
+            fm.plain(
+                b'%s\n' % _commentlines(self.unfinishedmsg), label=self._label
+            )
+
+    def _formatconflicts(self, fm):
+        if not self.activemerge:
+            return
+
+        if self.unresolvedpaths:
+            mergeliststr = b'\n'.join(
+                [
+                    b'    %s'
+                    % util.pathto(self.repo.root, encoding.getcwd(), path)
+                    for path in self.unresolvedpaths
+                ]
+            )
+            msg = (
+                _(
+                    b'''Unresolved merge conflicts:
+
+%s
+
+To mark files as resolved:  hg resolve --mark FILE'''
+                )
+                % mergeliststr
+            )
+
+            # If any paths with unresolved conflicts were not previously
+            # formatted, output them now.
+            for f in self.unresolvedpaths:
+                if f in self._formattedpaths:
+                    # Already output.
+                    continue
+                fm.startitem()
+                fm.context(repo=self.repo)
+                # We can't claim to know the status of the file - it may just
+                # have been in one of the states that were not requested for
+                # display, so it could be anything.
+                fm.data(itemtype=b'file', path=f, unresolved=True)
+
+        else:
+            msg = _(b'No unresolved merge conflicts.')
+
+        fm.plain(b'%s\n' % _commentlines(msg), label=self._label)
+
+
+def readmorestatus(repo):
+    """Returns a morestatus object if the repo has unfinished state."""
+    statetuple = statemod.getrepostate(repo)
+    mergestate = mergestatemod.mergestate.read(repo)
+    activemerge = mergestate.active()
+    if not statetuple and not activemerge:
+        return None
+
+    unfinishedop = unfinishedmsg = unresolved = None
+    if statetuple:
+        unfinishedop, unfinishedmsg = statetuple
+    if activemerge:
+        unresolved = sorted(mergestate.unresolved())
+    return morestatus(
+        repo, unfinishedop, unfinishedmsg, activemerge, unresolved
+    )
+
+
+def findpossible(cmd, table, strict=False):
+    """
+    Return cmd -> (aliases, command table entry)
+    for each matching command.
+    Return debug commands (or their aliases) only if no normal command matches.
+    """
+    choice = {}
+    debugchoice = {}
+
+    if cmd in table:
+        # short-circuit exact matches, "log" alias beats "log|history"
+        keys = [cmd]
+    else:
+        keys = table.keys()
+
+    allcmds = []
+    for e in keys:
+        aliases = parsealiases(e)
+        allcmds.extend(aliases)
+        found = None
+        if cmd in aliases:
+            found = cmd
+        elif not strict:
+            for a in aliases:
+                if a.startswith(cmd):
+                    found = a
+                    break
+        if found is not None:
+            if aliases[0].startswith(b"debug") or found.startswith(b"debug"):
+                debugchoice[found] = (aliases, table[e])
+            else:
+                choice[found] = (aliases, table[e])
+
+    if not choice and debugchoice:
+        choice = debugchoice
+
+    return choice, allcmds
+
+
+def findcmd(cmd, table, strict=True):
+    """Return (aliases, command table entry) for command string."""
+    choice, allcmds = findpossible(cmd, table, strict)
+
+    if cmd in choice:
+        return choice[cmd]
+
+    if len(choice) > 1:
+        clist = sorted(choice)
+        raise error.AmbiguousCommand(cmd, clist)
+
+    if choice:
+        return list(choice.values())[0]
+
+    raise error.UnknownCommand(cmd, allcmds)
+
+
+def changebranch(ui, repo, revs, label, opts):
+    """Change the branch name of given revs to label"""
+
+    with repo.wlock(), repo.lock(), repo.transaction(b'branches'):
+        # abort in case of uncommitted merge or dirty wdir
+        bailifchanged(repo)
+        revs = logcmdutil.revrange(repo, revs)
+        if not revs:
+            raise error.InputError(b"empty revision set")
+        roots = repo.revs(b'roots(%ld)', revs)
+        if len(roots) > 1:
+            raise error.InputError(
+                _(b"cannot change branch of non-linear revisions")
+            )
+        rewriteutil.precheck(repo, revs, b'change branch of')
+
+        root = repo[roots.first()]
+        rpb = {parent.branch() for parent in root.parents()}
+        if (
+            not opts.get(b'force')
+            and label not in rpb
+            and label in repo.branchmap()
+        ):
+            raise error.InputError(
+                _(b"a branch of the same name already exists")
+            )
+
+        # make sure only topological heads
+        if repo.revs(b'heads(%ld) - head()', revs):
+            raise error.InputError(
+                _(b"cannot change branch in middle of a stack")
+            )
+
+        replacements = {}
+        # avoid import cycle mercurial.cmdutil -> mercurial.context ->
+        # mercurial.subrepo -> mercurial.cmdutil
+        from . import context
+
+        for rev in revs:
+            ctx = repo[rev]
+            oldbranch = ctx.branch()
+            # check if ctx has same branch
+            if oldbranch == label:
+                continue
+
+            def filectxfn(repo, newctx, path):
+                try:
+                    return ctx[path]
+                except error.ManifestLookupError:
+                    return None
+
+            ui.debug(
+                b"changing branch of '%s' from '%s' to '%s'\n"
+                % (hex(ctx.node()), oldbranch, label)
+            )
+            extra = ctx.extra()
+            extra[b'branch_change'] = hex(ctx.node())
+            # While changing branch of set of linear commits, make sure that
+            # we base our commits on new parent rather than old parent which
+            # was obsoleted while changing the branch
+            p1 = ctx.p1().node()
+            p2 = ctx.p2().node()
+            if p1 in replacements:
+                p1 = replacements[p1][0]
+            if p2 in replacements:
+                p2 = replacements[p2][0]
+
+            mc = context.memctx(
+                repo,
+                (p1, p2),
+                ctx.description(),
+                ctx.files(),
+                filectxfn,
+                user=ctx.user(),
+                date=ctx.date(),
+                extra=extra,
+                branch=label,
+            )
+
+            newnode = repo.commitctx(mc)
+            replacements[ctx.node()] = (newnode,)
+            ui.debug(b'new node id is %s\n' % hex(newnode))
+
+        # create obsmarkers and move bookmarks
+        scmutil.cleanupnodes(
+            repo, replacements, b'branch-change', fixphase=True
+        )
+
+        # move the working copy too
+        wctx = repo[None]
+        # in-progress merge is a bit too complex for now.
+        if len(wctx.parents()) == 1:
+            newid = replacements.get(wctx.p1().node())
+            if newid is not None:
+                # avoid import cycle mercurial.cmdutil -> mercurial.hg ->
+                # mercurial.cmdutil
+                from . import hg
+
+                hg.update(repo, newid[0], quietempty=True)
+
+        ui.status(_(b"changed branch on %d changesets\n") % len(replacements))
+
+
+def findrepo(p):
+    while not os.path.isdir(os.path.join(p, b".hg")):
+        oldp, p = p, os.path.dirname(p)
+        if p == oldp:
+            return None
+
+    return p
+
+
+def bailifchanged(repo, merge=True, hint=None):
+    """enforce the precondition that working directory must be clean.
+
+    'merge' can be set to false if a pending uncommitted merge should be
+    ignored (such as when 'update --check' runs).
+
+    'hint' is the usual hint given to Abort exception.
+    """
+
+    if merge and repo.dirstate.p2() != repo.nullid:
+        raise error.StateError(_(b'outstanding uncommitted merge'), hint=hint)
+    st = repo.status()
+    if st.modified or st.added or st.removed or st.deleted:
+        raise error.StateError(_(b'uncommitted changes'), hint=hint)
+    ctx = repo[None]
+    for s in sorted(ctx.substate):
+        ctx.sub(s).bailifchanged(hint=hint)
+
+
+def logmessage(ui, opts):
+    """get the log message according to -m and -l option"""
+
+    check_at_most_one_arg(opts, b'message', b'logfile')
+
+    message = opts.get(b'message')
+    logfile = opts.get(b'logfile')
+
+    if not message and logfile:
+        try:
+            if isstdiofilename(logfile):
+                message = ui.fin.read()
+            else:
+                message = b'\n'.join(util.readfile(logfile).splitlines())
+        except IOError as inst:
+            raise error.Abort(
+                _(b"can't read commit message '%s': %s")
+                % (logfile, encoding.strtolocal(inst.strerror))
+            )
+    return message
+
+
+def mergeeditform(ctxorbool, baseformname):
+    """return appropriate editform name (referencing a committemplate)
+
+    'ctxorbool' is either a ctx to be committed, or a bool indicating whether
+    merging is committed.
+
+    This returns baseformname with '.merge' appended if it is a merge,
+    otherwise '.normal' is appended.
+    """
+    if isinstance(ctxorbool, bool):
+        if ctxorbool:
+            return baseformname + b".merge"
+    elif len(ctxorbool.parents()) > 1:
+        return baseformname + b".merge"
+
+    return baseformname + b".normal"
+
+
+def getcommiteditor(
+    edit=False, finishdesc=None, extramsg=None, editform=b'', **opts
+):
+    """get appropriate commit message editor according to '--edit' option
+
+    'finishdesc' is a function to be called with edited commit message
+    (= 'description' of the new changeset) just after editing, but
+    before checking empty-ness. It should return actual text to be
+    stored into history. This allows to change description before
+    storing.
+
+    'extramsg' is a extra message to be shown in the editor instead of
+    'Leave message empty to abort commit' line. 'HG: ' prefix and EOL
+    is automatically added.
+
+    'editform' is a dot-separated list of names, to distinguish
+    the purpose of commit text editing.
+
+    'getcommiteditor' returns 'commitforceeditor' regardless of
+    'edit', if one of 'finishdesc' or 'extramsg' is specified, because
+    they are specific for usage in MQ.
+    """
+    if edit or finishdesc or extramsg:
+        return lambda r, c, s: commitforceeditor(
+            r, c, s, finishdesc=finishdesc, extramsg=extramsg, editform=editform
+        )
+    elif editform:
+        return lambda r, c, s: commiteditor(r, c, s, editform=editform)
+    else:
+        return commiteditor
+
+
+def _escapecommandtemplate(tmpl):
+    parts = []
+    for typ, start, end in templater.scantemplate(tmpl, raw=True):
+        if typ == b'string':
+            parts.append(stringutil.escapestr(tmpl[start:end]))
+        else:
+            parts.append(tmpl[start:end])
+    return b''.join(parts)
+
+
+def rendercommandtemplate(ui, tmpl, props):
+    r"""Expand a literal template 'tmpl' in a way suitable for command line
+
+    '\' in outermost string is not taken as an escape character because it
+    is a directory separator on Windows.
+
+    >>> from . import ui as uimod
+    >>> ui = uimod.ui()
+    >>> rendercommandtemplate(ui, b'c:\\{path}', {b'path': b'foo'})
+    'c:\\foo'
+    >>> rendercommandtemplate(ui, b'{"c:\\{path}"}', {'path': b'foo'})
+    'c:{path}'
+    """
+    if not tmpl:
+        return tmpl
+    t = formatter.maketemplater(ui, _escapecommandtemplate(tmpl))
+    return t.renderdefault(props)
+
+
+def rendertemplate(ctx, tmpl, props=None):
+    """Expand a literal template 'tmpl' byte-string against one changeset
+
+    Each props item must be a stringify-able value or a callable returning
+    such value, i.e. no bare list nor dict should be passed.
+    """
+    repo = ctx.repo()
+    tres = formatter.templateresources(repo.ui, repo)
+    t = formatter.maketemplater(
+        repo.ui, tmpl, defaults=templatekw.keywords, resources=tres
+    )
+    mapping = {b'ctx': ctx}
+    if props:
+        mapping.update(props)
+    return t.renderdefault(mapping)
+
+
+def format_changeset_summary(ui, ctx, command=None, default_spec=None):
+    """Format a changeset summary (one line)."""
+    spec = None
+    if command:
+        spec = ui.config(
+            b'command-templates', b'oneline-summary.%s' % command, None
+        )
+    if not spec:
+        spec = ui.config(b'command-templates', b'oneline-summary')
+    if not spec:
+        spec = default_spec
+    if not spec:
+        spec = (
+            b'{separate(" ", '
+            b'label("oneline-summary.changeset", "{rev}:{node|short}")'
+            b', '
+            b'join(filter(namespaces % "{ifeq(namespace, "branches", "", join(names % "{label("oneline-summary.{namespace}", name)}", " "))}"), " ")'
+            b')} '
+            b'"{label("oneline-summary.desc", desc|firstline)}"'
+        )
+    text = rendertemplate(ctx, spec)
+    return text.split(b'\n')[0]
+
+
+def _buildfntemplate(pat, total=None, seqno=None, revwidth=None, pathname=None):
+    r"""Convert old-style filename format string to template string
+
+    >>> _buildfntemplate(b'foo-%b-%n.patch', seqno=0)
+    'foo-{reporoot|basename}-{seqno}.patch'
+    >>> _buildfntemplate(b'%R{tags % "{tag}"}%H')
+    '{rev}{tags % "{tag}"}{node}'
+
+    '\' in outermost strings has to be escaped because it is a directory
+    separator on Windows:
+
+    >>> _buildfntemplate(b'c:\\tmp\\%R\\%n.patch', seqno=0)
+    'c:\\\\tmp\\\\{rev}\\\\{seqno}.patch'
+    >>> _buildfntemplate(b'\\\\foo\\bar.patch')
+    '\\\\\\\\foo\\\\bar.patch'
+    >>> _buildfntemplate(b'\\{tags % "{tag}"}')
+    '\\\\{tags % "{tag}"}'
+
+    but inner strings follow the template rules (i.e. '\' is taken as an
+    escape character):
+
+    >>> _buildfntemplate(br'{"c:\tmp"}', seqno=0)
+    '{"c:\\tmp"}'
+    """
+    expander = {
+        b'H': b'{node}',
+        b'R': b'{rev}',
+        b'h': b'{node|short}',
+        b'm': br'{sub(r"[^\w]", "_", desc|firstline)}',
+        b'r': b'{if(revwidth, pad(rev, revwidth, "0", left=True), rev)}',
+        b'%': b'%',
+        b'b': b'{reporoot|basename}',
+    }
+    if total is not None:
+        expander[b'N'] = b'{total}'
+    if seqno is not None:
+        expander[b'n'] = b'{seqno}'
+    if total is not None and seqno is not None:
+        expander[b'n'] = b'{pad(seqno, total|stringify|count, "0", left=True)}'
+    if pathname is not None:
+        expander[b's'] = b'{pathname|basename}'
+        expander[b'd'] = b'{if(pathname|dirname, pathname|dirname, ".")}'
+        expander[b'p'] = b'{pathname}'
+
+    newname = []
+    for typ, start, end in templater.scantemplate(pat, raw=True):
+        if typ != b'string':
+            newname.append(pat[start:end])
+            continue
+        i = start
+        while i < end:
+            n = pat.find(b'%', i, end)
+            if n < 0:
+                newname.append(stringutil.escapestr(pat[i:end]))
+                break
+            newname.append(stringutil.escapestr(pat[i:n]))
+            if n + 2 > end:
+                raise error.Abort(
+                    _(b"incomplete format spec in output filename")
+                )
+            c = pat[n + 1 : n + 2]
+            i = n + 2
+            try:
+                newname.append(expander[c])
+            except KeyError:
+                raise error.Abort(
+                    _(b"invalid format spec '%%%s' in output filename") % c
+                )
+    return b''.join(newname)
+
+
+def makefilename(ctx, pat, **props):
+    if not pat:
+        return pat
+    tmpl = _buildfntemplate(pat, **props)
+    # BUG: alias expansion shouldn't be made against template fragments
+    # rewritten from %-format strings, but we have no easy way to partially
+    # disable the expansion.
+    return rendertemplate(ctx, tmpl, pycompat.byteskwargs(props))
+
+
+def isstdiofilename(pat):
+    """True if the given pat looks like a filename denoting stdin/stdout"""
+    return not pat or pat == b'-'
+
+
+class _unclosablefile:
+    def __init__(self, fp):
+        self._fp = fp
+
+    def close(self):
+        pass
+
+    def __iter__(self):
+        return iter(self._fp)
+
+    def __getattr__(self, attr):
+        return getattr(self._fp, attr)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, exc_tb):
+        pass
+
+
+def makefileobj(ctx, pat, mode=b'wb', **props):
+    writable = mode not in (b'r', b'rb')
+
+    if isstdiofilename(pat):
+        repo = ctx.repo()
+        if writable:
+            fp = repo.ui.fout
+        else:
+            fp = repo.ui.fin
+        return _unclosablefile(fp)
+    fn = makefilename(ctx, pat, **props)
+    return open(fn, mode)
+
+
+def openstorage(repo, cmd, file_, opts, returnrevlog=False):
+    """opens the changelog, manifest, a filelog or a given revlog"""
+    cl = opts[b'changelog']
+    mf = opts[b'manifest']
+    dir = opts[b'dir']
+    msg = None
+    if cl and mf:
+        msg = _(b'cannot specify --changelog and --manifest at the same time')
+    elif cl and dir:
+        msg = _(b'cannot specify --changelog and --dir at the same time')
+    elif cl or mf or dir:
+        if file_:
+            msg = _(b'cannot specify filename with --changelog or --manifest')
+        elif not repo:
+            msg = _(
+                b'cannot specify --changelog or --manifest or --dir '
+                b'without a repository'
+            )
+    if msg:
+        raise error.InputError(msg)
+
+    r = None
+    if repo:
+        if cl:
+            r = repo.unfiltered().changelog
+        elif dir:

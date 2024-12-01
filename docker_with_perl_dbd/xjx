@@ -1,0 +1,1000 @@
+                ]
+                merges = [
+                    r for r in rebaseset if cl.parentrevs(r)[1] != nullrev
+                ]
+                unwanted[i] = list(
+                    repo.revs(
+                        b'%ld - (::%ld) - %ld', siderevs, merges, rebaseset
+                    )
+                )
+
+        if any(revs is not None for revs in unwanted):
+            # Choose a merge base that has a minimal number of unwanted revs.
+            l, i = min(
+                (len(revs), i)
+                for i, revs in enumerate(unwanted)
+                if revs is not None
+            )
+
+            # The merge will include unwanted revisions. Abort now. Revisit this if
+            # we have a more advanced merge algorithm that handles multiple bases.
+            if l > 0:
+                unwanteddesc = _(b' or ').join(
+                    (
+                        b', '.join(b'%d:%s' % (r, repo[r]) for r in revs)
+                        for revs in unwanted
+                        if revs is not None
+                    )
+                )
+                raise error.InputError(
+                    _(b'rebasing %d:%s will include unwanted changes from %s')
+                    % (rev, repo[rev], unwanteddesc)
+                )
+
+            # newps[0] should match merge base if possible. Currently, if newps[i]
+            # is nullrev, the only case is newps[i] and newps[j] (j < i), one is
+            # the other's ancestor. In that case, it's fine to not swap newps here.
+            # (see CASE-1 and CASE-2 above)
+            if i != 0:
+                if newps[i] != nullrev:
+                    newps[0], newps[i] = newps[i], newps[0]
+                bases[0], bases[i] = bases[i], bases[0]
+
+    # "rebasenode" updates to new p1, use the corresponding merge base.
+    base = bases[0]
+
+    repo.ui.debug(b" future parents are %d and %d\n" % tuple(newps))
+
+    return newps[0], newps[1], base
+
+
+def isagitpatch(repo, patchname):
+    """Return true if the given patch is in git format"""
+    mqpatch = os.path.join(repo.mq.path, patchname)
+    for line in patch.linereader(open(mqpatch, b'rb')):
+        if line.startswith(b'diff --git'):
+            return True
+    return False
+
+
+def updatemq(repo, state, skipped, **opts):
+    """Update rebased mq patches - finalize and then import them"""
+    mqrebase = {}
+    mq = repo.mq
+    original_series = mq.fullseries[:]
+    skippedpatches = set()
+
+    for p in mq.applied:
+        rev = repo[p.node].rev()
+        if rev in state:
+            repo.ui.debug(
+                b'revision %d is an mq patch (%s), finalize it.\n'
+                % (rev, p.name)
+            )
+            mqrebase[rev] = (p.name, isagitpatch(repo, p.name))
+        else:
+            # Applied but not rebased, not sure this should happen
+            skippedpatches.add(p.name)
+
+    if mqrebase:
+        mq.finish(repo, mqrebase.keys())
+
+        # We must start import from the newest revision
+        for rev in sorted(mqrebase, reverse=True):
+            if rev not in skipped:
+                name, isgit = mqrebase[rev]
+                repo.ui.note(
+                    _(b'updating mq patch %s to %d:%s\n')
+                    % (name, state[rev], repo[state[rev]])
+                )
+                mq.qimport(
+                    repo,
+                    (),
+                    patchname=name,
+                    git=isgit,
+                    rev=[b"%d" % state[rev]],
+                )
+            else:
+                # Rebased and skipped
+                skippedpatches.add(mqrebase[rev][0])
+
+        # Patches were either applied and rebased and imported in
+        # order, applied and removed or unapplied. Discard the removed
+        # ones while preserving the original series order and guards.
+        newseries = [
+            s
+            for s in original_series
+            if mq.guard_re.split(s, 1)[0] not in skippedpatches
+        ]
+        mq.fullseries[:] = newseries
+        mq.seriesdirty = True
+        mq.savedirty()
+
+
+def storecollapsemsg(repo, collapsemsg):
+    """Store the collapse message to allow recovery"""
+    collapsemsg = collapsemsg or b''
+    f = repo.vfs(b"last-message.txt", b"w")
+    f.write(b"%s\n" % collapsemsg)
+    f.close()
+
+
+def clearcollapsemsg(repo):
+    """Remove collapse message file"""
+    repo.vfs.unlinkpath(b"last-message.txt", ignoremissing=True)
+
+
+def restorecollapsemsg(repo, isabort):
+    """Restore previously stored collapse message"""
+    try:
+        f = repo.vfs(b"last-message.txt")
+        collapsemsg = f.readline().strip()
+        f.close()
+    except FileNotFoundError:
+        if isabort:
+            # Oh well, just abort like normal
+            collapsemsg = b''
+        else:
+            raise error.Abort(_(b'missing .hg/last-message.txt for rebase'))
+    return collapsemsg
+
+
+def clearstatus(repo):
+    """Remove the status files"""
+    # Make sure the active transaction won't write the state file
+    tr = repo.currenttransaction()
+    if tr:
+        tr.removefilegenerator(b'rebasestate')
+    repo.vfs.unlinkpath(b"rebasestate", ignoremissing=True)
+
+
+def sortsource(destmap):
+    """yield source revisions in an order that we only rebase things once
+
+    If source and destination overlaps, we should filter out revisions
+    depending on other revisions which hasn't been rebased yet.
+
+    Yield a sorted list of revisions each time.
+
+    For example, when rebasing A to B, B to C. This function yields [B], then
+    [A], indicating B needs to be rebased first.
+
+    Raise if there is a cycle so the rebase is impossible.
+    """
+    srcset = set(destmap)
+    while srcset:
+        srclist = sorted(srcset)
+        result = []
+        for r in srclist:
+            if destmap[r] not in srcset:
+                result.append(r)
+        if not result:
+            raise error.InputError(_(b'source and destination form a cycle'))
+        srcset -= set(result)
+        yield result
+
+
+def buildstate(repo, destmap, collapse):
+    """Define which revisions are going to be rebased and where
+
+    repo: repo
+    destmap: {srcrev: destrev}
+    """
+    rebaseset = destmap.keys()
+    originalwd = repo[b'.'].rev()
+
+    # This check isn't strictly necessary, since mq detects commits over an
+    # applied patch. But it prevents messing up the working directory when
+    # a partially completed rebase is blocked by mq.
+    if b'qtip' in repo.tags():
+        mqapplied = {repo[s.node].rev() for s in repo.mq.applied}
+        if set(destmap.values()) & mqapplied:
+            raise error.StateError(_(b'cannot rebase onto an applied mq patch'))
+
+    # Get "cycle" error early by exhausting the generator.
+    sortedsrc = list(sortsource(destmap))  # a list of sorted revs
+    if not sortedsrc:
+        raise error.InputError(_(b'no matching revisions'))
+
+    # Only check the first batch of revisions to rebase not depending on other
+    # rebaseset. This means "source is ancestor of destination" for the second
+    # (and following) batches of revisions are not checked here. We rely on
+    # "defineparents" to do that check.
+    roots = list(repo.set(b'roots(%ld)', sortedsrc[0]))
+    if not roots:
+        raise error.InputError(_(b'no matching revisions'))
+
+    def revof(r):
+        return r.rev()
+
+    roots = sorted(roots, key=revof)
+    state = dict.fromkeys(rebaseset, revtodo)
+    emptyrebase = len(sortedsrc) == 1
+    for root in roots:
+        dest = repo[destmap[root.rev()]]
+        commonbase = root.ancestor(dest)
+        if commonbase == root:
+            raise error.InputError(_(b'source is ancestor of destination'))
+        if commonbase == dest:
+            wctx = repo[None]
+            if dest == wctx.p1():
+                # when rebasing to '.', it will use the current wd branch name
+                samebranch = root.branch() == wctx.branch()
+            else:
+                samebranch = root.branch() == dest.branch()
+            if not collapse and samebranch and dest in root.parents():
+                # mark the revision as done by setting its new revision
+                # equal to its old (current) revisions
+                state[root.rev()] = root.rev()
+                repo.ui.debug(b'source is a child of destination\n')
+                continue
+
+        emptyrebase = False
+        repo.ui.debug(b'rebase onto %s starting from %s\n' % (dest, root))
+    if emptyrebase:
+        return None
+    for rev in sorted(state):
+        parents = [p for p in repo.changelog.parentrevs(rev) if p != nullrev]
+        # if all parents of this revision are done, then so is this revision
+        if parents and all((state.get(p) == p for p in parents)):
+            state[rev] = rev
+    return originalwd, destmap, state
+
+
+def clearrebased(
+    ui,
+    repo,
+    destmap,
+    state,
+    skipped,
+    collapsedas=None,
+    keepf=False,
+    fm=None,
+    backup=True,
+):
+    """dispose of rebased revision at the end of the rebase
+
+    If `collapsedas` is not None, the rebase was a collapse whose result if the
+    `collapsedas` node.
+
+    If `keepf` is not True, the rebase has --keep set and no nodes should be
+    removed (but bookmarks still need to be moved).
+
+    If `backup` is False, no backup will be stored when stripping rebased
+    revisions.
+    """
+    tonode = repo.changelog.node
+    replacements = {}
+    moves = {}
+    stripcleanup = not obsolete.isenabled(repo, obsolete.createmarkersopt)
+
+    collapsednodes = []
+    for rev, newrev in sorted(state.items()):
+        if newrev >= 0 and newrev != rev:
+            oldnode = tonode(rev)
+            newnode = collapsedas or tonode(newrev)
+            moves[oldnode] = newnode
+            succs = None
+            if rev in skipped:
+                if stripcleanup or not repo[rev].obsolete():
+                    succs = ()
+            elif collapsedas:
+                collapsednodes.append(oldnode)
+            else:
+                succs = (newnode,)
+            if succs is not None:
+                replacements[(oldnode,)] = succs
+    if collapsednodes:
+        replacements[tuple(collapsednodes)] = (collapsedas,)
+    if fm:
+        hf = fm.hexfunc
+        fl = fm.formatlist
+        fd = fm.formatdict
+        changes = {}
+        for oldns, newn in replacements.items():
+            for oldn in oldns:
+                changes[hf(oldn)] = fl([hf(n) for n in newn], name=b'node')
+        nodechanges = fd(changes, key=b"oldnode", value=b"newnodes")
+        fm.data(nodechanges=nodechanges)
+    if keepf:
+        replacements = {}
+    scmutil.cleanupnodes(repo, replacements, b'rebase', moves, backup=backup)
+
+
+def pullrebase(orig, ui, repo, *args, **opts):
+    """Call rebase after pull if the latter has been invoked with --rebase"""
+    if opts.get('rebase'):
+        if ui.configbool(b'commands', b'rebase.requiredest'):
+            msg = _(b'rebase destination required by configuration')
+            hint = _(b'use hg pull followed by hg rebase -d DEST')
+            raise error.InputError(msg, hint=hint)
+
+        with repo.wlock(), repo.lock():
+            if opts.get('update'):
+                del opts['update']
+                ui.debug(
+                    b'--update and --rebase are not compatible, ignoring '
+                    b'the update flag\n'
+                )
+
+            cmdutil.checkunfinished(repo, skipmerge=True)
+            cmdutil.bailifchanged(
+                repo,
+                hint=_(
+                    b'cannot pull with rebase: '
+                    b'please commit or shelve your changes first'
+                ),
+            )
+
+            revsprepull = len(repo)
+            origpostincoming = commands.postincoming
+
+            def _dummy(*args, **kwargs):
+                pass
+
+            commands.postincoming = _dummy
+            try:
+                ret = orig(ui, repo, *args, **opts)
+            finally:
+                commands.postincoming = origpostincoming
+            revspostpull = len(repo)
+            if revspostpull > revsprepull:
+                # --rev option from pull conflict with rebase own --rev
+                # dropping it
+                if 'rev' in opts:
+                    del opts['rev']
+                # positional argument from pull conflicts with rebase's own
+                # --source.
+                if 'source' in opts:
+                    del opts['source']
+                # revsprepull is the len of the repo, not revnum of tip.
+                destspace = list(repo.changelog.revs(start=revsprepull))
+                opts['_destspace'] = destspace
+                try:
+                    rebase(ui, repo, **opts)
+                except error.NoMergeDestAbort:
+                    # we can maybe update instead
+                    rev, _a, _b = destutil.destupdate(repo)
+                    if rev == repo[b'.'].rev():
+                        ui.status(_(b'nothing to rebase\n'))
+                    else:
+                        ui.status(_(b'nothing to rebase - updating instead\n'))
+                        # not passing argument to get the bare update behavior
+                        # with warning and trumpets
+                        commands.update(ui, repo)
+    else:
+        if opts.get('tool'):
+            raise error.InputError(_(b'--tool can only be used with --rebase'))
+        ret = orig(ui, repo, *args, **opts)
+
+    return ret
+
+
+def _compute_obsolete_sets(repo, rebaseobsrevs, destmap):
+    """Figure out what to do about about obsolete revisions
+
+    `obsolete_with_successor_in_destination` is a mapping mapping obsolete => successor for all
+    obsolete nodes to be rebased given in `rebaseobsrevs`.
+
+    `obsolete_with_successor_in_rebase_set` is a set with obsolete revisions,
+    without a successor in destination, that would cause divergence.
+    """
+    obsolete_with_successor_in_destination = {}
+    obsolete_with_successor_in_rebase_set = set()
+
+    cl = repo.changelog
+    get_rev = cl.index.get_rev
+    extinctrevs = set(repo.revs(b'extinct()'))
+    for srcrev in rebaseobsrevs:
+        srcnode = cl.node(srcrev)
+        # XXX: more advanced APIs are required to handle split correctly
+        successors = set(obsutil.allsuccessors(repo.obsstore, [srcnode]))
+        # obsutil.allsuccessors includes node itself
+        successors.remove(srcnode)
+        succrevs = {get_rev(s) for s in successors}
+        succrevs.discard(None)
+        if not successors or succrevs.issubset(extinctrevs):
+            # no successor, or all successors are extinct
+            obsolete_with_successor_in_destination[srcrev] = None
+        else:
+            dstrev = destmap[srcrev]
+            for succrev in succrevs:
+                if cl.isancestorrev(succrev, dstrev):
+                    obsolete_with_successor_in_destination[srcrev] = succrev
+                    break
+            else:
+                # If 'srcrev' has a successor in rebase set but none in
+                # destination (which would be catched above), we shall skip it
+                # and its descendants to avoid divergence.
+                if srcrev in extinctrevs or any(s in destmap for s in succrevs):
+                    obsolete_with_successor_in_rebase_set.add(srcrev)
+
+    return (
+        obsolete_with_successor_in_destination,
+        obsolete_with_successor_in_rebase_set,
+    )
+
+
+def abortrebase(ui, repo):
+    with repo.wlock(), repo.lock():
+        rbsrt = rebaseruntime(repo, ui)
+        rbsrt._prepareabortorcontinue(isabort=True)
+
+
+def continuerebase(ui, repo):
+    with repo.wlock(), repo.lock():
+        rbsrt = rebaseruntime(repo, ui)
+        ms = mergestatemod.mergestate.read(repo)
+        mergeutil.checkunresolved(ms)
+        retcode = rbsrt._prepareabortorcontinue(isabort=False)
+        if retcode is not None:
+            return retcode
+        rbsrt._performrebase(None)
+        rbsrt._finishrebase()
+
+
+def summaryhook(ui, repo):
+    if not repo.vfs.exists(b'rebasestate'):
+        return
+    try:
+        rbsrt = rebaseruntime(repo, ui, {})
+        rbsrt.restorestatus()
+        state = rbsrt.state
+    except error.RepoLookupError:
+        # i18n: column positioning for "hg summary"
+        msg = _(b'rebase: (use "hg rebase --abort" to clear broken state)\n')
+        ui.write(msg)
+        return
+    numrebased = len([i for i in state.values() if i >= 0])
+    # i18n: column positioning for "hg summary"
+    ui.write(
+        _(b'rebase: %s, %s (rebase --continue)\n')
+        % (
+            ui.label(_(b'%d rebased'), b'rebase.rebased') % numrebased,
+            ui.label(_(b'%d remaining'), b'rebase.remaining')
+            % (len(state) - numrebased),
+        )
+    )
+
+
+def uisetup(ui):
+    # Replace pull with a decorator to provide --rebase option
+    entry = extensions.wrapcommand(commands.table, b'pull', pullrebase)
+    entry[1].append(
+        (b'', b'rebase', None, _(b"rebase working directory to branch head"))
+    )
+    entry[1].append((b't', b'tool', b'', _(b"specify merge tool for rebase")))
+    cmdutil.summaryhooks.add(b'rebase', summaryhook)
+    statemod.addunfinished(
+        b'rebase',
+        fname=b'rebasestate',
+        stopflag=True,
+        continueflag=True,
+        abortfunc=abortrebase,
+        continuefunc=continuerebase,
+    )
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           usr/lib/python3/dist-packages/hgext/record.py                                                       0000644 0000000 0000000 00000012043 14355257011 017720  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        # record.py
+#
+# Copyright 2007 Bryan O'Sullivan <bos@serpentine.com>
+#
+# This software may be used and distributed according to the terms of the
+# GNU General Public License version 2 or any later version.
+
+'''commands to interactively select changes for commit/qrefresh (DEPRECATED)
+
+The feature provided by this extension has been moved into core Mercurial as
+:hg:`commit --interactive`.'''
+
+
+from mercurial.i18n import _
+from mercurial import (
+    cmdutil,
+    commands,
+    error,
+    extensions,
+    registrar,
+)
+
+cmdtable = {}
+command = registrar.command(cmdtable)
+# Note for extension authors: ONLY specify testedwith = 'ships-with-hg-core' for
+# extensions which SHIP WITH MERCURIAL. Non-mainline extensions should
+# be specifying the version(s) of Mercurial they are tested with, or
+# leave the attribute unspecified.
+testedwith = b'ships-with-hg-core'
+
+
+@command(
+    b"record",
+    # same options as commit + white space diff options
+    [c for c in commands.table[b'commit|ci'][1][:] if c[1] != b"interactive"]
+    + cmdutil.diffwsopts,
+    _(b'hg record [OPTION]... [FILE]...'),
+    helpcategory=command.CATEGORY_COMMITTING,
+)
+def record(ui, repo, *pats, **opts):
+    """interactively select changes to commit
+
+    If a list of files is omitted, all changes reported by :hg:`status`
+    will be candidates for recording.
+
+    See :hg:`help dates` for a list of formats valid for -d/--date.
+
+    If using the text interface (see :hg:`help config`),
+    you will be prompted for whether to record changes to each
+    modified file, and for files with multiple changes, for each
+    change to use. For each query, the following responses are
+    possible::
+
+      y - record this change
+      n - skip this change
+      e - edit this change manually
+
+      s - skip remaining changes to this file
+      f - record remaining changes to this file
+
+      d - done, skip remaining changes and files
+      a - record all changes to all remaining files
+      q - quit, recording no changes
+
+      ? - display help
+
+    This command is not available when committing a merge."""
+
+    if not ui.interactive():
+        raise error.Abort(
+            _(b'running non-interactively, use %s instead') % b'commit'
+        )
+
+    opts["interactive"] = True
+    overrides = {(b'experimental', b'crecord'): False}
+    with ui.configoverride(overrides, b'record'):
+        return commands.commit(ui, repo, *pats, **opts)
+
+
+def qrefresh(origfn, ui, repo, *pats, **opts):
+    if not opts['interactive']:
+        return origfn(ui, repo, *pats, **opts)
+
+    mq = extensions.find(b'mq')
+
+    def committomq(ui, repo, *pats, **opts):
+        # At this point the working copy contains only changes that
+        # were accepted. All other changes were reverted.
+        # We can't pass *pats here since qrefresh will undo all other
+        # changed files in the patch that aren't in pats.
+        mq.refresh(ui, repo, **opts)
+
+    # backup all changed files
+    cmdutil.dorecord(
+        ui, repo, committomq, None, True, cmdutil.recordfilter, *pats, **opts
+    )
+
+
+# This command registration is replaced during uisetup().
+@command(
+    b'qrecord',
+    [],
+    _(b'hg qrecord [OPTION]... PATCH [FILE]...'),
+    helpcategory=command.CATEGORY_COMMITTING,
+    inferrepo=True,
+)
+def qrecord(ui, repo, patch, *pats, **opts):
+    """interactively record a new patch
+
+    See :hg:`help qnew` & :hg:`help record` for more information and
+    usage.
+    """
+    return _qrecord(b'qnew', ui, repo, patch, *pats, **opts)
+
+
+def _qrecord(cmdsuggest, ui, repo, patch, *pats, **opts):
+    try:
+        mq = extensions.find(b'mq')
+    except KeyError:
+        raise error.Abort(_(b"'mq' extension not loaded"))
+
+    repo.mq.checkpatchname(patch)
+
+    def committomq(ui, repo, *pats, **opts):
+        opts['checkname'] = False
+        mq.new(ui, repo, patch, *pats, **opts)
+
+    overrides = {(b'experimental', b'crecord'): False}
+    with ui.configoverride(overrides, b'record'):
+        cmdutil.checkunfinished(repo)
+        cmdutil.dorecord(
+            ui,
+            repo,
+            committomq,
+            cmdsuggest,
+            False,
+            cmdutil.recordfilter,
+            *pats,
+            **opts
+        )
+
+
+def qnew(origfn, ui, repo, patch, *args, **opts):
+    if opts['interactive']:
+        return _qrecord(None, ui, repo, patch, *args, **opts)
+    return origfn(ui, repo, patch, *args, **opts)
+
+
+def uisetup(ui):
+    try:
+        mq = extensions.find(b'mq')
+    except KeyError:
+        return
+
+    cmdtable[b"qrecord"] = (
+        qrecord,
+        # same options as qnew, but copy them so we don't get
+        # -i/--interactive for qrecord and add white space diff options
+        mq.cmdtable[b'qnew'][1][:] + cmdutil.diffwsopts,
+        _(b'hg qrecord [OPTION]... PATCH [FILE]...'),
+    )
+
+    _wrapcmd(b'qnew', mq.cmdtable, qnew, _(b"interactively record a new patch"))
+    _wrapcmd(
+        b'qrefresh',
+        mq.cmdtable,
+        qrefresh,
+        _(b"interactively select changes to refresh"),
+    )
+
+
+def _wrapcmd(cmd, table, wrapfn, msg):
+    entry = extensions.wrapcommand(table, cmd, wrapfn)
+    entry[1].append((b'i', b'interactive', None, msg))
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             usr/lib/python3/dist-packages/hgext/releasenotes.py                                                 0000644 0000000 0000000 00000053414 14355257011 021142  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        # Copyright 2017-present Gregory Szorc <gregory.szorc@gmail.com>
+#
+# This software may be used and distributed according to the terms of the
+# GNU General Public License version 2 or any later version.
+
+"""generate release notes from commit messages (EXPERIMENTAL)
+
+It is common to maintain files detailing changes in a project between
+releases. Maintaining these files can be difficult and time consuming.
+The :hg:`releasenotes` command provided by this extension makes the
+process simpler by automating it.
+"""
+
+
+import difflib
+import re
+
+from mercurial.i18n import _
+from mercurial.pycompat import open
+from mercurial.node import hex
+from mercurial import (
+    cmdutil,
+    config,
+    error,
+    logcmdutil,
+    minirst,
+    pycompat,
+    registrar,
+    util,
+)
+from mercurial.utils import (
+    procutil,
+    stringutil,
+)
+
+cmdtable = {}
+command = registrar.command(cmdtable)
+
+try:
+    # Silence a warning about python-Levenshtein.
+    #
+    # We don't need the the performance that much and it get anoying in tests.
+    import warnings
+
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            action="ignore",
+            message=".*python-Levenshtein.*",
+            category=UserWarning,
+            module="fuzzywuzzy.fuzz",
+        )
+
+        import fuzzywuzzy.fuzz as fuzz
+
+        fuzz.token_set_ratio
+except ImportError:
+    fuzz = None
+
+# Note for extension authors: ONLY specify testedwith = 'ships-with-hg-core' for
+# extensions which SHIP WITH MERCURIAL. Non-mainline extensions should
+# be specifying the version(s) of Mercurial they are tested with, or
+# leave the attribute unspecified.
+testedwith = b'ships-with-hg-core'
+
+DEFAULT_SECTIONS = [
+    (b'feature', _(b'New Features')),
+    (b'bc', _(b'Backwards Compatibility Changes')),
+    (b'fix', _(b'Bug Fixes')),
+    (b'perf', _(b'Performance Improvements')),
+    (b'api', _(b'API Changes')),
+]
+
+RE_DIRECTIVE = re.compile(br'^\.\. ([a-zA-Z0-9_]+)::\s*([^$]+)?$', re.MULTILINE)
+RE_ISSUE = br'\bissue ?[0-9]{4,6}(?![0-9])\b'
+
+BULLET_SECTION = _(b'Other Changes')
+
+
+class parsedreleasenotes:
+    def __init__(self):
+        self.sections = {}
+
+    def __contains__(self, section):
+        return section in self.sections
+
+    def __iter__(self):
+        return iter(sorted(self.sections))
+
+    def addtitleditem(self, section, title, paragraphs):
+        """Add a titled release note entry."""
+        self.sections.setdefault(section, ([], []))
+        self.sections[section][0].append((title, paragraphs))
+
+    def addnontitleditem(self, section, paragraphs):
+        """Adds a non-titled release note entry.
+
+        Will be rendered as a bullet point.
+        """
+        self.sections.setdefault(section, ([], []))
+        self.sections[section][1].append(paragraphs)
+
+    def titledforsection(self, section):
+        """Returns titled entries in a section.
+
+        Returns a list of (title, paragraphs) tuples describing sub-sections.
+        """
+        return self.sections.get(section, ([], []))[0]
+
+    def nontitledforsection(self, section):
+        """Returns non-titled, bulleted paragraphs in a section."""
+        return self.sections.get(section, ([], []))[1]
+
+    def hastitledinsection(self, section, title):
+        return any(t[0] == title for t in self.titledforsection(section))
+
+    def merge(self, ui, other):
+        """Merge another instance into this one.
+
+        This is used to combine multiple sources of release notes together.
+        """
+        if not fuzz:
+            ui.warn(
+                _(
+                    b"module 'fuzzywuzzy' not found, merging of similar "
+                    b"releasenotes is disabled\n"
+                )
+            )
+
+        for section in other:
+            existingnotes = converttitled(
+                self.titledforsection(section)
+            ) + convertnontitled(self.nontitledforsection(section))
+            for title, paragraphs in other.titledforsection(section):
+                if self.hastitledinsection(section, title):
+                    # TODO prompt for resolution if different and running in
+                    # interactive mode.
+                    ui.write(
+                        _(b'%s already exists in %s section; ignoring\n')
+                        % (title, section)
+                    )
+                    continue
+
+                incoming_str = converttitled([(title, paragraphs)])[0]
+                if section == b'fix':
+                    issue = getissuenum(incoming_str)
+                    if issue:
+                        if findissue(ui, existingnotes, issue):
+                            continue
+
+                if similar(ui, existingnotes, incoming_str):
+                    continue
+
+                self.addtitleditem(section, title, paragraphs)
+
+            for paragraphs in other.nontitledforsection(section):
+                if paragraphs in self.nontitledforsection(section):
+                    continue
+
+                incoming_str = convertnontitled([paragraphs])[0]
+                if section == b'fix':
+                    issue = getissuenum(incoming_str)
+                    if issue:
+                        if findissue(ui, existingnotes, issue):
+                            continue
+
+                if similar(ui, existingnotes, incoming_str):
+                    continue
+
+                self.addnontitleditem(section, paragraphs)
+
+
+class releasenotessections:
+    def __init__(self, ui, repo=None):
+        if repo:
+            sections = util.sortdict(DEFAULT_SECTIONS)
+            custom_sections = getcustomadmonitions(repo)
+            if custom_sections:
+                sections.update(custom_sections)
+            self._sections = list(sections.items())
+        else:
+            self._sections = list(DEFAULT_SECTIONS)
+
+    def __iter__(self):
+        return iter(self._sections)
+
+    def names(self):
+        return [t[0] for t in self._sections]
+
+    def sectionfromtitle(self, title):
+        for name, value in self._sections:
+            if value == title:
+                return name
+
+        return None
+
+
+def converttitled(titledparagraphs):
+    """
+    Convert titled paragraphs to strings
+    """
+    string_list = []
+    for title, paragraphs in titledparagraphs:
+        lines = []
+        for para in paragraphs:
+            lines.extend(para)
+        string_list.append(b' '.join(lines))
+    return string_list
+
+
+def convertnontitled(nontitledparagraphs):
+    """
+    Convert non-titled bullets to strings
+    """
+    string_list = []
+    for paragraphs in nontitledparagraphs:
+        lines = []
+        for para in paragraphs:
+            lines.extend(para)
+        string_list.append(b' '.join(lines))
+    return string_list
+
+
+def getissuenum(incoming_str):
+    """
+    Returns issue number from the incoming string if it exists
+    """
+    issue = re.search(RE_ISSUE, incoming_str, re.IGNORECASE)
+    if issue:
+        issue = issue.group()
+    return issue
+
+
+def findissue(ui, existing, issue):
+    """
+    Returns true if issue number already exists in notes.
+    """
+    if any(issue in s for s in existing):
+        ui.write(_(b'"%s" already exists in notes; ignoring\n') % issue)
+        return True
+    else:
+        return False
+
+
+def similar(ui, existing, incoming_str):
+    """
+    Returns true if similar note found in existing notes.
+    """
+    if len(incoming_str.split()) > 10:
+        merge = similaritycheck(incoming_str, existing)
+        if not merge:
+            ui.write(
+                _(b'"%s" already exists in notes file; ignoring\n')
+                % incoming_str
+            )
+            return True
+        else:
+            return False
+    else:
+        return False
+
+
+def similaritycheck(incoming_str, existingnotes):
+    """
+    Returns false when note fragment can be merged to existing notes.
+    """
+    # fuzzywuzzy not present
+    if not fuzz:
+        return True
+
+    merge = True
+    for bullet in existingnotes:
+        score = fuzz.token_set_ratio(incoming_str, bullet)
+        if score > 75:
+            merge = False
+            break
+    return merge
+
+
+def getcustomadmonitions(repo):
+    ctx = repo[b'.']
+    p = config.config()
+
+    def read(f, sections=None, remap=None):
+        if f in ctx:
+            data = ctx[f].data()
+            p.parse(f, data, sections, remap, read)
+        else:
+            raise error.Abort(
+                _(b".hgreleasenotes file \'%s\' not found") % repo.pathto(f)
+            )
+
+    if b'.hgreleasenotes' in ctx:
+        read(b'.hgreleasenotes')
+    return p.items(b'sections')
+
+
+def checkadmonitions(ui, repo, directives, revs):
+    """
+    Checks the commit messages for admonitions and their validity.
+
+    .. abcd::
+
+       First paragraph under this admonition
+
+    For this commit message, using `hg releasenotes -r . --check`
+    returns: Invalid admonition 'abcd' present in changeset 3ea92981e103
+
+    As admonition 'abcd' is neither present in default nor custom admonitions
+    """
+    for rev in revs:
+        ctx = repo[rev]
+        admonition = re.search(RE_DIRECTIVE, ctx.description())
+        if admonition:
+            if admonition.group(1) in directives:
+                continue
+            else:
+                ui.write(
+                    _(b"Invalid admonition '%s' present in changeset %s\n")
+                    % (admonition.group(1), ctx.hex()[:12])
+                )
+                sim = lambda x: difflib.SequenceMatcher(
+                    None, admonition.group(1), x
+                ).ratio()
+
+                similar = [s for s in directives if sim(s) > 0.6]
+                if len(similar) == 1:
+                    ui.write(_(b"(did you mean %s?)\n") % similar[0])
+                elif similar:
+                    ss = b", ".join(sorted(similar))
+                    ui.write(_(b"(did you mean one of %s?)\n") % ss)
+
+
+def _getadmonitionlist(ui, sections):
+    for section in sections:
+        ui.write(b"%s: %s\n" % (section[0], section[1]))
+
+
+def parsenotesfromrevisions(repo, directives, revs):
+    notes = parsedreleasenotes()
+
+    for rev in revs:
+        ctx = repo[rev]
+
+        blocks, pruned = minirst.parse(
+            ctx.description(), admonitions=directives
+        )
+
+        for i, block in enumerate(blocks):
+            if block[b'type'] != b'admonition':
+                continue
+

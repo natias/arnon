@@ -1,0 +1,1000 @@
+        repo.ui.debug(b'sending pullbundle "%s"\n' % path)
+        try:
+            return repo.vfs.open(path)
+        except IOError:
+            repo.ui.debug(b'pullbundle "%s" not accessible\n' % path)
+            continue
+    return None
+
+
+@wireprotocommand(b'getbundle', b'*', permission=b'pull')
+def getbundle(repo, proto, others):
+    opts = options(
+        b'getbundle', wireprototypes.GETBUNDLE_ARGUMENTS.keys(), others
+    )
+    for k, v in opts.items():
+        keytype = wireprototypes.GETBUNDLE_ARGUMENTS[k]
+        if keytype == b'nodes':
+            opts[k] = wireprototypes.decodelist(v)
+        elif keytype == b'csv':
+            opts[k] = list(v.split(b','))
+        elif keytype == b'scsv':
+            opts[k] = set(v.split(b','))
+        elif keytype == b'boolean':
+            # Client should serialize False as '0', which is a non-empty string
+            # so it evaluates as a True bool.
+            if v == b'0':
+                opts[k] = False
+            else:
+                opts[k] = bool(v)
+        elif keytype != b'plain':
+            raise KeyError(b'unknown getbundle option type %s' % keytype)
+
+    if not bundle1allowed(repo, b'pull'):
+        if not exchange.bundle2requested(opts.get(b'bundlecaps')):
+            if proto.name == b'http-v1':
+                return wireprototypes.ooberror(bundle2required)
+            raise error.Abort(bundle2requiredmain, hint=bundle2requiredhint)
+
+    try:
+        clheads = set(repo.changelog.heads())
+        heads = set(opts.get(b'heads', set()))
+        common = set(opts.get(b'common', set()))
+        common.discard(repo.nullid)
+        if (
+            repo.ui.configbool(b'server', b'pullbundle')
+            and b'partial-pull' in proto.getprotocaps()
+        ):
+            # Check if a pre-built bundle covers this request.
+            bundle = find_pullbundle(repo, proto, opts, clheads, heads, common)
+            if bundle:
+                return wireprototypes.streamres(
+                    gen=util.filechunkiter(bundle), prefer_uncompressed=True
+                )
+
+        if repo.ui.configbool(b'server', b'disablefullbundle'):
+            # Check to see if this is a full clone.
+            changegroup = opts.get(b'cg', True)
+            if changegroup and not common and clheads == heads:
+                raise error.Abort(
+                    _(b'server has pull-based clones disabled'),
+                    hint=_(b'remove --pull if specified or upgrade Mercurial'),
+                )
+
+        info, chunks = exchange.getbundlechunks(
+            repo, b'serve', **pycompat.strkwargs(opts)
+        )
+        prefercompressed = info.get(b'prefercompressed', True)
+    except error.Abort as exc:
+        # cleanly forward Abort error to the client
+        if not exchange.bundle2requested(opts.get(b'bundlecaps')):
+            if proto.name == b'http-v1':
+                return wireprototypes.ooberror(exc.message + b'\n')
+            raise  # cannot do better for bundle1 + ssh
+        # bundle2 request expect a bundle2 reply
+        bundler = bundle2.bundle20(repo.ui)
+        manargs = [(b'message', exc.message)]
+        advargs = []
+        if exc.hint is not None:
+            advargs.append((b'hint', exc.hint))
+        bundler.addpart(bundle2.bundlepart(b'error:abort', manargs, advargs))
+        chunks = bundler.getchunks()
+        prefercompressed = False
+
+    return wireprototypes.streamres(
+        gen=chunks, prefer_uncompressed=not prefercompressed
+    )
+
+
+@wireprotocommand(b'heads', permission=b'pull')
+def heads(repo, proto):
+    h = repo.heads()
+    return wireprototypes.bytesresponse(wireprototypes.encodelist(h) + b'\n')
+
+
+@wireprotocommand(b'hello', permission=b'pull')
+def hello(repo, proto):
+    """Called as part of SSH handshake to obtain server info.
+
+    Returns a list of lines describing interesting things about the
+    server, in an RFC822-like format.
+
+    Currently, the only one defined is ``capabilities``, which consists of a
+    line of space separated tokens describing server abilities:
+
+        capabilities: <token0> <token1> <token2>
+    """
+    caps = capabilities(repo, proto).data
+    return wireprototypes.bytesresponse(b'capabilities: %s\n' % caps)
+
+
+@wireprotocommand(b'listkeys', b'namespace', permission=b'pull')
+def listkeys(repo, proto, namespace):
+    d = sorted(repo.listkeys(encoding.tolocal(namespace)).items())
+    return wireprototypes.bytesresponse(pushkeymod.encodekeys(d))
+
+
+@wireprotocommand(b'lookup', b'key', permission=b'pull')
+def lookup(repo, proto, key):
+    try:
+        k = encoding.tolocal(key)
+        n = repo.lookup(k)
+        r = hex(n)
+        success = 1
+    except Exception as inst:
+        r = stringutil.forcebytestr(inst)
+        success = 0
+    return wireprototypes.bytesresponse(b'%d %s\n' % (success, r))
+
+
+@wireprotocommand(b'known', b'nodes *', permission=b'pull')
+def known(repo, proto, nodes, others):
+    v = b''.join(
+        b and b'1' or b'0' for b in repo.known(wireprototypes.decodelist(nodes))
+    )
+    return wireprototypes.bytesresponse(v)
+
+
+@wireprotocommand(b'protocaps', b'caps', permission=b'pull')
+def protocaps(repo, proto, caps):
+    if proto.name == wireprototypes.SSHV1:
+        proto._protocaps = set(caps.split(b' '))
+    return wireprototypes.bytesresponse(b'OK')
+
+
+@wireprotocommand(b'pushkey', b'namespace key old new', permission=b'push')
+def pushkey(repo, proto, namespace, key, old, new):
+    # compatibility with pre-1.8 clients which were accidentally
+    # sending raw binary nodes rather than utf-8-encoded hex
+    if len(new) == 20 and stringutil.escapestr(new) != new:
+        # looks like it could be a binary node
+        try:
+            new.decode('utf-8')
+            new = encoding.tolocal(new)  # but cleanly decodes as UTF-8
+        except UnicodeDecodeError:
+            pass  # binary, leave unmodified
+    else:
+        new = encoding.tolocal(new)  # normal path
+
+    with proto.mayberedirectstdio() as output:
+        r = (
+            repo.pushkey(
+                encoding.tolocal(namespace),
+                encoding.tolocal(key),
+                encoding.tolocal(old),
+                new,
+            )
+            or False
+        )
+
+    output = output.getvalue() if output else b''
+    return wireprototypes.bytesresponse(b'%d\n%s' % (int(r), output))
+
+
+@wireprotocommand(b'stream_out', permission=b'pull')
+def stream(repo, proto):
+    """If the server supports streaming clone, it advertises the "stream"
+    capability with a value representing the version and flags of the repo
+    it is serving. Client checks to see if it understands the format.
+    """
+    return wireprototypes.streamreslegacy(streamclone.generatev1wireproto(repo))
+
+
+@wireprotocommand(b'unbundle', b'heads', permission=b'push')
+def unbundle(repo, proto, heads):
+    their_heads = wireprototypes.decodelist(heads)
+
+    with proto.mayberedirectstdio() as output:
+        try:
+            exchange.check_heads(repo, their_heads, b'preparing changes')
+            cleanup = lambda: None
+            try:
+                payload = proto.getpayload()
+                if repo.ui.configbool(b'server', b'streamunbundle'):
+
+                    def cleanup():
+                        # Ensure that the full payload is consumed, so
+                        # that the connection doesn't contain trailing garbage.
+                        for p in payload:
+                            pass
+
+                    fp = util.chunkbuffer(payload)
+                else:
+                    # write bundle data to temporary file as it can be big
+                    fp, tempname = None, None
+
+                    def cleanup():
+                        if fp:
+                            fp.close()
+                        if tempname:
+                            os.unlink(tempname)
+
+                    fd, tempname = pycompat.mkstemp(prefix=b'hg-unbundle-')
+                    repo.ui.debug(
+                        b'redirecting incoming bundle to %s\n' % tempname
+                    )
+                    fp = os.fdopen(fd, pycompat.sysstr(b'wb+'))
+                    for p in payload:
+                        fp.write(p)
+                    fp.seek(0)
+
+                gen = exchange.readbundle(repo.ui, fp, None)
+                if isinstance(
+                    gen, changegroupmod.cg1unpacker
+                ) and not bundle1allowed(repo, b'push'):
+                    if proto.name == b'http-v1':
+                        # need to special case http because stderr do not get to
+                        # the http client on failed push so we need to abuse
+                        # some other error type to make sure the message get to
+                        # the user.
+                        return wireprototypes.ooberror(bundle2required)
+                    raise error.Abort(
+                        bundle2requiredmain, hint=bundle2requiredhint
+                    )
+
+                r = exchange.unbundle(
+                    repo, gen, their_heads, b'serve', proto.client()
+                )
+                if util.safehasattr(r, b'addpart'):
+                    # The return looks streamable, we are in the bundle2 case
+                    # and should return a stream.
+                    return wireprototypes.streamreslegacy(gen=r.getchunks())
+                return wireprototypes.pushres(
+                    r, output.getvalue() if output else b''
+                )
+
+            finally:
+                cleanup()
+
+        except (error.BundleValueError, error.Abort, error.PushRaced) as exc:
+            # handle non-bundle2 case first
+            if not getattr(exc, 'duringunbundle2', False):
+                try:
+                    raise
+                except error.Abort as exc:
+                    # The old code we moved used procutil.stderr directly.
+                    # We did not change it to minimise code change.
+                    # This need to be moved to something proper.
+                    # Feel free to do it.
+                    procutil.stderr.write(exc.format())
+                    procutil.stderr.flush()
+                    return wireprototypes.pushres(
+                        0, output.getvalue() if output else b''
+                    )
+                except error.PushRaced:
+                    return wireprototypes.pusherr(
+                        pycompat.bytestr(exc),
+                        output.getvalue() if output else b'',
+                    )
+
+            bundler = bundle2.bundle20(repo.ui)
+            for out in getattr(exc, '_bundle2salvagedoutput', ()):
+                bundler.addpart(out)
+            try:
+                try:
+                    raise
+                except error.PushkeyFailed as exc:
+                    # check client caps
+                    remotecaps = getattr(exc, '_replycaps', None)
+                    if (
+                        remotecaps is not None
+                        and b'pushkey' not in remotecaps.get(b'error', ())
+                    ):
+                        # no support remote side, fallback to Abort handler.
+                        raise
+                    part = bundler.newpart(b'error:pushkey')
+                    part.addparam(b'in-reply-to', exc.partid)
+                    if exc.namespace is not None:
+                        part.addparam(
+                            b'namespace', exc.namespace, mandatory=False
+                        )
+                    if exc.key is not None:
+                        part.addparam(b'key', exc.key, mandatory=False)
+                    if exc.new is not None:
+                        part.addparam(b'new', exc.new, mandatory=False)
+                    if exc.old is not None:
+                        part.addparam(b'old', exc.old, mandatory=False)
+                    if exc.ret is not None:
+                        part.addparam(b'ret', exc.ret, mandatory=False)
+            except error.BundleValueError as exc:
+                errpart = bundler.newpart(b'error:unsupportedcontent')
+                if exc.parttype is not None:
+                    errpart.addparam(b'parttype', exc.parttype)
+                if exc.params:
+                    errpart.addparam(b'params', b'\0'.join(exc.params))
+            except error.Abort as exc:
+                manargs = [(b'message', exc.message)]
+                advargs = []
+                if exc.hint is not None:
+                    advargs.append((b'hint', exc.hint))
+                bundler.addpart(
+                    bundle2.bundlepart(b'error:abort', manargs, advargs)
+                )
+            except error.PushRaced as exc:
+                bundler.newpart(
+                    b'error:pushraced',
+                    [(b'message', stringutil.forcebytestr(exc))],
+                )
+            return wireprototypes.streamreslegacy(gen=bundler.getchunks())
+                                                                                                                                                                                                                                              usr/lib/python3/dist-packages/mercurial/worker.py                                                   0000644 0000000 0000000 00000037470 14355257011 020632  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        # worker.py - master-slave parallelism support
+#
+# Copyright 2013 Facebook, Inc.
+#
+# This software may be used and distributed according to the terms of the
+# GNU General Public License version 2 or any later version.
+
+
+import os
+import pickle
+import selectors
+import signal
+import sys
+import threading
+import time
+
+from .i18n import _
+from . import (
+    encoding,
+    error,
+    pycompat,
+    scmutil,
+)
+
+
+def countcpus():
+    '''try to count the number of CPUs on the system'''
+
+    # posix
+    try:
+        n = int(os.sysconf('SC_NPROCESSORS_ONLN'))
+        if n > 0:
+            return n
+    except (AttributeError, ValueError):
+        pass
+
+    # windows
+    try:
+        n = int(encoding.environ[b'NUMBER_OF_PROCESSORS'])
+        if n > 0:
+            return n
+    except (KeyError, ValueError):
+        pass
+
+    return 1
+
+
+def _numworkers(ui):
+    s = ui.config(b'worker', b'numcpus')
+    if s:
+        try:
+            n = int(s)
+            if n >= 1:
+                return n
+        except ValueError:
+            raise error.Abort(_(b'number of cpus must be an integer'))
+    return min(max(countcpus(), 4), 32)
+
+
+def ismainthread():
+    return threading.current_thread() == threading.main_thread()
+
+
+class _blockingreader:
+    """Wrap unbuffered stream such that pickle.load() works with it.
+
+    pickle.load() expects that calls to read() and readinto() read as many
+    bytes as requested. On EOF, it is fine to read fewer bytes. In this case,
+    pickle.load() raises an EOFError.
+    """
+
+    def __init__(self, wrapped):
+        self._wrapped = wrapped
+
+    def readline(self):
+        return self._wrapped.readline()
+
+    def readinto(self, buf):
+        pos = 0
+        size = len(buf)
+
+        with memoryview(buf) as view:
+            while pos < size:
+                with view[pos:] as subview:
+                    ret = self._wrapped.readinto(subview)
+                if not ret:
+                    break
+                pos += ret
+
+        return pos
+
+    # issue multiple reads until size is fulfilled (or EOF is encountered)
+    def read(self, size=-1):
+        if size < 0:
+            return self._wrapped.readall()
+
+        buf = bytearray(size)
+        n_read = self.readinto(buf)
+        del buf[n_read:]
+        return bytes(buf)
+
+
+if pycompat.isposix or pycompat.iswindows:
+    _STARTUP_COST = 0.01
+    # The Windows worker is thread based. If tasks are CPU bound, threads
+    # in the presence of the GIL result in excessive context switching and
+    # this overhead can slow down execution.
+    _DISALLOW_THREAD_UNSAFE = pycompat.iswindows
+else:
+    _STARTUP_COST = 1e30
+    _DISALLOW_THREAD_UNSAFE = False
+
+
+def worthwhile(ui, costperop, nops, threadsafe=True):
+    """try to determine whether the benefit of multiple processes can
+    outweigh the cost of starting them"""
+
+    if not threadsafe and _DISALLOW_THREAD_UNSAFE:
+        return False
+
+    linear = costperop * nops
+    workers = _numworkers(ui)
+    benefit = linear - (_STARTUP_COST * workers + linear / workers)
+    return benefit >= 0.15
+
+
+def worker(
+    ui,
+    costperarg,
+    func,
+    staticargs,
+    args,
+    hasretval=False,
+    threadsafe=True,
+    prefork=None,
+):
+    """run a function, possibly in parallel in multiple worker
+    processes.
+
+    returns a progress iterator
+
+    costperarg - cost of a single task
+
+    func - function to run. It is expected to return a progress iterator.
+
+    staticargs - arguments to pass to every invocation of the function
+
+    args - arguments to split into chunks, to pass to individual
+    workers
+
+    hasretval - when True, func and the current function return an progress
+    iterator then a dict (encoded as an iterator that yield many (False, ..)
+    then a (True, dict)). The dicts are joined in some arbitrary order, so
+    overlapping keys are a bad idea.
+
+    threadsafe - whether work items are thread safe and can be executed using
+    a thread-based worker. Should be disabled for CPU heavy tasks that don't
+    release the GIL.
+
+    prefork - a parameterless Callable that is invoked prior to forking the
+    process.  fork() is only used on non-Windows platforms, but is also not
+    called on POSIX platforms if the work amount doesn't warrant a worker.
+    """
+    enabled = ui.configbool(b'worker', b'enabled')
+    if enabled and _platformworker is _posixworker and not ismainthread():
+        # The POSIX worker has to install a handler for SIGCHLD.
+        # Python up to 3.9 only allows this in the main thread.
+        enabled = False
+
+    if enabled and worthwhile(ui, costperarg, len(args), threadsafe=threadsafe):
+        return _platformworker(
+            ui, func, staticargs, args, hasretval, prefork=prefork
+        )
+    return func(*staticargs + (args,))
+
+
+def _posixworker(ui, func, staticargs, args, hasretval, prefork=None):
+    workers = _numworkers(ui)
+    oldhandler = signal.getsignal(signal.SIGINT)
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    pids, problem = set(), [0]
+
+    def killworkers():
+        # unregister SIGCHLD handler as all children will be killed. This
+        # function shouldn't be interrupted by another SIGCHLD; otherwise pids
+        # could be updated while iterating, which would cause inconsistency.
+        signal.signal(signal.SIGCHLD, oldchldhandler)
+        # if one worker bails, there's no good reason to wait for the rest
+        for p in pids:
+            try:
+                os.kill(p, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+
+    def waitforworkers(blocking=True):
+        for pid in pids.copy():
+            p = st = 0
+            try:
+                p, st = os.waitpid(pid, (0 if blocking else os.WNOHANG))
+            except ChildProcessError:
+                # child would already be reaped, but pids yet been
+                # updated (maybe interrupted just after waitpid)
+                pids.discard(pid)
+            if not p:
+                # skip subsequent steps, because child process should
+                # be still running in this case
+                continue
+            pids.discard(p)
+            st = _exitstatus(st)
+            if st and not problem[0]:
+                problem[0] = st
+
+    def sigchldhandler(signum, frame):
+        waitforworkers(blocking=False)
+        if problem[0]:
+            killworkers()
+
+    oldchldhandler = signal.signal(signal.SIGCHLD, sigchldhandler)
+    ui.flush()
+    parentpid = os.getpid()
+    pipes = []
+    retval = {}
+
+    if prefork:
+        prefork()
+
+    for pargs in partition(args, min(workers, len(args))):
+        # Every worker gets its own pipe to send results on, so we don't have to
+        # implement atomic writes larger than PIPE_BUF. Each forked process has
+        # its own pipe's descriptors in the local variables, and the parent
+        # process has the full list of pipe descriptors (and it doesn't really
+        # care what order they're in).
+        rfd, wfd = os.pipe()
+        pipes.append((rfd, wfd))
+        # make sure we use os._exit in all worker code paths. otherwise the
+        # worker may do some clean-ups which could cause surprises like
+        # deadlock. see sshpeer.cleanup for example.
+        # override error handling *before* fork. this is necessary because
+        # exception (signal) may arrive after fork, before "pid =" assignment
+        # completes, and other exception handler (dispatch.py) can lead to
+        # unexpected code path without os._exit.
+        ret = -1
+        try:
+            pid = os.fork()
+            if pid == 0:
+                signal.signal(signal.SIGINT, oldhandler)
+                signal.signal(signal.SIGCHLD, oldchldhandler)
+
+                def workerfunc():
+                    for r, w in pipes[:-1]:
+                        os.close(r)
+                        os.close(w)
+                    os.close(rfd)
+                    with os.fdopen(wfd, 'wb') as wf:
+                        for result in func(*(staticargs + (pargs,))):
+                            pickle.dump(result, wf)
+                            wf.flush()
+                    return 0
+
+                ret = scmutil.callcatch(ui, workerfunc)
+        except:  # parent re-raises, child never returns
+            if os.getpid() == parentpid:
+                raise
+            exctype = sys.exc_info()[0]
+            force = not issubclass(exctype, KeyboardInterrupt)
+            ui.traceback(force=force)
+        finally:
+            if os.getpid() != parentpid:
+                try:
+                    ui.flush()
+                except:  # never returns, no re-raises
+                    pass
+                finally:
+                    os._exit(ret & 255)
+        pids.add(pid)
+    selector = selectors.DefaultSelector()
+    for rfd, wfd in pipes:
+        os.close(wfd)
+        # The stream has to be unbuffered. Otherwise, if all data is read from
+        # the raw file into the buffer, the selector thinks that the FD is not
+        # ready to read while pickle.load() could read from the buffer. This
+        # would delay the processing of readable items.
+        selector.register(os.fdopen(rfd, 'rb', 0), selectors.EVENT_READ)
+
+    def cleanup():
+        signal.signal(signal.SIGINT, oldhandler)
+        waitforworkers()
+        signal.signal(signal.SIGCHLD, oldchldhandler)
+        selector.close()
+        return problem[0]
+
+    try:
+        openpipes = len(pipes)
+        while openpipes > 0:
+            for key, events in selector.select():
+                try:
+                    # The pytype error likely goes away on a modern version of
+                    # pytype having a modern typeshed snapshot.
+                    # pytype: disable=wrong-arg-types
+                    res = pickle.load(_blockingreader(key.fileobj))
+                    # pytype: enable=wrong-arg-types
+                    if hasretval and res[0]:
+                        retval.update(res[1])
+                    else:
+                        yield res
+                except EOFError:
+                    selector.unregister(key.fileobj)
+                    # pytype: disable=attribute-error
+                    key.fileobj.close()
+                    # pytype: enable=attribute-error
+                    openpipes -= 1
+    except:  # re-raises
+        killworkers()
+        cleanup()
+        raise
+    status = cleanup()
+    if status:
+        if status < 0:
+            os.kill(os.getpid(), -status)
+        raise error.WorkerError(status)
+    if hasretval:
+        yield True, retval
+
+
+def _posixexitstatus(code):
+    """convert a posix exit status into the same form returned by
+    os.spawnv
+
+    returns None if the process was stopped instead of exiting"""
+    if os.WIFEXITED(code):
+        return os.WEXITSTATUS(code)
+    elif os.WIFSIGNALED(code):
+        return -(os.WTERMSIG(code))
+
+
+def _windowsworker(ui, func, staticargs, args, hasretval, prefork=None):
+    class Worker(threading.Thread):
+        def __init__(
+            self, taskqueue, resultqueue, func, staticargs, *args, **kwargs
+        ):
+            threading.Thread.__init__(self, *args, **kwargs)
+            self._taskqueue = taskqueue
+            self._resultqueue = resultqueue
+            self._func = func
+            self._staticargs = staticargs
+            self._interrupted = False
+            self.daemon = True
+            self.exception = None
+
+        def interrupt(self):
+            self._interrupted = True
+
+        def run(self):
+            try:
+                while not self._taskqueue.empty():
+                    try:
+                        args = self._taskqueue.get_nowait()
+                        for res in self._func(*self._staticargs + (args,)):
+                            self._resultqueue.put(res)
+                            # threading doesn't provide a native way to
+                            # interrupt execution. handle it manually at every
+                            # iteration.
+                            if self._interrupted:
+                                return
+                    except pycompat.queue.Empty:
+                        break
+            except Exception as e:
+                # store the exception such that the main thread can resurface
+                # it as if the func was running without workers.
+                self.exception = e
+                raise
+
+    threads = []
+
+    def trykillworkers():
+        # Allow up to 1 second to clean worker threads nicely
+        cleanupend = time.time() + 1
+        for t in threads:
+            t.interrupt()
+        for t in threads:
+            remainingtime = cleanupend - time.time()
+            t.join(remainingtime)
+            if t.is_alive():
+                # pass over the workers joining failure. it is more
+                # important to surface the inital exception than the
+                # fact that one of workers may be processing a large
+                # task and does not get to handle the interruption.
+                ui.warn(
+                    _(
+                        b"failed to kill worker threads while "
+                        b"handling an exception\n"
+                    )
+                )
+                return
+
+    workers = _numworkers(ui)
+    resultqueue = pycompat.queue.Queue()
+    taskqueue = pycompat.queue.Queue()
+    retval = {}
+    # partition work to more pieces than workers to minimize the chance
+    # of uneven distribution of large tasks between the workers
+    for pargs in partition(args, workers * 20):
+        taskqueue.put(pargs)
+    for _i in range(workers):
+        t = Worker(taskqueue, resultqueue, func, staticargs)
+        threads.append(t)
+        t.start()
+    try:
+        while len(threads) > 0:
+            while not resultqueue.empty():
+                res = resultqueue.get()
+                if hasretval and res[0]:
+                    retval.update(res[1])
+                else:
+                    yield res
+            threads[0].join(0.05)
+            finishedthreads = [_t for _t in threads if not _t.is_alive()]
+            for t in finishedthreads:
+                if t.exception is not None:
+                    raise t.exception
+                threads.remove(t)
+    except (Exception, KeyboardInterrupt):  # re-raises
+        trykillworkers()
+        raise
+    while not resultqueue.empty():
+        res = resultqueue.get()
+        if hasretval and res[0]:
+            retval.update(res[1])
+        else:
+            yield res
+    if hasretval:
+        yield True, retval
+
+
+if pycompat.iswindows:
+    _platformworker = _windowsworker
+else:
+    _platformworker = _posixworker
+    _exitstatus = _posixexitstatus
+
+
+def partition(lst, nslices):
+    """partition a list into N slices of roughly equal size
+
+    The current strategy takes every Nth element from the input. If
+    we ever write workers that need to preserve grouping in input
+    we should consider allowing callers to specify a partition strategy.
+
+    olivia is not a fan of this partitioning strategy when files are involved.
+    In his words:
+
+        Single-threaded Mercurial makes a point of creating and visiting
+        files in a fixed order (alphabetical). When creating files in order,
+        a typical filesystem is likely to allocate them on nearby regions on
+        disk. Thus, when revisiting in the same order, locality is maximized
+        and various forms of OS and disk-level caching and read-ahead get a
+        chance to work.
+
+        This effect can be quite significant on spinning disks. I discovered it
+        circa Mercurial v0.4 when revlogs were named by hashes of filenames.
+        Tarring a repo and copying it to another disk effectively randomized
+        the revlog ordering on disk by sorting the revlogs by hash and suddenly
+        performance of my kernel checkout benchmark dropped by ~10x because the
+        "working set" of sectors visited no longer fit in the drive's cache and
+        the workload switched from streaming to random I/O.
+
+        What we should really be doing is have workers read filenames from a
+        ordered queue. This preserves locality and also keeps any worker from
+        getting more than one file out of balance.
+    """
+    for i in range(nslices):
+        yield lst[i::nslices]
+                                                                                                                                                                                                        usr/lib/python3/dist-packages/mercurial/zstd.cpython-311-x86_64-linux-gnu.so                        0000644 0000000 0000000 00002454760 14374730616 025162  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        ELF          >            @       0S
+         @ 8 	 @                                 Ä]      Ä]                    `       `       `      °X     °X                   ¿      ¿      ¿     4I     4I                  p
+     p
+     p
+     òE      »E                   ê
+     ê
+     ê
+     ¿      ¿                   8      8      8      $       $              PÂtd   ¯d	     ¯d	     ¯d	     î      î             QÂtd                                                  RÂtd   p
+     p
+     p
+     ê      ê                      GNU O<‚5›;¯I⁄¢®…À  '$V       j         @       j       á\Â                            €                     0                     R                                                                                      £                     6                                          e                     ì                     |                     Ø                      ¡                     à                     ò                     x                                           p                     ∆                     3                     ·                      º                     Ç                                           ü                      %                     é                      »                                          …                     O                     ü                     ¬                     W                     J                     Ú                     Z                     å                                          Ê                     Ì                     @                                          Ü                     p                     –                     Û                     d                     T                                                                 Õ                      Ê                     ]                     å                     {                     r                     c                                          0                     ¨                     ÿ                     ≠                     w                     Æ                     î                     K                     õ                     U                      v                     ~                     E                                          /                     u                     »                     Ñ                                          ;                     ÿ                                          $                     ˇ                     õ                     ]                     ´                     ‹                     ∑                     ™                     ‘                      µ                     †                     ,                       €                                                               @                     ¿                      P                     F   "                   º                     ≥                     j                     ô                     o    Ä5     T        __gmon_start__ _ITM_deregisterTMCloneTable _ITM_registerTMCloneTable __cxa_finalize _PyArg_ParseTupleAndKeywords_SizeT PyBuffer_IsContiguous PyExc_ValueError PyErr_SetString PyBuffer_Release PyMem_Malloc memcpy PyErr_Format PyErr_NoMemory __stack_chk_fail PyBytes_FromStringAndSize PyObject_CallObject PyExc_IndexError PyBuffer_FillInfo free PyObject_Free PyMem_Free _Py_Dealloc PyLong_FromUnsignedLongLong PyExc_BufferError PyTuple_Size PyType_IsSubtype PyExc_TypeError _PyObject_New PyType_Type PyType_Ready PyModule_AddObject PyType_GenericNew PyEval_SaveThread PyEval_RestoreThread _Py_NoneStruct PyLong_FromLong PyList_Type PyList_Size PyLong_FromSize_t _PyArg_ParseTuple_SizeT PyDict_GetItemString PyLong_AsUnsignedLongLong PyDict_DelItemString PyLong_AsSsize_t PyTuple_New PyDict_New PyLong_FromUnsignedLong PyDict_SetItemString _Py_TrueStruct _Py_FalseStruct PyExc_OSError PyImport_ImportModule PyObject_GetAttrString PyErr_SetNone _PyObject_CallMethod_SizeT PyObject_GetBuffer PyList_New PyBytes_Size PyList_Append PyBytes_AsStringAndSize PyExc_NotImplementedError PyObject_HasAttrString PyLong_FromSsize_t PyBytes_FromString calloc malloc realloc PyObject_CheckBuffer PyObject_IsTrue PyBytes_AsString PyTuple_Pack memset PyErr_Clear PyExc_StopIteration PyUnicode_FromString PyErr_NewException PyModule_AddIntConstant PyTuple_SetItem PyList_GetItem PyMem_Realloc PyExc_ImportError PyInit_zstd PyModule_Create2 PyErr_Occurred sysconf _PyBytes_Resize pthread_mutex_lock pthread_cond_wait pthread_mutex_unlock pthread_cond_signal pthread_cond_broadcast pthread_join pthread_mutex_destroy pthread_cond_destroy pthread_mutex_init pthread_cond_init pthread_create memmove memcmp qsort stderr __fprintf_chk fflush fwrite clock fputc libc.so.6 GLIBC_2.3.4 GLIBC_2.34 GLIBC_2.14 GLIBC_2.4 GLIBC_2.3.2 GLIBC_2.2.5                                                                                                                   »         ti	   “     ¥ëñ   ﬁ     îëñ   È     ii   Ù     ri	   ˛     ui	   
+      p
+            pf      x
+            0f      Ä
+            †\     à
+            pf     †
+            –Õ     ®
+            –Õ     ∞
+            PM     ∏
+            ¿w     ¿
+            ¿a     »
+             A     –
+            @6     ÿ
+             å     ‡
+            ∞Õ     Ë
+                  
+            p     ¯
+            p      
+            ¿≥     
+            ¿≥     
+            ∞Õ     
+            0Ò      
+                  (
+            @     0
+            êZ     8
+            êZ     @
+            ‡Ë     H
+            ‡Ë     P
+            Ä}     X
+            ™     `
+            †ù     h
+            ë     p
+            ÄÑ     x
+            †L     Ä
+            PØ     à
+            PØ     P
+             9
+     ¿"
+            ¿"
+     ‡"
+            ˜”     Ë"
+            ™¿      #
+            ¬À     #
+            Äk      #
+            @√     @#
+            †f      X#
+            ¿i      †#
+            ∆¿     ¿#
+            h√      $
+            Õ¿     $
+            †h      $
+             ƒ     @$
+            ∞j      `$
+            êf      ∞$
+            Äj      ¿$
+            ¬À     ‡$
+            ê√      %
+            ™¿     (%
+            ∞h      8%
+             ≈     @%
+            Õ¿     H%
+            ‡k      X%
+            @≈     Ä%
+             l      †%
+            Äf      ∏%
+            h      &
+            √     0&
+             n      h&
+            @#
+     ∞&
+            ¿√     Ë&
+             #
+     ('
+            pl      ∏'
+            ≥¿     –'
+            ên      (
+            `$
+     @(
+            @$
+     P(
+            @ƒ     à(
+             $
+     ê(
+            †#
+     X)
+            ’¿     p)
+            @k      ‡)
+            ∞$
+     )
+            †ƒ     ¯*
+            È¿     +
+            –j      H+
+            †%
+     Ä+
+            Ä%
+     ê+
+            Ä≈     »+
+             %
+     –+
+            ¿$
+     ,
+            ∞f      Ä,
+            ˜”     †,
+                  ®,
+             t      ∏,
+            à¯     ¿,
+                  »,
+            Äs      ÿ,
+                  ‡,
+            å’     Ë,
+             s      ¯,
+                  8-
+            ®…     P-
+            0u      –-
+            @      .
+            †,
+     ÿ.
+            »…     .
+            Äu      p/
+            Ä      ò/
+            –p      †/
+            ‡p      `0
+            b–     h0
+            LÀ     Ä0
+            ˜”     à0
+            _À     †0
+            iÀ     ®0
+            sÀ     ∞0
+            Òˆ     ∏0
+            ß’     ¿0
+            {À     »0
+            —     –0
+            b–     ÿ0
+            âÀ     ‡0
+            èÀ      1
+            u      `1
+            Òˆ     Ä1
+            ∞À     à1
+            ß’     ®1
+            ΩÀ     ‡1
+            —     Ë1
+            êy      ¯1
+            »Ã      2
+            «À     2
+            Äy      2
+            ¯Ã      2
+            ÷      (2
+            @w      82
+            @Õ     x2
+            óÀ     ê2
+            ∞y      »2
+             1
+     3
+            †Õ     H3
+            ‡1
+     P3
+            `1
+     à3
+             v       4
+            —–     4
+            ÿ–     4
+            t–     4
+            `—      4
+            –     (4
+            â–     04
+            m—     84
+            î–     @4
+            ¢–     H4
+            Æ–     P4
+            Í–     X4
+            ˝–     `4
+            —     h4
+            —     p4
+            #—     x4
+            /—     Ä4
+            @—     à4
+            Q—     ê4
+            \—     ò4
+            i—     †4
+            w—     ®4
+            ã—     ∞4
+            ù—     ∏4
+            èÀ     ‡4
+            —–     Ë4
+            –~      5
+            ÿ–     5
+            `      05
+            t–     85
+                  X5
+            `—     `5
+            ÄÄ      Ä5
+            –     à5
+            Å      ®5
+            â–     ∞5
+            †Å      –5
+            m—     ÿ5
+            0Ç      ¯5
+            î–      6
+            ¿Ç       6
+            ¢–     (6

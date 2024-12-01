@@ -1,0 +1,1000 @@
+        else:
+            for f in match.files():
+                filelog = repo.file(f)
+                if not filelog:
+                    # A zero count may be a directory or deleted file, so
+                    # try to find matching entries on the slow path.
+                    slowpath = True
+
+        # We decided to fall back to the slowpath because at least one
+        # of the paths was not a file. Check to see if at least one of them
+        # existed in history - in that case, we'll continue down the
+        # slowpath; otherwise, we can turn off the slowpath
+        if slowpath:
+            for path in match.files():
+                if not path or path in repo.store:
+                    break
+            else:
+                slowpath = False
+
+    return match, pats, slowpath
+
+
+def _fileancestors(repo, revs, match, followfirst):
+    fctxs = []
+    for r in revs:
+        ctx = repo[r]
+        fctxs.extend(ctx[f].introfilectx() for f in ctx.walk(match))
+
+    # When displaying a revision with --patch --follow FILE, we have
+    # to know which file of the revision must be diffed. With
+    # --follow, we want the names of the ancestors of FILE in the
+    # revision, stored in "fcache". "fcache" is populated as a side effect
+    # of the graph traversal.
+    fcache = {}
+
+    def filematcher(ctx):
+        return scmutil.matchfiles(repo, fcache.get(scmutil.intrev(ctx), []))
+
+    def revgen():
+        for rev, cs in dagop.filectxancestors(fctxs, followfirst=followfirst):
+            fcache[rev] = [c.path() for c in cs]
+            yield rev
+
+    return smartset.generatorset(revgen(), iterasc=False), filematcher
+
+
+def _makenofollowfilematcher(repo, pats, opts):
+    '''hook for extensions to override the filematcher for non-follow cases'''
+    return None
+
+
+def revsingle(repo, revspec, default=b'.', localalias=None):
+    """Resolves user-provided revset(s) into a single revision.
+
+    This just wraps the lower-level scmutil.revsingle() in order to raise an
+    exception indicating user error.
+    """
+    try:
+        return scmutil.revsingle(repo, revspec, default, localalias)
+    except error.RepoLookupError as e:
+        raise error.InputError(e.args[0], hint=e.hint)
+
+
+def revpair(repo, revs):
+    """Resolves user-provided revset(s) into two revisions.
+
+    This just wraps the lower-level scmutil.revpair() in order to raise an
+    exception indicating user error.
+    """
+    try:
+        return scmutil.revpair(repo, revs)
+    except error.RepoLookupError as e:
+        raise error.InputError(e.args[0], hint=e.hint)
+
+
+def revrange(repo, specs, localalias=None):
+    """Resolves user-provided revset(s).
+
+    This just wraps the lower-level scmutil.revrange() in order to raise an
+    exception indicating user error.
+    """
+    try:
+        return scmutil.revrange(repo, specs, localalias)
+    except error.RepoLookupError as e:
+        raise error.InputError(e.args[0], hint=e.hint)
+
+
+_opt2logrevset = {
+    b'no_merges': (b'not merge()', None),
+    b'only_merges': (b'merge()', None),
+    b'_matchfiles': (None, b'_matchfiles(%ps)'),
+    b'date': (b'date(%s)', None),
+    b'branch': (b'branch(%s)', b'%lr'),
+    b'_patslog': (b'filelog(%s)', b'%lr'),
+    b'keyword': (b'keyword(%s)', b'%lr'),
+    b'prune': (b'ancestors(%s)', b'not %lr'),
+    b'user': (b'user(%s)', b'%lr'),
+}
+
+
+def _makerevset(repo, wopts, slowpath):
+    """Return a revset string built from log options and file patterns"""
+    opts = {
+        b'branch': [b'literal:' + repo.lookupbranch(b) for b in wopts.branches],
+        b'date': wopts.date,
+        b'keyword': wopts.keywords,
+        b'no_merges': wopts.no_merges,
+        b'only_merges': wopts.only_merges,
+        b'prune': wopts.prune_ancestors,
+        b'user': [b'literal:' + v for v in wopts.users],
+    }
+
+    if wopts.filter_revisions_by_pats and slowpath:
+        # pats/include/exclude cannot be represented as separate
+        # revset expressions as their filtering logic applies at file
+        # level. For instance "-I a -X b" matches a revision touching
+        # "a" and "b" while "file(a) and not file(b)" does
+        # not. Besides, filesets are evaluated against the working
+        # directory.
+        matchargs = [b'r:', b'd:relpath']
+        for p in wopts.pats:
+            matchargs.append(b'p:' + p)
+        for p in wopts.include_pats:
+            matchargs.append(b'i:' + p)
+        for p in wopts.exclude_pats:
+            matchargs.append(b'x:' + p)
+        opts[b'_matchfiles'] = matchargs
+    elif wopts.filter_revisions_by_pats and not wopts.follow:
+        opts[b'_patslog'] = list(wopts.pats)
+
+    expr = []
+    for op, val in sorted(opts.items()):
+        if not val:
+            continue
+        revop, listop = _opt2logrevset[op]
+        if revop and b'%' not in revop:
+            expr.append(revop)
+        elif not listop:
+            expr.append(revsetlang.formatspec(revop, val))
+        else:
+            if revop:
+                val = [revsetlang.formatspec(revop, v) for v in val]
+            expr.append(revsetlang.formatspec(listop, val))
+
+    if wopts.bookmarks:
+        expr.append(
+            revsetlang.formatspec(
+                b'%lr',
+                [scmutil.format_bookmark_revspec(v) for v in wopts.bookmarks],
+            )
+        )
+
+    if expr:
+        expr = b'(' + b' and '.join(expr) + b')'
+    else:
+        expr = None
+    return expr
+
+
+def _initialrevs(repo, wopts):
+    """Return the initial set of revisions to be filtered or followed"""
+    if wopts.revspec:
+        revs = revrange(repo, wopts.revspec)
+    elif wopts.follow and repo.dirstate.p1() == repo.nullid:
+        revs = smartset.baseset()
+    elif wopts.follow:
+        revs = repo.revs(b'.')
+    else:
+        revs = smartset.spanset(repo)
+        revs.reverse()
+    return revs
+
+
+def makewalker(repo, wopts):
+    # type: (Any, walkopts) -> Tuple[smartset.abstractsmartset, Optional[Callable[[Any], matchmod.basematcher]]]
+    """Build (revs, makefilematcher) to scan revision/file history
+
+    - revs is the smartset to be traversed.
+    - makefilematcher is a function to map ctx to a matcher for that revision
+    """
+    revs = _initialrevs(repo, wopts)
+    if not revs:
+        return smartset.baseset(), None
+    # TODO: might want to merge slowpath with wopts.force_changelog_traversal
+    match, pats, slowpath = _makematcher(repo, revs, wopts)
+    wopts = attr.evolve(wopts, pats=pats)
+
+    filematcher = None
+    if wopts.follow:
+        if slowpath or match.always():
+            revs = dagop.revancestors(repo, revs, followfirst=wopts.follow == 1)
+        else:
+            assert not wopts.force_changelog_traversal
+            revs, filematcher = _fileancestors(
+                repo, revs, match, followfirst=wopts.follow == 1
+            )
+        revs.reverse()
+    if filematcher is None:
+        filematcher = _makenofollowfilematcher(repo, wopts.pats, wopts.opts)
+    if filematcher is None:
+
+        def filematcher(ctx):
+            return match
+
+    expr = _makerevset(repo, wopts, slowpath)
+    if wopts.sort_revisions:
+        assert wopts.sort_revisions in {b'topo', b'desc'}
+        if wopts.sort_revisions == b'topo':
+            if not revs.istopo():
+                revs = dagop.toposort(revs, repo.changelog.parentrevs)
+                # TODO: try to iterate the set lazily
+                revs = revset.baseset(list(revs), istopo=True)
+        elif not (revs.isdescending() or revs.istopo()):
+            # User-specified revs might be unsorted
+            revs.sort(reverse=True)
+    if expr:
+        matcher = revset.match(None, expr)
+        revs = matcher(repo, revs)
+    if wopts.limit is not None:
+        revs = revs.slice(0, wopts.limit)
+
+    return revs, filematcher
+
+
+def getrevs(repo, wopts):
+    # type: (Any, walkopts) -> Tuple[smartset.abstractsmartset, Optional[changesetdiffer]]
+    """Return (revs, differ) where revs is a smartset
+
+    differ is a changesetdiffer with pre-configured file matcher.
+    """
+    revs, filematcher = makewalker(repo, wopts)
+    if not revs:
+        return revs, None
+    differ = changesetdiffer()
+    differ._makefilematcher = filematcher
+    return revs, differ
+
+
+def _parselinerangeopt(repo, opts):
+    """Parse --line-range log option and return a list of tuples (filename,
+    (fromline, toline)).
+    """
+    linerangebyfname = []
+    for pat in opts.get(b'line_range', []):
+        try:
+            pat, linerange = pat.rsplit(b',', 1)
+        except ValueError:
+            raise error.InputError(
+                _(b'malformatted line-range pattern %s') % pat
+            )
+        try:
+            fromline, toline = map(int, linerange.split(b':'))
+        except ValueError:
+            raise error.InputError(_(b"invalid line range for %s") % pat)
+        msg = _(b"line range pattern '%s' must match exactly one file") % pat
+        fname = scmutil.parsefollowlinespattern(repo, None, pat, msg)
+        linerangebyfname.append(
+            (fname, util.processlinerange(fromline, toline))
+        )
+    return linerangebyfname
+
+
+def getlinerangerevs(repo, userrevs, opts):
+    """Return (revs, differ).
+
+    "revs" are revisions obtained by processing "line-range" log options and
+    walking block ancestors of each specified file/line-range.
+
+    "differ" is a changesetdiffer with pre-configured file matcher and hunks
+    filter.
+    """
+    wctx = repo[None]
+
+    # Two-levels map of "rev -> file ctx -> [line range]".
+    linerangesbyrev = {}
+    for fname, (fromline, toline) in _parselinerangeopt(repo, opts):
+        if fname not in wctx:
+            raise error.StateError(
+                _(b'cannot follow file not in parent revision: "%s"') % fname
+            )
+        fctx = wctx.filectx(fname)
+        for fctx, linerange in dagop.blockancestors(fctx, fromline, toline):
+            rev = fctx.introrev()
+            if rev is None:
+                rev = wdirrev
+            if rev not in userrevs:
+                continue
+            linerangesbyrev.setdefault(rev, {}).setdefault(
+                fctx.path(), []
+            ).append(linerange)
+
+    def nofilterhunksfn(fctx, hunks):
+        return hunks
+
+    def hunksfilter(ctx):
+        fctxlineranges = linerangesbyrev.get(scmutil.intrev(ctx))
+        if fctxlineranges is None:
+            return nofilterhunksfn
+
+        def filterfn(fctx, hunks):
+            lineranges = fctxlineranges.get(fctx.path())
+            if lineranges is not None:
+                for hr, lines in hunks:
+                    if hr is None:  # binary
+                        yield hr, lines
+                        continue
+                    if any(mdiff.hunkinrange(hr[2:], lr) for lr in lineranges):
+                        yield hr, lines
+            else:
+                for hunk in hunks:
+                    yield hunk
+
+        return filterfn
+
+    def filematcher(ctx):
+        files = list(linerangesbyrev.get(scmutil.intrev(ctx), []))
+        return scmutil.matchfiles(repo, files)
+
+    revs = sorted(linerangesbyrev, reverse=True)
+
+    differ = changesetdiffer()
+    differ._makefilematcher = filematcher
+    differ._makehunksfilter = hunksfilter
+    return smartset.baseset(revs), differ
+
+
+def _graphnodeformatter(ui, displayer):
+    spec = ui.config(b'command-templates', b'graphnode')
+    if not spec:
+        return templatekw.getgraphnode  # fast path for "{graphnode}"
+
+    spec = templater.unquotestring(spec)
+    if isinstance(displayer, changesettemplater):
+        # reuse cache of slow templates
+        tres = displayer._tresources
+    else:
+        tres = formatter.templateresources(ui)
+    templ = formatter.maketemplater(
+        ui, spec, defaults=templatekw.keywords, resources=tres
+    )
+
+    def formatnode(repo, ctx, cache):
+        props = {b'ctx': ctx, b'repo': repo}
+        return templ.renderdefault(props)
+
+    return formatnode
+
+
+def displaygraph(ui, repo, dag, displayer, edgefn, getcopies=None, props=None):
+    props = props or {}
+    formatnode = _graphnodeformatter(ui, displayer)
+    state = graphmod.asciistate()
+    styles = state.styles
+
+    # only set graph styling if HGPLAIN is not set.
+    if ui.plain(b'graph'):
+        # set all edge styles to |, the default pre-3.8 behaviour
+        styles.update(dict.fromkeys(styles, b'|'))
+    else:
+        edgetypes = {
+            b'parent': graphmod.PARENT,
+            b'grandparent': graphmod.GRANDPARENT,
+            b'missing': graphmod.MISSINGPARENT,
+        }
+        for name, key in edgetypes.items():
+            # experimental config: experimental.graphstyle.*
+            styles[key] = ui.config(
+                b'experimental', b'graphstyle.%s' % name, styles[key]
+            )
+            if not styles[key]:
+                styles[key] = None
+
+        # experimental config: experimental.graphshorten
+        state.graphshorten = ui.configbool(b'experimental', b'graphshorten')
+
+    formatnode_cache = {}
+    for rev, type, ctx, parents in dag:
+        char = formatnode(repo, ctx, formatnode_cache)
+        copies = getcopies(ctx) if getcopies else None
+        edges = edgefn(type, char, state, rev, parents)
+        firstedge = next(edges)
+        width = firstedge[2]
+        displayer.show(
+            ctx, copies=copies, graphwidth=width, **pycompat.strkwargs(props)
+        )
+        lines = displayer.hunk.pop(rev).split(b'\n')
+        if not lines[-1]:
+            del lines[-1]
+        displayer.flush(ctx)
+        for type, char, width, coldata in itertools.chain([firstedge], edges):
+            graphmod.ascii(ui, state, type, char, lines, coldata)
+            lines = []
+    displayer.close()
+
+
+def displaygraphrevs(ui, repo, revs, displayer, getrenamed):
+    revdag = graphmod.dagwalker(repo, revs)
+    displaygraph(ui, repo, revdag, displayer, graphmod.asciiedges, getrenamed)
+
+
+def displayrevs(ui, repo, revs, displayer, getcopies):
+    for rev in revs:
+        ctx = repo[rev]
+        copies = getcopies(ctx) if getcopies else None
+        displayer.show(ctx, copies=copies)
+        displayer.flush(ctx)
+    displayer.close()
+
+
+def checkunsupportedgraphflags(pats, opts):
+    for op in [b"newest_first"]:
+        if op in opts and opts[op]:
+            raise error.InputError(
+                _(b"-G/--graph option is incompatible with --%s")
+                % op.replace(b"_", b"-")
+            )
+
+
+def graphrevs(repo, nodes, opts):
+    limit = getlimit(opts)
+    nodes.reverse()
+    if limit is not None:
+        nodes = nodes[:limit]
+    return graphmod.nodes(repo, nodes)
+                                                                                                                                                                                                                             usr/lib/python3/dist-packages/mercurial/logexchange.py                                              0000644 0000000 0000000 00000011641 14355257011 021575  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        # logexchange.py
+#
+# Copyright 2017 Augie Fackler <raf@durin42.com>
+# Copyright 2017 Sean Farley <sean@farley.io>
+#
+# This software may be used and distributed according to the terms of the
+# GNU General Public License version 2 or any later version.
+
+
+from .node import hex
+
+from . import (
+    util,
+    vfs as vfsmod,
+)
+from .utils import (
+    urlutil,
+)
+
+# directory name in .hg/ in which remotenames files will be present
+remotenamedir = b'logexchange'
+
+
+def readremotenamefile(repo, filename):
+    """
+    reads a file from .hg/logexchange/ directory and yields it's content
+    filename: the file to be read
+    yield a tuple (node, remotepath, name)
+    """
+
+    vfs = vfsmod.vfs(repo.vfs.join(remotenamedir))
+    if not vfs.exists(filename):
+        return
+    f = vfs(filename)
+    lineno = 0
+    for line in f:
+        line = line.strip()
+        if not line:
+            continue
+        # contains the version number
+        if lineno == 0:
+            lineno += 1
+        try:
+            node, remote, rname = line.split(b'\0')
+            yield node, remote, rname
+        except ValueError:
+            pass
+
+    f.close()
+
+
+def readremotenames(repo):
+    """
+    read the details about the remotenames stored in .hg/logexchange/ and
+    yields a tuple (node, remotepath, name). It does not yields information
+    about whether an entry yielded is branch or bookmark. To get that
+    information, call the respective functions.
+    """
+
+    for bmentry in readremotenamefile(repo, b'bookmarks'):
+        yield bmentry
+    for branchentry in readremotenamefile(repo, b'branches'):
+        yield branchentry
+
+
+def writeremotenamefile(repo, remotepath, names, nametype):
+    vfs = vfsmod.vfs(repo.vfs.join(remotenamedir))
+    f = vfs(nametype, b'w', atomictemp=True)
+    # write the storage version info on top of file
+    # version '0' represents the very initial version of the storage format
+    f.write(b'0\n\n')
+
+    olddata = set(readremotenamefile(repo, nametype))
+    # re-save the data from a different remote than this one.
+    for node, oldpath, rname in sorted(olddata):
+        if oldpath != remotepath:
+            f.write(b'%s\0%s\0%s\n' % (node, oldpath, rname))
+
+    for name, node in sorted(names.items()):
+        if nametype == b"branches":
+            for n in node:
+                f.write(b'%s\0%s\0%s\n' % (n, remotepath, name))
+        elif nametype == b"bookmarks":
+            if node:
+                f.write(b'%s\0%s\0%s\n' % (node, remotepath, name))
+
+    f.close()
+
+
+def saveremotenames(repo, remotepath, branches=None, bookmarks=None):
+    """
+    save remotenames i.e. remotebookmarks and remotebranches in their
+    respective files under ".hg/logexchange/" directory.
+    """
+    wlock = repo.wlock()
+    try:
+        if bookmarks:
+            writeremotenamefile(repo, remotepath, bookmarks, b'bookmarks')
+        if branches:
+            writeremotenamefile(repo, remotepath, branches, b'branches')
+    finally:
+        wlock.release()
+
+
+def activepath(repo, remote):
+    """returns remote path"""
+    # is the remote a local peer
+    local = remote.local()
+
+    # determine the remote path from the repo, if possible; else just
+    # use the string given to us
+    rpath = remote
+    if local:
+        rpath = util.pconvert(remote._repo.root)
+    elif not isinstance(remote, bytes):
+        rpath = remote._url
+
+    # represent the remotepath with user defined path name if exists
+    for path, url in repo.ui.configitems(b'paths'):
+        # remove auth info from user defined url
+        noauthurl = urlutil.removeauth(url)
+
+        # Standardize on unix style paths, otherwise some {remotenames} end up
+        # being an absolute path on Windows.
+        url = util.pconvert(bytes(url))
+        noauthurl = util.pconvert(noauthurl)
+        if url == rpath or noauthurl == rpath:
+            rpath = path
+            break
+
+    return rpath
+
+
+def pullremotenames(localrepo, remoterepo):
+    """
+    pulls bookmarks and branches information of the remote repo during a
+    pull or clone operation.
+    localrepo is our local repository
+    remoterepo is the peer instance
+    """
+    remotepath = activepath(localrepo, remoterepo)
+
+    with remoterepo.commandexecutor() as e:
+        bookmarks = e.callcommand(
+            b'listkeys',
+            {
+                b'namespace': b'bookmarks',
+            },
+        ).result()
+
+    # on a push, we don't want to keep obsolete heads since
+    # they won't show up as heads on the next pull, so we
+    # remove them here otherwise we would require the user
+    # to issue a pull to refresh the storage
+    bmap = {}
+    repo = localrepo.unfiltered()
+
+    with remoterepo.commandexecutor() as e:
+        branchmap = e.callcommand(b'branchmap', {}).result()
+
+    for branch, nodes in branchmap.items():
+        bmap[branch] = []
+        for node in nodes:
+            if node in repo and not repo[node].obsolete():
+                bmap[branch].append(hex(node))
+
+    saveremotenames(localrepo, remotepath, bmap, bookmarks)
+                                                                                               usr/lib/python3/dist-packages/mercurial/loggingutil.py                                              0000644 0000000 0000000 00000007540 14355257011 021640  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        # loggingutil.py - utility for logging events
+#
+# Copyright 2010 Nicolas Dumazet
+# Copyright 2013 Facebook, Inc.
+#
+# This software may be used and distributed according to the terms of the
+# GNU General Public License version 2 or any later version.
+
+
+import errno
+
+from . import (
+    encoding,
+)
+
+from .utils import (
+    dateutil,
+    procutil,
+    stringutil,
+)
+
+
+def openlogfile(ui, vfs, name, maxfiles=0, maxsize=0):
+    """Open log file in append mode, with optional rotation
+
+    If maxsize > 0, the log file will be rotated up to maxfiles.
+    """
+
+    def rotate(oldpath, newpath):
+        try:
+            vfs.unlink(newpath)
+        except OSError as err:
+            if err.errno != errno.ENOENT:
+                ui.debug(
+                    b"warning: cannot remove '%s': %s\n"
+                    % (newpath, encoding.strtolocal(err.strerror))
+                )
+        try:
+            if newpath:
+                vfs.rename(oldpath, newpath)
+        except OSError as err:
+            if err.errno != errno.ENOENT:
+                ui.debug(
+                    b"warning: cannot rename '%s' to '%s': %s\n"
+                    % (newpath, oldpath, encoding.strtolocal(err.strerror))
+                )
+
+    if maxsize > 0:
+        try:
+            st = vfs.stat(name)
+        except OSError:
+            pass
+        else:
+            if st.st_size >= maxsize:
+                path = vfs.join(name)
+                for i in range(maxfiles - 1, 1, -1):
+                    rotate(
+                        oldpath=b'%s.%d' % (path, i - 1),
+                        newpath=b'%s.%d' % (path, i),
+                    )
+                rotate(oldpath=path, newpath=maxfiles > 0 and path + b'.1')
+    return vfs(name, b'a', makeparentdirs=False)
+
+
+def _formatlogline(msg):
+    date = dateutil.datestr(format=b'%Y/%m/%d %H:%M:%S')
+    pid = procutil.getpid()
+    return b'%s (%d)> %s' % (date, pid, msg)
+
+
+def _matchevent(event, tracked):
+    return b'*' in tracked or event in tracked
+
+
+class filelogger:
+    """Basic logger backed by physical file with optional rotation"""
+
+    def __init__(self, vfs, name, tracked, maxfiles=0, maxsize=0):
+        self._vfs = vfs
+        self._name = name
+        self._trackedevents = set(tracked)
+        self._maxfiles = maxfiles
+        self._maxsize = maxsize
+
+    def tracked(self, event):
+        return _matchevent(event, self._trackedevents)
+
+    def log(self, ui, event, msg, opts):
+        line = _formatlogline(msg)
+        try:
+            with openlogfile(
+                ui,
+                self._vfs,
+                self._name,
+                maxfiles=self._maxfiles,
+                maxsize=self._maxsize,
+            ) as fp:
+                fp.write(line)
+        except IOError as err:
+            ui.debug(
+                b'cannot write to %s: %s\n'
+                % (self._name, stringutil.forcebytestr(err))
+            )
+
+
+class fileobjectlogger:
+    """Basic logger backed by file-like object"""
+
+    def __init__(self, fp, tracked):
+        self._fp = fp
+        self._trackedevents = set(tracked)
+
+    def tracked(self, event):
+        return _matchevent(event, self._trackedevents)
+
+    def log(self, ui, event, msg, opts):
+        line = _formatlogline(msg)
+        try:
+            self._fp.write(line)
+            self._fp.flush()
+        except IOError as err:
+            ui.debug(
+                b'cannot write to %s: %s\n'
+                % (
+                    stringutil.forcebytestr(self._fp.name),
+                    stringutil.forcebytestr(err),
+                )
+            )
+
+
+class proxylogger:
+    """Forward log events to another logger to be set later"""
+
+    def __init__(self):
+        self.logger = None
+
+    def tracked(self, event):
+        return self.logger is not None and self.logger.tracked(event)
+
+    def log(self, ui, event, msg, opts):
+        assert self.logger is not None
+        self.logger.log(ui, event, msg, opts)
+                                                                                                                                                                usr/lib/python3/dist-packages/mercurial/lsprof.py                                                   0000644 0000000 0000000 00000010046 14355257011 020614  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        import _lsprof
+import sys
+
+from .pycompat import getattr
+
+Profiler = _lsprof.Profiler
+
+# PyPy doesn't expose profiler_entry from the module.
+profiler_entry = getattr(_lsprof, 'profiler_entry', None)
+
+__all__ = [b'profile', b'Stats']
+
+
+def profile(f, *args, **kwds):
+    """XXX docstring"""
+    p = Profiler()
+    p.enable(subcalls=True, builtins=True)
+    try:
+        f(*args, **kwds)
+    finally:
+        p.disable()
+    return Stats(p.getstats())
+
+
+class Stats:
+    """XXX docstring"""
+
+    def __init__(self, data):
+        self.data = data
+
+    def sort(self, crit="inlinetime"):
+        """XXX docstring"""
+        # profiler_entries isn't defined when running under PyPy.
+        if profiler_entry:
+            if crit not in profiler_entry.__dict__:
+                raise ValueError(b"Can't sort by %s" % crit)
+        elif self.data and not getattr(self.data[0], crit, None):
+            raise ValueError(b"Can't sort by %s" % crit)
+
+        self.data.sort(key=lambda x: getattr(x, crit), reverse=True)
+        for e in self.data:
+            if e.calls:
+                e.calls.sort(key=lambda x: getattr(x, crit), reverse=True)
+
+    def pprint(self, top=None, file=None, limit=None, climit=None):
+        """XXX docstring"""
+        if file is None:
+            file = sys.stdout
+        d = self.data
+        if top is not None:
+            d = d[:top]
+        cols = b"% 12d %12d %11.4f %11.4f   %s\n"
+        hcols = b"% 12s %12s %12s %12s %s\n"
+        file.write(
+            hcols
+            % (
+                b"CallCount",
+                b"Recursive",
+                b"Total(s)",
+                b"Inline(s)",
+                b"module:lineno(function)",
+            )
+        )
+        count = 0
+        for e in d:
+            file.write(
+                cols
+                % (
+                    e.callcount,
+                    e.reccallcount,
+                    e.totaltime,
+                    e.inlinetime,
+                    label(e.code),
+                )
+            )
+            count += 1
+            if limit is not None and count == limit:
+                return
+            ccount = 0
+            if climit and e.calls:
+                for se in e.calls:
+                    file.write(
+                        cols
+                        % (
+                            se.callcount,
+                            se.reccallcount,
+                            se.totaltime,
+                            se.inlinetime,
+                            b"    %s" % label(se.code),
+                        )
+                    )
+                    count += 1
+                    ccount += 1
+                    if limit is not None and count == limit:
+                        return
+                    if climit is not None and ccount == climit:
+                        break
+
+    def freeze(self):
+        """Replace all references to code objects with string
+        descriptions; this makes it possible to pickle the instance."""
+
+        # this code is probably rather ickier than it needs to be!
+        for i in range(len(self.data)):
+            e = self.data[i]
+            if not isinstance(e.code, str):
+                self.data[i] = type(e)((label(e.code),) + e[1:])
+            if e.calls:
+                for j in range(len(e.calls)):
+                    se = e.calls[j]
+                    if not isinstance(se.code, str):
+                        e.calls[j] = type(se)((label(se.code),) + se[1:])
+
+
+_fn2mod = {}
+
+
+def label(code):
+    if isinstance(code, str):
+        return code.encode('latin-1')
+    try:
+        mname = _fn2mod[code.co_filename]
+    except KeyError:
+        for k, v in list(sys.modules.items()):
+            if v is None:
+                continue
+            if not isinstance(getattr(v, '__file__', None), str):
+                continue
+            if v.__file__.startswith(code.co_filename):
+                mname = _fn2mod[code.co_filename] = k
+                break
+        else:
+            mname = _fn2mod[code.co_filename] = '<%s>' % code.co_filename
+
+    res = '%s:%d(%s)' % (mname, code.co_firstlineno, code.co_name)
+
+    return res.encode('latin-1')
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          usr/lib/python3/dist-packages/mercurial/lsprofcalltree.py                                           0000644 0000000 0000000 00000005305 14355257011 022332  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        """
+lsprofcalltree.py - lsprof output which is readable by kcachegrind
+
+Authors:
+    * David Allouche <david <at> allouche.net>
+    * Jp Calderone & Itamar Shtull-Trauring
+    * Johan Dahlin
+
+This software may be used and distributed according to the terms
+of the GNU General Public License, incorporated herein by reference.
+"""
+
+
+from . import pycompat
+
+
+def label(code):
+    if isinstance(code, str):
+        # built-in functions ('~' sorts at the end)
+        return b'~' + pycompat.sysbytes(code)
+    else:
+        return b'%s %s:%d' % (
+            pycompat.sysbytes(code.co_name),
+            pycompat.sysbytes(code.co_filename),
+            code.co_firstlineno,
+        )
+
+
+class KCacheGrind:
+    def __init__(self, profiler):
+        self.data = profiler.getstats()
+        self.out_file = None
+
+    def output(self, out_file):
+        self.out_file = out_file
+        out_file.write(b'events: Ticks\n')
+        self._print_summary()
+        for entry in self.data:
+            self._entry(entry)
+
+    def _print_summary(self):
+        max_cost = 0
+        for entry in self.data:
+            totaltime = int(entry.totaltime * 1000)
+            max_cost = max(max_cost, totaltime)
+        self.out_file.write(b'summary: %d\n' % max_cost)
+
+    def _entry(self, entry):
+        out_file = self.out_file
+
+        code = entry.code
+        if isinstance(code, str):
+            out_file.write(b'fi=~\n')
+        else:
+            out_file.write(b'fi=%s\n' % pycompat.sysbytes(code.co_filename))
+
+        out_file.write(b'fn=%s\n' % label(code))
+
+        inlinetime = int(entry.inlinetime * 1000)
+        if isinstance(code, str):
+            out_file.write(b'0 %d\n' % inlinetime)
+        else:
+            out_file.write(b'%d %d\n' % (code.co_firstlineno, inlinetime))
+
+        # recursive calls are counted in entry.calls
+        if entry.calls:
+            calls = entry.calls
+        else:
+            calls = []
+
+        if isinstance(code, str):
+            lineno = 0
+        else:
+            lineno = code.co_firstlineno
+
+        for subentry in calls:
+            self._subentry(lineno, subentry)
+
+        out_file.write(b'\n')
+
+    def _subentry(self, lineno, subentry):
+        out_file = self.out_file
+        code = subentry.code
+        out_file.write(b'cfn=%s\n' % label(code))
+        if isinstance(code, str):
+            out_file.write(b'cfi=~\n')
+            out_file.write(b'calls=%d 0\n' % subentry.callcount)
+        else:
+            out_file.write(b'cfi=%s\n' % pycompat.sysbytes(code.co_filename))
+            out_file.write(
+                b'calls=%d %d\n' % (subentry.callcount, code.co_firstlineno)
+            )
+
+        totaltime = int(subentry.totaltime * 1000)
+        out_file.write(b'%d %d\n' % (lineno, totaltime))
+                                                                                                                                                                                                                                                                                                                           usr/lib/python3/dist-packages/mercurial/mail.py                                                     0000644 0000000 0000000 00000041403 14355257011 020232  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        # mail.py - mail sending bits for mercurial
+#
+# Copyright 2006 Olivia Mackall <olivia@selenic.com>
+#
+# This software may be used and distributed according to the terms of the
+# GNU General Public License version 2 or any later version.
+
+
+import email
+import email.charset
+import email.generator
+import email.header
+import email.message
+import email.parser
+import io
+import os
+import smtplib
+import socket
+import time
+
+from .i18n import _
+from .pycompat import (
+    getattr,
+    open,
+)
+from . import (
+    encoding,
+    error,
+    pycompat,
+    sslutil,
+    util,
+)
+from .utils import (
+    procutil,
+    stringutil,

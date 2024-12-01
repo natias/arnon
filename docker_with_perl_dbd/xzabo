@@ -1,0 +1,1000 @@
+        if token is not None:
+            for t in token:
+                if t.token_type == 'extended-attrtext':
+                    break
+            t.token_type == 'attrtext'
+            appendto.append(t)
+            param.charset = t.value
+        if value[0] != "'":
+            raise errors.HeaderParseError("Expected RFC2231 char/lang encoding "
+                                          "delimiter, but found {!r}".format(value))
+        appendto.append(ValueTerminal("'", 'RFC2231-delimiter'))
+        value = value[1:]
+        if value and value[0] != "'":
+            token, value = get_attrtext(value)
+            appendto.append(token)
+            param.lang = token.value
+            if not value or value[0] != "'":
+                raise errors.HeaderParseError("Expected RFC2231 char/lang encoding "
+                                  "delimiter, but found {}".format(value))
+        appendto.append(ValueTerminal("'", 'RFC2231-delimiter'))
+        value = value[1:]
+    if remainder is not None:
+        # Treat the rest of value as bare quoted string content.
+        v = Value()
+        while value:
+            if value[0] in WSP:
+                token, value = get_fws(value)
+            elif value[0] == '"':
+                token = ValueTerminal('"', 'DQUOTE')
+                value = value[1:]
+            else:
+                token, value = get_qcontent(value)
+            v.append(token)
+        token = v
+    else:
+        token, value = get_value(value)
+    appendto.append(token)
+    if remainder is not None:
+        assert not value, value
+        value = remainder
+    return param, value
+
+def parse_mime_parameters(value):
+    """ parameter *( ";" parameter )
+
+    That BNF is meant to indicate this routine should only be called after
+    finding and handling the leading ';'.  There is no corresponding rule in
+    the formal RFC grammar, but it is more convenient for us for the set of
+    parameters to be treated as its own TokenList.
+
+    This is 'parse' routine because it consumes the remaining value, but it
+    would never be called to parse a full header.  Instead it is called to
+    parse everything after the non-parameter value of a specific MIME header.
+
+    """
+    mime_parameters = MimeParameters()
+    while value:
+        try:
+            token, value = get_parameter(value)
+            mime_parameters.append(token)
+        except errors.HeaderParseError as err:
+            leader = None
+            if value[0] in CFWS_LEADER:
+                leader, value = get_cfws(value)
+            if not value:
+                mime_parameters.append(leader)
+                return mime_parameters
+            if value[0] == ';':
+                if leader is not None:
+                    mime_parameters.append(leader)
+                mime_parameters.defects.append(errors.InvalidHeaderDefect(
+                    "parameter entry with no content"))
+            else:
+                token, value = get_invalid_parameter(value)
+                if leader:
+                    token[:0] = [leader]
+                mime_parameters.append(token)
+                mime_parameters.defects.append(errors.InvalidHeaderDefect(
+                    "invalid parameter {!r}".format(token)))
+        if value and value[0] != ';':
+            # Junk after the otherwise valid parameter.  Mark it as
+            # invalid, but it will have a value.
+            param = mime_parameters[-1]
+            param.token_type = 'invalid-parameter'
+            token, value = get_invalid_parameter(value)
+            param.extend(token)
+            mime_parameters.defects.append(errors.InvalidHeaderDefect(
+                "parameter with invalid trailing text {!r}".format(token)))
+        if value:
+            # Must be a ';' at this point.
+            mime_parameters.append(ValueTerminal(';', 'parameter-separator'))
+            value = value[1:]
+    return mime_parameters
+
+def _find_mime_parameters(tokenlist, value):
+    """Do our best to find the parameters in an invalid MIME header
+
+    """
+    while value and value[0] != ';':
+        if value[0] in PHRASE_ENDS:
+            tokenlist.append(ValueTerminal(value[0], 'misplaced-special'))
+            value = value[1:]
+        else:
+            token, value = get_phrase(value)
+            tokenlist.append(token)
+    if not value:
+        return
+    tokenlist.append(ValueTerminal(';', 'parameter-separator'))
+    tokenlist.append(parse_mime_parameters(value[1:]))
+
+def parse_content_type_header(value):
+    """ maintype "/" subtype *( ";" parameter )
+
+    The maintype and substype are tokens.  Theoretically they could
+    be checked against the official IANA list + x-token, but we
+    don't do that.
+    """
+    ctype = ContentType()
+    recover = False
+    if not value:
+        ctype.defects.append(errors.HeaderMissingRequiredValue(
+            "Missing content type specification"))
+        return ctype
+    try:
+        token, value = get_token(value)
+    except errors.HeaderParseError:
+        ctype.defects.append(errors.InvalidHeaderDefect(
+            "Expected content maintype but found {!r}".format(value)))
+        _find_mime_parameters(ctype, value)
+        return ctype
+    ctype.append(token)
+    # XXX: If we really want to follow the formal grammar we should make
+    # mantype and subtype specialized TokenLists here.  Probably not worth it.
+    if not value or value[0] != '/':
+        ctype.defects.append(errors.InvalidHeaderDefect(
+            "Invalid content type"))
+        if value:
+            _find_mime_parameters(ctype, value)
+        return ctype
+    ctype.maintype = token.value.strip().lower()
+    ctype.append(ValueTerminal('/', 'content-type-separator'))
+    value = value[1:]
+    try:
+        token, value = get_token(value)
+    except errors.HeaderParseError:
+        ctype.defects.append(errors.InvalidHeaderDefect(
+            "Expected content subtype but found {!r}".format(value)))
+        _find_mime_parameters(ctype, value)
+        return ctype
+    ctype.append(token)
+    ctype.subtype = token.value.strip().lower()
+    if not value:
+        return ctype
+    if value[0] != ';':
+        ctype.defects.append(errors.InvalidHeaderDefect(
+            "Only parameters are valid after content type, but "
+            "found {!r}".format(value)))
+        # The RFC requires that a syntactically invalid content-type be treated
+        # as text/plain.  Perhaps we should postel this, but we should probably
+        # only do that if we were checking the subtype value against IANA.
+        del ctype.maintype, ctype.subtype
+        _find_mime_parameters(ctype, value)
+        return ctype
+    ctype.append(ValueTerminal(';', 'parameter-separator'))
+    ctype.append(parse_mime_parameters(value[1:]))
+    return ctype
+
+def parse_content_disposition_header(value):
+    """ disposition-type *( ";" parameter )
+
+    """
+    disp_header = ContentDisposition()
+    if not value:
+        disp_header.defects.append(errors.HeaderMissingRequiredValue(
+            "Missing content disposition"))
+        return disp_header
+    try:
+        token, value = get_token(value)
+    except errors.HeaderParseError:
+        disp_header.defects.append(errors.InvalidHeaderDefect(
+            "Expected content disposition but found {!r}".format(value)))
+        _find_mime_parameters(disp_header, value)
+        return disp_header
+    disp_header.append(token)
+    disp_header.content_disposition = token.value.strip().lower()
+    if not value:
+        return disp_header
+    if value[0] != ';':
+        disp_header.defects.append(errors.InvalidHeaderDefect(
+            "Only parameters are valid after content disposition, but "
+            "found {!r}".format(value)))
+        _find_mime_parameters(disp_header, value)
+        return disp_header
+    disp_header.append(ValueTerminal(';', 'parameter-separator'))
+    disp_header.append(parse_mime_parameters(value[1:]))
+    return disp_header
+
+def parse_content_transfer_encoding_header(value):
+    """ mechanism
+
+    """
+    # We should probably validate the values, since the list is fixed.
+    cte_header = ContentTransferEncoding()
+    if not value:
+        cte_header.defects.append(errors.HeaderMissingRequiredValue(
+            "Missing content transfer encoding"))
+        return cte_header
+    try:
+        token, value = get_token(value)
+    except errors.HeaderParseError:
+        cte_header.defects.append(errors.InvalidHeaderDefect(
+            "Expected content transfer encoding but found {!r}".format(value)))
+    else:
+        cte_header.append(token)
+        cte_header.cte = token.value.strip().lower()
+    if not value:
+        return cte_header
+    while value:
+        cte_header.defects.append(errors.InvalidHeaderDefect(
+            "Extra text after content transfer encoding"))
+        if value[0] in PHRASE_ENDS:
+            cte_header.append(ValueTerminal(value[0], 'misplaced-special'))
+            value = value[1:]
+        else:
+            token, value = get_phrase(value)
+            cte_header.append(token)
+    return cte_header
+
+
+#
+# Header folding
+#
+# Header folding is complex, with lots of rules and corner cases.  The
+# following code does its best to obey the rules and handle the corner
+# cases, but you can be sure there are few bugs:)
+#
+# This folder generally canonicalizes as it goes, preferring the stringified
+# version of each token.  The tokens contain information that supports the
+# folder, including which tokens can be encoded in which ways.
+#
+# Folded text is accumulated in a simple list of strings ('lines'), each
+# one of which should be less than policy.max_line_length ('maxlen').
+#
+
+def _steal_trailing_WSP_if_exists(lines):
+    wsp = ''
+    if lines and lines[-1] and lines[-1][-1] in WSP:
+        wsp = lines[-1][-1]
+        lines[-1] = lines[-1][:-1]
+    return wsp
+
+def _refold_parse_tree(parse_tree, *, policy):
+    """Return string of contents of parse_tree folded according to RFC rules.
+
+    """
+    # max_line_length 0/None means no limit, ie: infinitely long.
+    maxlen = policy.max_line_length or sys.maxsize
+    encoding = 'utf-8' if policy.utf8 else 'us-ascii'
+    lines = ['']
+    last_ew = None
+    wrap_as_ew_blocked = 0
+    want_encoding = False
+    end_ew_not_allowed = Terminal('', 'wrap_as_ew_blocked')
+    parts = list(parse_tree)
+    while parts:
+        part = parts.pop(0)
+        if part is end_ew_not_allowed:
+            wrap_as_ew_blocked -= 1
+            continue
+        tstr = str(part)
+        if part.token_type == 'ptext' and set(tstr) & SPECIALS:
+            # Encode if tstr contains special characters.
+            want_encoding = True
+        try:
+            tstr.encode(encoding)
+            charset = encoding
+        except UnicodeEncodeError:
+            if any(isinstance(x, errors.UndecodableBytesDefect)
+                   for x in part.all_defects):
+                charset = 'unknown-8bit'
+            else:
+                # If policy.utf8 is false this should really be taken from a
+                # 'charset' property on the policy.
+                charset = 'utf-8'
+            want_encoding = True
+        if part.token_type == 'mime-parameters':
+            # Mime parameter folding (using RFC2231) is extra special.
+            _fold_mime_parameters(part, lines, maxlen, encoding)
+            continue
+        if want_encoding and not wrap_as_ew_blocked:
+            if not part.as_ew_allowed:
+                want_encoding = False
+                last_ew = None
+                if part.syntactic_break:
+                    encoded_part = part.fold(policy=policy)[:-len(policy.linesep)]
+                    if policy.linesep not in encoded_part:
+                        # It fits on a single line
+                        if len(encoded_part) > maxlen - len(lines[-1]):
+                            # But not on this one, so start a new one.
+                            newline = _steal_trailing_WSP_if_exists(lines)
+                            # XXX what if encoded_part has no leading FWS?
+                            lines.append(newline)
+                        lines[-1] += encoded_part
+                        continue
+                # Either this is not a major syntactic break, so we don't
+                # want it on a line by itself even if it fits, or it
+                # doesn't fit on a line by itself.  Either way, fall through
+                # to unpacking the subparts and wrapping them.
+            if not hasattr(part, 'encode'):
+                # It's not a Terminal, do each piece individually.
+                parts = list(part) + parts
+            else:
+                # It's a terminal, wrap it as an encoded word, possibly
+                # combining it with previously encoded words if allowed.
+                last_ew = _fold_as_ew(tstr, lines, maxlen, last_ew,
+                                      part.ew_combine_allowed, charset)
+            want_encoding = False
+            continue
+        if len(tstr) <= maxlen - len(lines[-1]):
+            lines[-1] += tstr
+            continue
+        # This part is too long to fit.  The RFC wants us to break at
+        # "major syntactic breaks", so unless we don't consider this
+        # to be one, check if it will fit on the next line by itself.
+        if (part.syntactic_break and
+                len(tstr) + 1 <= maxlen):
+            newline = _steal_trailing_WSP_if_exists(lines)
+            if newline or part.startswith_fws():
+                lines.append(newline + tstr)
+                last_ew = None
+                continue
+        if not hasattr(part, 'encode'):
+            # It's not a terminal, try folding the subparts.
+            newparts = list(part)
+            if not part.as_ew_allowed:
+                wrap_as_ew_blocked += 1
+                newparts.append(end_ew_not_allowed)
+            parts = newparts + parts
+            continue
+        if part.as_ew_allowed and not wrap_as_ew_blocked:
+            # It doesn't need CTE encoding, but encode it anyway so we can
+            # wrap it.
+            parts.insert(0, part)
+            want_encoding = True
+            continue
+        # We can't figure out how to wrap, it, so give up.
+        newline = _steal_trailing_WSP_if_exists(lines)
+        if newline or part.startswith_fws():
+            lines.append(newline + tstr)
+        else:
+            # We can't fold it onto the next line either...
+            lines[-1] += tstr
+    return policy.linesep.join(lines) + policy.linesep
+
+def _fold_as_ew(to_encode, lines, maxlen, last_ew, ew_combine_allowed, charset):
+    """Fold string to_encode into lines as encoded word, combining if allowed.
+    Return the new value for last_ew, or None if ew_combine_allowed is False.
+
+    If there is already an encoded word in the last line of lines (indicated by
+    a non-None value for last_ew) and ew_combine_allowed is true, decode the
+    existing ew, combine it with to_encode, and re-encode.  Otherwise, encode
+    to_encode.  In either case, split to_encode as necessary so that the
+    encoded segments fit within maxlen.
+
+    """
+    if last_ew is not None and ew_combine_allowed:
+        to_encode = str(
+            get_unstructured(lines[-1][last_ew:] + to_encode))
+        lines[-1] = lines[-1][:last_ew]
+    if to_encode[0] in WSP:
+        # We're joining this to non-encoded text, so don't encode
+        # the leading blank.
+        leading_wsp = to_encode[0]
+        to_encode = to_encode[1:]
+        if (len(lines[-1]) == maxlen):
+            lines.append(_steal_trailing_WSP_if_exists(lines))
+        lines[-1] += leading_wsp
+    trailing_wsp = ''
+    if to_encode[-1] in WSP:
+        # Likewise for the trailing space.
+        trailing_wsp = to_encode[-1]
+        to_encode = to_encode[:-1]
+    new_last_ew = len(lines[-1]) if last_ew is None else last_ew
+
+    encode_as = 'utf-8' if charset == 'us-ascii' else charset
+
+    # The RFC2047 chrome takes up 7 characters plus the length
+    # of the charset name.
+    chrome_len = len(encode_as) + 7
+
+    if (chrome_len + 1) >= maxlen:
+        raise errors.HeaderParseError(
+            "max_line_length is too small to fit an encoded word")
+
+    while to_encode:
+        remaining_space = maxlen - len(lines[-1])
+        text_space = remaining_space - chrome_len
+        if text_space <= 0:
+            lines.append(' ')
+            continue
+
+        to_encode_word = to_encode[:text_space]
+        encoded_word = _ew.encode(to_encode_word, charset=encode_as)
+        excess = len(encoded_word) - remaining_space
+        while excess > 0:
+            # Since the chunk to encode is guaranteed to fit into less than 100 characters,
+            # shrinking it by one at a time shouldn't take long.
+            to_encode_word = to_encode_word[:-1]
+            encoded_word = _ew.encode(to_encode_word, charset=encode_as)
+            excess = len(encoded_word) - remaining_space
+        lines[-1] += encoded_word
+        to_encode = to_encode[len(to_encode_word):]
+
+        if to_encode:
+            lines.append(' ')
+            new_last_ew = len(lines[-1])
+    lines[-1] += trailing_wsp
+    return new_last_ew if ew_combine_allowed else None
+
+def _fold_mime_parameters(part, lines, maxlen, encoding):
+    """Fold TokenList 'part' into the 'lines' list as mime parameters.
+
+    Using the decoded list of parameters and values, format them according to
+    the RFC rules, including using RFC2231 encoding if the value cannot be
+    expressed in 'encoding' and/or the parameter+value is too long to fit
+    within 'maxlen'.
+
+    """
+    # Special case for RFC2231 encoding: start from decoded values and use
+    # RFC2231 encoding iff needed.
+    #
+    # Note that the 1 and 2s being added to the length calculations are
+    # accounting for the possibly-needed spaces and semicolons we'll be adding.
+    #
+    for name, value in part.params:
+        # XXX What if this ';' puts us over maxlen the first time through the
+        # loop?  We should split the header value onto a newline in that case,
+        # but to do that we need to recognize the need earlier or reparse the
+        # header, so I'm going to ignore that bug for now.  It'll only put us
+        # one character over.
+        if not lines[-1].rstrip().endswith(';'):
+            lines[-1] += ';'
+        charset = encoding
+        error_handler = 'strict'
+        try:
+            value.encode(encoding)
+            encoding_required = False
+        except UnicodeEncodeError:
+            encoding_required = True
+            if utils._has_surrogates(value):
+                charset = 'unknown-8bit'
+                error_handler = 'surrogateescape'
+            else:
+                charset = 'utf-8'
+        if encoding_required:
+            encoded_value = urllib.parse.quote(
+                value, safe='', errors=error_handler)
+            tstr = "{}*={}''{}".format(name, charset, encoded_value)
+        else:
+            tstr = '{}={}'.format(name, quote_string(value))
+        if len(lines[-1]) + len(tstr) + 1 < maxlen:
+            lines[-1] = lines[-1] + ' ' + tstr
+            continue
+        elif len(tstr) + 2 <= maxlen:
+            lines.append(' ' + tstr)
+            continue
+        # We need multiple sections.  We are allowed to mix encoded and
+        # non-encoded sections, but we aren't going to.  We'll encode them all.
+        section = 0
+        extra_chrome = charset + "''"
+        while value:
+            chrome_len = len(name) + len(str(section)) + 3 + len(extra_chrome)
+            if maxlen <= chrome_len + 3:
+                # We need room for the leading blank, the trailing semicolon,
+                # and at least one character of the value.  If we don't
+                # have that, we'd be stuck, so in that case fall back to
+                # the RFC standard width.
+                maxlen = 78
+            splitpoint = maxchars = maxlen - chrome_len - 2
+            while True:
+                partial = value[:splitpoint]
+                encoded_value = urllib.parse.quote(
+                    partial, safe='', errors=error_handler)
+                if len(encoded_value) <= maxchars:
+                    break
+                splitpoint -= 1
+            lines.append(" {}*{}*={}{}".format(
+                name, section, extra_chrome, encoded_value))
+            extra_chrome = ''
+            section += 1
+            value = value[splitpoint:]
+            if value:
+                lines[-1] += ';'
+                          usr/lib/python3.11/email/_parseaddr.py                                                              0000644 0000000 0000000 00000042635 14671176116 016240  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        # Copyright (C) 2002-2007 Python Software Foundation
+# Contact: email-sig@python.org
+
+"""Email address parsing code.
+
+Lifted directly from rfc822.py.  This should eventually be rewritten.
+"""
+
+__all__ = [
+    'mktime_tz',
+    'parsedate',
+    'parsedate_tz',
+    'quote',
+    ]
+
+import time, calendar
+
+SPACE = ' '
+EMPTYSTRING = ''
+COMMASPACE = ', '
+
+# Parse a date field
+_monthnames = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul',
+               'aug', 'sep', 'oct', 'nov', 'dec',
+               'january', 'february', 'march', 'april', 'may', 'june', 'july',
+               'august', 'september', 'october', 'november', 'december']
+
+_daynames = ['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun']
+
+# The timezone table does not include the military time zones defined
+# in RFC822, other than Z.  According to RFC1123, the description in
+# RFC822 gets the signs wrong, so we can't rely on any such time
+# zones.  RFC1123 recommends that numeric timezone indicators be used
+# instead of timezone names.
+
+_timezones = {'UT':0, 'UTC':0, 'GMT':0, 'Z':0,
+              'AST': -400, 'ADT': -300,  # Atlantic (used in Canada)
+              'EST': -500, 'EDT': -400,  # Eastern
+              'CST': -600, 'CDT': -500,  # Central
+              'MST': -700, 'MDT': -600,  # Mountain
+              'PST': -800, 'PDT': -700   # Pacific
+              }
+
+
+def parsedate_tz(data):
+    """Convert a date string to a time tuple.
+
+    Accounts for military timezones.
+    """
+    res = _parsedate_tz(data)
+    if not res:
+        return
+    if res[9] is None:
+        res[9] = 0
+    return tuple(res)
+
+def _parsedate_tz(data):
+    """Convert date to extended time tuple.
+
+    The last (additional) element is the time zone offset in seconds, except if
+    the timezone was specified as -0000.  In that case the last element is
+    None.  This indicates a UTC timestamp that explicitly declaims knowledge of
+    the source timezone, as opposed to a +0000 timestamp that indicates the
+    source timezone really was UTC.
+
+    """
+    if not data:
+        return None
+    data = data.split()
+    if not data:  # This happens for whitespace-only input.
+        return None
+    # The FWS after the comma after the day-of-week is optional, so search and
+    # adjust for this.
+    if data[0].endswith(',') or data[0].lower() in _daynames:
+        # There's a dayname here. Skip it
+        del data[0]
+    else:
+        i = data[0].rfind(',')
+        if i >= 0:
+            data[0] = data[0][i+1:]
+    if len(data) == 3: # RFC 850 date, deprecated
+        stuff = data[0].split('-')
+        if len(stuff) == 3:
+            data = stuff + data[1:]
+    if len(data) == 4:
+        s = data[3]
+        i = s.find('+')
+        if i == -1:
+            i = s.find('-')
+        if i > 0:
+            data[3:] = [s[:i], s[i:]]
+        else:
+            data.append('') # Dummy tz
+    if len(data) < 5:
+        return None
+    data = data[:5]
+    [dd, mm, yy, tm, tz] = data
+    if not (dd and mm and yy):
+        return None
+    mm = mm.lower()
+    if mm not in _monthnames:
+        dd, mm = mm, dd.lower()
+        if mm not in _monthnames:
+            return None
+    mm = _monthnames.index(mm) + 1
+    if mm > 12:
+        mm -= 12
+    if dd[-1] == ',':
+        dd = dd[:-1]
+    i = yy.find(':')
+    if i > 0:
+        yy, tm = tm, yy
+    if yy[-1] == ',':
+        yy = yy[:-1]
+        if not yy:
+            return None
+    if not yy[0].isdigit():
+        yy, tz = tz, yy
+    if tm[-1] == ',':
+        tm = tm[:-1]
+    tm = tm.split(':')
+    if len(tm) == 2:
+        [thh, tmm] = tm
+        tss = '0'
+    elif len(tm) == 3:
+        [thh, tmm, tss] = tm
+    elif len(tm) == 1 and '.' in tm[0]:
+        # Some non-compliant MUAs use '.' to separate time elements.
+        tm = tm[0].split('.')
+        if len(tm) == 2:
+            [thh, tmm] = tm
+            tss = 0
+        elif len(tm) == 3:
+            [thh, tmm, tss] = tm
+        else:
+            return None
+    else:
+        return None
+    try:
+        yy = int(yy)
+        dd = int(dd)
+        thh = int(thh)
+        tmm = int(tmm)
+        tss = int(tss)
+    except ValueError:
+        return None
+    # Check for a yy specified in two-digit format, then convert it to the
+    # appropriate four-digit format, according to the POSIX standard. RFC 822
+    # calls for a two-digit yy, but RFC 2822 (which obsoletes RFC 822)
+    # mandates a 4-digit yy. For more information, see the documentation for
+    # the time module.
+    if yy < 100:
+        # The year is between 1969 and 1999 (inclusive).
+        if yy > 68:
+            yy += 1900
+        # The year is between 2000 and 2068 (inclusive).
+        else:
+            yy += 2000
+    tzoffset = None
+    tz = tz.upper()
+    if tz in _timezones:
+        tzoffset = _timezones[tz]
+    else:
+        try:
+            tzoffset = int(tz)
+        except ValueError:
+            pass
+        if tzoffset==0 and tz.startswith('-'):
+            tzoffset = None
+    # Convert a timezone offset into seconds ; -0500 -> -18000
+    if tzoffset:
+        if tzoffset < 0:
+            tzsign = -1
+            tzoffset = -tzoffset
+        else:
+            tzsign = 1
+        tzoffset = tzsign * ( (tzoffset//100)*3600 + (tzoffset % 100)*60)
+    # Daylight Saving Time flag is set to -1, since DST is unknown.
+    return [yy, mm, dd, thh, tmm, tss, 0, 1, -1, tzoffset]
+
+
+def parsedate(data):
+    """Convert a time string to a time tuple."""
+    t = parsedate_tz(data)
+    if isinstance(t, tuple):
+        return t[:9]
+    else:
+        return t
+
+
+def mktime_tz(data):
+    """Turn a 10-tuple as returned by parsedate_tz() into a POSIX timestamp."""
+    if data[9] is None:
+        # No zone info, so localtime is better assumption than GMT
+        return time.mktime(data[:8] + (-1,))
+    else:
+        t = calendar.timegm(data)
+        return t - data[9]
+
+
+def quote(str):
+    """Prepare string to be used in a quoted string.
+
+    Turns backslash and double quote characters into quoted pairs.  These
+    are the only characters that need to be quoted inside a quoted string.
+    Does not add the surrounding double quotes.
+    """
+    return str.replace('\\', '\\\\').replace('"', '\\"')
+
+
+class AddrlistClass:
+    """Address parser class by Ben Escoto.
+
+    To understand what this class does, it helps to have a copy of RFC 2822 in
+    front of you.
+
+    Note: this class interface is deprecated and may be removed in the future.
+    Use email.utils.AddressList instead.
+    """
+
+    def __init__(self, field):
+        """Initialize a new instance.
+
+        `field' is an unparsed address header field, containing
+        one or more addresses.
+        """
+        self.specials = '()<>@,:;.\"[]'
+        self.pos = 0
+        self.LWS = ' \t'
+        self.CR = '\r\n'
+        self.FWS = self.LWS + self.CR
+        self.atomends = self.specials + self.LWS + self.CR
+        # Note that RFC 2822 now specifies `.' as obs-phrase, meaning that it
+        # is obsolete syntax.  RFC 2822 requires that we recognize obsolete
+        # syntax, so allow dots in phrases.
+        self.phraseends = self.atomends.replace('.', '')
+        self.field = field
+        self.commentlist = []
+
+    def gotonext(self):
+        """Skip white space and extract comments."""
+        wslist = []
+        while self.pos < len(self.field):
+            if self.field[self.pos] in self.LWS + '\n\r':
+                if self.field[self.pos] not in '\n\r':
+                    wslist.append(self.field[self.pos])
+                self.pos += 1
+            elif self.field[self.pos] == '(':
+                self.commentlist.append(self.getcomment())
+            else:
+                break
+        return EMPTYSTRING.join(wslist)
+
+    def getaddrlist(self):
+        """Parse all addresses.
+
+        Returns a list containing all of the addresses.
+        """
+        result = []
+        while self.pos < len(self.field):
+            ad = self.getaddress()
+            if ad:
+                result += ad
+            else:
+                result.append(('', ''))
+        return result
+
+    def getaddress(self):
+        """Parse the next address."""
+        self.commentlist = []
+        self.gotonext()
+
+        oldpos = self.pos
+        oldcl = self.commentlist
+        plist = self.getphraselist()
+
+        self.gotonext()
+        returnlist = []
+
+        if self.pos >= len(self.field):
+            # Bad email address technically, no domain.
+            if plist:
+                returnlist = [(SPACE.join(self.commentlist), plist[0])]
+
+        elif self.field[self.pos] in '.@':
+            # email address is just an addrspec
+            # this isn't very efficient since we start over
+            self.pos = oldpos
+            self.commentlist = oldcl
+            addrspec = self.getaddrspec()
+            returnlist = [(SPACE.join(self.commentlist), addrspec)]
+
+        elif self.field[self.pos] == ':':
+            # address is a group
+            returnlist = []
+
+            fieldlen = len(self.field)
+            self.pos += 1
+            while self.pos < len(self.field):
+                self.gotonext()
+                if self.pos < fieldlen and self.field[self.pos] == ';':
+                    self.pos += 1
+                    break
+                returnlist = returnlist + self.getaddress()
+
+        elif self.field[self.pos] == '<':
+            # Address is a phrase then a route addr
+            routeaddr = self.getrouteaddr()
+
+            if self.commentlist:
+                returnlist = [(SPACE.join(plist) + ' (' +
+                               ' '.join(self.commentlist) + ')', routeaddr)]
+            else:
+                returnlist = [(SPACE.join(plist), routeaddr)]
+
+        else:
+            if plist:
+                returnlist = [(SPACE.join(self.commentlist), plist[0])]
+            elif self.field[self.pos] in self.specials:
+                self.pos += 1
+
+        self.gotonext()
+        if self.pos < len(self.field) and self.field[self.pos] == ',':
+            self.pos += 1
+        return returnlist
+
+    def getrouteaddr(self):
+        """Parse a route address (Return-path value).
+
+        This method just skips all the route stuff and returns the addrspec.
+        """
+        if self.field[self.pos] != '<':
+            return
+
+        expectroute = False
+        self.pos += 1
+        self.gotonext()
+        adlist = ''
+        while self.pos < len(self.field):
+            if expectroute:
+                self.getdomain()
+                expectroute = False
+            elif self.field[self.pos] == '>':
+                self.pos += 1
+                break
+            elif self.field[self.pos] == '@':
+                self.pos += 1
+                expectroute = True
+            elif self.field[self.pos] == ':':
+                self.pos += 1
+            else:
+                adlist = self.getaddrspec()
+                self.pos += 1
+                break
+            self.gotonext()
+
+        return adlist
+
+    def getaddrspec(self):
+        """Parse an RFC 2822 addr-spec."""
+        aslist = []
+
+        self.gotonext()
+        while self.pos < len(self.field):
+            preserve_ws = True
+            if self.field[self.pos] == '.':
+                if aslist and not aslist[-1].strip():
+                    aslist.pop()
+                aslist.append('.')
+                self.pos += 1
+                preserve_ws = False
+            elif self.field[self.pos] == '"':
+                aslist.append('"%s"' % quote(self.getquote()))
+            elif self.field[self.pos] in self.atomends:
+                if aslist and not aslist[-1].strip():
+                    aslist.pop()
+                break
+            else:
+                aslist.append(self.getatom())
+            ws = self.gotonext()
+            if preserve_ws and ws:
+                aslist.append(ws)
+
+        if self.pos >= len(self.field) or self.field[self.pos] != '@':
+            return EMPTYSTRING.join(aslist)
+
+        aslist.append('@')
+        self.pos += 1
+        self.gotonext()
+        domain = self.getdomain()
+        if not domain:
+            # Invalid domain, return an empty address instead of returning a
+            # local part to denote failed parsing.
+            return EMPTYSTRING
+        return EMPTYSTRING.join(aslist) + domain
+
+    def getdomain(self):
+        """Get the complete domain name from an address."""
+        sdlist = []
+        while self.pos < len(self.field):
+            if self.field[self.pos] in self.LWS:
+                self.pos += 1
+            elif self.field[self.pos] == '(':
+                self.commentlist.append(self.getcomment())
+            elif self.field[self.pos] == '[':
+                sdlist.append(self.getdomainliteral())
+            elif self.field[self.pos] == '.':
+                self.pos += 1
+                sdlist.append('.')
+            elif self.field[self.pos] == '@':
+                # bpo-34155: Don't parse domains with two `@` like
+                # `a@malicious.org@important.com`.
+                return EMPTYSTRING
+            elif self.field[self.pos] in self.atomends:
+                break
+            else:
+                sdlist.append(self.getatom())
+        return EMPTYSTRING.join(sdlist)
+
+    def getdelimited(self, beginchar, endchars, allowcomments=True):
+        """Parse a header fragment delimited by special characters.
+
+        `beginchar' is the start character for the fragment.
+        If self is not looking at an instance of `beginchar' then
+        getdelimited returns the empty string.
+
+        `endchars' is a sequence of allowable end-delimiting characters.
+        Parsing stops when one of these is encountered.
+
+        If `allowcomments' is non-zero, embedded RFC 2822 comments are allowed
+        within the parsed fragment.
+        """
+        if self.field[self.pos] != beginchar:
+            return ''
+
+        slist = ['']
+        quote = False
+        self.pos += 1
+        while self.pos < len(self.field):
+            if quote:
+                slist.append(self.field[self.pos])
+                quote = False
+            elif self.field[self.pos] in endchars:
+                self.pos += 1
+                break
+            elif allowcomments and self.field[self.pos] == '(':
+                slist.append(self.getcomment())
+                continue        # have already advanced pos from getcomment
+            elif self.field[self.pos] == '\\':
+                quote = True
+            else:
+                slist.append(self.field[self.pos])
+            self.pos += 1
+
+        return EMPTYSTRING.join(slist)
+
+    def getquote(self):
+        """Get a quote-delimited fragment from self's field."""
+        return self.getdelimited('"', '"\r', False)
+
+    def getcomment(self):
+        """Get a parenthesis-delimited fragment from self's field."""
+        return self.getdelimited('(', ')\r', True)
+
+    def getdomainliteral(self):
+        """Parse an RFC 2822 domain-literal."""
+        return '[%s]' % self.getdelimited('[', ']\r', False)
+
+    def getatom(self, atomends=None):
+        """Parse an RFC 2822 atom.
+
+        Optional atomends specifies a different set of end token delimiters
+        (the default is to use self.atomends).  This is used e.g. in
+        getphraselist() since phrase endings must not include the `.' (which
+        is legal in phrases)."""
+        atomlist = ['']
+        if atomends is None:
+            atomends = self.atomends
+
+        while self.pos < len(self.field):
+            if self.field[self.pos] in atomends:
+                break
+            else:
+                atomlist.append(self.field[self.pos])
+            self.pos += 1
+
+        return EMPTYSTRING.join(atomlist)
+
+    def getphraselist(self):
+        """Parse a sequence of RFC 2822 phrases.
+
+        A phrase is a sequence of words, which are in turn either RFC 2822
+        atoms or quoted-strings.  Phrases are canonicalized by squeezing all
+        runs of continuous whitespace into one space.
+        """
+        plist = []
+
+        while self.pos < len(self.field):
+            if self.field[self.pos] in self.FWS:
+                self.pos += 1
+            elif self.field[self.pos] == '"':
+                plist.append(self.getquote())
+            elif self.field[self.pos] == '(':
+                self.commentlist.append(self.getcomment())
+            elif self.field[self.pos] in self.phraseends:
+                break
+            else:

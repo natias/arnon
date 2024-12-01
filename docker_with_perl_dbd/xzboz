@@ -1,0 +1,1000 @@
+
+	return qr/^\Q$prefix\E$rx\Q$infix\E$rx$/;
+}
+
+# A regex matching a valid object ID.
+our $oid_regex;
+{
+	my $x = oid_nlen_regex($sha1_len);
+	my $y = oid_nlen_regex($sha256_extra_len);
+	$oid_regex = qr/(?:$x(?:$y)?)/;
+}
+
+# input parameters can be collected from a variety of sources (presently, CGI
+# and PATH_INFO), so we define an %input_params hash that collects them all
+# together during validation: this allows subsequent uses (e.g. href()) to be
+# agnostic of the parameter origin
+
+our %input_params = ();
+
+# input parameters are stored with the long parameter name as key. This will
+# also be used in the href subroutine to convert parameters to their CGI
+# equivalent, and since the href() usage is the most frequent one, we store
+# the name -> CGI key mapping here, instead of the reverse.
+#
+# XXX: Warning: If you touch this, check the search form for updating,
+# too.
+
+our @cgi_param_mapping = (
+	project => "p",
+	action => "a",
+	file_name => "f",
+	file_parent => "fp",
+	hash => "h",
+	hash_parent => "hp",
+	hash_base => "hb",
+	hash_parent_base => "hpb",
+	page => "pg",
+	order => "o",
+	searchtext => "s",
+	searchtype => "st",
+	snapshot_format => "sf",
+	extra_options => "opt",
+	search_use_regexp => "sr",
+	ctag => "by_tag",
+	diff_style => "ds",
+	project_filter => "pf",
+	# this must be last entry (for manipulation from JavaScript)
+	javascript => "js"
+);
+our %cgi_param_mapping = @cgi_param_mapping;
+
+# we will also need to know the possible actions, for validation
+our %actions = (
+	"blame" => \&git_blame,
+	"blame_incremental" => \&git_blame_incremental,
+	"blame_data" => \&git_blame_data,
+	"blobdiff" => \&git_blobdiff,
+	"blobdiff_plain" => \&git_blobdiff_plain,
+	"blob" => \&git_blob,
+	"blob_plain" => \&git_blob_plain,
+	"commitdiff" => \&git_commitdiff,
+	"commitdiff_plain" => \&git_commitdiff_plain,
+	"commit" => \&git_commit,
+	"forks" => \&git_forks,
+	"heads" => \&git_heads,
+	"history" => \&git_history,
+	"log" => \&git_log,
+	"patch" => \&git_patch,
+	"patches" => \&git_patches,
+	"remotes" => \&git_remotes,
+	"rss" => \&git_rss,
+	"atom" => \&git_atom,
+	"search" => \&git_search,
+	"search_help" => \&git_search_help,
+	"shortlog" => \&git_shortlog,
+	"summary" => \&git_summary,
+	"tag" => \&git_tag,
+	"tags" => \&git_tags,
+	"tree" => \&git_tree,
+	"snapshot" => \&git_snapshot,
+	"object" => \&git_object,
+	# those below don't need $project
+	"opml" => \&git_opml,
+	"project_list" => \&git_project_list,
+	"project_index" => \&git_project_index,
+);
+
+# finally, we have the hash of allowed extra_options for the commands that
+# allow them
+our %allowed_options = (
+	"--no-merges" => [ qw(rss atom log shortlog history) ],
+);
+
+# fill %input_params with the CGI parameters. All values except for 'opt'
+# should be single values, but opt can be an array. We should probably
+# build an array of parameters that can be multi-valued, but since for the time
+# being it's only this one, we just single it out
+sub evaluate_query_params {
+	our $cgi;
+
+	while (my ($name, $symbol) = each %cgi_param_mapping) {
+		if ($symbol eq 'opt') {
+			$input_params{$name} = [ map { decode_utf8($_) } $cgi->multi_param($symbol) ];
+		} else {
+			$input_params{$name} = decode_utf8($cgi->param($symbol));
+		}
+	}
+}
+
+# now read PATH_INFO and update the parameter list for missing parameters
+sub evaluate_path_info {
+	return if defined $input_params{'project'};
+	return if !$path_info;
+	$path_info =~ s,^/+,,;
+	return if !$path_info;
+
+	# find which part of PATH_INFO is project
+	my $project = $path_info;
+	$project =~ s,/+$,,;
+	while ($project && !check_head_link("$projectroot/$project")) {
+		$project =~ s,/*[^/]*$,,;
+	}
+	return unless $project;
+	$input_params{'project'} = $project;
+
+	# do not change any parameters if an action is given using the query string
+	return if $input_params{'action'};
+	$path_info =~ s,^\Q$project\E/*,,;
+
+	# next, check if we have an action
+	my $action = $path_info;
+	$action =~ s,/.*$,,;
+	if (exists $actions{$action}) {
+		$path_info =~ s,^$action/*,,;
+		$input_params{'action'} = $action;
+	}
+
+	# list of actions that want hash_base instead of hash, but can have no
+	# pathname (f) parameter
+	my @wants_base = (
+		'tree',
+		'history',
+	);
+
+	# we want to catch, among others
+	# [$hash_parent_base[:$file_parent]..]$hash_parent[:$file_name]
+	my ($parentrefname, $parentpathname, $refname, $pathname) =
+		($path_info =~ /^(?:(.+?)(?::(.+))?\.\.)?([^:]+?)?(?::(.+))?$/);
+
+	# first, analyze the 'current' part
+	if (defined $pathname) {
+		# we got "branch:filename" or "branch:dir/"
+		# we could use git_get_type(branch:pathname), but:
+		# - it needs $git_dir
+		# - it does a git() call
+		# - the convention of terminating directories with a slash
+		#   makes it superfluous
+		# - embedding the action in the PATH_INFO would make it even
+		#   more superfluous
+		$pathname =~ s,^/+,,;
+		if (!$pathname || substr($pathname, -1) eq "/") {
+			$input_params{'action'} ||= "tree";
+			$pathname =~ s,/$,,;
+		} else {
+			# the default action depends on whether we had parent info
+			# or not
+			if ($parentrefname) {
+				$input_params{'action'} ||= "blobdiff_plain";
+			} else {
+				$input_params{'action'} ||= "blob_plain";
+			}
+		}
+		$input_params{'hash_base'} ||= $refname;
+		$input_params{'file_name'} ||= $pathname;
+	} elsif (defined $refname) {
+		# we got "branch". In this case we have to choose if we have to
+		# set hash or hash_base.
+		#
+		# Most of the actions without a pathname only want hash to be
+		# set, except for the ones specified in @wants_base that want
+		# hash_base instead. It should also be noted that hand-crafted
+		# links having 'history' as an action and no pathname or hash
+		# set will fail, but that happens regardless of PATH_INFO.
+		if (defined $parentrefname) {
+			# if there is parent let the default be 'shortlog' action
+			# (for http://git.example.com/repo.git/A..B links); if there
+			# is no parent, dispatch will detect type of object and set
+			# action appropriately if required (if action is not set)
+			$input_params{'action'} ||= "shortlog";
+		}
+		if ($input_params{'action'} &&
+		    grep { $_ eq $input_params{'action'} } @wants_base) {
+			$input_params{'hash_base'} ||= $refname;
+		} else {
+			$input_params{'hash'} ||= $refname;
+		}
+	}
+
+	# next, handle the 'parent' part, if present
+	if (defined $parentrefname) {
+		# a missing pathspec defaults to the 'current' filename, allowing e.g.
+		# someproject/blobdiff/oldrev..newrev:/filename
+		if ($parentpathname) {
+			$parentpathname =~ s,^/+,,;
+			$parentpathname =~ s,/$,,;
+			$input_params{'file_parent'} ||= $parentpathname;
+		} else {
+			$input_params{'file_parent'} ||= $input_params{'file_name'};
+		}
+		# we assume that hash_parent_base is wanted if a path was specified,
+		# or if the action wants hash_base instead of hash
+		if (defined $input_params{'file_parent'} ||
+			grep { $_ eq $input_params{'action'} } @wants_base) {
+			$input_params{'hash_parent_base'} ||= $parentrefname;
+		} else {
+			$input_params{'hash_parent'} ||= $parentrefname;
+		}
+	}
+
+	# for the snapshot action, we allow URLs in the form
+	# $project/snapshot/$hash.ext
+	# where .ext determines the snapshot and gets removed from the
+	# passed $refname to provide the $hash.
+	#
+	# To be able to tell that $refname includes the format extension, we
+	# require the following two conditions to be satisfied:
+	# - the hash input parameter MUST have been set from the $refname part
+	#   of the URL (i.e. they must be equal)
+	# - the snapshot format MUST NOT have been defined already (e.g. from
+	#   CGI parameter sf)
+	# It's also useless to try any matching unless $refname has a dot,
+	# so we check for that too
+	if (defined $input_params{'action'} &&
+		$input_params{'action'} eq 'snapshot' &&
+		defined $refname && index($refname, '.') != -1 &&
+		$refname eq $input_params{'hash'} &&
+		!defined $input_params{'snapshot_format'}) {
+		# We loop over the known snapshot formats, checking for
+		# extensions. Allowed extensions are both the defined suffix
+		# (which includes the initial dot already) and the snapshot
+		# format key itself, with a prepended dot
+		while (my ($fmt, $opt) = each %known_snapshot_formats) {
+			my $hash = $refname;
+			unless ($hash =~ s/(\Q$opt->{'suffix'}\E|\Q.$fmt\E)$//) {
+				next;
+			}
+			my $sfx = $1;
+			# a valid suffix was found, so set the snapshot format
+			# and reset the hash parameter
+			$input_params{'snapshot_format'} = $fmt;
+			$input_params{'hash'} = $hash;
+			# we also set the format suffix to the one requested
+			# in the URL: this way a request for e.g. .tgz returns
+			# a .tgz instead of a .tar.gz
+			$known_snapshot_formats{$fmt}{'suffix'} = $sfx;
+			last;
+		}
+	}
+}
+
+our ($action, $project, $file_name, $file_parent, $hash, $hash_parent, $hash_base,
+     $hash_parent_base, @extra_options, $page, $searchtype, $search_use_regexp,
+     $searchtext, $search_regexp, $project_filter);
+sub evaluate_and_validate_params {
+	our $action = $input_params{'action'};
+	if (defined $action) {
+		if (!is_valid_action($action)) {
+			die_error(400, "Invalid action parameter");
+		}
+	}
+
+	# parameters which are pathnames
+	our $project = $input_params{'project'};
+	if (defined $project) {
+		if (!is_valid_project($project)) {
+			undef $project;
+			die_error(404, "No such project");
+		}
+	}
+
+	our $project_filter = $input_params{'project_filter'};
+	if (defined $project_filter) {
+		if (!is_valid_pathname($project_filter)) {
+			die_error(404, "Invalid project_filter parameter");
+		}
+	}
+
+	our $file_name = $input_params{'file_name'};
+	if (defined $file_name) {
+		if (!is_valid_pathname($file_name)) {
+			die_error(400, "Invalid file parameter");
+		}
+	}
+
+	our $file_parent = $input_params{'file_parent'};
+	if (defined $file_parent) {
+		if (!is_valid_pathname($file_parent)) {
+			die_error(400, "Invalid file parent parameter");
+		}
+	}
+
+	# parameters which are refnames
+	our $hash = $input_params{'hash'};
+	if (defined $hash) {
+		if (!is_valid_refname($hash)) {
+			die_error(400, "Invalid hash parameter");
+		}
+	}
+
+	our $hash_parent = $input_params{'hash_parent'};
+	if (defined $hash_parent) {
+		if (!is_valid_refname($hash_parent)) {
+			die_error(400, "Invalid hash parent parameter");
+		}
+	}
+
+	our $hash_base = $input_params{'hash_base'};
+	if (defined $hash_base) {
+		if (!is_valid_refname($hash_base)) {
+			die_error(400, "Invalid hash base parameter");
+		}
+	}
+
+	our @extra_options = @{$input_params{'extra_options'}};
+	# @extra_options is always defined, since it can only be (currently) set from
+	# CGI, and $cgi->param() returns the empty array in array context if the param
+	# is not set
+	foreach my $opt (@extra_options) {
+		if (not exists $allowed_options{$opt}) {
+			die_error(400, "Invalid option parameter");
+		}
+		if (not grep(/^$action$/, @{$allowed_options{$opt}})) {
+			die_error(400, "Invalid option parameter for this action");
+		}
+	}
+
+	our $hash_parent_base = $input_params{'hash_parent_base'};
+	if (defined $hash_parent_base) {
+		if (!is_valid_refname($hash_parent_base)) {
+			die_error(400, "Invalid hash parent base parameter");
+		}
+	}
+
+	# other parameters
+	our $page = $input_params{'page'};
+	if (defined $page) {
+		if ($page =~ m/[^0-9]/) {
+			die_error(400, "Invalid page parameter");
+		}
+	}
+
+	our $searchtype = $input_params{'searchtype'};
+	if (defined $searchtype) {
+		if ($searchtype =~ m/[^a-z]/) {
+			die_error(400, "Invalid searchtype parameter");
+		}
+	}
+
+	our $search_use_regexp = $input_params{'search_use_regexp'};
+
+	our $searchtext = $input_params{'searchtext'};
+	our $search_regexp = undef;
+	if (defined $searchtext) {
+		if (length($searchtext) < 2) {
+			die_error(403, "At least two characters are required for search parameter");
+		}
+		if ($search_use_regexp) {
+			$search_regexp = $searchtext;
+			if (!eval { qr/$search_regexp/; 1; }) {
+				(my $error = $@) =~ s/ at \S+ line \d+.*\n?//;
+				die_error(400, "Invalid search regexp '$search_regexp'",
+				          esc_html($error));
+			}
+		} else {
+			$search_regexp = quotemeta $searchtext;
+		}
+	}
+}
+
+# path to the current git repository
+our $git_dir;
+sub evaluate_git_dir {
+	our $git_dir = "$projectroot/$project" if $project;
+}
+
+our (@snapshot_fmts, $git_avatar, @extra_branch_refs);
+sub configure_gitweb_features {
+	# list of supported snapshot formats
+	our @snapshot_fmts = gitweb_get_feature('snapshot');
+	@snapshot_fmts = filter_snapshot_fmts(@snapshot_fmts);
+
+	our ($git_avatar) = gitweb_get_feature('avatar');
+	$git_avatar = '' unless $git_avatar =~ /^(?:gravatar|picon)$/s;
+
+	our @extra_branch_refs = gitweb_get_feature('extra-branch-refs');
+	@extra_branch_refs = filter_and_validate_refs (@extra_branch_refs);
+}
+
+sub get_branch_refs {
+	return ('heads', @extra_branch_refs);
+}
+
+# custom error handler: 'die <message>' is Internal Server Error
+sub handle_errors_html {
+	my $msg = shift; # it is already HTML escaped
+
+	# to avoid infinite loop where error occurs in die_error,
+	# change handler to default handler, disabling handle_errors_html
+	set_message("Error occurred when inside die_error:\n$msg");
+
+	# you cannot jump out of die_error when called as error handler;
+	# the subroutine set via CGI::Carp::set_message is called _after_
+	# HTTP headers are already written, so it cannot write them itself
+	die_error(undef, undef, $msg, -error_handler => 1, -no_http_header => 1);
+}
+set_message(\&handle_errors_html);
+
+# dispatch
+sub dispatch {
+	if (!defined $action) {
+		if (defined $hash) {
+			$action = git_get_type($hash);
+			$action or die_error(404, "Object does not exist");
+		} elsif (defined $hash_base && defined $file_name) {
+			$action = git_get_type("$hash_base:$file_name");
+			$action or die_error(404, "File or directory does not exist");
+		} elsif (defined $project) {
+			$action = 'summary';
+		} else {
+			$action = 'project_list';
+		}
+	}
+	if (!defined($actions{$action})) {
+		die_error(400, "Unknown action");
+	}
+	if ($action !~ m/^(?:opml|project_list|project_index)$/ &&
+	    !$project) {
+		die_error(400, "Project needed");
+	}
+	$actions{$action}->();
+}
+
+sub reset_timer {
+	our $t0 = [ gettimeofday() ]
+		if defined $t0;
+	our $number_of_git_cmds = 0;
+}
+
+our $first_request = 1;
+sub run_request {
+	reset_timer();
+
+	evaluate_uri();
+	if ($first_request) {
+		evaluate_gitweb_config();
+		evaluate_git_version();
+	}
+	if ($per_request_config) {
+		if (ref($per_request_config) eq 'CODE') {
+			$per_request_config->();
+		} elsif (!$first_request) {
+			evaluate_gitweb_config();
+		}
+	}
+	check_loadavg();
+
+	# $projectroot and $projects_list might be set in gitweb config file
+	$projects_list ||= $projectroot;
+
+	evaluate_query_params();
+	evaluate_path_info();
+	evaluate_and_validate_params();
+	evaluate_git_dir();
+
+	configure_gitweb_features();
+
+	dispatch();
+}
+
+our $is_last_request = sub { 1 };
+our ($pre_dispatch_hook, $post_dispatch_hook, $pre_listen_hook);
+our $CGI = 'CGI';
+our $cgi;
+our $FCGI_Stream_PRINT_raw = \&FCGI::Stream::PRINT;
+sub configure_as_fcgi {
+	require CGI::Fast;
+	our $CGI = 'CGI::Fast';
+	# FCGI is not Unicode aware hence the UTF-8 encoding must be done manually.
+	# However no encoding must be done within git_blob_plain() and git_snapshot()
+	# which must still output in raw binary mode.
+	no warnings 'redefine';
+	my $enc = Encode::find_encoding('UTF-8');
+	*FCGI::Stream::PRINT = sub {
+		my @OUTPUT = @_;
+		for (my $i = 1; $i < @_; $i++) {
+			$OUTPUT[$i] = $enc->encode($_[$i], Encode::FB_CROAK|Encode::LEAVE_SRC);
+		}
+		@_ = @OUTPUT;
+		goto $FCGI_Stream_PRINT_raw;
+	};
+
+	my $request_number = 0;
+	# let each child service 100 requests
+	our $is_last_request = sub { ++$request_number > 100 };
+}
+sub evaluate_argv {
+	my $script_name = $ENV{'SCRIPT_NAME'} || $ENV{'SCRIPT_FILENAME'} || __FILE__;
+	configure_as_fcgi()
+		if $script_name =~ /\.fcgi$/;
+
+	return unless (@ARGV);
+
+	require Getopt::Long;
+	Getopt::Long::GetOptions(
+		'fastcgi|fcgi|f' => \&configure_as_fcgi,
+		'nproc|n=i' => sub {
+			my ($arg, $val) = @_;
+			return unless eval { require FCGI::ProcManager; 1; };
+			my $proc_manager = FCGI::ProcManager->new({
+				n_processes => $val,
+			});
+			our $pre_listen_hook    = sub { $proc_manager->pm_manage()        };
+			our $pre_dispatch_hook  = sub { $proc_manager->pm_pre_dispatch()  };
+			our $post_dispatch_hook = sub { $proc_manager->pm_post_dispatch() };
+		},
+	);
+}
+
+sub run {
+	evaluate_argv();
+
+	$first_request = 1;
+	$pre_listen_hook->()
+		if $pre_listen_hook;
+
+ REQUEST:
+	while ($cgi = $CGI->new()) {
+		$pre_dispatch_hook->()
+			if $pre_dispatch_hook;
+
+		run_request();
+
+		$post_dispatch_hook->()
+			if $post_dispatch_hook;
+		$first_request = 0;
+
+		last REQUEST if ($is_last_request->());
+	}
+
+ DONE_GITWEB:
+	1;
+}
+
+run();
+
+if (defined caller) {
+	# wrapped in a subroutine processing requests,
+	# e.g. mod_perl with ModPerl::Registry, or PSGI with Plack::App::WrapCGI
+	return;
+} else {
+	# pure CGI script, serving single request
+	exit;
+}
+
+## ======================================================================
+## action links
+
+# possible values of extra options
+# -full => 0|1      - use absolute/full URL ($my_uri/$my_url as base)
+# -replay => 1      - start from a current view (replay with modifications)
+# -path_info => 0|1 - don't use/use path_info URL (if possible)
+# -anchor => ANCHOR - add #ANCHOR to end of URL, implies -replay if used alone
+sub href {
+	my %params = @_;
+	# default is to use -absolute url() i.e. $my_uri
+	my $href = $params{-full} ? $my_url : $my_uri;
+
+	# implicit -replay, must be first of implicit params
+	$params{-replay} = 1 if (keys %params == 1 && $params{-anchor});
+
+	$params{'project'} = $project unless exists $params{'project'};
+
+	if ($params{-replay}) {
+		while (my ($name, $symbol) = each %cgi_param_mapping) {
+			if (!exists $params{$name}) {
+				$params{$name} = $input_params{$name};
+			}
+		}
+	}
+
+	my $use_pathinfo = gitweb_check_feature('pathinfo');
+	if (defined $params{'project'} &&
+	    (exists $params{-path_info} ? $params{-path_info} : $use_pathinfo)) {
+		# try to put as many parameters as possible in PATH_INFO:
+		#   - project name
+		#   - action
+		#   - hash_parent or hash_parent_base:/file_parent
+		#   - hash or hash_base:/filename
+		#   - the snapshot_format as an appropriate suffix
+
+		# When the script is the root DirectoryIndex for the domain,
+		# $href here would be something like http://gitweb.example.com/
+		# Thus, we strip any trailing / from $href, to spare us double
+		# slashes in the final URL
+		$href =~ s,/$,,;
+
+		# Then add the project name, if present
+		$href .= "/".esc_path_info($params{'project'});
+		delete $params{'project'};
+
+		# since we destructively absorb parameters, we keep this
+		# boolean that remembers if we're handling a snapshot
+		my $is_snapshot = $params{'action'} eq 'snapshot';
+
+		# Summary just uses the project path URL, any other action is
+		# added to the URL
+		if (defined $params{'action'}) {
+			$href .= "/".esc_path_info($params{'action'})
+				unless $params{'action'} eq 'summary';
+			delete $params{'action'};
+		}
+
+		# Next, we put hash_parent_base:/file_parent..hash_base:/file_name,
+		# stripping nonexistent or useless pieces
+		$href .= "/" if ($params{'hash_base'} || $params{'hash_parent_base'}
+			|| $params{'hash_parent'} || $params{'hash'});
+		if (defined $params{'hash_base'}) {
+			if (defined $params{'hash_parent_base'}) {
+				$href .= esc_path_info($params{'hash_parent_base'});
+				# skip the file_parent if it's the same as the file_name
+				if (defined $params{'file_parent'}) {
+					if (defined $params{'file_name'} && $params{'file_parent'} eq $params{'file_name'}) {
+						delete $params{'file_parent'};
+					} elsif ($params{'file_parent'} !~ /\.\./) {
+						$href .= ":/".esc_path_info($params{'file_parent'});
+						delete $params{'file_parent'};
+					}
+				}
+				$href .= "..";
+				delete $params{'hash_parent'};
+				delete $params{'hash_parent_base'};
+			} elsif (defined $params{'hash_parent'}) {
+				$href .= esc_path_info($params{'hash_parent'}). "..";
+				delete $params{'hash_parent'};
+			}
+
+			$href .= esc_path_info($params{'hash_base'});
+			if (defined $params{'file_name'} && $params{'file_name'} !~ /\.\./) {
+				$href .= ":/".esc_path_info($params{'file_name'});
+				delete $params{'file_name'};
+			}
+			delete $params{'hash'};
+			delete $params{'hash_base'};
+		} elsif (defined $params{'hash'}) {
+			$href .= esc_path_info($params{'hash'});
+			delete $params{'hash'};
+		}
+
+		# If the action was a snapshot, we can absorb the
+		# snapshot_format parameter too
+		if ($is_snapshot) {
+			my $fmt = $params{'snapshot_format'};
+			# snapshot_format should always be defined when href()
+			# is called, but just in case some code forgets, we
+			# fall back to the default
+			$fmt ||= $snapshot_fmts[0];
+			$href .= $known_snapshot_formats{$fmt}{'suffix'};
+			delete $params{'snapshot_format'};
+		}
+	}
+
+	# now encode the parameters explicitly
+	my @result = ();
+	for (my $i = 0; $i < @cgi_param_mapping; $i += 2) {
+		my ($name, $symbol) = ($cgi_param_mapping[$i], $cgi_param_mapping[$i+1]);
+		if (defined $params{$name}) {
+			if (ref($params{$name}) eq "ARRAY") {
+				foreach my $par (@{$params{$name}}) {
+					push @result, $symbol . "=" . esc_param($par);
+				}
+			} else {
+				push @result, $symbol . "=" . esc_param($params{$name});
+			}
+		}
+	}
+	$href .= "?" . join(';', @result) if scalar @result;
+
+	# final transformation: trailing spaces must be escaped (URI-encoded)
+	$href =~ s/(\s+)$/CGI::escape($1)/e;
+
+	if ($params{-anchor}) {
+		$href .= "#".esc_param($params{-anchor});
+	}
+
+	return $href;
+}
+
+
+## ======================================================================
+## validation, quoting/unquoting and escaping
+
+sub is_valid_action {
+	my $input = shift;
+	return undef unless exists $actions{$input};
+	return 1;
+}
+
+sub is_valid_project {
+	my $input = shift;
+
+	return unless defined $input;
+	if (!is_valid_pathname($input) ||
+		!(-d "$projectroot/$input") ||
+		!check_export_ok("$projectroot/$input") ||
+		($strict_export && !project_in_list($input))) {
+		return undef;
+	} else {
+		return 1;
+	}
+}
+
+sub is_valid_pathname {
+	my $input = shift;
+
+	return undef unless defined $input;
+	# no '.' or '..' as elements of path, i.e. no '.' or '..'
+	# at the beginning, at the end, and between slashes.
+	# also this catches doubled slashes
+	if ($input =~ m!(^|/)(|\.|\.\.)(/|$)!) {
+		return undef;
+	}
+	# no null characters
+	if ($input =~ m!\0!) {
+		return undef;
+	}
+	return 1;
+}
+
+sub is_valid_ref_format {
+	my $input = shift;
+
+	return undef unless defined $input;
+	# restrictions on ref name according to git-check-ref-format
+	if ($input =~ m!(/\.|\.\.|[\000-\040\177 ~^:?*\[]|/$)!) {
+		return undef;
+	}
+	return 1;
+}
+
+sub is_valid_refname {
+	my $input = shift;
+
+	return undef unless defined $input;
+	# textual hashes are O.K.
+	if ($input =~ m/^$oid_regex$/) {
+		return 1;
+	}
+	# it must be correct pathname
+	is_valid_pathname($input) or return undef;
+	# check git-check-ref-format restrictions
+	is_valid_ref_format($input) or return undef;
+	return 1;
+}
+
+# decode sequences of octets in utf8 into Perl's internal form,
+# which is utf-8 with utf8 flag set if needed.  gitweb writes out
+# in utf-8 thanks to "binmode STDOUT, ':utf8'" at beginning
+sub to_utf8 {
+	my $str = shift;
+	return undef unless defined $str;
+
+	if (utf8::is_utf8($str) || utf8::decode($str)) {
+		return $str;
+	} else {
+		return decode($fallback_encoding, $str, Encode::FB_DEFAULT);
+	}
+}
+
+# quote unsafe chars, but keep the slash, even when it's not
+# correct, but quoted slashes look too horrible in bookmarks
+sub esc_param {
+	my $str = shift;
+	return undef unless defined $str;
+	$str =~ s/([^A-Za-z0-9\-_.~()\/:@ ]+)/CGI::escape($1)/eg;
+	$str =~ s/ /\+/g;
+	return $str;
+}
+
+# the quoting rules for path_info fragment are slightly different
+sub esc_path_info {
+	my $str = shift;
+	return undef unless defined $str;
+
+	# path_info doesn't treat '+' as space (specially), but '?' must be escaped
+	$str =~ s/([^A-Za-z0-9\-_.~();\/;:@&= +]+)/CGI::escape($1)/eg;
+
+	return $str;
+}
+
+# quote unsafe chars in whole URL, so some characters cannot be quoted
+sub esc_url {
+	my $str = shift;
+	return undef unless defined $str;
+	$str =~ s/([^A-Za-z0-9\-_.~();\/;?:@&= ]+)/CGI::escape($1)/eg;
+	$str =~ s/ /\+/g;
+	return $str;
+}
+
+# quote unsafe characters in HTML attributes
+sub esc_attr {
+
+	# for XHTML conformance escaping '"' to '&quot;' is not enough
+	return esc_html(@_);
+}
+
+# replace invalid utf8 character with SUBSTITUTION sequence
+sub esc_html {
+	my $str = shift;
+	my %opts = @_;
+
+	return undef unless defined $str;
+
+	$str = to_utf8($str);
+	$str = $cgi->escapeHTML($str);
+	if ($opts{'-nbsp'}) {
+		$str =~ s/ /&nbsp;/g;
+	}
+	$str =~ s|([[:cntrl:]])|(($1 ne "\t") ? quot_cec($1) : $1)|eg;
+	return $str;
+}
+
+# quote control characters and escape filename to HTML
+sub esc_path {
+	my $str = shift;
+	my %opts = @_;
+
+	return undef unless defined $str;
+
+	$str = to_utf8($str);
+	$str = $cgi->escapeHTML($str);
+	if ($opts{'-nbsp'}) {
+		$str =~ s/ /&nbsp;/g;
+	}
+	$str =~ s|([[:cntrl:]])|quot_cec($1)|eg;
+	return $str;
+}
+
+# Sanitize for use in XHTML + application/xml+xhtml (valid XML 1.0)
+sub sanitize {
+	my $str = shift;
+
+	return undef unless defined $str;
+
+	$str = to_utf8($str);
+	$str =~ s|([[:cntrl:]])|(index("\t\n\r", $1) != -1 ? $1 : quot_cec($1))|eg;
+	return $str;
+}
+
+# Make control characters "printable", using character escape codes (CEC)
+sub quot_cec {
+	my $cntrl = shift;
+	my %opts = @_;
+	my %es = ( # character escape codes, aka escape sequences
+		"\t" => '\t',   # tab             (HT)
+		"\n" => '\n',   # line feed       (LF)
+		"\r" => '\r',   # carriage return (CR)
+		"\f" => '\f',   # form feed       (FF)
+		"\b" => '\b',   # backspace       (BS)
+		"\a" => '\a',   # alarm (bell)    (BEL)
+		"\e" => '\e',   # escape          (ESC)
+		"\013" => '\v', # vertical tab    (VT)
+		"\000" => '\0', # nul character   (NUL)
+	);
+	my $chr = ( (exists $es{$cntrl})
+		    ? $es{$cntrl}
+		    : sprintf('\%2x', ord($cntrl)) );
+	if ($opts{-nohtml}) {
+		return $chr;
+	} else {
+		return "<span class=\"cntrl\">$chr</span>";
+	}
+}
+
+# Alternatively use unicode control pictures codepoints,
+# Unicode "printable representation" (PR)
+sub quot_upr {
+	my $cntrl = shift;
+	my %opts = @_;
+
+	my $chr = sprintf('&#%04d;', 0x2400+ord($cntrl));
+	if ($opts{-nohtml}) {
+		return $chr;
+	} else {
+		return "<span class=\"cntrl\">$chr</span>";
+	}
+}
+
+# git may return quoted and escaped filenames
+sub unquote {
+	my $str = shift;
+
+	sub unq {
+		my $seq = shift;
+		my %es = ( # character escape codes, aka escape sequences
+			't' => "\t",   # tab            (HT, TAB)
+			'n' => "\n",   # newline        (NL)
+			'r' => "\r",   # return         (CR)
+			'f' => "\f",   # form feed      (FF)
+			'b' => "\b",   # backspace      (BS)
+			'a' => "\a",   # alarm (bell)   (BEL)
+			'e' => "\e",   # escape         (ESC)
+			'v' => "\013", # vertical tab   (VT)
+		);
+
+		if ($seq =~ m/^[0-7]{1,3}$/) {
+			# octal char sequence
+			return chr(oct($seq));
+		} elsif (exists $es{$seq}) {
+			# C escape sequence, aka character escape code
+			return $es{$seq};
+		}
+		# quoted ordinary character
+		return $seq;
+	}
+
+	if ($str =~ m/^"(.*)"$/) {
+		# needs unquoting
+		$str = $1;
+		$str =~ s/\\([^0-7]|[0-7]{1,3})/unq($1)/eg;
+	}
+	return $str;
+}
+
+# escape tabs (convert tabs to spaces)
+sub untabify {
+	my $line = shift;
+
+	while ((my $pos = index($line, "\t")) != -1) {
+		if (my $count = (8 - ($pos % 8))) {
+			my $spaces = ' ' x $count;
+			$line =~ s/\t/$spaces/;
+		}
+	}
+
+	return $line;
+}
+
+sub project_in_list {
+	my $project = shift;
+	my @list = git_get_projects_list();
+	return @list && scalar(grep { $_->{'path'} eq $project } @list);
+}
+
+## ----------------------------------------------------------------------
+## HTML aware string manipulation
+
+# Try to chop given string on a word boundary between position
+# $len and $len+$add_len. If there is no word boundary there,
+# chop at $len+$add_len. Do not chop if chopped part plus ellipsis
+# (marking chopped part) would be longer than given string.
+sub chop_str {
+	my $str = shift;
+	my $len = shift;
+	my $add_len = shift || 10;
+	my $where = shift || 'right'; # 'left' | 'center' | 'right'
+
+	# Make sure perl knows it is utf8 encoded so we don't
+	# cut in the middle of a utf8 multibyte char.
+	$str = to_utf8($str);
+
+	# allow only $len chars, but don't cut a word if it would fit in $add_len
+	# if it doesn't fit, cut it if it's still longer than the dots we would add
+	# remove chopped character entities entirely
+
+	# when chopping in the middle, distribute $len into left and right part
+	# return early if chopping wouldn't make string shorter
+	if ($where eq 'center') {
+		return $str if ($len + 5 >= length($str)); # filler is length 5
+		$len = int($len/2);
+	} else {
+		return $str if ($len + 4 >= length($str)); # filler is length 4
+	}
+
+	# regexps: ending and beginning with word part up to $add_len
+	my $endre = qr/.{$len}\w{0,$add_len}/;
+	my $begre = qr/\w{0,$add_len}.{$len}/;
+
+	if ($where eq 'left') {
+		$str =~ m/^(.*?)($begre)$/;
+		my ($lead, $body) = ($1, $2);
+		if (length($lead) > 4) {
+			$lead = " ...";
+		}
+		return "$lead$body";
+
+	} elsif ($where eq 'center') {
+		$str =~ m/^($endre)(.*)$/;
+		my ($left, $str)  = ($1, $2);
+		$str =~ m/^(.*?)($begre)$/;
+		my ($mid, $right) = ($1, $2);

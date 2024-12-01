@@ -1,0 +1,1000 @@
+All filter methods return the existing filter, if present, or C<undef>
+in not.
+
+To delete a filter pass C<undef> to it.
+
+=head2 The Filter
+
+When each filter is called by Perl, a local copy of C<$_> will contain
+the key or value to be filtered. Filtering is achieved by modifying
+the contents of C<$_>. The return code from the filter is ignored.
+
+=head2 An Example -- the NULL termination problem.
+
+Consider the following scenario. You have a DBM database
+that you need to share with a third-party C application. The C application
+assumes that I<all> keys and values are NULL terminated. Unfortunately
+when Perl writes to DBM databases it doesn't use NULL termination, so
+your Perl application will have to manage NULL termination itself. When
+you write to the database you will have to use something like this:
+
+    $hash{"$key\0"} = "$value\0" ;
+
+Similarly the NULL needs to be taken into account when you are considering
+the length of existing keys/values.
+
+It would be much better if you could ignore the NULL terminations issue
+in the main application code and have a mechanism that automatically
+added the terminating NULL to all keys and values whenever you write to
+the database and have them removed when you read from the database. As I'm
+sure you have already guessed, this is a problem that DBM Filters can
+fix very easily.
+
+    use warnings ;
+    use strict ;
+    use DB_File ;
+
+    my %hash ;
+    my $filename = "filt" ;
+    unlink $filename ;
+
+    my $db = tie %hash, 'DB_File', $filename, O_CREAT|O_RDWR, 0666, $DB_HASH
+      or die "Cannot open $filename: $!\n" ;
+
+    # Install DBM Filters
+    $db->filter_fetch_key  ( sub { s/\0$//    } ) ;
+    $db->filter_store_key  ( sub { $_ .= "\0" } ) ;
+    $db->filter_fetch_value( sub { s/\0$//    } ) ;
+    $db->filter_store_value( sub { $_ .= "\0" } ) ;
+
+    $hash{"abc"} = "def" ;
+    my $a = $hash{"ABC"} ;
+    # ...
+    undef $db ;
+    untie %hash ;
+
+Hopefully the contents of each of the filters should be
+self-explanatory. Both "fetch" filters remove the terminating NULL,
+and both "store" filters add a terminating NULL.
+
+
+=head2 Another Example -- Key is a C int.
+
+Here is another real-life example. By default, whenever Perl writes to
+a DBM database it always writes the key and value as strings. So when
+you use this:
+
+    $hash{12345} = "something" ;
+
+the key 12345 will get stored in the DBM database as the 5 byte string
+"12345". If you actually want the key to be stored in the DBM database
+as a C int, you will have to use C<pack> when writing, and C<unpack>
+when reading.
+
+Here is a DBM Filter that does it:
+
+    use warnings ;
+    use strict ;
+    use DB_File ;
+    my %hash ;
+    my $filename = "filt" ;
+    unlink $filename ;
+
+
+    my $db = tie %hash, 'DB_File', $filename, O_CREAT|O_RDWR, 0666, $DB_HASH
+      or die "Cannot open $filename: $!\n" ;
+
+    $db->filter_fetch_key  ( sub { $_ = unpack("i", $_) } ) ;
+    $db->filter_store_key  ( sub { $_ = pack ("i", $_) } ) ;
+    $hash{123} = "def" ;
+    # ...
+    undef $db ;
+    untie %hash ;
+
+This time only two filters have been used -- we only need to manipulate
+the contents of the key, so it wasn't necessary to install any value
+filters.
+
+=head1 HINTS AND TIPS
+
+
+=head2 Locking: The Trouble with fd
+
+Until version 1.72 of this module, the recommended technique for locking
+B<DB_File> databases was to flock the filehandle returned from the "fd"
+function. Unfortunately this technique has been shown to be fundamentally
+flawed (Kudos to David Harris for tracking this down). Use it at your own
+peril!
+
+The locking technique went like this.
+
+    $db = tie(%db, 'DB_File', 'foo.db', O_CREAT|O_RDWR, 0644)
+        || die "dbcreat foo.db $!";
+    $fd = $db->fd;
+    open(DB_FH, "+<&=$fd") || die "dup $!";
+    flock (DB_FH, LOCK_EX) || die "flock: $!";
+    ...
+    $db{"Tom"} = "Jerry" ;
+    ...
+    flock(DB_FH, LOCK_UN);
+    undef $db;
+    untie %db;
+    close(DB_FH);
+
+In simple terms, this is what happens:
+
+=over 5
+
+=item 1.
+
+Use "tie" to open the database.
+
+=item 2.
+
+Lock the database with fd & flock.
+
+=item 3.
+
+Read & Write to the database.
+
+=item 4.
+
+Unlock and close the database.
+
+=back
+
+Here is the crux of the problem. A side-effect of opening the B<DB_File>
+database in step 2 is that an initial block from the database will get
+read from disk and cached in memory.
+
+To see why this is a problem, consider what can happen when two processes,
+say "A" and "B", both want to update the same B<DB_File> database
+using the locking steps outlined above. Assume process "A" has already
+opened the database and has a write lock, but it hasn't actually updated
+the database yet (it has finished step 2, but not started step 3 yet). Now
+process "B" tries to open the same database - step 1 will succeed,
+but it will block on step 2 until process "A" releases the lock. The
+important thing to notice here is that at this point in time both
+processes will have cached identical initial blocks from the database.
+
+Now process "A" updates the database and happens to change some of the
+data held in the initial buffer. Process "A" terminates, flushing
+all cached data to disk and releasing the database lock. At this point
+the database on disk will correctly reflect the changes made by process
+"A".
+
+With the lock released, process "B" can now continue. It also updates the
+database and unfortunately it too modifies the data that was in its
+initial buffer. Once that data gets flushed to disk it will overwrite
+some/all of the changes process "A" made to the database.
+
+The result of this scenario is at best a database that doesn't contain
+what you expect. At worst the database will corrupt.
+
+The above won't happen every time competing process update the same
+B<DB_File> database, but it does illustrate why the technique should
+not be used.
+
+=head2 Safe ways to lock a database
+
+Starting with version 2.x, Berkeley DB  has internal support for locking.
+The companion module to this one, L<BerkeleyDB|https://metacpan.org/pod/BerkeleyDB>, provides an interface
+to this locking functionality. If you are serious about locking
+Berkeley DB databases, I strongly recommend using L<BerkeleyDB|https://metacpan.org/pod/BerkeleyDB>.
+
+If using L<BerkeleyDB|https://metacpan.org/pod/BerkeleyDB> isn't an option, there are a number of modules
+available on CPAN that can be used to implement locking. Each one
+implements locking differently and has different goals in mind. It is
+therefore worth knowing the difference, so that you can pick the right
+one for your application. Here are the three locking wrappers:
+
+=over 5
+
+=item B<Tie::DB_Lock>
+
+A B<DB_File> wrapper which creates copies of the database file for
+read access, so that you have a kind of a multiversioning concurrent read
+system. However, updates are still serial. Use for databases where reads
+may be lengthy and consistency problems may occur.
+
+=item B<Tie::DB_LockFile>
+
+A B<DB_File> wrapper that has the ability to lock and unlock the database
+while it is being used. Avoids the tie-before-flock problem by simply
+re-tie-ing the database when you get or drop a lock.  Because of the
+flexibility in dropping and re-acquiring the lock in the middle of a
+session, this can be massaged into a system that will work with long
+updates and/or reads if the application follows the hints in the POD
+documentation.
+
+=item B<DB_File::Lock>
+
+An extremely lightweight B<DB_File> wrapper that simply flocks a lockfile
+before tie-ing the database and drops the lock after the untie. Allows
+one to use the same lockfile for multiple databases to avoid deadlock
+problems, if desired. Use for databases where updates are reads are
+quick and simple flock locking semantics are enough.
+
+=back
+
+=head2 Sharing Databases With C Applications
+
+There is no technical reason why a Berkeley DB database cannot be
+shared by both a Perl and a C application.
+
+The vast majority of problems that are reported in this area boil down
+to the fact that C strings are NULL terminated, whilst Perl strings are
+not. See L<DBM FILTERS> for a generic way to work around this problem.
+
+Here is a real example. Netscape 2.0 keeps a record of the locations you
+visit along with the time you last visited them in a DB_HASH database.
+This is usually stored in the file F<~/.netscape/history.db>. The key
+field in the database is the location string and the value field is the
+time the location was last visited stored as a 4 byte binary value.
+
+If you haven't already guessed, the location string is stored with a
+terminating NULL. This means you need to be careful when accessing the
+database.
+
+Here is a snippet of code that is loosely based on Tom Christiansen's
+I<ggh> script (available from your nearest CPAN archive in
+F<authors/id/TOMC/scripts/nshist.gz>).
+
+    use warnings ;
+    use strict ;
+    use DB_File ;
+    use Fcntl ;
+
+    my ($dotdir, $HISTORY, %hist_db, $href, $binary_time, $date) ;
+    $dotdir = $ENV{HOME} || $ENV{LOGNAME};
+
+    $HISTORY = "$dotdir/.netscape/history.db";
+
+    tie %hist_db, 'DB_File', $HISTORY
+        or die "Cannot open $HISTORY: $!\n" ;;
+
+    # Dump the complete database
+    while ( ($href, $binary_time) = each %hist_db ) {
+
+        # remove the terminating NULL
+        $href =~ s/\x00$// ;
+
+        # convert the binary time into a user friendly string
+        $date = localtime unpack("V", $binary_time);
+        print "$date $href\n" ;
+    }
+
+    # check for the existence of a specific key
+    # remember to add the NULL
+    if ( $binary_time = $hist_db{"http://mox.perl.com/\x00"} ) {
+        $date = localtime unpack("V", $binary_time) ;
+        print "Last visited mox.perl.com on $date\n" ;
+    }
+    else {
+        print "Never visited mox.perl.com\n"
+    }
+
+    untie %hist_db ;
+
+=head2 The untie() Gotcha
+
+If you make use of the Berkeley DB API, it is I<very> strongly
+recommended that you read L<perltie/The untie Gotcha>.
+
+Even if you don't currently make use of the API interface, it is still
+worth reading it.
+
+Here is an example which illustrates the problem from a B<DB_File>
+perspective:
+
+    use DB_File ;
+    use Fcntl ;
+
+    my %x ;
+    my $X ;
+
+    $X = tie %x, 'DB_File', 'tst.fil' , O_RDWR|O_TRUNC
+        or die "Cannot tie first time: $!" ;
+
+    $x{123} = 456 ;
+
+    untie %x ;
+
+    tie %x, 'DB_File', 'tst.fil' , O_RDWR|O_CREAT
+        or die "Cannot tie second time: $!" ;
+
+    untie %x ;
+
+When run, the script will produce this error message:
+
+    Cannot tie second time: Invalid argument at bad.file line 14.
+
+Although the error message above refers to the second tie() statement
+in the script, the source of the problem is really with the untie()
+statement that precedes it.
+
+Having read L<perltie> you will probably have already guessed that the
+error is caused by the extra copy of the tied object stored in C<$X>.
+If you haven't, then the problem boils down to the fact that the
+B<DB_File> destructor, DESTROY, will not be called until I<all>
+references to the tied object are destroyed. Both the tied variable,
+C<%x>, and C<$X> above hold a reference to the object. The call to
+untie() will destroy the first, but C<$X> still holds a valid
+reference, so the destructor will not get called and the database file
+F<tst.fil> will remain open. The fact that Berkeley DB then reports the
+attempt to open a database that is already open via the catch-all
+"Invalid argument" doesn't help.
+
+If you run the script with the C<-w> flag the error message becomes:
+
+    untie attempted while 1 inner references still exist at bad.file line 12.
+    Cannot tie second time: Invalid argument at bad.file line 14.
+
+which pinpoints the real problem. Finally the script can now be
+modified to fix the original problem by destroying the API object
+before the untie:
+
+    ...
+    $x{123} = 456 ;
+
+    undef $X ;
+    untie %x ;
+
+    $X = tie %x, 'DB_File', 'tst.fil' , O_RDWR|O_CREAT
+    ...
+
+
+=head1 COMMON QUESTIONS
+
+=head2 Why is there Perl source in my database?
+
+If you look at the contents of a database file created by DB_File,
+there can sometimes be part of a Perl script included in it.
+
+This happens because Berkeley DB uses dynamic memory to allocate
+buffers which will subsequently be written to the database file. Being
+dynamic, the memory could have been used for anything before DB
+malloced it. As Berkeley DB doesn't clear the memory once it has been
+allocated, the unused portions will contain random junk. In the case
+where a Perl script gets written to the database, the random junk will
+correspond to an area of dynamic memory that happened to be used during
+the compilation of the script.
+
+Unless you don't like the possibility of there being part of your Perl
+scripts embedded in a database file, this is nothing to worry about.
+
+=head2 How do I store complex data structures with DB_File?
+
+Although B<DB_File> cannot do this directly, there is a module which
+can layer transparently over B<DB_File> to accomplish this feat.
+
+Check out the MLDBM module, available on CPAN in the directory
+F<modules/by-module/MLDBM>.
+
+=head2 What does "wide character in subroutine entry" mean?
+
+You will usually get this message if you are working with UTF-8 data and
+want to read/write it from/to a Berkeley DB database file.
+
+The easist way to deal with this issue is to use the pre-defined "utf8"
+B<DBM_Filter> (see L<DBM_Filter>) that was designed to deal with this
+situation.
+
+The example below shows what you need if I<both> the key and value are
+expected to be in UTF-8.
+
+    use DB_File;
+    use DBM_Filter;
+
+    my $db = tie %h, 'DB_File', '/tmp/try.db', O_CREAT|O_RDWR, 0666, $DB_BTREE;
+    $db->Filter_Key_Push('utf8');
+    $db->Filter_Value_Push('utf8');
+
+    my $key = "\N{LATIN SMALL LETTER A WITH ACUTE}";
+    my $value = "\N{LATIN SMALL LETTER E WITH ACUTE}";
+    $h{ $key } = $value;
+
+=head2 What does "Invalid Argument" mean?
+
+You will get this error message when one of the parameters in the
+C<tie> call is wrong. Unfortunately there are quite a few parameters to
+get wrong, so it can be difficult to figure out which one it is.
+
+Here are a couple of possibilities:
+
+=over 5
+
+=item 1.
+
+Attempting to reopen a database without closing it.
+
+=item 2.
+
+Using the O_WRONLY flag.
+
+=back
+
+=head2 What does "Bareword 'DB_File' not allowed" mean?
+
+You will encounter this particular error message when you have the
+C<strict 'subs'> pragma (or the full strict pragma) in your script.
+Consider this script:
+
+    use warnings ;
+    use strict ;
+    use DB_File ;
+    my %x ;
+    tie %x, DB_File, "filename" ;
+
+Running it produces the error in question:
+
+    Bareword "DB_File" not allowed while "strict subs" in use
+
+To get around the error, place the word C<DB_File> in either single or
+double quotes, like this:
+
+    tie %x, "DB_File", "filename" ;
+
+Although it might seem like a real pain, it is really worth the effort
+of having a C<use strict> in all your scripts.
+
+=head1 REFERENCES
+
+Articles that are either about B<DB_File> or make use of it.
+
+=over 5
+
+=item 1.
+
+I<Full-Text Searching in Perl>, Tim Kientzle (tkientzle@ddj.com),
+Dr. Dobb's Journal, Issue 295, January 1999, pp 34-41
+
+=back
+
+=head1 HISTORY
+
+Moved to the Changes file.
+
+=head1 BUGS
+
+Some older versions of Berkeley DB had problems with fixed length
+records using the RECNO file format. This problem has been fixed since
+version 1.85 of Berkeley DB.
+
+I am sure there are bugs in the code. If you do find any, or can
+suggest any enhancements, I would welcome your comments.
+
+=head1 SUPPORT
+
+General feedback/questions/bug reports should be sent to
+L<https://github.com/pmqs/DB_File/issues> (preferred) or
+L<https://rt.cpan.org/Public/Dist/Display.html?Name=DB_File>.
+
+=head1 AVAILABILITY
+
+B<DB_File> comes with the standard Perl source distribution. Look in
+the directory F<ext/DB_File>. Given the amount of time between releases
+of Perl the version that ships with Perl is quite likely to be out of
+date, so the most recent version can always be found on CPAN (see
+L<perlmodlib/CPAN> for details), in the directory
+F<modules/by-module/DB_File>.
+
+B<DB_File> is designed to work with any version of Berkeley DB, but is limited to the functionality provided by
+version 1. If you want to make use of the new features available in Berkeley DB
+2.x, or greater, use the Perl module L<BerkeleyDB|https://metacpan.org/pod/BerkeleyDB> instead.
+
+The official web site for Berkeley DB is L<http://www.oracle.com/technology/products/berkeley-db/db/index.html>.
+All versions of Berkeley DB are available there.
+
+Alternatively, Berkeley DB version 1 is available at your nearest CPAN
+archive in F<src/misc/db.1.85.tar.gz>.
+
+=head1 COPYRIGHT
+
+Copyright (c) 1995-2022 Paul Marquess. All rights reserved. This program
+is free software; you can redistribute it and/or modify it under the
+same terms as Perl itself.
+
+Although B<DB_File> is covered by the Perl license, the library it
+makes use of, namely Berkeley DB, is not. Berkeley DB has its own
+copyright and its own license. Please take the time to read it.
+
+Here are a few words taken from the Berkeley DB FAQ (at
+L<http://www.oracle.com/technology/products/berkeley-db/db/index.html>) regarding the license:
+
+    Do I have to license DB to use it in Perl scripts?
+
+    No. The Berkeley DB license requires that software that uses
+    Berkeley DB be freely redistributable. In the case of Perl, that
+    software is Perl, and not your scripts. Any Perl scripts that you
+    write are your property, including scripts that make use of
+    Berkeley DB. Neither the Perl license nor the Berkeley DB license
+    place any restriction on what you may do with them.
+
+If you are in any doubt about the license situation, contact either the
+Berkeley DB authors or the author of DB_File. See L<"AUTHOR"> for details.
+
+
+=head1 SEE ALSO
+
+L<perl>, L<dbopen(3)>, L<hash(3)>, L<recno(3)>, L<btree(3)>,
+L<perldbmfilter>, L<DBM_Filter>
+
+=head1 AUTHOR
+
+The DB_File interface was written by Paul Marquess
+E<lt>pmqs@cpan.orgE<gt>.
+
+=cut
+                                                                    usr/lib/x86_64-linux-gnu/perl/5.36.0/Data/                                                          0000755 0000000 0000000 00000000000 14714551115 016055  5                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        usr/lib/x86_64-linux-gnu/perl/5.36.0/Data/Dumper.pm                                                 0000644 0000000 0000000 00000131600 14530460112 017640  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        #
+# Data/Dumper.pm
+#
+# convert perl data structures into perl syntax suitable for both printing
+# and eval
+#
+# Documentation at the __END__
+#
+
+package Data::Dumper;
+
+use strict;
+use warnings;
+
+#$| = 1;
+
+use 5.008_001;
+require Exporter;
+
+use constant IS_PRE_516_PERL => $] < 5.016;
+
+use Carp ();
+
+# Globals people alter.
+our ( $Indent, $Trailingcomma, $Purity, $Pad, $Varname, $Useqq, $Terse, $Freezer,
+      $Toaster, $Deepcopy, $Quotekeys, $Bless, $Maxdepth, $Pair, $Sortkeys,
+      $Deparse, $Sparseseen, $Maxrecurse, $Useperl );
+
+our ( @ISA, @EXPORT, @EXPORT_OK, $VERSION );
+
+BEGIN {
+    $VERSION = '2.184'; # Don't forget to set version and release
+                        # date in POD below!
+
+    @ISA = qw(Exporter);
+    @EXPORT = qw(Dumper);
+    @EXPORT_OK = qw(DumperX);
+
+    # if run under miniperl, or otherwise lacking dynamic loading,
+    # XSLoader should be attempted to load, or the pure perl flag
+    # toggled on load failure.
+    eval {
+        require XSLoader;
+        XSLoader::load( 'Data::Dumper' );
+        1
+    }
+    or $Useperl = 1;
+}
+
+my $IS_ASCII  = ord 'A' ==  65;
+
+# module vars and their defaults
+$Indent     = 2         unless defined $Indent;
+$Trailingcomma = 0      unless defined $Trailingcomma;
+$Purity     = 0         unless defined $Purity;
+$Pad        = ""        unless defined $Pad;
+$Varname    = "VAR"     unless defined $Varname;
+$Useqq      = 0         unless defined $Useqq;
+$Terse      = 0         unless defined $Terse;
+$Freezer    = ""        unless defined $Freezer;
+$Toaster    = ""        unless defined $Toaster;
+$Deepcopy   = 0         unless defined $Deepcopy;
+$Quotekeys  = 1         unless defined $Quotekeys;
+$Bless      = "bless"   unless defined $Bless;
+#$Expdepth   = 0         unless defined $Expdepth;
+$Maxdepth   = 0         unless defined $Maxdepth;
+$Pair       = ' => '    unless defined $Pair;
+$Useperl    = 0         unless defined $Useperl;
+$Sortkeys   = 0         unless defined $Sortkeys;
+$Deparse    = 0         unless defined $Deparse;
+$Sparseseen = 0         unless defined $Sparseseen;
+$Maxrecurse = 1000      unless defined $Maxrecurse;
+
+#
+# expects an arrayref of values to be dumped.
+# can optionally pass an arrayref of names for the values.
+# names must have leading $ sign stripped. begin the name with *
+# to cause output of arrays and hashes rather than refs.
+#
+sub new {
+  my($c, $v, $n) = @_;
+
+  Carp::croak("Usage:  PACKAGE->new(ARRAYREF, [ARRAYREF])")
+    unless (defined($v) && (ref($v) eq 'ARRAY'));
+  $n = [] unless (defined($n) && (ref($n) eq 'ARRAY'));
+
+  my($s) = {
+        level      => 0,           # current recursive depth
+        indent     => $Indent,     # various styles of indenting
+        trailingcomma => $Trailingcomma, # whether to add comma after last elem
+        pad        => $Pad,        # all lines prefixed by this string
+        xpad       => "",          # padding-per-level
+        apad       => "",          # added padding for hash keys n such
+        sep        => "",          # list separator
+        pair       => $Pair,    # hash key/value separator: defaults to ' => '
+        seen       => {},          # local (nested) refs (id => [name, val])
+        todump     => $v,          # values to dump []
+        names      => $n,          # optional names for values []
+        varname    => $Varname,    # prefix to use for tagging nameless ones
+        purity     => $Purity,     # degree to which output is evalable
+        useqq      => $Useqq,      # use "" for strings (backslashitis ensues)
+        terse      => $Terse,      # avoid name output (where feasible)
+        freezer    => $Freezer,    # name of Freezer method for objects
+        toaster    => $Toaster,    # name of method to revive objects
+        deepcopy   => $Deepcopy,   # do not cross-ref, except to stop recursion
+        quotekeys  => $Quotekeys,  # quote hash keys
+        'bless'    => $Bless,    # keyword to use for "bless"
+#        expdepth   => $Expdepth,   # cutoff depth for explicit dumping
+        maxdepth   => $Maxdepth,   # depth beyond which we give up
+	maxrecurse => $Maxrecurse, # depth beyond which we abort
+        useperl    => $Useperl,    # use the pure Perl implementation
+        sortkeys   => $Sortkeys,   # flag or filter for sorting hash keys
+        deparse    => $Deparse,    # use B::Deparse for coderefs
+        noseen     => $Sparseseen, # do not populate the seen hash unless necessary
+       };
+
+  if ($Indent > 0) {
+    $s->{xpad} = "  ";
+    $s->{sep} = "\n";
+  }
+  return bless($s, $c);
+}
+
+# Packed numeric addresses take less memory. Plus pack is faster than sprintf
+
+sub format_refaddr {
+    require Scalar::Util;
+    pack "J", Scalar::Util::refaddr(shift);
+};
+
+#
+# add-to or query the table of already seen references
+#
+sub Seen {
+  my($s, $g) = @_;
+  if (defined($g) && (ref($g) eq 'HASH'))  {
+    my($k, $v, $id);
+    while (($k, $v) = each %$g) {
+      if (defined $v) {
+        if (ref $v) {
+          $id = format_refaddr($v);
+          if ($k =~ /^[*](.*)$/) {
+            $k = (ref $v eq 'ARRAY') ? ( "\\\@" . $1 ) :
+                 (ref $v eq 'HASH')  ? ( "\\\%" . $1 ) :
+                 (ref $v eq 'CODE')  ? ( "\\\&" . $1 ) :
+                 (   "\$" . $1 ) ;
+          }
+          elsif ($k !~ /^\$/) {
+            $k = "\$" . $k;
+          }
+          $s->{seen}{$id} = [$k, $v];
+        }
+        else {
+          Carp::carp("Only refs supported, ignoring non-ref item \$$k");
+        }
+      }
+      else {
+        Carp::carp("Value of ref must be defined; ignoring undefined item \$$k");
+      }
+    }
+    return $s;
+  }
+  else {
+    return map { @$_ } values %{$s->{seen}};
+  }
+}
+
+#
+# set or query the values to be dumped
+#
+sub Values {
+  my($s, $v) = @_;
+  if (defined($v)) {
+    if (ref($v) eq 'ARRAY')  {
+      $s->{todump} = [@$v];        # make a copy
+      return $s;
+    }
+    else {
+      Carp::croak("Argument to Values, if provided, must be array ref");
+    }
+  }
+  else {
+    return @{$s->{todump}};
+  }
+}
+
+#
+# set or query the names of the values to be dumped
+#
+sub Names {
+  my($s, $n) = @_;
+  if (defined($n)) {
+    if (ref($n) eq 'ARRAY') {
+      $s->{names} = [@$n];         # make a copy
+      return $s;
+    }
+    else {
+      Carp::croak("Argument to Names, if provided, must be array ref");
+    }
+  }
+  else {
+    return @{$s->{names}};
+  }
+}
+
+sub DESTROY {}
+
+sub Dump {
+  return &Dumpxs
+    unless $Data::Dumper::Useperl || (ref($_[0]) && $_[0]->{useperl})
+            # Use pure perl version on earlier releases on EBCDIC platforms
+        || (! $IS_ASCII && $] lt 5.021_010);
+  return &Dumpperl;
+}
+
+#
+# dump the refs in the current dumper object.
+# expects same args as new() if called via package name.
+#
+our @post;
+sub Dumpperl {
+  my($s) = shift;
+  my(@out, $val, $name);
+  my($i) = 0;
+  local(@post);
+
+  $s = $s->new(@_) unless ref $s;
+
+  for $val (@{$s->{todump}}) {
+    @post = ();
+    $name = $s->{names}[$i++];
+    $name = $s->_refine_name($name, $val, $i);
+
+    my $valstr;
+    {
+      local($s->{apad}) = $s->{apad};
+      $s->{apad} .= ' ' x (length($name) + 3) if $s->{indent} >= 2 and !$s->{terse};
+      $valstr = $s->_dump($val, $name);
+    }
+
+    $valstr = "$name = " . $valstr . ';' if @post or !$s->{terse};
+    my $out = $s->_compose_out($valstr, \@post);
+
+    push @out, $out;
+  }
+  return wantarray ? @out : join('', @out);
+}
+
+# wrap string in single quotes (escaping if needed)
+sub _quote {
+    my $val = shift;
+    $val =~ s/([\\\'])/\\$1/g;
+    return  "'" . $val .  "'";
+}
+
+# Old Perls (5.14-) have trouble resetting vstring magic when it is no
+# longer valid.
+use constant _bad_vsmg => defined &_vstring && (_vstring(~v0)||'') eq "v0";
+
+#
+# twist, toil and turn;
+# and recurse, of course.
+# sometimes sordidly;
+# and curse if no recourse.
+#
+sub _dump {
+  my($s, $val, $name) = @_;
+  my($out, $type, $id, $sname);
+
+  $type = ref $val;
+  $out = "";
+
+  if ($type) {
+
+    # Call the freezer method if it's specified and the object has the
+    # method.  Trap errors and warn() instead of die()ing, like the XS
+    # implementation.
+    my $freezer = $s->{freezer};
+    if ($freezer and UNIVERSAL::can($val, $freezer)) {
+      eval { $val->$freezer() };
+      warn "WARNING(Freezer method call failed): $@" if $@;
+    }
+
+    require Scalar::Util;
+    my $realpack = Scalar::Util::blessed($val);
+    my $realtype = $realpack ? Scalar::Util::reftype($val) : ref $val;
+    $id = format_refaddr($val);
+
+    # Note: By this point $name is always defined and of non-zero length.
+    # Keep a tab on it so that we do not fall into recursive pit.
+    if (exists $s->{seen}{$id}) {
+      if ($s->{purity} and $s->{level} > 0) {
+        $out = ($realtype eq 'HASH')  ? '{}' :
+               ($realtype eq 'ARRAY') ? '[]' :
+               'do{my $o}' ;
+        push @post, $name . " = " . $s->{seen}{$id}[0];
+      }
+      else {
+        $out = $s->{seen}{$id}[0];
+        if ($name =~ /^([\@\%])/) {
+          my $start = $1;
+          if ($out =~ /^\\$start/) {
+            $out = substr($out, 1);
+          }
+          else {
+            $out = $start . '{' . $out . '}';
+          }
+        }
+      }
+      return $out;
+    }
+    else {
+      # store our name
+      $s->{seen}{$id} = [ (
+          ($name =~ /^[@%]/)
+            ? ('\\' . $name )
+            : ($realtype eq 'CODE' and $name =~ /^[*](.*)$/)
+              ? ('\\&' . $1 )
+              : $name
+        ), $val ];
+    }
+    my $no_bless = 0;
+    my $is_regex = 0;
+    if ( $realpack and ($] >= 5.009005 ? re::is_regexp($val) : $realpack eq 'Regexp') ) {
+        $is_regex = 1;
+        $no_bless = $realpack eq 'Regexp';
+    }
+
+    # If purity is not set and maxdepth is set, then check depth:
+    # if we have reached maximum depth, return the string
+    # representation of the thing we are currently examining
+    # at this depth (i.e., 'Foo=ARRAY(0xdeadbeef)').
+    if (!$s->{purity}
+      and defined($s->{maxdepth})
+      and $s->{maxdepth} > 0
+      and $s->{level} >= $s->{maxdepth})
+    {
+      return qq['$val'];
+    }
+
+    # avoid recursing infinitely [perl #122111]
+    if ($s->{maxrecurse} > 0
+        and $s->{level} >= $s->{maxrecurse}) {
+        die "Recursion limit of $s->{maxrecurse} exceeded";
+    }
+
+    # we have a blessed ref
+    my ($blesspad);
+    if ($realpack and !$no_bless) {
+      $out = $s->{'bless'} . '( ';
+      $blesspad = $s->{apad};
+      $s->{apad} .= '       ' if ($s->{indent} >= 2);
+    }
+
+    $s->{level}++;
+    my $ipad = $s->{xpad} x $s->{level};
+
+    if ($is_regex) {
+        my $pat;
+        my $flags = "";
+        if (defined(*re::regexp_pattern{CODE})) {
+          ($pat, $flags) = re::regexp_pattern($val);
+        }
+        else {
+          $pat = "$val";
+        }
+        $pat =~ s <
+                     (\\.)           # anything backslash escaped
+                   | (\$)(?![)|]|\z) # any unescaped $, except $| $) and end
+                   | /               # any unescaped /
+                  >
+                  {
+                      $1 ? $1
+                          : $2 ? '${\q($)}'
+                          : '\\/'
+                  }gex;
+        $out .= "qr/$pat/$flags";
+    }
+    elsif ($realtype eq 'SCALAR' || $realtype eq 'REF'
+    || $realtype eq 'VSTRING') {
+      if ($realpack) {
+        $out .= 'do{\\(my $o = ' . $s->_dump($$val, "\${$name}") . ')}';
+      }
+      else {
+        $out .= '\\' . $s->_dump($$val, "\${$name}");
+      }
+    }
+    elsif ($realtype eq 'GLOB') {
+      $out .= '\\' . $s->_dump($$val, "*{$name}");
+    }
+    elsif ($realtype eq 'ARRAY') {
+      my($pad, $mname);
+      my($i) = 0;
+      $out .= ($name =~ /^\@/) ? '(' : '[';
+      $pad = $s->{sep} . $s->{pad} . $s->{apad};
+      ($name =~ /^\@(.*)$/) ? ($mname = "\$" . $1) :
+    # omit -> if $foo->[0]->{bar}, but not ${$foo->[0]}->{bar}
+        ($name =~ /^\\?[\%\@\*\$][^{].*[]}]$/) ? ($mname = $name) :
+        ($mname = $name . '->');
+      $mname .= '->' if $mname =~ /^\*.+\{[A-Z]+\}$/;
+      for my $v (@$val) {
+        $sname = $mname . '[' . $i . ']';
+        $out .= $pad . $ipad . '#' . $i
+          if $s->{indent} >= 3;
+        $out .= $pad . $ipad . $s->_dump($v, $sname);
+        $out .= ","
+            if $i++ < $#$val
+            || ($s->{trailingcomma} && $s->{indent} >= 1);
+      }
+      $out .= $pad . ($s->{xpad} x ($s->{level} - 1)) if $i;
+      $out .= ($name =~ /^\@/) ? ')' : ']';
+    }
+    elsif ($realtype eq 'HASH') {
+      my ($k, $v, $pad, $lpad, $mname, $pair);
+      $out .= ($name =~ /^\%/) ? '(' : '{';
+      $pad = $s->{sep} . $s->{pad} . $s->{apad};
+      $lpad = $s->{apad};
+      $pair = $s->{pair};
+      ($name =~ /^\%(.*)$/) ? ($mname = "\$" . $1) :
+    # omit -> if $foo->[0]->{bar}, but not ${$foo->[0]}->{bar}
+        ($name =~ /^\\?[\%\@\*\$][^{].*[]}]$/) ? ($mname = $name) :
+        ($mname = $name . '->');
+      $mname .= '->' if $mname =~ /^\*.+\{[A-Z]+\}$/;
+      my $sortkeys = defined($s->{sortkeys}) ? $s->{sortkeys} : '';
+      my $keys = [];
+      if ($sortkeys) {
+        if (ref($s->{sortkeys}) eq 'CODE') {
+          $keys = $s->{sortkeys}($val);
+          unless (ref($keys) eq 'ARRAY') {
+            Carp::carp("Sortkeys subroutine did not return ARRAYREF");
+            $keys = [];
+          }
+        }
+        else {
+          $keys = [ sort keys %$val ];
+        }
+      }
+
+      # Ensure hash iterator is reset
+      keys(%$val);
+
+      my $key;
+      while (($k, $v) = ! $sortkeys ? (each %$val) :
+         @$keys ? ($key = shift(@$keys), $val->{$key}) :
+         () )
+      {
+        my $nk = $s->_dump($k, "");
+
+        # _dump doesn't quote numbers of this form
+        if ($s->{quotekeys} && $nk =~ /^(?:0|-?[1-9][0-9]{0,8})\z/) {
+          $nk = $s->{useqq} ? qq("$nk") : qq('$nk');
+        }
+        elsif (!$s->{quotekeys} and $nk =~ /^[\"\']([A-Za-z_]\w*)[\"\']$/) {
+          $nk = $1
+        }
+
+        $sname = $mname . '{' . $nk . '}';
+        $out .= $pad . $ipad . $nk . $pair;
+
+        # temporarily alter apad
+        $s->{apad} .= (" " x (length($nk) + 4))
+          if $s->{indent} >= 2;
+        $out .= $s->_dump($val->{$k}, $sname) . ",";
+        $s->{apad} = $lpad
+          if $s->{indent} >= 2;
+      }
+      if (substr($out, -1) eq ',') {
+        chop $out if !$s->{trailingcomma} || !$s->{indent};
+        $out .= $pad . ($s->{xpad} x ($s->{level} - 1));
+      }
+      $out .= ($name =~ /^\%/) ? ')' : '}';
+    }

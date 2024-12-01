@@ -1,0 +1,1000 @@
+    allow = C    for ^tags/v\\d+$
+
+For all new commit or tag objects the committer (or tagger) line
+within the object must exactly match one of the user.committer
+values listed in the acl file ("HEAD:users/$this_user.acl").
+
+For a branch to be modified an allow line within the matching
+repository section must be matched for both the refname and the
+opcode.
+
+Repository sections are matched on the basename of the repository
+(after removing the .git suffix).
+
+The opcode abbreviations are:
+
+  C: create new ref
+  D: delete existing ref
+  U: fast-forward existing ref (no commit loss)
+  R: rewind/rebase existing ref (commit loss)
+
+if no opcodes are listed before the "for" keyword then "U" (for
+fast-forward update only) is assumed as this is the most common
+usage.
+
+Refnames are matched by always assuming a prefix of "refs/".
+This hook forbids pushing or deleting anything not under "refs/".
+
+Refnames that start with ^ are Perl regular expressions, and the ^
+is kept as part of the regexp.  \\ is needed to get just one \, so
+\\d expands to \d in Perl.  The 3rd allow line above is an example.
+
+Refnames that don't start with ^ but that end with / are prefix
+matches (2nd allow line above); all other refnames are strict
+equality matches (1st allow line).
+
+Anything pushed to "heads/" (ok, really "refs/heads/") must be
+a commit.  Tags are not permitted here.
+
+Anything pushed to "tags/" (err, really "refs/tags/") must be an
+annotated tag.  Commits, blobs, trees, etc. are not permitted here.
+Annotated tag signatures aren't checked, nor are they required.
+
+The special subrepository of 'info/new-commit-check' can
+be created and used to allow users to push new commits and
+tags from another local repository to this one, even if they
+aren't the committer/tagger of those objects.  In a nut shell
+the info/new-commit-check directory is a Git repository whose
+objects/info/alternates file lists this repository and all other
+possible sources, and whose refs subdirectory contains symlinks
+to this repository's refs subdirectory, and to all other possible
+sources refs subdirectories.  Yes, this means that you cannot
+use packed-refs in those repositories as they won't be resolved
+correctly.
+
+=cut
+
+my $git_dir = $ENV{GIT_DIR};
+my $new_commit_check = "$git_dir/info/new-commit-check";
+my $ref = $ARGV[0];
+my $old = $ARGV[1];
+my $new = $ARGV[2];
+my $new_type;
+my ($this_user) = getpwuid $<; # REAL_USER_ID
+my $repository_name;
+my %user_committer;
+my @allow_rules;
+my @path_rules;
+my %diff_cache;
+
+sub deny ($) {
+	print STDERR "-Deny-    $_[0]\n" if $debug;
+	print STDERR "\ndenied: $_[0]\n\n";
+	exit 1;
+}
+
+sub grant ($) {
+	print STDERR "-Grant-   $_[0]\n" if $debug;
+	exit 0;
+}
+
+sub info ($) {
+	print STDERR "-Info-    $_[0]\n" if $debug;
+}
+
+sub git_value (@) {
+	open(T,'-|','git',@_); local $_ = <T>; chop; close T; $_;
+}
+
+sub match_string ($$) {
+	my ($acl_n, $ref) = @_;
+	   ($acl_n eq $ref)
+	|| ($acl_n =~ m,/$, && substr($ref,0,length $acl_n) eq $acl_n)
+	|| ($acl_n =~ m,^\^, && $ref =~ m:$acl_n:);
+}
+
+sub parse_config ($$$$) {
+	my $data = shift;
+	local $ENV{GIT_DIR} = shift;
+	my $br = shift;
+	my $fn = shift;
+	return unless git_value('rev-list','--max-count=1',$br,'--',$fn);
+	info "Loading $br:$fn";
+	open(I,'-|','git','cat-file','blob',"$br:$fn");
+	my $section = '';
+	while (<I>) {
+		chomp;
+		if (/^\s*$/ || /^\s*#/) {
+		} elsif (/^\[([a-z]+)\]$/i) {
+			$section = lc $1;
+		} elsif (/^\[([a-z]+)\s+"(.*)"\]$/i) {
+			$section = join('.',lc $1,$2);
+		} elsif (/^\s*([a-z][a-z0-9]+)\s*=\s*(.*?)\s*$/i) {
+			push @{$data->{join('.',$section,lc $1)}}, $2;
+		} else {
+			deny "bad config file line $. in $br:$fn";
+		}
+	}
+	close I;
+}
+
+sub all_new_committers () {
+	local $ENV{GIT_DIR} = $git_dir;
+	$ENV{GIT_DIR} = $new_commit_check if -d $new_commit_check;
+
+	info "Getting committers of new commits.";
+	my %used;
+	open(T,'-|','git','rev-list','--pretty=raw',$new,'--not','--all');
+	while (<T>) {
+		next unless s/^committer //;
+		chop;
+		s/>.*$/>/;
+		info "Found $_." unless $used{$_}++;
+	}
+	close T;
+	info "No new commits." unless %used;
+	keys %used;
+}
+
+sub all_new_taggers () {
+	my %exists;
+	open(T,'-|','git','for-each-ref','--format=%(objectname)','refs/tags');
+	while (<T>) {
+		chop;
+		$exists{$_} = 1;
+	}
+	close T;
+
+	info "Getting taggers of new tags.";
+	my %used;
+	my $obj = $new;
+	my $obj_type = $new_type;
+	while ($obj_type eq 'tag') {
+		last if $exists{$obj};
+		$obj_type = '';
+		open(T,'-|','git','cat-file','tag',$obj);
+		while (<T>) {
+			chop;
+			if (/^object ([a-z0-9]{40})$/) {
+				$obj = $1;
+			} elsif (/^type (.+)$/) {
+				$obj_type = $1;
+			} elsif (s/^tagger //) {
+				s/>.*$/>/;
+				info "Found $_." unless $used{$_}++;
+				last;
+			}
+		}
+		close T;
+	}
+	info "No new tags." unless %used;
+	keys %used;
+}
+
+sub check_committers (@) {
+	my @bad;
+	foreach (@_) { push @bad, $_ unless $user_committer{$_}; }
+	if (@bad) {
+		print STDERR "\n";
+		print STDERR "You are not $_.\n" foreach (sort @bad);
+		deny "You cannot push changes not committed by you.";
+	}
+}
+
+sub load_diff ($) {
+	my $base = shift;
+	my $d = $diff_cache{$base};
+	unless ($d) {
+		local $/ = "\0";
+		my %this_diff;
+		if ($base =~ /^0{40}$/) {
+			# Don't load the diff at all; we are making the
+			# branch and have no base to compare to in this
+			# case.  A file level ACL makes no sense in this
+			# context.  Having an empty diff will allow the
+			# branch creation.
+			#
+		} else {
+			open(T,'-|','git','diff-tree',
+				'-r','--name-status','-z',
+				$base,$new) or return undef;
+			while (<T>) {
+				my $op = $_;
+				chop $op;
+
+				my $path = <T>;
+				chop $path;
+
+				$this_diff{$path} = $op;
+			}
+			close T or return undef;
+		}
+		$d = \%this_diff;
+		$diff_cache{$base} = $d;
+	}
+	return $d;
+}
+
+deny "No GIT_DIR inherited from caller" unless $git_dir;
+deny "Need a ref name" unless $ref;
+deny "Refusing funny ref $ref" unless $ref =~ s,^refs/,,;
+deny "Bad old value $old" unless $old =~ /^[a-z0-9]{40}$/;
+deny "Bad new value $new" unless $new =~ /^[a-z0-9]{40}$/;
+deny "Cannot determine who you are." unless $this_user;
+grant "No change requested." if $old eq $new;
+
+$repository_name = File::Spec->rel2abs($git_dir);
+$repository_name =~ m,/([^/]+)(?:\.git|/\.git)$,;
+$repository_name = $1;
+info "Updating in '$repository_name'.";
+
+my $op;
+if    ($old =~ /^0{40}$/) { $op = 'C'; }
+elsif ($new =~ /^0{40}$/) { $op = 'D'; }
+else                      { $op = 'R'; }
+
+# This is really an update (fast-forward) if the
+# merge base of $old and $new is $old.
+#
+$op = 'U' if ($op eq 'R'
+	&& $ref =~ m,^heads/,
+	&& $old eq git_value('merge-base',$old,$new));
+
+# Load the user's ACL file. Expand groups (user.memberof) one level.
+{
+	my %data = ('user.committer' => []);
+	parse_config(\%data,$acl_git,$acl_branch,"external/$repository_name.acl");
+
+	%data = (
+		'user.committer' => $data{'user.committer'},
+		'user.memberof' => [],
+	);
+	parse_config(\%data,$acl_git,$acl_branch,"users/$this_user.acl");
+
+	%user_committer = map {$_ => $_} @{$data{'user.committer'}};
+	my $rule_key = "repository.$repository_name.allow";
+	my $rules = $data{$rule_key} || [];
+
+	foreach my $group (@{$data{'user.memberof'}}) {
+		my %g;
+		parse_config(\%g,$acl_git,$acl_branch,"groups/$group.acl");
+		my $group_rules = $g{$rule_key};
+		push @$rules, @$group_rules if $group_rules;
+	}
+
+RULE:
+	foreach (@$rules) {
+		while (/\${user\.([a-z][a-zA-Z0-9]+)}/) {
+			my $k = lc $1;
+			my $v = $data{"user.$k"};
+			next RULE unless defined $v;
+			next RULE if @$v != 1;
+			next RULE unless defined $v->[0];
+			s/\${user\.$k}/$v->[0]/g;
+		}
+
+		if (/^([AMD ]+)\s+of\s+([^\s]+)\s+for\s+([^\s]+)\s+diff\s+([^\s]+)$/) {
+			my ($ops, $pth, $ref, $bst) = ($1, $2, $3, $4);
+			$ops =~ s/ //g;
+			$pth =~ s/\\\\/\\/g;
+			$ref =~ s/\\\\/\\/g;
+			push @path_rules, [$ops, $pth, $ref, $bst];
+		} elsif (/^([AMD ]+)\s+of\s+([^\s]+)\s+for\s+([^\s]+)$/) {
+			my ($ops, $pth, $ref) = ($1, $2, $3);
+			$ops =~ s/ //g;
+			$pth =~ s/\\\\/\\/g;
+			$ref =~ s/\\\\/\\/g;
+			push @path_rules, [$ops, $pth, $ref, $old];
+		} elsif (/^([CDRU ]+)\s+for\s+([^\s]+)$/) {
+			my $ops = $1;
+			my $ref = $2;
+			$ops =~ s/ //g;
+			$ref =~ s/\\\\/\\/g;
+			push @allow_rules, [$ops, $ref];
+		} elsif (/^for\s+([^\s]+)$/) {
+			# Mentioned, but nothing granted?
+		} elsif (/^[^\s]+$/) {
+			s/\\\\/\\/g;
+			push @allow_rules, ['U', $_];
+		}
+	}
+}
+
+if ($op ne 'D') {
+	$new_type = git_value('cat-file','-t',$new);
+
+	if ($ref =~ m,^heads/,) {
+		deny "$ref must be a commit." unless $new_type eq 'commit';
+	} elsif ($ref =~ m,^tags/,) {
+		deny "$ref must be an annotated tag." unless $new_type eq 'tag';
+	}
+
+	check_committers (all_new_committers);
+	check_committers (all_new_taggers) if $new_type eq 'tag';
+}
+
+info "$this_user wants $op for $ref";
+foreach my $acl_entry (@allow_rules) {
+	my ($acl_ops, $acl_n) = @$acl_entry;
+	next unless $acl_ops =~ /^[CDRU]+$/; # Uhh.... shouldn't happen.
+	next unless $acl_n;
+	next unless $op =~ /^[$acl_ops]$/;
+	next unless match_string $acl_n, $ref;
+
+	# Don't test path rules on branch deletes.
+	#
+	grant "Allowed by: $acl_ops for $acl_n" if $op eq 'D';
+
+	# Aggregate matching path rules; allow if there aren't
+	# any matching this ref.
+	#
+	my %pr;
+	foreach my $p_entry (@path_rules) {
+		my ($p_ops, $p_n, $p_ref, $p_bst) = @$p_entry;
+		next unless $p_ref;
+		push @{$pr{$p_bst}}, $p_entry if match_string $p_ref, $ref;
+	}
+	grant "Allowed by: $acl_ops for $acl_n" unless %pr;
+
+	# Allow only if all changes against a single base are
+	# allowed by file path rules.
+	#
+	my @bad;
+	foreach my $p_bst (keys %pr) {
+		my $diff_ref = load_diff $p_bst;
+		deny "Cannot difference trees." unless ref $diff_ref;
+
+		my %fd = %$diff_ref;
+		foreach my $p_entry (@{$pr{$p_bst}}) {
+			my ($p_ops, $p_n, $p_ref, $p_bst) = @$p_entry;
+			next unless $p_ops =~ /^[AMD]+$/;
+			next unless $p_n;
+
+			foreach my $f_n (keys %fd) {
+				my $f_op = $fd{$f_n};
+				next unless $f_op;
+				next unless $f_op =~ /^[$p_ops]$/;
+				delete $fd{$f_n} if match_string $p_n, $f_n;
+			}
+			last unless %fd;
+		}
+
+		if (%fd) {
+			push @bad, [$p_bst, \%fd];
+		} else {
+			# All changes relative to $p_bst were allowed.
+			#
+			grant "Allowed by: $acl_ops for $acl_n diff $p_bst";
+		}
+	}
+
+	foreach my $bad_ref (@bad) {
+		my ($p_bst, $fd) = @$bad_ref;
+		print STDERR "\n";
+		print STDERR "Not allowed to make the following changes:\n";
+		print STDERR "(base: $p_bst)\n";
+		foreach my $f_n (sort keys %$fd) {
+			print STDERR "  $fd->{$f_n} $f_n\n";
+		}
+	}
+	deny "You are not permitted to $op $ref";
+}
+close A;
+deny "You are not permitted to $op $ref";
+                                                                                                                                usr/share/git-core/templates/                                                                       0000755 0000000 0000000 00000000000 14714551120 014666  5                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        usr/share/git-core/templates/branches/                                                              0000755 0000000 0000000 00000000000 14633621306 016457  5                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        usr/share/git-core/templates/description                                                            0000644 0000000 0000000 00000000111 14633621306 017131  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        Unnamed repository; edit this file 'description' to name the repository.
+                                                                                                                                                                                                                                                                                                                                                                                                                                                       usr/share/git-core/templates/hooks/                                                                 0000755 0000000 0000000 00000000000 14714551120 016011  5                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        usr/share/git-core/templates/hooks/applypatch-msg.sample                                            0000755 0000000 0000000 00000000736 14633621306 022162  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        #!/bin/sh
+#
+# An example hook script to check the commit log message taken by
+# applypatch from an e-mail message.
+#
+# The hook should exit with non-zero status after issuing an
+# appropriate message if it wants to stop the commit.  The hook is
+# allowed to edit the commit message file.
+#
+# To enable this hook, rename this file to "applypatch-msg".
+
+. git-sh-setup
+commitmsg="$(git rev-parse --git-path hooks/commit-msg)"
+test -x "$commitmsg" && exec "$commitmsg" ${1+"$@"}
+:
+                                  usr/share/git-core/templates/hooks/commit-msg.sample                                                0000755 0000000 0000000 00000001600 14633621306 021274  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        #!/bin/sh
+#
+# An example hook script to check the commit log message.
+# Called by "git commit" with one argument, the name of the file
+# that has the commit message.  The hook should exit with non-zero
+# status after issuing an appropriate message if it wants to stop the
+# commit.  The hook is allowed to edit the commit message file.
+#
+# To enable this hook, rename this file to "commit-msg".
+
+# Uncomment the below to add a Signed-off-by line to the message.
+# Doing this in a hook is a bad idea in general, but the prepare-commit-msg
+# hook is more suited to it.
+#
+# SOB=$(git var GIT_AUTHOR_IDENT | sed -n 's/^\(.*>\).*$/Signed-off-by: \1/p')
+# grep -qs "^$SOB" "$1" || echo "$SOB" >> "$1"
+
+# This example catches duplicate Signed-off-by lines.
+
+test "" = "$(grep '^Signed-off-by: ' "$1" |
+	 sort | uniq -c | sed -e '/^[ 	]*1[ 	]/d')" || {
+	echo >&2 Duplicate Signed-off-by lines.
+	exit 1
+}
+                                                                                                                                usr/share/git-core/templates/hooks/fsmonitor-watchman.sample                                        0000755 0000000 0000000 00000011166 14633621306 023050  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        #!/usr/bin/perl
+
+use strict;
+use warnings;
+use IPC::Open2;
+
+# An example hook script to integrate Watchman
+# (https://facebook.github.io/watchman/) with git to speed up detecting
+# new and modified files.
+#
+# The hook is passed a version (currently 2) and last update token
+# formatted as a string and outputs to stdout a new update token and
+# all files that have been modified since the update token. Paths must
+# be relative to the root of the working tree and separated by a single NUL.
+#
+# To enable this hook, rename this file to "query-watchman" and set
+# 'git config core.fsmonitor .git/hooks/query-watchman'
+#
+my ($version, $last_update_token) = @ARGV;
+
+# Uncomment for debugging
+# print STDERR "$0 $version $last_update_token\n";
+
+# Check the hook interface version
+if ($version ne 2) {
+	die "Unsupported query-fsmonitor hook version '$version'.\n" .
+	    "Falling back to scanning...\n";
+}
+
+my $git_work_tree = get_working_dir();
+
+my $retry = 1;
+
+my $json_pkg;
+eval {
+	require JSON::XS;
+	$json_pkg = "JSON::XS";
+	1;
+} or do {
+	require JSON::PP;
+	$json_pkg = "JSON::PP";
+};
+
+launch_watchman();
+
+sub launch_watchman {
+	my $o = watchman_query();
+	if (is_work_tree_watched($o)) {
+		output_result($o->{clock}, @{$o->{files}});
+	}
+}
+
+sub output_result {
+	my ($clockid, @files) = @_;
+
+	# Uncomment for debugging watchman output
+	# open (my $fh, ">", ".git/watchman-output.out");
+	# binmode $fh, ":utf8";
+	# print $fh "$clockid\n@files\n";
+	# close $fh;
+
+	binmode STDOUT, ":utf8";
+	print $clockid;
+	print "\0";
+	local $, = "\0";
+	print @files;
+}
+
+sub watchman_clock {
+	my $response = qx/watchman clock "$git_work_tree"/;
+	die "Failed to get clock id on '$git_work_tree'.\n" .
+		"Falling back to scanning...\n" if $? != 0;
+
+	return $json_pkg->new->utf8->decode($response);
+}
+
+sub watchman_query {
+	my $pid = open2(\*CHLD_OUT, \*CHLD_IN, 'watchman -j --no-pretty')
+	or die "open2() failed: $!\n" .
+	"Falling back to scanning...\n";
+
+	# In the query expression below we're asking for names of files that
+	# changed since $last_update_token but not from the .git folder.
+	#
+	# To accomplish this, we're using the "since" generator to use the
+	# recency index to select candidate nodes and "fields" to limit the
+	# output to file names only. Then we're using the "expression" term to
+	# further constrain the results.
+	my $last_update_line = "";
+	if (substr($last_update_token, 0, 1) eq "c") {
+		$last_update_token = "\"$last_update_token\"";
+		$last_update_line = qq[\n"since": $last_update_token,];
+	}
+	my $query = <<"	END";
+		["query", "$git_work_tree", {$last_update_line
+			"fields": ["name"],
+			"expression": ["not", ["dirname", ".git"]]
+		}]
+	END
+
+	# Uncomment for debugging the watchman query
+	# open (my $fh, ">", ".git/watchman-query.json");
+	# print $fh $query;
+	# close $fh;
+
+	print CHLD_IN $query;
+	close CHLD_IN;
+	my $response = do {local $/; <CHLD_OUT>};
+
+	# Uncomment for debugging the watch response
+	# open ($fh, ">", ".git/watchman-response.json");
+	# print $fh $response;
+	# close $fh;
+
+	die "Watchman: command returned no output.\n" .
+	"Falling back to scanning...\n" if $response eq "";
+	die "Watchman: command returned invalid output: $response\n" .
+	"Falling back to scanning...\n" unless $response =~ /^\{/;
+
+	return $json_pkg->new->utf8->decode($response);
+}
+
+sub is_work_tree_watched {
+	my ($output) = @_;
+	my $error = $output->{error};
+	if ($retry > 0 and $error and $error =~ m/unable to resolve root .* directory (.*) is not watched/) {
+		$retry--;
+		my $response = qx/watchman watch "$git_work_tree"/;
+		die "Failed to make watchman watch '$git_work_tree'.\n" .
+		    "Falling back to scanning...\n" if $? != 0;
+		$output = $json_pkg->new->utf8->decode($response);
+		$error = $output->{error};
+		die "Watchman: $error.\n" .
+		"Falling back to scanning...\n" if $error;
+
+		# Uncomment for debugging watchman output
+		# open (my $fh, ">", ".git/watchman-output.out");
+		# close $fh;
+
+		# Watchman will always return all files on the first query so
+		# return the fast "everything is dirty" flag to git and do the
+		# Watchman query just to get it over with now so we won't pay
+		# the cost in git to look up each individual file.
+		my $o = watchman_clock();
+		$error = $output->{error};
+
+		die "Watchman: $error.\n" .
+		"Falling back to scanning...\n" if $error;
+
+		output_result($o->{clock}, ("/"));
+		$last_update_token = $o->{clock};
+
+		eval { launch_watchman() };
+		return 0;
+	}
+
+	die "Watchman: $error.\n" .
+	"Falling back to scanning...\n" if $error;
+
+	return 1;
+}
+
+sub get_working_dir {
+	my $working_dir;
+	if ($^O =~ 'msys' || $^O =~ 'cygwin') {
+		$working_dir = Win32::GetCwd();
+		$working_dir =~ tr/\\/\//;
+	} else {
+		require Cwd;
+		$working_dir = Cwd::cwd();
+	}
+
+	return $working_dir;
+}
+                                                                                                                                                                                                                                                                                                                                                                                                          usr/share/git-core/templates/hooks/post-update.sample                                               0000755 0000000 0000000 00000000275 14633621306 021474  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        #!/bin/sh
+#
+# An example hook script to prepare a packed repository for use over
+# dumb transports.
+#
+# To enable this hook, rename this file to "post-update".
+
+exec git update-server-info
+                                                                                                                                                                                                                                                                                                                                   usr/share/git-core/templates/hooks/pre-applypatch.sample                                            0000755 0000000 0000000 00000000650 14633621306 022155  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        #!/bin/sh
+#
+# An example hook script to verify what is about to be committed
+# by applypatch from an e-mail message.
+#
+# The hook should exit with non-zero status after issuing an
+# appropriate message if it wants to stop the commit.
+#
+# To enable this hook, rename this file to "pre-applypatch".
+
+. git-sh-setup
+precommit="$(git rev-parse --git-path hooks/pre-commit)"
+test -x "$precommit" && exec "$precommit" ${1+"$@"}
+:
+                                                                                        usr/share/git-core/templates/hooks/pre-commit.sample                                                0000755 0000000 0000000 00000003153 14633621306 021301  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        #!/bin/sh
+#
+# An example hook script to verify what is about to be committed.
+# Called by "git commit" with no arguments.  The hook should
+# exit with non-zero status after issuing an appropriate message if
+# it wants to stop the commit.
+#
+# To enable this hook, rename this file to "pre-commit".
+
+if git rev-parse --verify HEAD >/dev/null 2>&1
+then
+	against=HEAD
+else
+	# Initial commit: diff against an empty tree object
+	against=$(git hash-object -t tree /dev/null)
+fi
+
+# If you want to allow non-ASCII filenames set this variable to true.
+allownonascii=$(git config --type=bool hooks.allownonascii)
+
+# Redirect output to stderr.
+exec 1>&2
+
+# Cross platform projects tend to avoid non-ASCII filenames; prevent
+# them from being added to the repository. We exploit the fact that the
+# printable range starts at the space character and ends with tilde.
+if [ "$allownonascii" != "true" ] &&
+	# Note that the use of brackets around a tr range is ok here, (it's
+	# even required, for portability to Solaris 10's /usr/bin/tr), since
+	# the square bracket bytes happen to fall in the designated range.
+	test $(git diff --cached --name-only --diff-filter=A -z $against |
+	  LC_ALL=C tr -d '[ -~]\0' | wc -c) != 0
+then
+	cat <<\EOF
+Error: Attempt to add a non-ASCII file name.
+
+This can cause problems if you want to work with people on other platforms.
+
+To be portable it is advisable to rename the file.
+
+If you know what you are doing you can disable this check using:
+
+  git config hooks.allownonascii true
+EOF
+	exit 1
+fi
+
+# If there are whitespace errors, print the offending file names and fail.
+exec git diff-index --check --cached $against --
+                                                                                                                                                                                                                                                                                                                                                                                                                     usr/share/git-core/templates/hooks/pre-merge-commit.sample                                          0000755 0000000 0000000 00000000640 14633621306 022374  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        #!/bin/sh
+#
+# An example hook script to verify what is about to be committed.
+# Called by "git merge" with no arguments.  The hook should
+# exit with non-zero status after issuing an appropriate message to
+# stderr if it wants to stop the merge commit.
+#
+# To enable this hook, rename this file to "pre-merge-commit".
+
+. git-sh-setup
+test -x "$GIT_DIR/hooks/pre-commit" &&
+        exec "$GIT_DIR/hooks/pre-commit"
+:
+                                                                                                usr/share/git-core/templates/hooks/pre-push.sample                                                  0000755 0000000 0000000 00000002536 14633621306 020774  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        #!/bin/sh
+
+# An example hook script to verify what is about to be pushed.  Called by "git
+# push" after it has checked the remote status, but before anything has been
+# pushed.  If this script exits with a non-zero status nothing will be pushed.
+#
+# This hook is called with the following parameters:
+#
+# $1 -- Name of the remote to which the push is being done
+# $2 -- URL to which the push is being done
+#
+# If pushing without using a named remote those arguments will be equal.
+#
+# Information about the commits which are being pushed is supplied as lines to
+# the standard input in the form:
+#
+#   <local ref> <local oid> <remote ref> <remote oid>
+#
+# This sample shows how to prevent push of commits where the log message starts
+# with "WIP" (work in progress).
+
+remote="$1"
+url="$2"
+
+zero=$(git hash-object --stdin </dev/null | tr '[0-9a-f]' '0')
+
+while read local_ref local_oid remote_ref remote_oid
+do
+	if test "$local_oid" = "$zero"
+	then
+		# Handle delete
+		:
+	else
+		if test "$remote_oid" = "$zero"
+		then
+			# New branch, examine all commits
+			range="$local_oid"
+		else
+			# Update to existing branch, examine new commits
+			range="$remote_oid..$local_oid"
+		fi
+
+		# Check for WIP commit
+		commit=$(git rev-list -n 1 --grep '^WIP' "$range")
+		if test -n "$commit"
+		then
+			echo >&2 "Found WIP commit in $local_ref, not pushing"
+			exit 1
+		fi
+	fi
+done
+
+exit 0
+                                                                                                                                                                  usr/share/git-core/templates/hooks/pre-rebase.sample                                                0000755 0000000 0000000 00000011442 14633621306 021252  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        #!/bin/sh
+#
+# Copyright (c) 2006, 2008 Junio C Hamano
+#
+# The "pre-rebase" hook is run just before "git rebase" starts doing
+# its job, and can prevent the command from running by exiting with
+# non-zero status.
+#
+# The hook is called with the following parameters:
+#
+# $1 -- the upstream the series was forked from.
+# $2 -- the branch being rebased (or empty when rebasing the current branch).
+#
+# This sample shows how to prevent topic branches that are already
+# merged to 'next' branch from getting rebased, because allowing it
+# would result in rebasing already published history.
+
+publish=next
+basebranch="$1"
+if test "$#" = 2
+then
+	topic="refs/heads/$2"
+else
+	topic=`git symbolic-ref HEAD` ||
+	exit 0 ;# we do not interrupt rebasing detached HEAD
+fi
+
+case "$topic" in
+refs/heads/??/*)
+	;;
+*)
+	exit 0 ;# we do not interrupt others.
+	;;
+esac
+
+# Now we are dealing with a topic branch being rebased
+# on top of master.  Is it OK to rebase it?
+
+# Does the topic really exist?
+git show-ref -q "$topic" || {
+	echo >&2 "No such branch $topic"
+	exit 1
+}
+
+# Is topic fully merged to master?
+not_in_master=`git rev-list --pretty=oneline ^master "$topic"`
+if test -z "$not_in_master"
+then
+	echo >&2 "$topic is fully merged to master; better remove it."
+	exit 1 ;# we could allow it, but there is no point.
+fi
+
+# Is topic ever merged to next?  If so you should not be rebasing it.
+only_next_1=`git rev-list ^master "^$topic" ${publish} | sort`
+only_next_2=`git rev-list ^master           ${publish} | sort`
+if test "$only_next_1" = "$only_next_2"
+then
+	not_in_topic=`git rev-list "^$topic" master`
+	if test -z "$not_in_topic"
+	then
+		echo >&2 "$topic is already up to date with master"
+		exit 1 ;# we could allow it, but there is no point.
+	else
+		exit 0
+	fi
+else
+	not_in_next=`git rev-list --pretty=oneline ^${publish} "$topic"`
+	/usr/bin/perl -e '
+		my $topic = $ARGV[0];
+		my $msg = "* $topic has commits already merged to public branch:\n";
+		my (%not_in_next) = map {
+			/^([0-9a-f]+) /;
+			($1 => 1);
+		} split(/\n/, $ARGV[1]);
+		for my $elem (map {
+				/^([0-9a-f]+) (.*)$/;
+				[$1 => $2];
+			} split(/\n/, $ARGV[2])) {
+			if (!exists $not_in_next{$elem->[0]}) {
+				if ($msg) {
+					print STDERR $msg;
+					undef $msg;
+				}
+				print STDERR " $elem->[1]\n";
+			}
+		}
+	' "$topic" "$not_in_next" "$not_in_master"
+	exit 1
+fi
+
+<<\DOC_END
+
+This sample hook safeguards topic branches that have been
+published from being rewound.
+
+The workflow assumed here is:
+
+ * Once a topic branch forks from "master", "master" is never
+   merged into it again (either directly or indirectly).
+
+ * Once a topic branch is fully cooked and merged into "master",
+   it is deleted.  If you need to build on top of it to correct
+   earlier mistakes, a new topic branch is created by forking at
+   the tip of the "master".  This is not strictly necessary, but
+   it makes it easier to keep your history simple.
+
+ * Whenever you need to test or publish your changes to topic
+   branches, merge them into "next" branch.
+
+The script, being an example, hardcodes the publish branch name
+to be "next", but it is trivial to make it configurable via
+$GIT_DIR/config mechanism.
+
+With this workflow, you would want to know:
+
+(1) ... if a topic branch has ever been merged to "next".  Young
+    topic branches can have stupid mistakes you would rather
+    clean up before publishing, and things that have not been
+    merged into other branches can be easily rebased without
+    affecting other people.  But once it is published, you would
+    not want to rewind it.
+
+(2) ... if a topic branch has been fully merged to "master".
+    Then you can delete it.  More importantly, you should not
+    build on top of it -- other people may already want to
+    change things related to the topic as patches against your
+    "master", so if you need further changes, it is better to
+    fork the topic (perhaps with the same name) afresh from the
+    tip of "master".
+
+Let's look at this example:
+
+		   o---o---o---o---o---o---o---o---o---o "next"
+		  /       /           /           /
+		 /   a---a---b A     /           /
+		/   /               /           /
+	       /   /   c---c---c---c B         /
+	      /   /   /             \         /
+	     /   /   /   b---b C     \       /
+	    /   /   /   /             \     /
+    ---o---o---o---o---o---o---o---o---o---o---o "master"
+
+
+A, B and C are topic branches.
+
+ * A has one fix since it was merged up to "next".
+
+ * B has finished.  It has been fully merged up to "master" and "next",
+   and is ready to be deleted.
+
+ * C has not merged to "next" at all.
+
+We would want to allow C to be rebased, refuse A, and encourage
+B to be deleted.
+
+To compute (1):
+
+	git rev-list ^master ^topic next
+	git rev-list ^master        next
+
+	if these match, topic has not merged in next at all.
+
+To compute (2):
+
+	git rev-list master..topic
+
+	if this is empty, it is fully merged to "master".
+
+DOC_END
+                                                                                                                                                                                                                              usr/share/git-core/templates/hooks/pre-receive.sample                                               0000755 0000000 0000000 00000001040 14633621306 021424  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        #!/bin/sh
+#
+# An example hook script to make use of push options.
+# The example simply echoes all push options that start with 'echoback='
+# and rejects all pushes when the "reject" push option is used.
+#
+# To enable this hook, rename this file to "pre-receive".
+
+if test -n "$GIT_PUSH_OPTION_COUNT"
+then
+	i=0
+	while test "$i" -lt "$GIT_PUSH_OPTION_COUNT"
+	do
+		eval "value=\$GIT_PUSH_OPTION_$i"
+		case "$value" in
+		echoback=*)
+			echo "echo from the pre-receive-hook: ${value#*=}" >&2
+			;;
+		reject)
+			exit 1
+		esac
+		i=$((i + 1))
+	done
+fi
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                usr/share/git-core/templates/hooks/prepare-commit-msg.sample                                        0000755 0000000 0000000 00000002724 14633621306 022740  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        #!/bin/sh
+#
+# An example hook script to prepare the commit log message.
+# Called by "git commit" with the name of the file that has the
+# commit message, followed by the description of the commit
+# message's source.  The hook's purpose is to edit the commit
+# message file.  If the hook fails with a non-zero status,
+# the commit is aborted.
+#
+# To enable this hook, rename this file to "prepare-commit-msg".
+
+# This hook includes three examples. The first one removes the
+# "# Please enter the commit message..." help message.
+#
+# The second includes the output of "git diff --name-status -r"
+# into the message, just before the "git status" output.  It is
+# commented because it doesn't cope with --amend or with squashed
+# commits.
+#
+# The third example adds a Signed-off-by line to the message, that can
+# still be edited.  This is rarely a good idea.
+
+COMMIT_MSG_FILE=$1
+COMMIT_SOURCE=$2
+SHA1=$3
+
+/usr/bin/perl -i.bak -ne 'print unless(m/^. Please enter the commit message/..m/^#$/)' "$COMMIT_MSG_FILE"
+
+# case "$COMMIT_SOURCE,$SHA1" in
+#  ,|template,)
+#    /usr/bin/perl -i.bak -pe '
+#       print "\n" . `git diff --cached --name-status -r`
+# 	 if /^#/ && $first++ == 0' "$COMMIT_MSG_FILE" ;;
+#  *) ;;
+# esac
+
+# SOB=$(git var GIT_COMMITTER_IDENT | sed -n 's/^\(.*>\).*$/Signed-off-by: \1/p')
+# git interpret-trailers --in-place --trailer "$SOB" "$COMMIT_MSG_FILE"
+# if test -z "$COMMIT_SOURCE"
+# then
+#   /usr/bin/perl -i.bak -pe 'print "\n" if !$first_line++' "$COMMIT_MSG_FILE"
+# fi
+                                            usr/share/git-core/templates/hooks/push-to-checkout.sample                                          0000755 0000000 0000000 00000005337 14633621306 022435  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        #!/bin/sh
+
+# An example hook script to update a checked-out tree on a git push.
+#
+# This hook is invoked by git-receive-pack(1) when it reacts to git
+# push and updates reference(s) in its repository, and when the push
+# tries to update the branch that is currently checked out and the
+# receive.denyCurrentBranch configuration variable is set to
+# updateInstead.
+#
+# By default, such a push is refused if the working tree and the index
+# of the remote repository has any difference from the currently
+# checked out commit; when both the working tree and the index match
+# the current commit, they are updated to match the newly pushed tip
+# of the branch. This hook is to be used to override the default
+# behaviour; however the code below reimplements the default behaviour
+# as a starting point for convenient modification.
+#
+# The hook receives the commit with which the tip of the current
+# branch is going to be updated:
+commit=$1
+
+# It can exit with a non-zero status to refuse the push (when it does
+# so, it must not modify the index or the working tree).
+die () {
+	echo >&2 "$*"
+	exit 1
+}
+
+# Or it can make any necessary changes to the working tree and to the
+# index to bring them to the desired state when the tip of the current

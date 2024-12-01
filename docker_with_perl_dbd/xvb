@@ -1,0 +1,1000 @@
+        return procutil.isatty(fh)
+
+    def protectfinout(self):
+        """Duplicate ui streams and redirect original if they are stdio
+
+        Returns (fin, fout) which point to the original ui fds, but may be
+        copy of them. The returned streams can be considered "owned" in that
+        print(), exec(), etc. never reach to them.
+        """
+        if self._finoutredirected:
+            # if already redirected, protectstdio() would just create another
+            # nullfd pair, which is equivalent to returning self._fin/_fout.
+            return self._fin, self._fout
+        fin, fout = procutil.protectstdio(self._fin, self._fout)
+        self._finoutredirected = (fin, fout) != (self._fin, self._fout)
+        return fin, fout
+
+    def restorefinout(self, fin, fout):
+        """Restore ui streams from possibly duplicated (fin, fout)"""
+        if (fin, fout) == (self._fin, self._fout):
+            return
+        procutil.restorestdio(self._fin, self._fout, fin, fout)
+        # protectfinout() won't create more than one duplicated streams,
+        # so we can just turn the redirection flag off.
+        self._finoutredirected = False
+
+    @contextlib.contextmanager
+    def protectedfinout(self):
+        """Run code block with protected standard streams"""
+        fin, fout = self.protectfinout()
+        try:
+            yield fin, fout
+        finally:
+            self.restorefinout(fin, fout)
+
+    def disablepager(self):
+        self._disablepager = True
+
+    def pager(self, command):
+        """Start a pager for subsequent command output.
+
+        Commands which produce a long stream of output should call
+        this function to activate the user's preferred pagination
+        mechanism (which may be no pager). Calling this function
+        precludes any future use of interactive functionality, such as
+        prompting the user or activating curses.
+
+        Args:
+          command: The full, non-aliased name of the command. That is, "log"
+                   not "history, "summary" not "summ", etc.
+        """
+        if self._disablepager or self.pageractive:
+            # how pager should do is already determined
+            return
+
+        if not command.startswith(b'internal-always-') and (
+            # explicit --pager=on (= 'internal-always-' prefix) should
+            # take precedence over disabling factors below
+            command in self.configlist(b'pager', b'ignore')
+            or not self.configbool(b'ui', b'paginate')
+            or not self.configbool(b'pager', b'attend-' + command, True)
+            or encoding.environ.get(b'TERM') == b'dumb'
+            # TODO: if we want to allow HGPLAINEXCEPT=pager,
+            # formatted() will need some adjustment.
+            or not self.formatted()
+            or self.plain()
+            or self._buffers
+            # TODO: expose debugger-enabled on the UI object
+            or b'--debugger' in pycompat.sysargv
+        ):
+            # We only want to paginate if the ui appears to be
+            # interactive, the user didn't say HGPLAIN or
+            # HGPLAINEXCEPT=pager, and the user didn't specify --debug.
+            return
+
+        # py2exe doesn't appear to be able to use legacy I/O, and nothing is
+        # output to the pager for paged commands.  Piping to `more` in cmd.exe
+        # works, but is easy to forget.  Just disable pager for py2exe, but
+        # leave it working for pyoxidizer and exewrapper builds.
+        if pycompat.iswindows and getattr(sys, "frozen", None) == "console_exe":
+            self.debug(b"pager is unavailable with py2exe packaging\n")
+            return
+
+        pagercmd = self.config(b'pager', b'pager', rcutil.fallbackpager)
+        if not pagercmd:
+            return
+
+        pagerenv = {}
+        for name, value in rcutil.defaultpagerenv().items():
+            if name not in encoding.environ:
+                pagerenv[name] = value
+
+        self.debug(
+            b'starting pager for command %s\n' % stringutil.pprint(command)
+        )
+        self.flush()
+
+        wasformatted = self.formatted()
+        if util.safehasattr(signal, b"SIGPIPE"):
+            signal.signal(signal.SIGPIPE, _catchterm)
+        if self._runpager(pagercmd, pagerenv):
+            self.pageractive = True
+            # Preserve the formatted-ness of the UI. This is important
+            # because we mess with stdout, which might confuse
+            # auto-detection of things being formatted.
+            self.setconfig(b'ui', b'formatted', wasformatted, b'pager')
+            self.setconfig(b'ui', b'interactive', False, b'pager')
+
+            # If pagermode differs from color.mode, reconfigure color now that
+            # pageractive is set.
+            cm = self._colormode
+            if cm != self.config(b'color', b'pagermode', cm):
+                color.setup(self)
+        else:
+            # If the pager can't be spawned in dispatch when --pager=on is
+            # given, don't try again when the command runs, to avoid a duplicate
+            # warning about a missing pager command.
+            self.disablepager()
+
+    def _runpager(self, command, env=None):
+        """Actually start the pager and set up file descriptors.
+
+        This is separate in part so that extensions (like chg) can
+        override how a pager is invoked.
+        """
+        if command == b'cat':
+            # Save ourselves some work.
+            return False
+        # If the command doesn't contain any of these characters, we
+        # assume it's a binary and exec it directly. This means for
+        # simple pager command configurations, we can degrade
+        # gracefully and tell the user about their broken pager.
+        shell = any(c in command for c in b"|&;<>()$`\\\"' \t\n*?[#~=%")
+
+        if pycompat.iswindows and not shell:
+            # Window's built-in `more` cannot be invoked with shell=False, but
+            # its `more.com` can.  Hide this implementation detail from the
+            # user so we can also get sane bad PAGER behavior.  MSYS has
+            # `more.exe`, so do a cmd.exe style resolution of the executable to
+            # determine which one to use.
+            fullcmd = procutil.findexe(command)
+            if not fullcmd:
+                self.warn(
+                    _(b"missing pager command '%s', skipping pager\n") % command
+                )
+                return False
+
+            command = fullcmd
+
+        try:
+            pager = subprocess.Popen(
+                procutil.tonativestr(command),
+                shell=shell,
+                bufsize=-1,
+                close_fds=procutil.closefds,
+                stdin=subprocess.PIPE,
+                stdout=procutil.stdout,
+                stderr=procutil.stderr,
+                env=procutil.tonativeenv(procutil.shellenviron(env)),
+            )
+        except FileNotFoundError:
+            if not shell:
+                self.warn(
+                    _(b"missing pager command '%s', skipping pager\n") % command
+                )
+                return False
+            raise
+
+        # back up original file descriptors
+        stdoutfd = os.dup(procutil.stdout.fileno())
+        stderrfd = os.dup(procutil.stderr.fileno())
+
+        os.dup2(pager.stdin.fileno(), procutil.stdout.fileno())
+        if self._isatty(procutil.stderr):
+            os.dup2(pager.stdin.fileno(), procutil.stderr.fileno())
+
+        @self.atexit
+        def killpager():
+            if util.safehasattr(signal, b"SIGINT"):
+                signal.signal(signal.SIGINT, signal.SIG_IGN)
+            # restore original fds, closing pager.stdin copies in the process
+            os.dup2(stdoutfd, procutil.stdout.fileno())
+            os.dup2(stderrfd, procutil.stderr.fileno())
+            pager.stdin.close()
+            pager.wait()
+
+        return True
+
+    @property
+    def _exithandlers(self):
+        return _reqexithandlers
+
+    def atexit(self, func, *args, **kwargs):
+        """register a function to run after dispatching a request
+
+        Handlers do not stay registered across request boundaries."""
+        self._exithandlers.append((func, args, kwargs))
+        return func
+
+    def interface(self, feature):
+        """what interface to use for interactive console features?
+
+        The interface is controlled by the value of `ui.interface` but also by
+        the value of feature-specific configuration. For example:
+
+        ui.interface.histedit = text
+        ui.interface.chunkselector = curses
+
+        Here the features are "histedit" and "chunkselector".
+
+        The configuration above means that the default interfaces for commands
+        is curses, the interface for histedit is text and the interface for
+        selecting chunk is crecord (the best curses interface available).
+
+        Consider the following example:
+        ui.interface = curses
+        ui.interface.histedit = text
+
+        Then histedit will use the text interface and chunkselector will use
+        the default curses interface (crecord at the moment).
+        """
+        alldefaults = frozenset([b"text", b"curses"])
+
+        featureinterfaces = {
+            b"chunkselector": [
+                b"text",
+                b"curses",
+            ],
+            b"histedit": [
+                b"text",
+                b"curses",
+            ],
+        }
+
+        # Feature-specific interface
+        if feature not in featureinterfaces.keys():
+            # Programming error, not user error
+            raise ValueError(b"Unknown feature requested %s" % feature)
+
+        availableinterfaces = frozenset(featureinterfaces[feature])
+        if alldefaults > availableinterfaces:
+            # Programming error, not user error. We need a use case to
+            # define the right thing to do here.
+            raise ValueError(
+                b"Feature %s does not handle all default interfaces" % feature
+            )
+
+        if self.plain() or encoding.environ.get(b'TERM') == b'dumb':
+            return b"text"
+
+        # Default interface for all the features
+        defaultinterface = b"text"
+        i = self.config(b"ui", b"interface")
+        if i in alldefaults:
+            defaultinterface = i
+
+        choseninterface = defaultinterface
+        f = self.config(b"ui", b"interface.%s" % feature)
+        if f in availableinterfaces:
+            choseninterface = f
+
+        if i is not None and defaultinterface != i:
+            if f is not None:
+                self.warn(_(b"invalid value for ui.interface: %s\n") % (i,))
+            else:
+                self.warn(
+                    _(b"invalid value for ui.interface: %s (using %s)\n")
+                    % (i, choseninterface)
+                )
+        if f is not None and choseninterface != f:
+            self.warn(
+                _(b"invalid value for ui.interface.%s: %s (using %s)\n")
+                % (feature, f, choseninterface)
+            )
+
+        return choseninterface
+
+    def interactive(self):
+        """is interactive input allowed?
+
+        An interactive session is a session where input can be reasonably read
+        from `sys.stdin'. If this function returns false, any attempt to read
+        from stdin should fail with an error, unless a sensible default has been
+        specified.
+
+        Interactiveness is triggered by the value of the `ui.interactive'
+        configuration variable or - if it is unset - when `sys.stdin' points
+        to a terminal device.
+
+        This function refers to input only; for output, see `ui.formatted()'.
+        """
+        i = self.configbool(b"ui", b"interactive")
+        if i is None:
+            # some environments replace stdin without implementing isatty
+            # usually those are non-interactive
+            return self._isatty(self._fin)
+
+        return i
+
+    def termwidth(self):
+        """how wide is the terminal in columns?"""
+        if b'COLUMNS' in encoding.environ:
+            try:
+                return int(encoding.environ[b'COLUMNS'])
+            except ValueError:
+                pass
+        return scmutil.termsize(self)[0]
+
+    def formatted(self):
+        """should formatted output be used?
+
+        It is often desirable to format the output to suite the output medium.
+        Examples of this are truncating long lines or colorizing messages.
+        However, this is not often not desirable when piping output into other
+        utilities, e.g. `grep'.
+
+        Formatted output is triggered by the value of the `ui.formatted'
+        configuration variable or - if it is unset - when `sys.stdout' points
+        to a terminal device. Please note that `ui.formatted' should be
+        considered an implementation detail; it is not intended for use outside
+        Mercurial or its extensions.
+
+        This function refers to output only; for input, see `ui.interactive()'.
+        This function always returns false when in plain mode, see `ui.plain()'.
+        """
+        if self.plain():
+            return False
+
+        i = self.configbool(b"ui", b"formatted")
+        if i is None:
+            # some environments replace stdout without implementing isatty
+            # usually those are non-interactive
+            return self._isatty(self._fout)
+
+        return i
+
+    def _readline(self, prompt=b' ', promptopts=None):
+        # Replacing stdin/stdout temporarily is a hard problem on Python 3
+        # because they have to be text streams with *no buffering*. Instead,
+        # we use rawinput() only if call_readline() will be invoked by
+        # PyOS_Readline(), so no I/O will be made at Python layer.
+        usereadline = (
+            self._isatty(self._fin)
+            and self._isatty(self._fout)
+            and procutil.isstdin(self._fin)
+            and procutil.isstdout(self._fout)
+        )
+        if usereadline:
+            try:
+                # magically add command line editing support, where
+                # available
+                import readline
+
+                # force demandimport to really load the module
+                readline.read_history_file
+                # windows sometimes raises something other than ImportError
+            except Exception:
+                usereadline = False
+
+        if self._colormode == b'win32' or not usereadline:
+            if not promptopts:
+                promptopts = {}
+            self._writemsgnobuf(
+                self._fmsgout, prompt, type=b'prompt', **promptopts
+            )
+            self.flush()
+            prompt = b' '
+        else:
+            prompt = self.label(prompt, b'ui.prompt') + b' '
+
+        # prompt ' ' must exist; otherwise readline may delete entire line
+        # - http://bugs.python.org/issue12833
+        with self.timeblockedsection(b'stdio'):
+            if usereadline:
+                self.flush()
+                prompt = encoding.strfromlocal(prompt)
+                line = encoding.strtolocal(input(prompt))
+                # When stdin is in binary mode on Windows, it can cause
+                # input() to emit an extra trailing carriage return
+                if pycompat.oslinesep == b'\r\n' and line.endswith(b'\r'):
+                    line = line[:-1]
+            else:
+                self._fout.write(pycompat.bytestr(prompt))
+                self._fout.flush()
+                line = self._fin.readline()
+                if not line:
+                    raise EOFError
+                line = line.rstrip(pycompat.oslinesep)
+
+        return line
+
+    def prompt(self, msg, default=b"y"):
+        """Prompt user with msg, read response.
+        If ui is not interactive, the default is returned.
+        """
+        return self._prompt(msg, default=default)
+
+    def _prompt(self, msg, **opts):
+        default = opts['default']
+        if not self.interactive():
+            self._writemsg(self._fmsgout, msg, b' ', type=b'prompt', **opts)
+            self._writemsg(
+                self._fmsgout, default or b'', b"\n", type=b'promptecho'
+            )
+            return default
+        try:
+            r = self._readline(prompt=msg, promptopts=opts)
+            if not r:
+                r = default
+            if self.configbool(b'ui', b'promptecho'):
+                self._writemsg(
+                    self._fmsgout, r or b'', b"\n", type=b'promptecho'
+                )
+            return r
+        except EOFError:
+            raise error.ResponseExpected()
+
+    @staticmethod
+    def extractchoices(prompt):
+        """Extract prompt message and list of choices from specified prompt.
+
+        This returns tuple "(message, choices)", and "choices" is the
+        list of tuple "(response character, text without &)".
+
+        >>> ui.extractchoices(b"awake? $$ &Yes $$ &No")
+        ('awake? ', [('y', 'Yes'), ('n', 'No')])
+        >>> ui.extractchoices(b"line\\nbreak? $$ &Yes $$ &No")
+        ('line\\nbreak? ', [('y', 'Yes'), ('n', 'No')])
+        >>> ui.extractchoices(b"want lots of $$money$$?$$Ye&s$$N&o")
+        ('want lots of $$money$$?', [('s', 'Yes'), ('o', 'No')])
+        """
+
+        # Sadly, the prompt string may have been built with a filename
+        # containing "$$" so let's try to find the first valid-looking
+        # prompt to start parsing. Sadly, we also can't rely on
+        # choices containing spaces, ASCII, or basically anything
+        # except an ampersand followed by a character.
+        m = re.match(br'(?s)(.+?)\$\$([^$]*&[^ $].*)', prompt)
+        msg = m.group(1)
+        choices = [p.strip(b' ') for p in m.group(2).split(b'$$')]
+
+        def choicetuple(s):
+            ampidx = s.index(b'&')
+            return s[ampidx + 1 : ampidx + 2].lower(), s.replace(b'&', b'', 1)
+
+        return (msg, [choicetuple(s) for s in choices])
+
+    def promptchoice(self, prompt, default=0):
+        """Prompt user with a message, read response, and ensure it matches
+        one of the provided choices. The prompt is formatted as follows:
+
+           "would you like fries with that (Yn)? $$ &Yes $$ &No"
+
+        The index of the choice is returned. Responses are case
+        insensitive. If ui is not interactive, the default is
+        returned.
+        """
+
+        msg, choices = self.extractchoices(prompt)
+        resps = [r for r, t in choices]
+        while True:
+            r = self._prompt(msg, default=resps[default], choices=choices)
+            if r.lower() in resps:
+                return resps.index(r.lower())
+            # TODO: shouldn't it be a warning?
+            self._writemsg(self._fmsgout, _(b"unrecognized response\n"))
+
+    def getpass(self, prompt=None, default=None):
+        if not self.interactive():
+            return default
+        try:
+            self._writemsg(
+                self._fmsgerr,
+                prompt or _(b'password: '),
+                type=b'prompt',
+                password=True,
+            )
+            # disable getpass() only if explicitly specified. it's still valid
+            # to interact with tty even if fin is not a tty.
+            with self.timeblockedsection(b'stdio'):
+                if self.configbool(b'ui', b'nontty'):
+                    l = self._fin.readline()
+                    if not l:
+                        raise EOFError
+                    return l.rstrip(b'\n')
+                else:
+                    return util.get_password()
+        except EOFError:
+            raise error.ResponseExpected()
+
+    def status(self, *msg, **opts):
+        """write status message to output (if ui.quiet is False)
+
+        This adds an output label of "ui.status".
+        """
+        if not self.quiet:
+            self._writemsg(self._fmsgout, type=b'status', *msg, **opts)
+
+    def warn(self, *msg, **opts):
+        """write warning message to output (stderr)
+
+        This adds an output label of "ui.warning".
+        """
+        self._writemsg(self._fmsgerr, type=b'warning', *msg, **opts)
+
+    def error(self, *msg, **opts):
+        """write error message to output (stderr)
+
+        This adds an output label of "ui.error".
+        """
+        self._writemsg(self._fmsgerr, type=b'error', *msg, **opts)
+
+    def note(self, *msg, **opts):
+        """write note to output (if ui.verbose is True)
+
+        This adds an output label of "ui.note".
+        """
+        if self.verbose:
+            self._writemsg(self._fmsgout, type=b'note', *msg, **opts)
+
+    def debug(self, *msg, **opts):
+        """write debug message to output (if ui.debugflag is True)
+
+        This adds an output label of "ui.debug".
+        """
+        if self.debugflag:
+            self._writemsg(self._fmsgout, type=b'debug', *msg, **opts)
+            self.log(b'debug', b'%s', b''.join(msg))
+
+    # Aliases to defeat check-code.
+    statusnoi18n = status
+    notenoi18n = note
+    warnnoi18n = warn
+    writenoi18n = write
+
+    def edit(
+        self,
+        text,
+        user,
+        extra=None,
+        editform=None,
+        pending=None,
+        repopath=None,
+        action=None,
+    ):
+        if action is None:
+            self.develwarn(
+                b'action is None but will soon be a required '
+                b'parameter to ui.edit()'
+            )
+        extra_defaults = {
+            b'prefix': b'editor',
+            b'suffix': b'.txt',
+        }
+        if extra is not None:
+            if extra.get(b'suffix') is not None:
+                self.develwarn(
+                    b'extra.suffix is not None but will soon be '
+                    b'ignored by ui.edit()'
+                )
+            extra_defaults.update(extra)
+        extra = extra_defaults
+
+        if action == b'diff':
+            suffix = b'.diff'
+        elif action:
+            suffix = b'.%s.hg.txt' % action
+        else:
+            suffix = extra[b'suffix']
+
+        rdir = None
+        if self.configbool(b'experimental', b'editortmpinhg'):
+            rdir = repopath
+        (fd, name) = pycompat.mkstemp(
+            prefix=b'hg-' + extra[b'prefix'] + b'-', suffix=suffix, dir=rdir
+        )
+        try:
+            with os.fdopen(fd, 'wb') as f:
+                f.write(util.tonativeeol(text))
+
+            environ = {b'HGUSER': user}
+            if b'transplant_source' in extra:
+                environ.update(
+                    {b'HGREVISION': hex(extra[b'transplant_source'])}
+                )
+            for label in (b'intermediate-source', b'source', b'rebase_source'):
+                if label in extra:
+                    environ.update({b'HGREVISION': extra[label]})
+                    break
+            if editform:
+                environ.update({b'HGEDITFORM': editform})
+            if pending:
+                environ.update({b'HG_PENDING': pending})
+
+            editor = self.geteditor()
+
+            self.system(
+                b"%s \"%s\"" % (editor, name),
+                environ=environ,
+                onerr=error.CanceledError,
+                errprefix=_(b"edit failed"),
+                blockedtag=b'editor',
+            )
+
+            with open(name, 'rb') as f:
+                t = util.fromnativeeol(f.read())
+        finally:
+            os.unlink(name)
+
+        return t
+
+    def system(
+        self,
+        cmd,
+        environ=None,
+        cwd=None,
+        onerr=None,
+        errprefix=None,
+        blockedtag=None,
+    ):
+        """execute shell command with appropriate output stream. command
+        output will be redirected if fout is not stdout.
+
+        if command fails and onerr is None, return status, else raise onerr
+        object as exception.
+        """
+        if blockedtag is None:
+            # Long cmds tend to be because of an absolute path on cmd. Keep
+            # the tail end instead
+            cmdsuffix = cmd.translate(None, _keepalnum)[-85:]
+            blockedtag = b'unknown_system_' + cmdsuffix
+        out = self._fout
+        if any(s[1] for s in self._bufferstates):
+            out = self
+        with self.timeblockedsection(blockedtag):
+            rc = self._runsystem(cmd, environ=environ, cwd=cwd, out=out)
+        if rc and onerr:
+            errmsg = b'%s %s' % (
+                procutil.shellsplit(cmd)[0],
+                procutil.explainexit(rc),
+            )
+            if errprefix:
+                errmsg = b'%s: %s' % (errprefix, errmsg)
+            raise onerr(errmsg)
+        return rc
+
+    def _runsystem(self, cmd, environ, cwd, out):
+        """actually execute the given shell command (can be overridden by
+        extensions like chg)"""
+        return procutil.system(cmd, environ=environ, cwd=cwd, out=out)
+
+    def traceback(self, exc=None, force=False):
+        """print exception traceback if traceback printing enabled or forced.
+        only to call in exception handler. returns true if traceback
+        printed."""
+        if self.tracebackflag or force:
+            if exc is None:
+                exc = sys.exc_info()
+            cause = getattr(exc[1], 'cause', None)
+
+            if cause is not None:
+                causetb = traceback.format_tb(cause[2])
+                exctb = traceback.format_tb(exc[2])
+                exconly = traceback.format_exception_only(cause[0], cause[1])
+
+                # exclude frame where 'exc' was chained and rethrown from exctb
+                self.write_err(
+                    b'Traceback (most recent call last):\n',
+                    encoding.strtolocal(''.join(exctb[:-1])),
+                    encoding.strtolocal(''.join(causetb)),
+                    encoding.strtolocal(''.join(exconly)),
+                )
+            else:
+                output = traceback.format_exception(exc[0], exc[1], exc[2])
+                self.write_err(encoding.strtolocal(''.join(output)))
+        return self.tracebackflag or force
+
+    def geteditor(self):
+        '''return editor to use'''
+        if pycompat.sysplatform == b'plan9':
+            # vi is the MIPS instruction simulator on Plan 9. We
+            # instead default to E to plumb commit messages to
+            # avoid confusion.
+            editor = b'E'
+        elif pycompat.isdarwin:
+            # vi on darwin is POSIX compatible to a fault, and that includes
+            # exiting non-zero if you make any mistake when running an ex
+            # command. Proof: `vi -c ':unknown' -c ':qa'; echo $?` produces 1,
+            # while s/vi/vim/ doesn't.
+            editor = b'vim'
+        else:
+            editor = b'vi'
+        return encoding.environ.get(b"HGEDITOR") or self.config(
+            b"ui", b"editor", editor
+        )
+
+    @util.propertycache
+    def _progbar(self):
+        """setup the progbar singleton to the ui object"""
+        if (
+            self.quiet
+            or self.debugflag
+            or self.configbool(b'progress', b'disable')
+            or not progress.shouldprint(self)
+        ):
+            return None
+        return getprogbar(self)
+
+    def _progclear(self):
+        """clear progress bar output if any. use it before any output"""
+        if not haveprogbar():  # nothing loaded yet
+            return
+        if self._progbar is not None and self._progbar.printed:
+            self._progbar.clear()
+
+    def makeprogress(self, topic, unit=b"", total=None):
+        """Create a progress helper for the specified topic"""
+        if getattr(self._fmsgerr, 'structured', False):
+            # channel for machine-readable output with metadata, just send
+            # raw information
+            # TODO: consider porting some useful information (e.g. estimated
+            # time) from progbar. we might want to support update delay to
+            # reduce the cost of transferring progress messages.
+            def updatebar(topic, pos, item, unit, total):
+                self._fmsgerr.write(
+                    None,
+                    type=b'progress',
+                    topic=topic,
+                    pos=pos,
+                    item=item,
+                    unit=unit,
+                    total=total,
+                )
+
+        elif self._progbar is not None:
+            updatebar = self._progbar.progress
+        else:
+
+            def updatebar(topic, pos, item, unit, total):
+                pass
+
+        return scmutil.progress(self, updatebar, topic, unit, total)
+
+    def getlogger(self, name):
+        """Returns a logger of the given name; or None if not registered"""
+        return self._loggers.get(name)
+
+    def setlogger(self, name, logger):
+        """Install logger which can be identified later by the given name
+
+        More than one loggers can be registered. Use extension or module
+        name to uniquely identify the logger instance.
+        """
+        self._loggers[name] = logger
+
+    def log(self, event, msgfmt, *msgargs, **opts):
+        """hook for logging facility extensions
+
+        event should be a readily-identifiable subsystem, which will
+        allow filtering.
+
+        msgfmt should be a newline-terminated format string to log, and
+        *msgargs are %-formatted into it.
+
+        **opts currently has no defined meanings.
+        """
+        if not self._loggers:
+            return
+        activeloggers = [l for l in self._loggers.values() if l.tracked(event)]
+        if not activeloggers:
+            return
+        msg = msgfmt % msgargs
+        opts = pycompat.byteskwargs(opts)
+        # guard against recursion from e.g. ui.debug()
+        registeredloggers = self._loggers
+        self._loggers = {}
+        try:
+            for logger in activeloggers:
+                logger.log(self, event, msg, opts)
+        finally:
+            self._loggers = registeredloggers
+
+    def label(self, msg, label):
+        """style msg based on supplied label
+
+        If some color mode is enabled, this will add the necessary control
+        characters to apply such color. In addition, 'debug' color mode adds
+        markup showing which label affects a piece of text.
+
+        ui.write(s, 'label') is equivalent to
+        ui.write(ui.label(s, 'label')).
+        """
+        if self._colormode is not None:
+            return color.colorlabel(self, msg, label)
+        return msg
+
+    def develwarn(self, msg, stacklevel=1, config=None):
+        """issue a developer warning message
+
+        Use 'stacklevel' to report the offender some layers further up in the
+        stack.
+        """
+        if not self.configbool(b'devel', b'all-warnings'):
+            if config is None or not self.configbool(b'devel', config):
+                return
+        msg = b'devel-warn: ' + msg
+        stacklevel += 1  # get in develwarn
+        if self.tracebackflag:
+            util.debugstacktrace(msg, stacklevel, self._ferr, self._fout)
+            self.log(
+                b'develwarn',
+                b'%s at:\n%s'
+                % (msg, b''.join(util.getstackframes(stacklevel))),
+            )
+        else:
+            curframe = inspect.currentframe()
+            calframe = inspect.getouterframes(curframe, 2)
+            fname, lineno, fmsg = calframe[stacklevel][1:4]
+            fname, fmsg = pycompat.sysbytes(fname), pycompat.sysbytes(fmsg)
+            self.write_err(b'%s at: %s:%d (%s)\n' % (msg, fname, lineno, fmsg))
+            self.log(
+                b'develwarn', b'%s at: %s:%d (%s)\n', msg, fname, lineno, fmsg
+            )
+
+            # avoid cycles
+            del curframe
+            del calframe
+
+    def deprecwarn(self, msg, version, stacklevel=2):
+        """issue a deprecation warning
+
+        - msg: message explaining what is deprecated and how to upgrade,
+        - version: last version where the API will be supported,
+        """
+        if not (
+            self.configbool(b'devel', b'all-warnings')
+            or self.configbool(b'devel', b'deprec-warn')
+        ):
+            return
+        msg += (
+            b"\n(compatibility will be dropped after Mercurial-%s,"
+            b" update your code.)"
+        ) % version
+        self.develwarn(msg, stacklevel=stacklevel, config=b'deprec-warn')
+
+    def exportableenviron(self):
+        """The environment variables that are safe to export, e.g. through
+        hgweb.
+        """
+        return self._exportableenviron
+
+    @contextlib.contextmanager
+    def configoverride(self, overrides, source=b""):
+        """Context manager for temporary config overrides
+        `overrides` must be a dict of the following structure:
+        {(section, name) : value}"""
+        backups = {}
+        try:
+            for (section, name), value in overrides.items():
+                backups[(section, name)] = self.backupconfig(section, name)
+                self.setconfig(section, name, value, source)
+            yield
+        finally:
+            for __, backup in backups.items():
+                self.restoreconfig(backup)
+            # just restoring ui.quiet config to the previous value is not enough
+            # as it does not update ui.quiet class member
+            if (b'ui', b'quiet') in overrides:
+                self.fixconfig(section=b'ui')
+
+    def estimatememory(self):
+        """Provide an estimate for the available system memory in Bytes.
+
+        This can be overriden via ui.available-memory. It returns None, if
+        no estimate can be computed.
+        """
+        value = self.config(b'ui', b'available-memory')
+        if value is not None:
+            try:
+                return util.sizetoint(value)
+            except error.ParseError:
+                raise error.ConfigError(
+                    _(b"ui.available-memory value is invalid ('%s')") % value
+                )
+        return util._estimatememory()
+
+
+# we instantiate one globally shared progress bar to avoid
+# competing progress bars when multiple UI objects get created
+_progresssingleton = None
+
+
+def getprogbar(ui):
+    global _progresssingleton
+    if _progresssingleton is None:
+        # passing 'ui' object to the singleton is fishy,
+        # this is how the extension used to work but feel free to rework it.
+        _progresssingleton = progress.progbar(ui)
+    return _progresssingleton
+
+
+def haveprogbar():
+    return _progresssingleton is not None
+
+
+def _selectmsgdests(ui):
+    name = ui.config(b'ui', b'message-output')
+    if name == b'channel':
+        if ui.fmsg:
+            return ui.fmsg, ui.fmsg
+        else:
+            # fall back to ferr if channel isn't ready so that status/error
+            # messages can be printed
+            return ui.ferr, ui.ferr
+    if name == b'stdio':
+        return ui.fout, ui.ferr
+    if name == b'stderr':
+        return ui.ferr, ui.ferr
+    raise error.Abort(b'invalid ui.message-output destination: %s' % name)
+
+
+def _writemsgwith(write, dest, *args, **opts):
+    """Write ui message with the given ui._write*() function
+
+    The specified message type is translated to 'ui.<type>' label if the dest
+    isn't a structured channel, so that the message will be colorized.
+    """
+    # TODO: maybe change 'type' to a mandatory option
+    if 'type' in opts and not getattr(dest, 'structured', False):
+        opts['label'] = opts.get('label', b'') + b' ui.%s' % opts.pop('type')
+    write(dest, *args, **opts)
+                                                                                                                                                                                                                                                                                                                                                                                                                                                           usr/lib/python3/dist-packages/mercurial/unionrepo.py                                                0000644 0000000 0000000 00000023256 14355257011 021334  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        # unionrepo.py - repository class for viewing union of repository changesets
+#
+# Derived from bundlerepo.py
+# Copyright 2006, 2007 Benoit Boissinot <bboissin@gmail.com>
+# Copyright 2013 Unity Technologies, Mads Kiilerich <madski@unity3d.com>
+#
+# This software may be used and distributed according to the terms of the
+# GNU General Public License version 2 or any later version.
+
+"""Repository class for "in-memory pull" of one local repository to another,
+allowing operations like diff and log with revsets.
+"""
+
+
+from .i18n import _
+from .pycompat import getattr
+
+from . import (
+    changelog,
+    cmdutil,
+    encoding,
+    error,
+    filelog,
+    localrepo,
+    manifest,
+    mdiff,
+    pathutil,
+    revlog,
+    util,
+    vfs as vfsmod,
+)
+
+from .revlogutils import (
+    constants as revlog_constants,
+)
+
+
+class unionrevlog(revlog.revlog):
+    def __init__(self, opener, radix, revlog2, linkmapper):
+        # How it works:
+        # To retrieve a revision, we just need to know the node id so we can
+        # look it up in revlog2.
+        #
+        # To differentiate a rev in the second revlog from a rev in the revlog,
+        # we check revision against repotiprev.
+        opener = vfsmod.readonlyvfs(opener)
+        target = getattr(revlog2, 'target', None)
+        if target is None:
+            # a revlog wrapper, eg: the manifestlog that is not an actual revlog
+            target = revlog2._revlog.target
+        revlog.revlog.__init__(self, opener, target=target, radix=radix)
+        self.revlog2 = revlog2
+
+        n = len(self)
+        self.repotiprev = n - 1
+        self.bundlerevs = set()  # used by 'bundle()' revset expression
+        for rev2 in self.revlog2:
+            rev = self.revlog2.index[rev2]
+            # rev numbers - in revlog2, very different from self.rev
+            (
+                _start,
+                _csize,
+                rsize,
+                base,
+                linkrev,
+                p1rev,
+                p2rev,
+                node,
+                _sdo,

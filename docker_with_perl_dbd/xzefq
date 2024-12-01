@@ -1,0 +1,1000 @@
+# support MAS.
+#
+# ref is a hash ref:
+#   error (0|1) whether we expect an error
+#   raise (0|1) means set RaiseError to this
+#   commit (0|1) do the inserts in a txn
+#   tuple arrayref of what we expect in the tuple status
+#      e.g., [1,1,1,1,[]]
+#      where the empty [] signifies we expect an error for this row
+#      where 1 signifies we the expect row count for this row
+#   affected - the total number of rows affected for insert/update
+#
+sub insert
+{
+    my ($self, $dbh, $sth, $ref) = @_;
+
+    die "need hashref arg" if (!$ref || (ref($ref) ne 'HASH'));
+    note("insert " . join(", ", map {"$_ = ". DBI::neat($ref->{$_})} keys %$ref ));
+    # DBD::Oracle supports MAS don't compensate for it not
+    if ($ref->{requires_mas} && $dbh->{Driver}->{Name} eq 'Oracle') {
+        delete $ref->{requires_mas};
+    }
+    @captured_error = ();
+
+    if ($ref->{raise}) {
+        $sth->{RaiseError} = 1;
+    } else {
+        $sth->{RaiseError} = 0;
+    }
+
+    my (@tuple_status, $sts, $total_affected);
+    my $tuple_status_arg = {};
+    $tuple_status_arg->{ArrayTupleStatus} = \@tuple_status unless $ref->{notuplestatus};
+
+    $sts = 999999;              # to ensure it is overwritten
+    $total_affected = 999998;
+    if ($ref->{array_context}) {
+        eval {
+            if ($ref->{params}) {
+                ($sts, $total_affected) =
+                    $sth->execute_array($tuple_status_arg,
+                                        @{$ref->{params}});
+            } elsif ($ref->{fetch}) {
+                ($sts, $total_affected) =
+                    $sth->execute_array(
+                        {%{$tuple_status_arg},
+                         ArrayTupleFetch => $ref->{fetch}});
+            } else {
+                ($sts, $total_affected) =
+                    $sth->execute_array($tuple_status_arg);
+            }
+        };
+    } else {
+        eval {
+            if ($ref->{params}) {
+                $sts =
+                    $sth->execute_array($tuple_status_arg,
+                                        @{$ref->{params}});
+            } else {
+                $sts =
+                    $sth->execute_array($tuple_status_arg);
+            }
+        };
+    }
+    if ($ref->{error} && $ref->{raise}) {
+        ok($@, 'error in execute_array eval');
+    } else {
+        if ($ref->{requires_mas} && $@) {
+            diag("\nThis test died with $@");
+            diag("It requires multiple active statement support in the driver and I cannot easily determine if your driver supports MAS. Ignoring the rest of this test.");
+            foreach (@tuple_status) {
+                if (ref($_)) {
+                    diag(join(",", @$_));
+                }
+            }
+            return 'mas';
+        }
+        ok(!$@, 'no error in execute_array eval') or note($@);
+    }
+    $dbh->commit if $ref->{commit};
+
+    if (!$ref->{raise} || ($ref->{error} == 0)) {
+        if (exists($ref->{sts})) {
+            is($sts, $ref->{sts},
+               "execute_array returned " . DBI::neat($sts) . " rows executed");
+        }
+        if (exists($ref->{affected}) && $ref->{array_context}) {
+            is($total_affected, $ref->{affected},
+               "total affected " . DBI::neat($total_affected))
+        }
+    }
+    if ($ref->{raise}) {
+        if ($ref->{error}) {
+            ok(scalar(@captured_error) > 0, "error captured");
+        } else {
+            is(scalar(@captured_error), 0, "no error captured");
+        }
+    }
+    if ($ref->{sts}) {
+        is(scalar(@tuple_status), (($ref->{sts} eq '0E0') ? 0 : $ref->{sts}),
+           "$ref->{sts} rows in tuple_status");
+    }
+    if ($ref->{tuple} && !exists($ref->{notuplestatus})) {
+        $self->check_tuple_status(\@tuple_status, $ref->{tuple});
+    }
+    return;
+}
+# simple test on ensure execute_array with no errors:
+# o checks returned status and affected is correct
+# o checks ArrayTupleStatus is correct
+# o checks no error is raised
+# o checks rows are inserted
+# o run twice with AutoCommit on/off
+# o checks if less values are specified for one parameter the right number
+#   of rows are still inserted and NULLs are placed in the missing rows
+# checks binding via bind_param_array and adding params to execute_array
+# checks binding no parameters at all
+sub simple
+{
+    my ($self, $dbh, $ref) = @_;
+
+    note('simple tests ' . join(", ", map {"$_ = $ref->{$_}"} keys %$ref ));
+
+    note("  all param arrays the same size");
+    foreach my $commit (1,0) {
+        note("    Autocommit: $commit");
+        clear_table($dbh, $table);
+        $dbh->begin_work if !$commit;
+
+        my $sth = $dbh->prepare(qq/insert into $table values(?,?)/);
+        $sth->bind_param_array(1, \@p1);
+        $sth->bind_param_array(2, \@p2);
+        $self->insert($dbh, $sth,
+                      { commit => !$commit, error => 0, sts => 5, affected => 5,
+                        tuple => [1, 1, 1, 1, 1], %$ref});
+        check_data($dbh, \@p1, \@p2);
+    }
+
+    note "  Not all param arrays the same size";
+    clear_table($dbh, $table);
+    my $sth = $dbh->prepare(qq/insert into $table values(?,?)/);
+
+    $sth->bind_param_array(1, \@p1);
+    $sth->bind_param_array(2, [qw(one)]);
+    $self->insert($dbh, $sth, {commit => 0, error => 0,
+                               raise => 1, sts => 5, affected => 5,
+                               tuple => [1, 1, 1, 1, 1], %$ref});
+    check_data($dbh, \@p1, ['one', undef, undef, undef, undef]);
+
+    note "  Not all param arrays the same size with bind on execute_array";
+    clear_table($dbh, $table);
+    $sth = $dbh->prepare(qq/insert into $table values(?,?)/);
+
+    $self->insert($dbh, $sth, {commit => 0, error => 0,
+                               raise => 1, sts => 5, affected => 5,
+                               tuple => [1, 1, 1, 1, 1], %$ref,
+                               params => [\@p1, [qw(one)]]});
+    check_data($dbh, \@p1, ['one', undef, undef, undef, undef]);
+
+    note "  no parameters";
+    clear_table($dbh, $table);
+    $sth = $dbh->prepare(qq/insert into $table values(?,?)/);
+
+    $self->insert($dbh, $sth, {commit => 0, error => 0,
+                               raise => 1, sts => '0E0', affected => 0,
+                               tuple => [], %$ref,
+                               params => [[], []]});
+    check_data($dbh, \@p1, ['one', undef, undef, undef, undef]);
+}
+
+# error test to ensure correct behavior for execute_array when it errors:
+# o execute_array of 5 inserts with last one failing
+#  o check it raises an error
+#  o check caught error is passed on from handler for eval
+#  o check returned status and affected rows
+#  o check ArrayTupleStatus
+#  o check valid inserts are inserted
+#  o execute_array of 5 inserts with 2nd last one failing
+#  o check it raises an error
+#  o check caught error is passed on from handler for eval
+#  o check returned status and affected rows
+#  o check ArrayTupleStatus
+#  o check valid inserts are inserted
+sub error
+{
+    my ($self, $dbh, $ref) = @_;
+
+    die "need hashref arg" if (!$ref || (ref($ref) ne 'HASH'));
+
+    note('error tests ' . join(", ", map {"$_ = $ref->{$_}"} keys %$ref ));
+    {
+        note("Last row in error");
+
+        clear_table($dbh, $table);
+        my $sth = $dbh->prepare(qq/insert into $table values(?,?)/);
+        my @pe1 = @p1;
+        $pe1[-1] = 1;
+        $sth->bind_param_array(1, \@pe1);
+        $sth->bind_param_array(2, \@p2);
+        $self->insert($dbh, $sth, {commit => 0, error => 1, sts => undef,
+                                   affected => undef, tuple => [1, 1, 1, 1, []],
+                                   %$ref});
+        check_data($dbh, [@pe1[0..4]], [@p2[0..4]]);
+    }
+
+    {
+        note("2nd last row in error");
+        clear_table($dbh, $table);
+        my $sth = $dbh->prepare(qq/insert into $table values(?,?)/);
+        my @pe1 = @p1;
+        $pe1[-2] = 1;
+        $sth->bind_param_array(1, \@pe1);
+        $sth->bind_param_array(2, \@p2);
+        $self->insert($dbh, $sth, {commit => 0, error => 1, sts => undef,
+                                   affected => undef, tuple => [1, 1, 1, [], 1], %$ref});
+        check_data($dbh, [@pe1[0..2],$pe1[4]], [@p2[0..2], $p2[4]]);
+    }
+}
+
+sub fetch_sub
+{
+    note("fetch_sub $fetch_row");
+    if ($fetch_row == @p1) {
+        note('returning undef');
+        $fetch_row = 0;
+        return;
+    }
+
+    return [$p1[$fetch_row], $p2[$fetch_row++]];
+}
+
+# test insertion via execute_array and ArrayTupleFetch
+sub row_wise
+{
+    my ($self, $dbh, $ref) = @_;
+
+    note("row_size via execute_for_fetch");
+
+    # Populate the first table via a ArrayTupleFetch which points to a sub
+    # returning rows
+    $fetch_row = 0;             # reset fetch_sub to start with first row
+    clear_table($dbh, $table);
+    my $sth = $dbh->prepare(qq/insert into $table values(?,?)/);
+    $self->insert($dbh, $sth,
+                  {commit => 0, error => 0, sts => 5, affected => 5,
+                   tuple => [1, 1, 1, 1, 1], %$ref,
+                   fetch => \&fetch_sub});
+
+    # NOTE: The following test requires Multiple Active Statements. Although
+    # I can find ODBC drivers which do this it is not easy (if at all possible)
+    # to know if an ODBC driver can handle MAS or not. If it errors the
+    # driver probably does not have MAS so the error is ignored and a
+    # diagnostic is output. Exceptions are DBD::Oracle which definitely does
+    # support MAS.
+    # The data pushed into the first table is retrieved via ArrayTupleFetch
+    # from the second table by passing an executed select statement handle into
+    # execute_array.
+    note("row_size via select");
+    clear_table($dbh, $table);
+    $sth = $dbh->prepare(qq/insert into $table values(?,?)/);
+    my $sth2 = $dbh->prepare(qq/select * from $table2/);
+    # some drivers issue warnings when mas fails and this causes
+    # Test::NoWarnings to output something when we already found
+    # the test failed and captured it.
+    # e.g., some ODBC drivers cannot do MAS and this test is then expected to
+    # fail but we ignore the failure. Unfortunately in failing DBD::ODBC will
+    # issue a warning in addition to the fail
+    $sth->{Warn} = 0;
+    $sth->{Warn} = 0;
+    ok($sth2->execute, 'execute on second table') or diag($sth2->errstr);
+    ok($sth2->{Executed}, 'second statement is in executed state');
+    my $res = $self->insert($dbh, $sth,
+           {commit => 0, error => 0, sts => 5, affected => 5,
+            tuple => [1, 1, 1, 1, 1], %$ref,
+            fetch => $sth2, requires_mas => 1});
+    return if $res && $res eq 'mas'; # aborted , does not seem to support MAS
+    check_data($dbh, \@p1, \@p2);
+}
+
+# test updates
+# updates are special as you can update more rows than there are parameter rows
+sub update
+{
+    my ($self, $dbh, $ref) = @_;
+
+    note("update test");
+
+    # populate the first table with the default 5 rows using a ArrayTupleFetch
+    $fetch_row = 0;
+    clear_table($dbh, $table);
+    my $sth = $dbh->prepare(qq/insert into $table values(?,?)/);
+    $self->insert($dbh, $sth,
+                  {commit => 0, error => 0, sts => 5, affected => 5,
+                   tuple => [1, 1, 1, 1, 1], %$ref,
+                   fetch => \&fetch_sub});
+    check_data($dbh, \@p1, \@p2);
+
+    # update all rows b column to 'fred' checking rows affected is 5
+    $sth = $dbh->prepare(qq/update $table set b = ? where a = ?/);
+    # NOTE, this also checks you can pass a scalar to bind_param_array
+    $sth->bind_param_array(1, 'fred');
+    $sth->bind_param_array(2, \@p1);
+    $self->insert($dbh, $sth,
+                  {commit => 0, error => 0, sts => 5, affected => 5,
+                   tuple => [1, 1, 1, 1, 1], %$ref});
+    check_data($dbh, \@p1, [qw(fred fred fred fred fred)]);
+
+    # update 4 rows column b to 'dave' checking rows affected is 4
+    $sth = $dbh->prepare(qq/update $table set b = ? where a = ?/);
+    # NOTE, this also checks you can pass a scalar to bind_param_array
+    $sth->bind_param_array(1, 'dave');
+    my @pe1 = @p1;
+    $pe1[-1] = 10;              # non-existent row
+    $sth->bind_param_array(2, \@pe1);
+    $self->insert($dbh, $sth,
+                  {commit => 0, error => 0, sts => 5, affected => 4,
+                   tuple => [1, 1, 1, 1, '0E0'], %$ref});
+    check_data($dbh, \@p1, [qw(dave dave dave dave fred)]);
+
+    # now change all rows b column to 'pete' - this will change all 5
+    # rows even though we have 2 rows of parameters so we can see if
+    # the rows affected is > parameter rows
+    $sth = $dbh->prepare(qq/update $table set b = ? where b like ?/);
+    # NOTE, this also checks you can pass a scalar to bind_param_array
+    $sth->bind_param_array(1, 'pete');
+    $sth->bind_param_array(2, ['dave%', 'fred%']);
+    $self->insert($dbh, $sth,
+                  {commit => 0, error => 0, sts => 2, affected => 5,
+                   tuple => [4, 1], %$ref});
+    check_data($dbh, \@p1, [qw(pete pete pete pete pete)]);
+}
+
+sub enable_mars {
+    my $dbh = shift;
+
+    # this test uses multiple active statements
+    # if we recognise the driver and it supports MAS enable it
+    my $driver_name = $dbh->get_info(6) || '';
+    if (($driver_name eq 'libessqlsrv.so') ||
+            ($driver_name =~ /libsqlncli/)) {
+        my $dsn = $ENV{DBI_DSN};
+        if ($dsn !~ /^dbi:ODBC:DSN=/ && $dsn !~ /DRIVER=/i) {
+            my @a = split(q/:/, $ENV{DBI_DSN});
+            $dsn = join(q/:/, @a[0..($#a - 1)]) . ":DSN=" . $a[-1];
+        }
+        $dsn .= ";MARS_Connection=yes";
+        $dbh->disconnect;
+        $dbh = DBI->connect($dsn, $ENV{DBI_USER}, $ENV{DBI_PASS});
+    }
+    return $dbh;
+}
+
+1;
+                                                                                                                                                                          root/.cpan/build/DBD-Oracle-1.90-0/t/rt13865.t                                                      0000644 0001750 0001750 00000006203 14616324562 016373  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        #!perl
+
+use strict;
+use warnings;
+
+use lib 't/lib';
+use DBDOracleTestLib qw/ db_handle table drop_table force_drop_table /;
+
+use DBI;
+use DBD::Oracle;
+
+use Test::More;
+
+my $dbh = db_handle()
+  or plan skip_all => q|Can't connect to database|;
+
+my %priv = map { $_ => 1 } get_privs($dbh);
+
+unless ( $priv{'CREATE TABLE'} ) {
+    plan skip_all => q{requires permissions 'CREATE TABLE'};
+}
+
+my $table = table('rt13865__drop_me');
+force_drop_table($dbh, $table);
+
+my $create_sql = <<"END_SQL";
+CREATE TABLE $table(
+    COL_INTEGER INTEGER,
+    COL_NUMBER NUMBER,
+    COL_NUMBER_37 NUMBER(37),
+    COL_DECIMAL NUMBER(9,2),
+    COL_FLOAT FLOAT(126),
+    COL_VC2   VARCHAR2(67),
+    COL_VC2_69CHAR  VARCHAR2(69 CHAR),
+    COL_NVC2  NVARCHAR2(69),
+    COL_NC    NCHAR(69),
+    COL_CHAR  CHAR(67),
+    COL_CHAR_69CHAR  CHAR(69 CHAR)
+)
+END_SQL
+
+my @tests = (
+    {
+        col  => 'COL_INTEGER',
+        size => 38,
+        cmp  => '==',
+        name => 'INTEGER is alias for NUMBER(38)'
+    },
+    {
+        col  => 'COL_NUMBER_37',
+        size => 37,
+        cmp  => '==',
+        name => 'NUMBER(37)'
+    },
+    {
+        col  => 'COL_NUMBER',
+        size => 0,
+        cmp  => '>',
+        name => 'NUMBER'
+    },
+    {
+        col  => 'COL_VC2',
+        size => 67,
+        cmp  => '==',
+        name => 'VARCHAR2(67)'
+    },
+    {
+        col  => 'COL_VC2_69CHAR',
+        size => 69,
+        cmp  => '==',
+        name => 'VARCHAR2(69)'
+    },
+    {
+        col  => 'COL_NVC2',
+        size => 69,
+        cmp  => '==',
+        name => 'NVARCHAR2(69)'
+    },
+    {
+        col  => 'COL_NC',
+        size => 69,
+        cmp  => '==',
+        name => 'NCHAR(69)'
+    },
+    {
+        col  => 'COL_CHAR',
+        size => 67,
+        cmp  => '==',
+        name => 'CHAR(67)'
+    },
+    {
+        col  => 'COL_CHAR_69CHAR',
+        size => 69,
+        cmp  => '==',
+        name => 'CHAR(69)'
+    },
+);    # @tests
+
+ok( $dbh->do($create_sql), "Create database: $table" )
+  or die $dbh->errstr;
+
+for my $test (@tests) {
+
+    my $col_h = $dbh->column_info( undef, undef, uc($table), $test->{col} );
+
+    # if column_info() returns undef, then the driver doesnt support column_info. DBD::Oracle should support it.
+    ok(
+        $col_h,
+        sprintf(
+            'column_info() returns something for test: %s', $test->{name}
+        )
+    ) or next;
+    cmp_ok( ref $col_h, 'eq', 'DBI::st',
+        sprintf( 'returned object is correct for test: %s', $test->{name} ) );
+
+# if there is no row, then the table/column couldnt be found... this should not happen either
+    my $row = $col_h->fetchrow_hashref;
+    cmp_ok(
+        ref $row,
+        'eq', 'HASH',
+        sprintf(
+'column/table now found - fetchrow_hashref returned a hash for test: %s',
+            $test->{name} )
+    ) or next;
+
+    # this is the actual test, everything above it sanity checking / pre-diagnosis
+    cmp_ok( $row->{COLUMN_SIZE}, $test->{cmp}, $test->{size}, $test->{name} );
+
+}
+
+drop_table($dbh, $table);
+
+# utility functions
+
+sub get_privs {
+    my $dbh = shift;
+
+    my $sth = $dbh->prepare('SELECT PRIVILEGE from session_privs');
+    $sth->execute;
+
+    return map { $_->[0] } @{ $sth->fetchall_arrayref };
+}
+
+done_testing();
+                                                                                                                                                                                                                                                                                                                                                                                             root/.cpan/build/DBD-Oracle-1.90-0/t/rt74753-utf8-encoded.t                                         0000644 0001750 0001750 00000003100 14616324562 020652  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        #!perl
+
+use strict;
+use warnings;
+
+use lib 't/lib';
+use DBDOracleTestLib qw/ oracle_test_dsn db_ochar_is_utf db_handle /;
+
+use Test::More;
+
+use DBI;
+use Encode;
+
+$ENV{NLS_LANG}  = 'AMERICAN_AMERICA.UTF8';
+$ENV{NLS_NCHAR} = 'UTF8';
+
+my $dbh = db_handle(
+    {
+        PrintError => 0,
+        AutoCommit => 0
+    }
+);
+
+plan skip_all => 'Unable to connect to Oracle database' if not $dbh;
+plan skip_all => 'Database character set is not Unicode'
+  unless db_ochar_is_utf($dbh);
+
+plan tests => 3;
+
+$dbh->do(q(alter session set nls_territory = 'GERMANY'));
+
+my $sth = $dbh->prepare(<<'END_SQL');
+    SELECT ltrim(rtrim(to_char(0, 'L'))) FROM dual
+END_SQL
+
+$sth->execute;
+
+my ($val);
+$sth->bind_columns( \($val) );
+
+$sth->fetch;
+
+is Encode::is_utf8($val) => 1, 'utf8 encoded';
+
+$sth->finish;
+
+$val = undef;
+
+$sth = $dbh->prepare(<<'END_SQL');
+declare
+    l_ret       varchar2(10);
+begin
+    select  ltrim(rtrim(to_char(0, 'L')))
+    into    l_ret
+    from    dual;
+    --
+    :ret := l_ret;
+end;
+END_SQL
+
+$sth->bind_param_inout( ':ret', \$val, 100 );
+$sth->execute;
+
+is Encode::is_utf8($val) => 1, 'utf8 encoded';
+
+$sth = $dbh->prepare(<<'END_SQL');
+declare
+    l_ret       varchar2(10);
+begin
+    select ltrim(rtrim(to_char(0, 'L')))
+        || ltrim(rtrim(to_char(0, 'L')))
+        || ltrim(rtrim(to_char(0, 'L')))
+    into    l_ret
+    from    dual;
+    --
+    :ret := l_ret;
+end;
+END_SQL
+
+$val = undef;
+
+# WARNING: does *not* truncate. DBD::Oracle doesn't heed the 3rd parameter
+$sth->bind_param_inout( ':ret', \$val, 1 );
+$sth->execute;
+
+is Encode::is_utf8($val) => 1, 'truncated, yet utf8 encoded';
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                root/.cpan/build/DBD-Oracle-1.90-0/t/rt85886.t                                                      0000755 0001750 0001750 00000001772 14616324562 016420  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        #!perl
+
+use strict;
+use warnings;
+
+use lib 't/lib';
+use DBDOracleTestLib qw/ oracle_test_dsn db_handle /;
+
+use Test::More;
+
+use DBI qw(:sql_types);
+use Devel::Peek;
+use B qw( svref_2object SVf_IOK SVf_NOK SVf_POK );
+
+sub is_iv {
+    my $sv = svref_2object( my $ref = \$_[0] );
+    my $flags = $sv->FLAGS;
+
+    # See http://www.perlmonks.org/?node_id=971411
+    my $x = $sv->can('PV') ? $sv->PV : undef;
+
+    if (wantarray) {
+        return ( $flags & SVf_IOK, $x );
+    }
+    else {
+        return $flags & SVf_IOK;
+    }
+}
+
+my $dbh = db_handle(
+    {
+        PrintError       => 0,
+        FetchHashKeyName => 'NAME_lc'
+    }
+);
+
+plan skip_all => 'Unable to connect to Oracle database' if not $dbh;
+
+plan tests => 2;
+
+my $s = $dbh->prepare(q/select 1 as one from dual/);
+$s->execute;
+
+$s->bind_col( 1, undef, { TYPE => SQL_INTEGER, DiscardString => 1 } );
+
+my $list = $s->fetchall_arrayref( {} );
+
+is( $list->[0]{one}, 1, 'correct value returned' );
+ok( is_iv( $list->[0]{one} ), 'ivok' ) or Dump( $list->[0]{one} );
+      root/.cpan/build/DBD-Oracle-1.90-0/typemap                                                          0000644 0001750 0001750 00000000067 14616324562 016313  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        OCILobLocator *         T_PTROBJ
+OCIXMLType *		T_PTROBJ                                                                                                                                                                                                                                                                                                                                                                                                                                                                         root/.cpan/build/DBD-Oracle-1.90-1/                                                                 0000755 0000000 0000000 00000000000 14723047276 014660  5                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        root/.cpan/build/DBD-Oracle-1.90-1/CONTRIBUTING.md                                                  0000644 0001750 0001750 00000006134 14616324562 017144  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        # CONTRIBUTING
+
+Thank you for considering contributing to {{ $dist }}.
+This file contains instructions that will help you work with
+the source code.
+
+## Repository branches structure
+
+The two main branches of this repository are:
+
+* **master**
+
+The main development branch. This branch has to
+be processed by Dist::Zilla to generate the
+code as it will appear in the CPAN distribution. See the
+next section for more details.
+
+* **releases**
+
+Contains the code as it appears on CPAN. Each official
+release is also tagged with its version.
+
+## Working on the master branch
+
+The distribution is managed with [Dist::Zilla][distzilla].
+This means than many of the usual files you might expect
+are not in the repository, but are generated at release time.
+
+However, you can run tests directly using the 'prove' tool:
+
+``` bash
+$ prove -l
+$ prove -lv t/some_test_file.t
+$ prove -lvr t/
+```
+
+In most cases, 'prove' is entirely sufficient for you to test any
+patches you have.
+
+You may need to satisfy some dependencies. The easiest way to satisfy
+dependencies is to install the last release -- this is available at
+https://metacpan.org/release/{{ $dist }}.
+
+If you use cpanminus, you can do it without downloading the tarball first:
+
+``` bash
+$ cpanm --reinstall --installdeps --with-recommends {{ $dist =~ s/-/::/gr }}
+```
+
+Dist::Zilla is a very powerful authoring tool, but requires a number of
+author-specific plugins. If you would like to use it for contributing,
+install it from CPAN, then run one of the following commands, depending on
+your CPAN client:
+
+``` bash
+$ cpan `dzil authordeps --missing`
+$ dzil authordeps --missing | cpanm
+```
+
+You should then also install any additional requirements not needed by the
+dzil build but may be needed by tests or other development:
+
+``` bash
+# cpan `dzil listdeps --author --missing`
+$ dzil listdeps --author --missing | cpanm
+```
+
+You can also do this via cpanm directly:
+
+``` bash
+$ cpanm --reinstall --installdeps --with-develop --with-recommends {{ $dist =~ s/-/::/gr }}
+```
+
+Once installed, here are some dzil commands you might try:
+
+``` bash
+$ dzil build
+$ dzil test
+$ dzil test --release
+$ dzil xtest
+$ dzil listdeps --json
+$ dzil build --notgz
+```
+
+
+## This Is Complicated. Is There an Easier Way?
+
+Actually, yes there is. You can also work directly on the `releases` branch,
+which corresponds to the code is generated by Dist::Zilla and
+correspond to what is uploaded to CPAN.
+
+It won't contain any of the changes brought to the codebase since the last
+CPAN release, but for a small patch that shouldn't be a problem.
+
+## Sending Patches
+
+The code for this distribution is hosted on [GitHub][repository].
+
+You can submit bug reports via the [repository's issue track][bugtracker].
+
+You can also submit code changes by forking the repository, pushing your code
+changes to your clone, and then submitting a pull request. Detailed
+instructions for doing that is available here:
+
+* https://help.github.com/
+* https://help.github.com/articles/creating-a-pull-request
+
+[distzilla]:  http://dzil.org/.
+[repository]: https://github.com/perl5-dbi/DBD-Oracle/
+[bugtracker]: https://github.com/perl5-dbi/DBD-Oracle/issues
+
+                                                                                                                                                                                                                                                                                                                                                                                                                                    root/.cpan/build/DBD-Oracle-1.90-1/CONTRIBUTORS                                                     0000644 0001750 0001750 00000001445 14616324562 016573  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        
+# DBD-ORACLE CONTRIBUTORS #
+
+This is the (likely incomplete) list of people who have helped
+make this distribution what it is, either via code contributions, 
+patches, bug reports, help with troubleshooting, etc. A huge
+'thank you' to all of them.
+
+    * Aaron Crane
+    * Alex Muntada
+    * Alice Maz
+    * Andrei Voropaev
+    * avorop
+    * Carsten Grohmann
+    * cjardine
+    * Dag Lem
+    * David E. Wheeler
+    * David Perry
+    * David Steinbrunner
+    * Dean Hamstead
+    * Dean Pearce
+    * Graham Knop
+    * gregor herrmann
+    * Gwen Shapira
+    * Håkon Hægland
+    * H.Merijn Brand - Tux
+    * Jochen Hayek
+    * Joe Crotty
+    * John Smith
+    * jurl
+    * kjetillll
+    * lbaxter
+    * Michael Portnoy
+    * Mike O'Regan
+    * robert
+    * StephenCIQG
+    * Tony Cook
+    * Wesley Hinds
+
+
+                                                                                                                                                                                                                           root/.cpan/build/DBD-Oracle-1.90-1/Changes                                                          0000644 0001750 0001750 00000250055 14616324562 016211  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        Revision history for DBD::Oracle
+
+1.90      2024-05-07
+
+  Specify resources metadata explicitly in dist.ini (HG#162, Graham Knop)
+  Ensure dbivport.h is installed- (GH#150, Wesley Hinds)
+  Add DBI to ConfigureRequires, BuildRequires, and Test Requires - (GH#155)
+  Move from TravisCI to Github Actions (GHA) - (PR#152, Wesley Hinds)
+  Update dbdcnx.c - (PR#152, Andrei Voropaev)
+  Rewrite of login6. This is an enormous rewrite which should fix many problems - (PR#150, Andrei Voropaev)
+  Improvements to Makefile.PL - (PR#150, Andrei Voropaev)
+  Have find_headers() also search for header files based off the major version number - (GH#142, Wesley Hinds)
+  Check for appropriate permissions before running 56embbeded.t tests - (#143, Wesley Hinds)
+  Updated links in doc in Oracle.pm - (Gh#145, kjetillll)
+  Update 25plsql.t and add 21.5 to @bad_oci_vers - (GH#144, kjetillll)
+  Check permissions for tests in 28array_bind.t - (GH#141, Wesley Hinds)
+  Exclude 19.9 and 19.13 from 25plsql.t - (GH#140, Wesley Hinds)
+
+1.83
+
+  Build improvements on Debian-ish systems (GH#112, Alex Muntada)
+  Add rpath to ORACLE_HOME to DBD/Oracle/Oracle.bundle (GH#129, hackonhagland).
+
+1.82      2021-12-29
+
+  Second try at github #130.  Still not fully cooperating but better.
+
+1.81      2021-12-24
+
+  [BUG FIXES]
+
+  Run nonassigned pl/sql tests based off versions known to have the issue. - (GH#70, Wesley Hinds)
+  Oracle Instant Client 21 support - (Tux)
+  Add rpath to ORACLE_HOME to DBD/Oracle/Oracle.bundle  - (GH#128, hakonhagland)
+  fix materialised views being misclassified as tables in ->table_info - (GH#132, John Smith)
+  Fix bugtracker ref in dist metadata github - (GH#130, John Smith)
+
+  [MISCELLANEOUS]
+
+  Updates to POD and README file
+  Moved old README file to t/TESTING.md
+  Updated links
+
+1.80      2019-07-25
+
+  [BUG FIXES]
+
+  orphaned test code in t/28_array_bind.t - (GH#64, dzort)
+  Made the code run so it is nolonger orphaned
+
+  [MISCELLANEOUS]
+
+  Updated bugtracker to git
+  updated home page to metacpan
+
+1.791     2019-07-22
+
+  [BUG FIXES]
+
+  Fix Avoid GCC-ism so that HP-UX can compile (GH#92, Dean Hamstead)
+
+  Destroy envhp with last dbh (GH#93, GH#89, Dean Hamstead, CarstenGrohmann)
+
+
+1.76      2018-11-22
+
+  No Changes from 1.75, we just botched up publishing to CPAN
+
+1.75   2018-11-22
+
+  No Changes from 1.75_42
+
+1.75_42   2018-08-22
+
+  [BUG FIXES]
+
+  Fix potential buffer overflow in dbdimp.c - (GH#57, Various)
+
+  Fix truncation error on ROWIDs from an Index Organized table as they are
+  not a fixed length. Code now allows up to a size of 2000.
+  (GH#31, Martin J. Evans)
+
+  Various fixes for compiler warnings, OCI handle leaks, and OCI programming
+  errors. - (PR#38, Dag Lem)
+
+  Corrections to t/25plsql.t - (GH#56, kjetillll)
+
+  Fix: Invalid binding call for large undef arrays. - (GH#36, GH ghost)
+
+  Fix: compile warnings about int vs long unsigned. - (PR#62, Dean Hamstead)
+
+  Fix: Spelling errors in pod. - (PR#63, Jochen Hayek)
+
+  Fix: Various changes in pod. - (PR#54, Mike O'Regan)
+
+  [ENHANCEMENT]
+
+  Connection informational messages like "ORA-28002: the password will
+  expire" were lost. Thanks to J.D. Laub.
+
+  Add new path to find 64 bit Oracle client on MAC OSX - (GH#20, Martin J. Evans)
+
+  Ignore constraints which are not enabled in primary/foreign key_info
+  (GH#23, Martin J. Evans)
+
+  dist.init overhaul. - (PR#62, Dean Hamstead)
+
+  Mailmap and TODO changes. - (PR#62, Dean Hamstead)
+
+  Travis CI testing. - (PR#62, Dean Hamstead)
+  Note: this uses Oracle XE which doesn't provide enough features to test
+  the entire suite. Nor does it test anything other than Linux on Linux.
+  Release tests are also NOT yet run in Travis.
+
+  Rewrite of DRCP session pooling to make it work as intended - (PR#38, Dag Lem)
+
+  Support for Oracle Fast Application Notification (FAN). - (PR#38, Dag Lem)
+
+  Work by Dag Lem was sponsored by EVRY Information Services. Thank you!
+
+1.75_2    2014-11-19
+
+  [ENHANCEMENT]
+
+  Try and set -l when the build would have failed (H.Merijn Brand)
+
+1.75_1    2014-11-17
+
+  [DOCUMENTATION]
+
+  Change mentions of READMEs in Makefile.PL to troubleshooting guides.
+  (GH#17, reported by Ken Williams)
+
+  [BUG FIXES]
+
+  Fix GH#15 and GH#21 (the same problem). Previous change for
+  RT91698 broke other things in output parameters.
+
+1.74      2014-04-24
+  - Promote to stable.
+
+1.73_01   2014-04-23
+  - Tweak fix for RT-88185. (GH#14, Martin J. Evans)
+
+1.73_00   2014-04-23
+  - Reverts current fix for RT-88185, as it causes breakage. (GH#14)
+
+1.72      2014-04-14
+  - promote 1.71_00 to stable.
+
+1.71_00   2014-03-31
+    - Recognizes __CYGWIN64__. (RT88709, reported by Witold Petriczek)
+    - CHOOSE hint is deprecated. (RT91217, reported by Andy Bucksch,
+        fix by Martin J Evans)
+    - Set UTF8 flag per-connection. (RT88185, reported by Heinrich Mislik, patch by Martin
+      J. Evans)
+    - Add a CONTRIBUTING.mkd file. (GH#2)
+    - Add SELinux trick. (RT#87003, patch submitted by Mike Doherty)
+
+1.70   2014-02-12
+  - promote 1.69_02 to stable.
+
+1.69_02 2014-01-19
+
+    [IMPROVEMENTS]
+
+    - The DSN 'dbi:Oracle:sid=foo' is now an alias for 'dbi:Oracle:foo'.
+        (RT#91775, Yanick Champoux, requested by David Wheeler)
+
+    - Support for ORA_SYSBACKUP, ORA_SYSDG and ORA_SYSKM. (RT#91473,
+        Kris Lemaire)
+
+    [BUG FIXES]
+
+   - OCI_THREADED setting had been accidentally removed, causing potential
+    crashes when using threads. (RT#92229, Martin J. Evans, reported
+    by Detlef Lütticke)
+
+  - When using fetch*_hashref the values are decoded but
+    not the keys so if you have unicode column names they were not
+    returned correctly.  (RT#92134, Martin J. Evans, reported by
+    Marcel Montes)
+
+
+1.69_01 2014-01-14
+
+  [BUG FIXES]
+
+  - Fix RT91698. If you bound an output parameter to a scalar and
+    repeatedly called execute the memory allocated in your bound
+    scalar could increase each time. (Martin J. Evans)
+
+1.68      2013-11-25
+  - promote 1.67_00 to stable.
+
+1.67_00   2013-11-05
+
+  [BUG FIXES]
+  - Fix RT88135. Add statistics_info support (patch by Steffen Goeldner)
+  - Fix RT89491. Add RULE hint (patch by Steffen Goeldner)
+
+  [DOCUMENTATION]
+  - POD typos (RT#88285, RT#88284, Gregor Herrman).
+  - Grooming of Hpux troubleshooting pod (GH#7, Martin J. Evans,
+    Yanick Champoux)
+
+1.66      2013-08-23
+  - promote 1.65_00 to stable.
+
+1.65_00   2013-07-29
+
+  [BUG FIXES]
+
+  - Fix RT85886. The TYPE passed to bind_col is supposed to be sticky
+  and it wasn't. Attributes passed to bind_col could be lost later if
+  bind_col is called again without attributes. Both of these occur

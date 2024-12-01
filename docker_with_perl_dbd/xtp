@@ -1,0 +1,1000 @@
+        return len(self._list)
+
+    def __nonzero__(self):
+        return bool(self._r1) or bool(self._r2)
+
+    __bool__ = __nonzero__
+
+    @util.propertycache
+    def _list(self):
+        if not self._genlist:
+            self._genlist = baseset(iter(self))
+        return self._genlist
+
+    def __iter__(self):
+        """Iterate over both collections without repeating elements
+
+        If the ascending attribute is not set, iterate over the first one and
+        then over the second one checking for membership on the first one so we
+        dont yield any duplicates.
+
+        If the ascending attribute is set, iterate over both collections at the
+        same time, yielding only one value at a time in the given order.
+        """
+        if self._ascending is None:
+            if self._genlist:
+                return iter(self._genlist)
+
+            def arbitraryordergen():
+                for r in self._r1:
+                    yield r
+                inr1 = self._r1.__contains__
+                for r in self._r2:
+                    if not inr1(r):
+                        yield r
+
+            return arbitraryordergen()
+        # try to use our own fast iterator if it exists
+        self._trysetasclist()
+        if self._ascending:
+            attr = b'fastasc'
+        else:
+            attr = b'fastdesc'
+        it = getattr(self, attr)
+        if it is not None:
+            return it()
+        # maybe half of the component supports fast
+        # get iterator for _r1
+        iter1 = getattr(self._r1, attr)
+        if iter1 is None:
+            # let's avoid side effect (not sure it matters)
+            iter1 = iter(sorted(self._r1, reverse=not self._ascending))
+        else:
+            iter1 = iter1()
+        # get iterator for _r2
+        iter2 = getattr(self._r2, attr)
+        if iter2 is None:
+            # let's avoid side effect (not sure it matters)
+            iter2 = iter(sorted(self._r2, reverse=not self._ascending))
+        else:
+            iter2 = iter2()
+        return _iterordered(self._ascending, iter1, iter2)
+
+    def _trysetasclist(self):
+        """populate the _asclist attribute if possible and necessary"""
+        if self._genlist is not None and self._asclist is None:
+            self._asclist = sorted(self._genlist)
+
+    @property
+    def fastasc(self):
+        self._trysetasclist()
+        if self._asclist is not None:
+            return self._asclist.__iter__
+        iter1 = self._r1.fastasc
+        iter2 = self._r2.fastasc
+        if None in (iter1, iter2):
+            return None
+        return lambda: _iterordered(True, iter1(), iter2())
+
+    @property
+    def fastdesc(self):
+        self._trysetasclist()
+        if self._asclist is not None:
+            return self._asclist.__reversed__
+        iter1 = self._r1.fastdesc
+        iter2 = self._r2.fastdesc
+        if None in (iter1, iter2):
+            return None
+        return lambda: _iterordered(False, iter1(), iter2())
+
+    def __contains__(self, x):
+        return x in self._r1 or x in self._r2
+
+    def sort(self, reverse=False):
+        """Sort the added set
+
+        For this we use the cached list with all the generated values and if we
+        know they are ascending or descending we can sort them in a smart way.
+        """
+        self._ascending = not reverse
+
+    def isascending(self):
+        return self._ascending is not None and self._ascending
+
+    def isdescending(self):
+        return self._ascending is not None and not self._ascending
+
+    def istopo(self):
+        # not worth the trouble asserting if the two sets combined are still
+        # in topographical order. Use the sort() predicate to explicitly sort
+        # again instead.
+        return False
+
+    def reverse(self):
+        if self._ascending is None:
+            self._list.reverse()
+        else:
+            self._ascending = not self._ascending
+
+    def first(self):
+        for x in self:
+            return x
+        return None
+
+    def last(self):
+        self.reverse()
+        val = self.first()
+        self.reverse()
+        return val
+
+    @encoding.strmethod
+    def __repr__(self):
+        d = {None: b'', False: b'-', True: b'+'}[self._ascending]
+        return b'<%s%s %r, %r>' % (_typename(self), d, self._r1, self._r2)
+
+
+class generatorset(abstractsmartset):
+    """Wrap a generator for lazy iteration
+
+    Wrapper structure for generators that provides lazy membership and can
+    be iterated more than once.
+    When asked for membership it generates values until either it finds the
+    requested one or has gone through all the elements in the generator
+
+    >>> xs = generatorset([0, 1, 4], iterasc=True)
+    >>> assert xs.last() == xs.last()
+    >>> xs.last()  # cached
+    4
+    """
+
+    def __new__(cls, gen, iterasc=None):
+        if iterasc is None:
+            typ = cls
+        elif iterasc:
+            typ = _generatorsetasc
+        else:
+            typ = _generatorsetdesc
+
+        return super(generatorset, cls).__new__(typ)
+
+    def __init__(self, gen, iterasc=None):
+        """
+        gen: a generator producing the values for the generatorset.
+        """
+        self._gen = gen
+        self._asclist = None
+        self._cache = {}
+        self._genlist = []
+        self._finished = False
+        self._ascending = True
+
+    def __nonzero__(self):
+        # Do not use 'for r in self' because it will enforce the iteration
+        # order (default ascending), possibly unrolling a whole descending
+        # iterator.
+        if self._genlist:
+            return True
+        for r in self._consumegen():
+            return True
+        return False
+
+    __bool__ = __nonzero__
+
+    def __contains__(self, x):
+        if x in self._cache:
+            return self._cache[x]
+
+        # Use new values only, as existing values would be cached.
+        for l in self._consumegen():
+            if l == x:
+                return True
+
+        self._cache[x] = False
+        return False
+
+    def __iter__(self):
+        if self._ascending:
+            it = self.fastasc
+        else:
+            it = self.fastdesc
+        if it is not None:
+            return it()
+        # we need to consume the iterator
+        for x in self._consumegen():
+            pass
+        # recall the same code
+        return iter(self)
+
+    def _iterator(self):
+        if self._finished:
+            return iter(self._genlist)
+
+        # We have to use this complex iteration strategy to allow multiple
+        # iterations at the same time. We need to be able to catch revision
+        # removed from _consumegen and added to genlist in another instance.
+        #
+        # Getting rid of it would provide an about 15% speed up on this
+        # iteration.
+        genlist = self._genlist
+        nextgen = self._consumegen()
+        _len, _next = len, next  # cache global lookup
+
+        def gen():
+            i = 0
+            while True:
+                if i < _len(genlist):
+                    yield genlist[i]
+                else:
+                    try:
+                        yield _next(nextgen)
+                    except StopIteration:
+                        return
+                i += 1
+
+        return gen()
+
+    def _consumegen(self):
+        cache = self._cache
+        genlist = self._genlist.append
+        for item in self._gen:
+            cache[item] = True
+            genlist(item)
+            yield item
+        if not self._finished:
+            self._finished = True
+            asc = self._genlist[:]
+            asc.sort()
+            self._asclist = asc
+            self.fastasc = asc.__iter__
+            self.fastdesc = asc.__reversed__
+
+    def __len__(self):
+        for x in self._consumegen():
+            pass
+        return len(self._genlist)
+
+    def sort(self, reverse=False):
+        self._ascending = not reverse
+
+    def reverse(self):
+        self._ascending = not self._ascending
+
+    def isascending(self):
+        return self._ascending
+
+    def isdescending(self):
+        return not self._ascending
+
+    def istopo(self):
+        # not worth the trouble asserting if the two sets combined are still
+        # in topographical order. Use the sort() predicate to explicitly sort
+        # again instead.
+        return False
+
+    def first(self):
+        if self._ascending:
+            it = self.fastasc
+        else:
+            it = self.fastdesc
+        if it is None:
+            # we need to consume all and try again
+            for x in self._consumegen():
+                pass
+            return self.first()
+        return next(it(), None)
+
+    def last(self):
+        if self._ascending:
+            it = self.fastdesc
+        else:
+            it = self.fastasc
+        if it is None:
+            # we need to consume all and try again
+            for x in self._consumegen():
+                pass
+            return self.last()
+        return next(it(), None)
+
+    @encoding.strmethod
+    def __repr__(self):
+        d = {False: b'-', True: b'+'}[self._ascending]
+        return b'<%s%s>' % (_typename(self), d)
+
+
+class _generatorsetasc(generatorset):
+    """Special case of generatorset optimized for ascending generators."""
+
+    fastasc = generatorset._iterator
+
+    def __contains__(self, x):
+        if x in self._cache:
+            return self._cache[x]
+
+        # Use new values only, as existing values would be cached.
+        for l in self._consumegen():
+            if l == x:
+                return True
+            if l > x:
+                break
+
+        self._cache[x] = False
+        return False
+
+
+class _generatorsetdesc(generatorset):
+    """Special case of generatorset optimized for descending generators."""
+
+    fastdesc = generatorset._iterator
+
+    def __contains__(self, x):
+        if x in self._cache:
+            return self._cache[x]
+
+        # Use new values only, as existing values would be cached.
+        for l in self._consumegen():
+            if l == x:
+                return True
+            if l < x:
+                break
+
+        self._cache[x] = False
+        return False
+
+
+def spanset(repo, start=0, end=None):
+    """Create a spanset that represents a range of repository revisions
+
+    start: first revision included the set (default to 0)
+    end:   first revision excluded (last+1) (default to len(repo))
+
+    Spanset will be descending if `end` < `start`.
+    """
+    if end is None:
+        end = len(repo)
+    ascending = start <= end
+    if not ascending:
+        start, end = end + 1, start + 1
+    return _spanset(start, end, ascending, repo.changelog.filteredrevs)
+
+
+class _spanset(abstractsmartset):
+    """Duck type for baseset class which represents a range of revisions and
+    can work lazily and without having all the range in memory
+
+    Note that spanset(x, y) behave almost like range(x, y) except for two
+    notable points:
+    - when x < y it will be automatically descending,
+    - revision filtered with this repoview will be skipped.
+
+    """
+
+    def __init__(self, start, end, ascending, hiddenrevs):
+        self._start = start
+        self._end = end
+        self._ascending = ascending
+        self._hiddenrevs = hiddenrevs
+
+    def sort(self, reverse=False):
+        self._ascending = not reverse
+
+    def reverse(self):
+        self._ascending = not self._ascending
+
+    def istopo(self):
+        # not worth the trouble asserting if the two sets combined are still
+        # in topographical order. Use the sort() predicate to explicitly sort
+        # again instead.
+        return False
+
+    def _iterfilter(self, iterrange):
+        s = self._hiddenrevs
+        for r in iterrange:
+            if r not in s:
+                yield r
+
+    def __iter__(self):
+        if self._ascending:
+            return self.fastasc()
+        else:
+            return self.fastdesc()
+
+    def fastasc(self):
+        iterrange = range(self._start, self._end)
+        if self._hiddenrevs:
+            return self._iterfilter(iterrange)
+        return iter(iterrange)
+
+    def fastdesc(self):
+        iterrange = range(self._end - 1, self._start - 1, -1)
+        if self._hiddenrevs:
+            return self._iterfilter(iterrange)
+        return iter(iterrange)
+
+    def __contains__(self, rev):
+        hidden = self._hiddenrevs
+        return (self._start <= rev < self._end) and not (
+            hidden and rev in hidden
+        )
+
+    def __nonzero__(self):
+        for r in self:
+            return True
+        return False
+
+    __bool__ = __nonzero__
+
+    def __len__(self):
+        if not self._hiddenrevs:
+            return abs(self._end - self._start)
+        else:
+            count = 0
+            start = self._start
+            end = self._end
+            for rev in self._hiddenrevs:
+                if (end < rev <= start) or (start <= rev < end):
+                    count += 1
+            return abs(self._end - self._start) - count
+
+    def isascending(self):
+        return self._ascending
+
+    def isdescending(self):
+        return not self._ascending
+
+    def first(self):
+        if self._ascending:
+            it = self.fastasc
+        else:
+            it = self.fastdesc
+        for x in it():
+            return x
+        return None
+
+    def last(self):
+        if self._ascending:
+            it = self.fastdesc
+        else:
+            it = self.fastasc
+        for x in it():
+            return x
+        return None
+
+    def _slice(self, start, stop):
+        if self._hiddenrevs:
+            # unoptimized since all hidden revisions in range has to be scanned
+            return super(_spanset, self)._slice(start, stop)
+        if self._ascending:
+            x = min(self._start + start, self._end)
+            y = min(self._start + stop, self._end)
+        else:
+            x = max(self._end - stop, self._start)
+            y = max(self._end - start, self._start)
+        return _spanset(x, y, self._ascending, self._hiddenrevs)
+
+    @encoding.strmethod
+    def __repr__(self):
+        d = {False: b'-', True: b'+'}[self._ascending]
+        return b'<%s%s %d:%d>' % (_typename(self), d, self._start, self._end)
+
+
+class fullreposet(_spanset):
+    """a set containing all revisions in the repo
+
+    This class exists to host special optimization and magic to handle virtual
+    revisions such as "null".
+    """
+
+    def __init__(self, repo):
+        super(fullreposet, self).__init__(
+            0, len(repo), True, repo.changelog.filteredrevs
+        )
+
+    def __and__(self, other):
+        """As self contains the whole repo, all of the other set should also be
+        in self. Therefore `self & other = other`.
+
+        This boldly assumes the other contains valid revs only.
+        """
+        # other not a smartset, make is so
+        if not util.safehasattr(other, b'isascending'):
+            # filter out hidden revision
+            # (this boldly assumes all smartset are pure)
+            #
+            # `other` was used with "&", let's assume this is a set like
+            # object.
+            other = baseset(other - self._hiddenrevs)
+
+        other.sort(reverse=self.isdescending())
+        return other
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                   usr/lib/python3/dist-packages/mercurial/sparse.py                                                   0000644 0000000 0000000 00000065423 14355257011 020615  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        # sparse.py - functionality for sparse checkouts
+#
+# Copyright 2014 Facebook, Inc.
+#
+# This software may be used and distributed according to the terms of the
+# GNU General Public License version 2 or any later version.
+
+
+import os
+
+from .i18n import _
+from .node import hex
+from . import (
+    error,
+    match as matchmod,
+    merge as mergemod,
+    mergestate as mergestatemod,
+    pathutil,
+    pycompat,
+    requirements,
+    scmutil,
+    util,
+)
+from .utils import hashutil
+
+
+# Whether sparse features are enabled. This variable is intended to be
+# temporary to facilitate porting sparse to core. It should eventually be
+# a per-repo option, possibly a repo requirement.
+enabled = False
+
+
+def use_sparse(repo):
+    if getattr(repo, "_has_sparse", False):
+        # When enabling sparse the first time we need it to be enabled before
+        # actually enabling it.  This hack could be avoided if the code was
+        # improved further, however this is an improvement over the previously
+        # existing global variable.
+        return True
+    return requirements.SPARSE_REQUIREMENT in repo.requirements
+
+
+def parseconfig(ui, raw, action):
+    """Parse sparse config file content.
+
+    action is the command which is trigerring this read, can be narrow, sparse
+
+    Returns a tuple of includes, excludes, and profiles.
+    """
+    with util.timedcm(
+        'sparse.parseconfig(ui, %d bytes, action=%s)', len(raw), action
+    ):
+        includes = set()
+        excludes = set()
+        profiles = set()
+        current = None
+        havesection = False
+
+        for line in raw.split(b'\n'):
+            line = line.strip()
+            if not line or line.startswith(b'#'):
+                # empty or comment line, skip
+                continue
+            elif line.startswith(b'%include '):
+                line = line[9:].strip()
+                if line:
+                    profiles.add(line)
+            elif line == b'[include]':
+                if havesection and current != includes:
+                    # TODO pass filename into this API so we can report it.
+                    raise error.Abort(
+                        _(
+                            b'%(action)s config cannot have includes '
+                            b'after excludes'
+                        )
+                        % {b'action': action}
+                    )
+                havesection = True
+                current = includes
+                continue
+            elif line == b'[exclude]':
+                havesection = True
+                current = excludes
+            elif line:
+                if current is None:
+                    raise error.Abort(
+                        _(
+                            b'%(action)s config entry outside of '
+                            b'section: %(line)s'
+                        )
+                        % {b'action': action, b'line': line},
+                        hint=_(
+                            b'add an [include] or [exclude] line '
+                            b'to declare the entry type'
+                        ),
+                    )
+
+                if line.strip().startswith(b'/'):
+                    ui.warn(
+                        _(
+                            b'warning: %(action)s profile cannot use'
+                            b' paths starting with /, ignoring %(line)s\n'
+                        )
+                        % {b'action': action, b'line': line}
+                    )
+                    continue
+                current.add(line)
+
+        return includes, excludes, profiles
+
+
+# Exists as separate function to facilitate monkeypatching.
+def readprofile(repo, profile, changeid):
+    """Resolve the raw content of a sparse profile file."""
+    # TODO add some kind of cache here because this incurs a manifest
+    # resolve and can be slow.
+    return repo.filectx(profile, changeid=changeid).data()
+
+
+def patternsforrev(repo, rev):
+    """Obtain sparse checkout patterns for the given rev.
+
+    Returns a tuple of iterables representing includes, excludes, and
+    patterns.
+    """
+    # Feature isn't enabled. No-op.
+    if not use_sparse(repo):
+        return set(), set(), set()
+
+    raw = repo.vfs.tryread(b'sparse')
+    if not raw:
+        return set(), set(), set()
+
+    if rev is None:
+        raise error.Abort(
+            _(b'cannot parse sparse patterns from working directory')
+        )
+
+    includes, excludes, profiles = parseconfig(repo.ui, raw, b'sparse')
+    ctx = repo[rev]
+
+    if profiles:
+        visited = set()
+        while profiles:
+            profile = profiles.pop()
+            if profile in visited:
+                continue
+
+            visited.add(profile)
+
+            try:
+                raw = readprofile(repo, profile, rev)
+            except error.ManifestLookupError:
+                msg = (
+                    b"warning: sparse profile '%s' not found "
+                    b"in rev %s - ignoring it\n" % (profile, ctx)
+                )
+                # experimental config: sparse.missingwarning
+                if repo.ui.configbool(b'sparse', b'missingwarning'):
+                    repo.ui.warn(msg)
+                else:
+                    repo.ui.debug(msg)
+                continue
+
+            pincludes, pexcludes, subprofs = parseconfig(
+                repo.ui, raw, b'sparse'
+            )
+            includes.update(pincludes)
+            excludes.update(pexcludes)
+            profiles.update(subprofs)
+
+        profiles = visited
+
+    if includes:
+        includes.add(b'.hg*')
+
+    return includes, excludes, profiles
+
+
+def activeconfig(repo):
+    """Determine the active sparse config rules.
+
+    Rules are constructed by reading the current sparse config and bringing in
+    referenced profiles from parents of the working directory.
+    """
+    revs = [
+        repo.changelog.rev(node)
+        for node in repo.dirstate.parents()
+        if node != repo.nullid
+    ]
+
+    allincludes = set()
+    allexcludes = set()
+    allprofiles = set()
+
+    for rev in revs:
+        includes, excludes, profiles = patternsforrev(repo, rev)
+        allincludes |= includes
+        allexcludes |= excludes
+        allprofiles |= profiles
+
+    return allincludes, allexcludes, allprofiles
+
+
+def configsignature(repo, includetemp=True):
+    """Obtain the signature string for the current sparse configuration.
+
+    This is used to construct a cache key for matchers.
+    """
+    cache = repo._sparsesignaturecache
+
+    signature = cache.get(b'signature')
+
+    if includetemp:
+        tempsignature = cache.get(b'tempsignature')
+    else:
+        tempsignature = b'0'
+
+    if signature is None or (includetemp and tempsignature is None):
+        signature = hex(hashutil.sha1(repo.vfs.tryread(b'sparse')).digest())
+        cache[b'signature'] = signature
+
+        if includetemp:
+            raw = repo.vfs.tryread(b'tempsparse')
+            tempsignature = hex(hashutil.sha1(raw).digest())
+            cache[b'tempsignature'] = tempsignature
+
+    return b'%s %s' % (signature, tempsignature)
+
+
+def writeconfig(repo, includes, excludes, profiles):
+    """Write the sparse config file given a sparse configuration."""
+    with repo.vfs(b'sparse', b'wb') as fh:
+        for p in sorted(profiles):
+            fh.write(b'%%include %s\n' % p)
+
+        if includes:
+            fh.write(b'[include]\n')
+            for i in sorted(includes):
+                fh.write(i)
+                fh.write(b'\n')
+
+        if excludes:
+            fh.write(b'[exclude]\n')
+            for e in sorted(excludes):
+                fh.write(e)
+                fh.write(b'\n')
+
+    repo._sparsesignaturecache.clear()
+
+
+def readtemporaryincludes(repo):
+    raw = repo.vfs.tryread(b'tempsparse')
+    if not raw:
+        return set()
+
+    return set(raw.split(b'\n'))
+
+
+def writetemporaryincludes(repo, includes):
+    repo.vfs.write(b'tempsparse', b'\n'.join(sorted(includes)))
+    repo._sparsesignaturecache.clear()
+
+
+def addtemporaryincludes(repo, additional):
+    includes = readtemporaryincludes(repo)
+    for i in additional:
+        includes.add(i)
+    writetemporaryincludes(repo, includes)
+
+
+def prunetemporaryincludes(repo):
+    if not use_sparse(repo) or not repo.vfs.exists(b'tempsparse'):
+        return
+
+    s = repo.status()
+    if s.modified or s.added or s.removed or s.deleted:
+        # Still have pending changes. Don't bother trying to prune.
+        return
+
+    sparsematch = matcher(repo, includetemp=False)
+    dirstate = repo.dirstate
+    mresult = mergemod.mergeresult()
+    dropped = []
+    tempincludes = readtemporaryincludes(repo)
+    for file in tempincludes:
+        if file in dirstate and not sparsematch(file):
+            message = _(b'dropping temporarily included sparse files')
+            mresult.addfile(file, mergestatemod.ACTION_REMOVE, None, message)
+            dropped.append(file)
+
+    mergemod.applyupdates(
+        repo, mresult, repo[None], repo[b'.'], False, wantfiledata=False
+    )
+
+    # Fix dirstate
+    for file in dropped:
+        dirstate.update_file(file, p1_tracked=False, wc_tracked=False)
+
+    repo.vfs.unlink(b'tempsparse')
+    repo._sparsesignaturecache.clear()
+    msg = _(
+        b'cleaned up %d temporarily added file(s) from the '
+        b'sparse checkout\n'
+    )
+    repo.ui.status(msg % len(tempincludes))
+
+
+def forceincludematcher(matcher, includes):
+    """Returns a matcher that returns true for any of the forced includes
+    before testing against the actual matcher."""
+    kindpats = [(b'path', include, b'') for include in includes]
+    includematcher = matchmod.includematcher(b'', kindpats)
+    return matchmod.unionmatcher([includematcher, matcher])
+
+
+def matcher(repo, revs=None, includetemp=True):
+    """Obtain a matcher for sparse working directories for the given revs.
+
+    If multiple revisions are specified, the matcher is the union of all
+    revs.
+
+    ``includetemp`` indicates whether to use the temporary sparse profile.
+    """
+    # If sparse isn't enabled, sparse matcher matches everything.
+    if not use_sparse(repo):
+        return matchmod.always()
+
+    if not revs or revs == [None]:
+        revs = [
+            repo.changelog.rev(node)
+            for node in repo.dirstate.parents()
+            if node != repo.nullid
+        ]
+
+    signature = configsignature(repo, includetemp=includetemp)
+
+    key = b'%s %s' % (signature, b' '.join(map(pycompat.bytestr, revs)))
+
+    result = repo._sparsematchercache.get(key)
+    if result:
+        return result
+
+    matchers = []
+    for rev in revs:
+        try:
+            includes, excludes, profiles = patternsforrev(repo, rev)
+
+            if includes or excludes:
+                matcher = matchmod.match(
+                    repo.root,
+                    b'',
+                    [],
+                    include=includes,
+                    exclude=excludes,
+                    default=b'relpath',
+                )
+                matchers.append(matcher)
+        except IOError:
+            pass
+
+    if not matchers:
+        result = matchmod.always()
+    elif len(matchers) == 1:
+        result = matchers[0]
+    else:
+        result = matchmod.unionmatcher(matchers)
+
+    if includetemp:
+        tempincludes = readtemporaryincludes(repo)
+        result = forceincludematcher(result, tempincludes)
+
+    repo._sparsematchercache[key] = result
+
+    return result
+
+
+def filterupdatesactions(repo, wctx, mctx, branchmerge, mresult):
+    """Filter updates to only lay out files that match the sparse rules."""
+    if not use_sparse(repo):
+        return
+
+    oldrevs = [pctx.rev() for pctx in wctx.parents()]
+    oldsparsematch = matcher(repo, oldrevs)
+
+    if oldsparsematch.always():
+        return
+
+    files = set()
+    prunedactions = {}
+
+    if branchmerge:
+        # If we're merging, use the wctx filter, since we're merging into
+        # the wctx.
+        sparsematch = matcher(repo, [wctx.p1().rev()])
+    else:
+        # If we're updating, use the target context's filter, since we're
+        # moving to the target context.
+        sparsematch = matcher(repo, [mctx.rev()])
+
+    temporaryfiles = []
+    for file, action in mresult.filemap():
+        type, args, msg = action
+        files.add(file)
+        if sparsematch(file):
+            prunedactions[file] = action
+        elif type == mergestatemod.ACTION_MERGE:
+            temporaryfiles.append(file)
+            prunedactions[file] = action
+        elif branchmerge:
+            if not type.no_op:
+                temporaryfiles.append(file)
+                prunedactions[file] = action
+        elif type == mergestatemod.ACTION_FORGET:
+            prunedactions[file] = action
+        elif file in wctx:
+            prunedactions[file] = (mergestatemod.ACTION_REMOVE, args, msg)
+
+        # in case or rename on one side, it is possible that f1 might not
+        # be present in sparse checkout we should include it
+        # TODO: should we do the same for f2?
+        # exists as a separate check because file can be in sparse and hence
+        # if we try to club this condition in above `elif type == ACTION_MERGE`
+        # it won't be triggered
+        if branchmerge and type == mergestatemod.ACTION_MERGE:
+            f1, f2, fa, move, anc = args
+            if not sparsematch(f1):
+                temporaryfiles.append(f1)
+
+    if len(temporaryfiles) > 0:
+        repo.ui.status(
+            _(
+                b'temporarily included %d file(s) in the sparse '
+                b'checkout for merging\n'
+            )
+            % len(temporaryfiles)
+        )
+        addtemporaryincludes(repo, temporaryfiles)
+
+        # Add the new files to the working copy so they can be merged, etc
+        tmresult = mergemod.mergeresult()
+        message = b'temporarily adding to sparse checkout'
+        wctxmanifest = repo[None].manifest()
+        for file in temporaryfiles:
+            if file in wctxmanifest:
+                fctx = repo[None][file]
+                tmresult.addfile(
+                    file,
+                    mergestatemod.ACTION_GET,
+                    (fctx.flags(), False),
+                    message,
+                )
+
+        with repo.dirstate.parentchange():
+            mergemod.applyupdates(
+                repo,
+                tmresult,
+                repo[None],
+                repo[b'.'],
+                False,
+                wantfiledata=False,
+            )
+
+            dirstate = repo.dirstate
+            for file, flags, msg in tmresult.getactions(
+                [mergestatemod.ACTION_GET]
+            ):
+                dirstate.update_file(file, p1_tracked=True, wc_tracked=True)
+
+    profiles = activeconfig(repo)[2]
+    changedprofiles = profiles & files
+    # If an active profile changed during the update, refresh the checkout.
+    # Don't do this during a branch merge, since all incoming changes should
+    # have been handled by the temporary includes above.
+    if changedprofiles and not branchmerge:
+        mf = mctx.manifest()
+        for file in mf:
+            old = oldsparsematch(file)
+            new = sparsematch(file)
+            if not old and new:
+                flags = mf.flags(file)
+                prunedactions[file] = (
+                    mergestatemod.ACTION_GET,
+                    (flags, False),
+                    b'',
+                )
+            elif old and not new:
+                prunedactions[file] = (mergestatemod.ACTION_REMOVE, [], b'')
+
+    mresult.setactions(prunedactions)
+
+

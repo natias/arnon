@@ -1,0 +1,1000 @@
+    if (join("", @from) eq join("", @to)) {
+
+        # the rhs is suppressed if identical to the left.  That's because
+        # tr/ABC/ABC/ can be written as tr/ABC//.  (Do this comparison before
+        # any complementing)
+        $to = "";
+    }
+    else {
+        $to = tr_invlist_to_string(\@to, 0);  # rhs not complemented
+    }
+
+    my $from = tr_invlist_to_string(\@from,
+                                   ($flags & OPpTRANS_COMPLEMENT) != 0);
+
+    print STDERR "Returning ", escape_str($from), "/",
+                               escape_str($to), "\n" if DEBUG;
+    return (escape_str($from), escape_str($to));
+}
+
+sub pp_trans {
+    my $self = shift;
+    my($op, $cx, $morflags) = @_;
+    my($from, $to);
+    my $class = class($op);
+    my $priv_flags = $op->private;
+    if ($class eq "PVOP") {
+	($from, $to) = tr_decode_byte($op->pv, $priv_flags);
+    } elsif ($class eq "PADOP") {
+	($from, $to)
+	  = tr_decode_utf8($self->padval($op->padix), $priv_flags);
+    } else { # class($op) eq "SVOP"
+	($from, $to) = tr_decode_utf8($op->sv, $priv_flags);
+    }
+    my $flags = "";
+    $flags .= "c" if $priv_flags & OPpTRANS_COMPLEMENT;
+    $flags .= "d" if $priv_flags & OPpTRANS_DELETE;
+    $to = "" if $from eq $to and $flags eq "";
+    $flags .= "s" if $priv_flags & OPpTRANS_SQUASH;
+    $flags .= $morflags if defined $morflags;
+    my $ret = $self->keyword("tr") . double_delim($from, $to) . $flags;
+    if (my $targ = $op->targ) {
+	return $self->maybe_parens($self->padname($targ) . " =~ $ret",
+				   $cx, 20);
+    }
+    return $ret;
+}
+
+sub pp_transr { push @_, 'r'; goto &pp_trans }
+
+# Join two components of a double-quoted re, disambiguating
+# "${foo}bar", "${foo}{bar}", "${foo}[1]".
+
+sub re_dq_disambiguate {
+    my ($first, $last) = @_;
+    ($last =~ /^[A-Z\\\^\[\]_?]/ &&
+	$first =~ s/([\$@])\^$/${1}{^}/)  # "${^}W" etc
+	|| ($last =~ /^[{\[\w_]/ &&
+	    $first =~ s/([\$@])([A-Za-z_]\w*)$/${1}{$2}/);
+    return $first . $last;
+}
+
+# Like dq(), but different
+sub re_dq {
+    my $self = shift;
+    my ($op) = @_;
+
+    my $type = $op->name;
+    if ($type eq "const") {
+	my $unbacked = re_unback($self->const_sv($op)->as_string);
+	return re_uninterp(escape_re($unbacked));
+    } elsif ($type eq "concat") {
+	my $first = $self->re_dq($op->first);
+	my $last  = $self->re_dq($op->last);
+	return re_dq_disambiguate($first, $last);
+    } elsif ($type eq "multiconcat") {
+        return $self->do_multiconcat($op, 26, 2);
+    } elsif ($type eq "uc") {
+	return '\U' . $self->re_dq($op->first->sibling) . '\E';
+    } elsif ($type eq "lc") {
+	return '\L' . $self->re_dq($op->first->sibling) . '\E';
+    } elsif ($type eq "ucfirst") {
+	return '\u' . $self->re_dq($op->first->sibling);
+    } elsif ($type eq "lcfirst") {
+	return '\l' . $self->re_dq($op->first->sibling);
+    } elsif ($type eq "quotemeta") {
+	return '\Q' . $self->re_dq($op->first->sibling) . '\E';
+    } elsif ($type eq "fc") {
+	return '\F' . $self->re_dq($op->first->sibling) . '\E';
+    } elsif ($type eq "join") {
+	return $self->deparse($op->last, 26); # was join($", @ary)
+    } else {
+	my $ret = $self->deparse($op, 26);
+	$ret =~ s/^\$([(|)])\z/\${$1}/ # $( $| $) need braces
+	or $ret =~ s/^\@([-+])\z/\@{$1}/; # @- @+ need braces
+	return $ret;
+    }
+}
+
+sub pure_string {
+    my ($self, $op) = @_;
+    return 0 if null $op;
+    my $type = $op->name;
+
+    if ($type eq 'const' || $type eq 'av2arylen') {
+	return 1;
+    }
+    elsif ($type =~ /^(?:[ul]c(first)?|fc)$/ || $type eq 'quotemeta') {
+	return $self->pure_string($op->first->sibling);
+    }
+    elsif ($type eq 'join') {
+	my $join_op = $op->first->sibling;  # Skip pushmark
+	return 0 unless $join_op->name eq 'null' && $join_op->targ == OP_RV2SV;
+
+	my $gvop = $join_op->first;
+	return 0 unless $gvop->name eq 'gvsv';
+        return 0 unless '"' eq $self->gv_name($self->gv_or_padgv($gvop));
+
+	return 0 unless ${$join_op->sibling} eq ${$op->last};
+	return 0 unless $op->last->name =~ /^(?:[ah]slice|(?:rv2|pad)av)$/;
+    }
+    elsif ($type eq 'concat') {
+	return $self->pure_string($op->first)
+            && $self->pure_string($op->last);
+    }
+    elsif ($type eq 'multiconcat') {
+        my ($kid, @kids);
+        for ($kid = $op->first; !null $kid; $kid = $kid->sibling) {
+            # skip the consts and/or padsv we've optimised away
+            push @kids, $kid
+                unless $kid->type == OP_NULL
+                  && (   $kid->targ == OP_PADSV
+                      || $kid->targ == OP_CONST
+                      || $kid->targ == OP_PUSHMARK);
+        }
+
+        if ($op->flags & OPf_STACKED) {
+            # remove expr from @kids where 'expr  = ...' or 'expr .= ....'
+            if ($op->private & OPpMULTICONCAT_APPEND) {
+                shift(@kids);
+            }
+            else {
+                pop(@kids);
+            }
+        }
+        for (@kids) {
+            return 0 unless $self->pure_string($_);
+        }
+        return 1;
+    }
+    elsif (is_scalar($op) || $type =~ /^[ah]elem$/) {
+	return 1;
+    }
+    elsif ($type eq "null" and $op->can('first') and not null $op->first) {
+        my $first = $op->first;
+
+        return 1 if $first->name eq "multideref";
+        return 1 if $first->name eq "aelemfast_lex";
+
+        if (    $first->name eq "null"
+            and $first->can('first')
+	    and not null $first->first
+            and $first->first->name eq "aelemfast"
+	   )
+        {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+sub code_list {
+    my ($self,$op,$cv) = @_;
+
+    # localise stuff relating to the current sub
+    $cv and
+	local($self->{'curcv'}) = $cv,
+	local($self->{'curcvlex'}),
+	local(@$self{qw'curstash warnings hints hinthash curcop'})
+	    = @$self{qw'curstash warnings hints hinthash curcop'};
+
+    my $re;
+    for ($op = $op->first->sibling; !null($op); $op = $op->sibling) {
+	if ($op->name eq 'null' and $op->flags & OPf_SPECIAL) {
+	    my $scope = $op->first;
+	    # 0 context (last arg to scopeop) means statement context, so
+	    # the contents of the block will not be wrapped in do{...}.
+	    my $block = scopeop($scope->first->name eq "enter", $self,
+				$scope, 0);
+	    # next op is the source code of the block
+	    $op = $op->sibling;
+	    $re .= ($self->const_sv($op)->PV =~ m|^(\(\?\??\{)|)[0];
+	    my $multiline = $block =~ /\n/;
+	    $re .= $multiline ? "\n\t" : ' ';
+	    $re .= $block;
+	    $re .= $multiline ? "\n\b})" : " })";
+	} else {
+	    $re = re_dq_disambiguate($re, $self->re_dq($op));
+	}
+    }
+    $re;
+}
+
+sub regcomp {
+    my $self = shift;
+    my($op, $cx) = @_;
+    my $kid = $op->first;
+    $kid = $kid->first if $kid->name eq "regcmaybe";
+    $kid = $kid->first if $kid->name eq "regcreset";
+    my $kname = $kid->name;
+    if ($kname eq "null" and !null($kid->first)
+	and $kid->first->name eq 'pushmark')
+    {
+	my $str = '';
+	$kid = $kid->first->sibling;
+	while (!null($kid)) {
+	    my $first = $str;
+	    my $last = $self->re_dq($kid);
+	    $str = re_dq_disambiguate($first, $last);
+	    $kid = $kid->sibling;
+	}
+	return $str, 1;
+    }
+
+    return ($self->re_dq($kid), 1)
+	if $kname =~ /^(?:rv2|pad)av/ or $self->pure_string($kid);
+    return ($self->deparse($kid, $cx), 0);
+}
+
+sub pp_regcomp {
+    my ($self, $op, $cx) = @_;
+    return (($self->regcomp($op, $cx, 0))[0]);
+}
+
+sub re_flags {
+    my ($self, $op) = @_;
+    my $flags = '';
+    my $pmflags = $op->pmflags;
+    if (!$pmflags) {
+	my $re = $op->pmregexp;
+	if ($$re) {
+	    $pmflags = $re->compflags;
+	}
+    }
+    $flags .= "g" if $pmflags & PMf_GLOBAL;
+    $flags .= "i" if $pmflags & PMf_FOLD;
+    $flags .= "m" if $pmflags & PMf_MULTILINE;
+    $flags .= "o" if $pmflags & PMf_KEEP;
+    $flags .= "s" if $pmflags & PMf_SINGLELINE;
+    $flags .= "x" if $pmflags & PMf_EXTENDED;
+    $flags .= "x" if $pmflags & PMf_EXTENDED_MORE;
+    $flags .= "p" if $pmflags & PMf_KEEPCOPY;
+    $flags .= "n" if $pmflags & PMf_NOCAPTURE;
+    if (my $charset = $pmflags & PMf_CHARSET) {
+	# Hardcoding this is fragile, but B does not yet export the
+	# constants we need.
+	$flags .= qw(d l u a aa)[$charset >> 7]
+    }
+    # The /d flag is indicated by 0; only show it if necessary.
+    elsif ($self->{hinthash} and
+	     $self->{hinthash}{reflags_charset}
+	    || $self->{hinthash}{feature_unicode}
+	or $self->{hints} & $feature::hint_mask
+	  && ($self->{hints} & $feature::hint_mask)
+	       != $feature::hint_mask
+	  && $self->{hints} & $feature::hint_uni8bit
+    ) {
+	$flags .= 'd';
+    }
+    $flags;
+}
+
+# osmic acid -- see osmium tetroxide
+
+my %matchwords;
+map($matchwords{join "", sort split //, $_} = $_, 'cig', 'cog', 'cos', 'cogs',
+    'cox', 'go', 'is', 'ism', 'iso', 'mig', 'mix', 'osmic', 'ox', 'sic',
+    'sig', 'six', 'smog', 'so', 'soc', 'sog', 'xi', 'soup', 'soupmix');
+
+# When deparsing a regular expression with code blocks, we have to look in
+# various places to find the blocks.
+#
+# For qr/(?{...})/ without interpolation, the CV is under $qr->qr_anoncv
+# and the code list (list of blocks and constants, maybe vars) is under
+# $cv->ROOT->first->code_list:
+#   ./perl -Ilib -MB -e 'use O "Concise", B::svref_2object(sub {qr/(?{die})/})->ROOT->first->first->sibling->pmregexp->qr_anoncv->object_2svref'
+#
+# For qr/$a(?{...})/ with interpolation, the code list is more accessible,
+# under $pmop->code_list, but the $cv is something you have to dig for in
+# the regcomp op’s kids:
+#   ./perl -Ilib -mO=Concise -e 'qr/$a(?{die})/'
+#
+# For m// and split //, things are much simpler.  There is no CV.  The code
+# list is under $pmop->code_list.
+
+sub matchop {
+    my $self = shift;
+    my($op, $cx, $name, $delim) = @_;
+    my $kid = $op->first;
+    my ($binop, $var, $re) = ("", "", "");
+    if ($op->name ne 'split' && $op->flags & OPf_STACKED) {
+	$binop = 1;
+	$var = $self->deparse($kid, 20);
+	$kid = $kid->sibling;
+    }
+           # not $name; $name will be 'm' for both match and split
+    elsif ($op->name eq 'match' and my $targ = $op->targ) {
+	$binop = 1;
+	$var = $self->padname($targ);
+    }
+    my $quote = 1;
+    my $pmflags = $op->pmflags;
+    my $rhs_bound_to_defsv;
+    my ($cv, $bregexp);
+    my $have_kid = !null $kid;
+    # Check for code blocks first
+    if (not null my $code_list = $op->code_list) {
+	$re = $self->code_list($code_list,
+			       $op->name eq 'qr'
+				   ? $self->padval(
+				         $kid->first   # ex-list
+					     ->first   #   pushmark
+					     ->sibling #   entersub
+					     ->first   #     ex-list
+					     ->first   #       pushmark
+					     ->sibling #       srefgen
+					     ->first   #         ex-list
+					     ->first   #           anoncode
+					     ->targ
+				     )
+				   : undef);
+    } elsif (${$bregexp = $op->pmregexp} && ${$cv = $bregexp->qr_anoncv}) {
+	my $patop = $cv->ROOT      # leavesub
+		       ->first     #   qr
+		       ->code_list;#     list
+	$re = $self->code_list($patop, $cv);
+    } elsif (!$have_kid) {
+	$re = re_uninterp(escape_re(re_unback($op->precomp)));
+    } elsif ($kid->name ne 'regcomp') {
+        if ($op->name eq 'split') {
+            # split has other kids, not just regcomp
+            $re = re_uninterp(escape_re(re_unback($op->precomp)));
+        }
+        else {
+            carp("found ".$kid->name." where regcomp expected");
+        }
+    } else {
+	($re, $quote) = $self->regcomp($kid, 21);
+    }
+    if ($have_kid and $kid->name eq 'regcomp') {
+	my $matchop = $kid->first;
+	if ($matchop->name eq 'regcreset') {
+	    $matchop = $matchop->first;
+	}
+	if ($matchop->name =~ /^(?:match|transr?|subst)\z/
+	   && $matchop->flags & OPf_SPECIAL) {
+	    $rhs_bound_to_defsv = 1;
+	}
+    }
+    my $flags = "";
+    $flags .= "c" if $pmflags & PMf_CONTINUE;
+    $flags .= $self->re_flags($op);
+    $flags = join '', sort split //, $flags;
+    $flags = $matchwords{$flags} if $matchwords{$flags};
+    if ($pmflags & PMf_ONCE) { # only one kind of delimiter works here
+	$re =~ s/\?/\\?/g;
+	$re = $self->keyword("m") . "?$re?";     # explicit 'm' is required
+    } elsif ($quote) {
+	$re = single_delim($name, $delim, $re, $self);
+    }
+    $re = $re . $flags if $quote;
+    if ($binop) {
+	return
+	 $self->maybe_parens(
+	  $rhs_bound_to_defsv
+	   ? "$var =~ (\$_ =~ $re)"
+	   : "$var =~ $re",
+	  $cx, 20
+	 );
+    } else {
+	return $re;
+    }
+}
+
+sub pp_match { matchop(@_, "m", "/") }
+sub pp_qr { matchop(@_, "qr", "") }
+
+sub pp_runcv { unop(@_, "__SUB__"); }
+
+sub pp_split {
+    my $self = shift;
+    my($op, $cx) = @_;
+    my($kid, @exprs, $ary, $expr);
+    my $stacked = $op->flags & OPf_STACKED;
+
+    $kid = $op->first;
+    $kid = $kid->sibling if $kid->name eq 'regcomp';
+    for (; !null($kid); $kid = $kid->sibling) {
+	push @exprs, $self->deparse($kid, 6);
+    }
+
+    unshift @exprs, $self->matchop($op, $cx, "m", "/");
+
+    if ($op->private & OPpSPLIT_ASSIGN) {
+        # With C<@array = split(/pat/, str);>,
+        #  array is stored in split's pmreplroot; either
+        # as an integer index into the pad (for a lexical array)
+        # or as GV for a package array (which will be a pad index
+        # on threaded builds)
+        # With my/our @array = split(/pat/, str), the array is instead
+        # accessed via an extra padav/rv2av op at the end of the
+        # split's kid ops.
+
+        if ($stacked) {
+            $ary = pop @exprs;
+        }
+        else {
+            if ($op->private & OPpSPLIT_LEX) {
+                $ary = $self->padname($op->pmreplroot);
+            }
+            else {
+                # union with op_pmtargetoff, op_pmtargetgv
+                my $gv = $op->pmreplroot;
+                $gv = $self->padval($gv) if !ref($gv);
+                $ary = $self->maybe_local(@_,
+			      $self->stash_variable('@',
+						     $self->gv_name($gv),
+						     $cx))
+            }
+            if ($op->private & OPpLVAL_INTRO) {
+                $ary = $op->private & OPpSPLIT_LEX ? "my $ary" : "local $ary";
+            }
+        }
+    }
+
+    # handle special case of split(), and split(' ') that compiles to /\s+/
+    $exprs[0] = q{' '} if ($op->reflags // 0) & RXf_SKIPWHITE();
+
+    $expr = "split(" . join(", ", @exprs) . ")";
+    if ($ary) {
+	return $self->maybe_parens("$ary = $expr", $cx, 7);
+    } else {
+	return $expr;
+    }
+}
+
+# oxime -- any of various compounds obtained chiefly by the action of
+# hydroxylamine on aldehydes and ketones and characterized by the
+# bivalent grouping C=NOH [Webster's Tenth]
+
+my %substwords;
+map($substwords{join "", sort split //, $_} = $_, 'ego', 'egoism', 'em',
+    'es', 'ex', 'exes', 'gee', 'go', 'goes', 'ie', 'ism', 'iso', 'me',
+    'meese', 'meso', 'mig', 'mix', 'os', 'ox', 'oxime', 'see', 'seem',
+    'seg', 'sex', 'sig', 'six', 'smog', 'sog', 'some', 'xi', 'rogue',
+    'sir', 'rise', 'smore', 'more', 'seer', 'rome', 'gore', 'grim', 'grime',
+    'or', 'rose', 'rosie');
+
+sub pp_subst {
+    my $self = shift;
+    my($op, $cx) = @_;
+    my $kid = $op->first;
+    my($binop, $var, $re, $repl) = ("", "", "", "");
+    if ($op->flags & OPf_STACKED) {
+	$binop = 1;
+	$var = $self->deparse($kid, 20);
+	$kid = $kid->sibling;
+    }
+    elsif (my $targ = $op->targ) {
+	$binop = 1;
+	$var = $self->padname($targ);
+    }
+    my $flags = "";
+    my $pmflags = $op->pmflags;
+    if (null($op->pmreplroot)) {
+	$repl = $kid;
+	$kid = $kid->sibling;
+    } else {
+	$repl = $op->pmreplroot->first; # skip substcont
+    }
+    while ($repl->name eq "entereval") {
+	    $repl = $repl->first;
+	    $flags .= "e";
+    }
+    {
+	local $self->{in_subst_repl} = 1;
+	if ($pmflags & PMf_EVAL) {
+	    $repl = $self->deparse($repl->first, 0);
+	} else {
+	    $repl = $self->dq($repl);	
+	}
+    }
+    if (not null my $code_list = $op->code_list) {
+	$re = $self->code_list($code_list);
+    } elsif (null $kid) {
+	$re = re_uninterp(escape_re(re_unback($op->precomp)));
+    } else {
+	($re) = $self->regcomp($kid, 1);
+    }
+    $flags .= "r" if $pmflags & PMf_NONDESTRUCT;
+    $flags .= "e" if $pmflags & PMf_EVAL;
+    $flags .= $self->re_flags($op);
+    $flags = join '', sort split //, $flags;
+    $flags = $substwords{$flags} if $substwords{$flags};
+    my $core_s = $self->keyword("s"); # maybe CORE::s
+    if ($binop) {
+	return $self->maybe_parens("$var =~ $core_s"
+				   . double_delim($re, $repl) . $flags,
+				   $cx, 20);
+    } else {
+	return "$core_s". double_delim($re, $repl) . $flags;	
+    }
+}
+
+sub is_lexical_subs {
+    my (@ops) = shift;
+    for my $op (@ops) {
+        return 0 if $op->name !~ /\A(?:introcv|clonecv)\z/;
+    }
+    return 1;
+}
+
+# Pretend these two ops do not exist.  The perl parser adds them to the
+# beginning of any block containing my-sub declarations, whereas we handle
+# the subs in pad_subs and next_todo.
+*pp_clonecv = *pp_introcv;
+sub pp_introcv {
+    my $self = shift;
+    my($op, $cx) = @_;
+    # For now, deparsing doesn't worry about the distinction between introcv
+    # and clonecv, so pretend this op doesn't exist:
+    return '';
+}
+
+sub pp_padcv {
+    my $self = shift;
+    my($op, $cx) = @_;
+    return $self->padany($op);
+}
+
+my %lvref_funnies = (
+    OPpLVREF_SV, => '$',
+    OPpLVREF_AV, => '@',
+    OPpLVREF_HV, => '%',
+    OPpLVREF_CV, => '&',
+);
+
+sub pp_refassign {
+    my ($self, $op, $cx) = @_;
+    my $left;
+    if ($op->private & OPpLVREF_ELEM) {
+	$left = $op->first->sibling;
+	$left = maybe_local(@_, elem($self, $left, undef,
+				     $left->targ == OP_AELEM
+					? qw([ ] padav)
+					: qw({ } padhv)));
+    } elsif ($op->flags & OPf_STACKED) {
+	$left = maybe_local(@_,
+			    $lvref_funnies{$op->private & OPpLVREF_TYPE}
+			  . $self->deparse($op->first->sibling));
+    } else {
+	$left = &pp_padsv;
+    }
+    my $right = $self->deparse_binop_right($op, $op->first, 7);
+    return $self->maybe_parens("\\$left = $right", $cx, 7);
+}
+
+sub pp_lvref {
+    my ($self, $op, $cx) = @_;
+    my $code;
+    if ($op->private & OPpLVREF_ELEM) {
+	$code = $op->first->name =~ /av\z/ ? &pp_aelem : &pp_helem;
+    } elsif ($op->flags & OPf_STACKED) {
+	$code = maybe_local(@_,
+			    $lvref_funnies{$op->private & OPpLVREF_TYPE}
+			  . $self->deparse($op->first));
+    } else {
+	$code = &pp_padsv;
+    }
+    "\\$code";
+}
+
+sub pp_lvrefslice {
+    my ($self, $op, $cx) = @_;
+    '\\' . ($op->last->name =~ /av\z/ ? &pp_aslice : &pp_hslice);
+}
+
+sub pp_lvavref {
+    my ($self, $op, $cx) = @_;
+    '\\(' . ($op->flags & OPf_STACKED
+		? maybe_local(@_, rv2x(@_, "\@"))
+		: &pp_padsv)  . ')'
+}
+
+
+sub pp_argcheck {
+    my $self = shift;
+    my($op, $cx) = @_;
+    my ($params, $opt_params, $slurpy) = $op->aux_list($self->{curcv});
+    my $mandatory = $params - $opt_params;
+    my $check = '';
+
+    $check .= <<EOF if !$slurpy;
+die sprintf("Too many arguments for subroutine at %s line %d.\\n", (caller)[1, 2]) unless \@_ <= $params;
+EOF
+
+    $check .= <<EOF if $mandatory > 0;
+die sprintf("Too few arguments for subroutine at %s line %d.\\n", (caller)[1, 2]) unless \@_ >= $mandatory;
+EOF
+
+    my $cond = ($params & 1) ? 'unless' : 'if';
+    $check .= <<EOF if $slurpy eq '%';
+die sprintf("Odd name/value argument for subroutine at %s line %d.\\n", (caller)[1, 2]) if \@_ > $params && ((\@_ - $params) & 1);
+EOF
+
+    $check =~ s/;\n\z//;
+    return $check;
+}
+
+
+sub pp_argelem {
+    my $self = shift;
+    my($op, $cx) = @_;
+    my $var = $self->padname($op->targ);
+    my $ix  = $op->string($self->{curcv});
+    my $expr;
+    if ($op->flags & OPf_KIDS) {
+        $expr = $self->deparse($op->first, 7);
+    }
+    elsif ($var =~ /^[@%]/) {
+        $expr = $ix ? "\@_[$ix .. \$#_]" : '@_';
+    }
+    else {
+        $expr = "\$_[$ix]";
+    }
+    return "my $var = $expr";
+}
+
+
+sub pp_argdefelem {
+    my $self = shift;
+    my($op, $cx) = @_;
+    my $ix  = $op->targ;
+    my $expr = "\@_ >= " . ($ix+1) . " ? \$_[$ix] : ";
+    my $def = $self->deparse($op->first, 7);
+    $def = "($def)" if $op->first->flags & OPf_PARENS;
+    $expr .= $self->deparse($op->first, $cx);
+    return $expr;
+}
+
+
+sub pp_pushdefer {
+    my $self = shift;
+    my($op, $cx) = @_;
+    # defer block body is stored in the ->first of an OP_NULL that is
+    # ->first of OP_PUSHDEFER
+    my $body = $self->deparse($op->first->first);
+    return "defer {\n\t$body\n\b}\cK";
+}
+
+sub builtin1 {
+    my $self = shift;
+    my ($op, $cx, $name) = @_;
+    my $arg = $self->deparse($op->first);
+    # TODO: work out if lexical alias is present somehow...
+    return "builtin::$name($arg)";
+}
+
+sub pp_is_bool  { $_[0]->maybe_targmy(@_[1,2], \&builtin1, "is_bool"); }
+sub pp_is_weak  { $_[0]->maybe_targmy(@_[1,2], \&builtin1, "is_weak"); }
+sub pp_weaken   { builtin1(@_, "weaken"); }
+sub pp_unweaken { builtin1(@_, "unweaken"); }
+sub pp_blessed  { builtin1(@_, "blessed"); }
+sub pp_refaddr  { $_[0]->maybe_targmy(@_[1,2], \&builtin1, "refaddr"); }
+sub pp_reftype  { $_[0]->maybe_targmy(@_[1,2], \&builtin1, "reftype"); }
+sub pp_ceil     { $_[0]->maybe_targmy(@_[1,2], \&builtin1, "ceil"); }
+sub pp_floor    { $_[0]->maybe_targmy(@_[1,2], \&builtin1, "floor"); }
+
+1;
+__END__
+
+=head1 NAME
+
+B::Deparse - Perl compiler backend to produce perl code
+
+=head1 SYNOPSIS
+
+B<perl> B<-MO=Deparse>[B<,-d>][B<,-f>I<FILE>][B<,-p>][B<,-q>][B<,-l>]
+        [B<,-s>I<LETTERS>][B<,-x>I<LEVEL>] I<prog.pl>
+
+=head1 DESCRIPTION
+
+B::Deparse is a backend module for the Perl compiler that generates
+perl source code, based on the internal compiled structure that perl
+itself creates after parsing a program.  The output of B::Deparse won't
+be exactly the same as the original source, since perl doesn't keep
+track of comments or whitespace, and there isn't a one-to-one
+correspondence between perl's syntactical constructions and their
+compiled form, but it will often be close.  When you use the B<-p>
+option, the output also includes parentheses even when they are not
+required by precedence, which can make it easy to see if perl is
+parsing your expressions the way you intended.
+
+While B::Deparse goes to some lengths to try to figure out what your
+original program was doing, some parts of the language can still trip
+it up; it still fails even on some parts of Perl's own test suite.  If
+you encounter a failure other than the most common ones described in
+the BUGS section below, you can help contribute to B::Deparse's
+ongoing development by submitting a bug report with a small
+example.
+
+=head1 OPTIONS
+
+As with all compiler backend options, these must follow directly after
+the '-MO=Deparse', separated by a comma but not any white space.
+
+=over 4
+
+=item B<-d>
+
+Output data values (when they appear as constants) using Data::Dumper.
+Without this option, B::Deparse will use some simple routines of its
+own for the same purpose.  Currently, Data::Dumper is better for some
+kinds of data (such as complex structures with sharing and
+self-reference) while the built-in routines are better for others
+(such as odd floating-point values).
+
+=item B<-f>I<FILE>
+
+Normally, B::Deparse deparses the main code of a program, and all the subs
+defined in the same file.  To include subs defined in
+other files, pass the B<-f> option with the filename.
+You can pass the B<-f> option several times, to
+include more than one secondary file.  (Most of the time you don't want to
+use it at all.)  You can also use this option to include subs which are
+defined in the scope of a B<#line> directive with two parameters.
+
+=item B<-l>
+
+Add '#line' declarations to the output based on the line and file
+locations of the original code.
+
+=item B<-p>
+
+Print extra parentheses.  Without this option, B::Deparse includes
+parentheses in its output only when they are needed, based on the
+structure of your program.  With B<-p>, it uses parentheses (almost)
+whenever they would be legal.  This can be useful if you are used to
+LISP, or if you want to see how perl parses your input.  If you say
+
+    if ($var & 0x7f == 65) {print "Gimme an A!"}
+    print ($which ? $a : $b), "\n";
+    $name = $ENV{USER} or "Bob";
+
+C<B::Deparse,-p> will print
+
+    if (($var & 0)) {
+        print('Gimme an A!')
+    };
+    (print(($which ? $a : $b)), '???');
+    (($name = $ENV{'USER'}) or '???')
+
+which probably isn't what you intended (the C<'???'> is a sign that
+perl optimized away a constant value).
+
+=item B<-P>
+
+Disable prototype checking.  With this option, all function calls are
+deparsed as if no prototype was defined for them.  In other words,
+
+    perl -MO=Deparse,-P -e 'sub foo (\@) { 1 } foo @x'
+
+will print
+
+    sub foo (\@) {
+	1;
+    }
+    &foo(\@x);
+
+making clear how the parameters are actually passed to C<foo>.
+
+=item B<-q>
+
+Expand double-quoted strings into the corresponding combinations of
+concatenation, uc, ucfirst, lc, lcfirst, quotemeta, and join.  For
+instance, print
+
+    print "Hello, $world, @ladies, \u$gentlemen\E, \u\L$me!";
+
+as
+
+    print 'Hello, ' . $world . ', ' . join($", @ladies) . ', '
+          . ucfirst($gentlemen) . ', ' . ucfirst(lc $me . '!');
+
+Note that the expanded form represents the way perl handles such
+constructions internally -- this option actually turns off the reverse
+translation that B::Deparse usually does.  On the other hand, note that
+C<$x = "$y"> is not the same as C<$x = $y>: the former makes the value
+of $y into a string before doing the assignment.
+
+=item B<-s>I<LETTERS>
+
+Tweak the style of B::Deparse's output.  The letters should follow
+directly after the 's', with no space or punctuation.  The following
+options are available:
+
+=over 4
+
+=item B<C>
+
+Cuddle C<elsif>, C<else>, and C<continue> blocks.  For example, print
+
+    if (...) {
+         ...
+    } else {
+         ...
+    }
+
+instead of
+
+    if (...) {
+         ...
+    }
+    else {
+         ...
+    }
+
+The default is not to cuddle.
+
+=item B<i>I<NUMBER>
+
+Indent lines by multiples of I<NUMBER> columns.  The default is 4 columns.
+
+=item B<T>
+
+Use tabs for each 8 columns of indent.  The default is to use only spaces.
+For instance, if the style options are B<-si4T>, a line that's indented
+3 times will be preceded by one tab and four spaces; if the options were
+B<-si8T>, the same line would be preceded by three tabs.
+
+=item B<v>I<STRING>B<.>
+
+Print I<STRING> for the value of a constant that can't be determined
+because it was optimized away (mnemonic: this happens when a constant
+is used in B<v>oid context).  The end of the string is marked by a period.
+The string should be a valid perl expression, generally a constant.
+Note that unless it's a number, it probably needs to be quoted, and on
+a command line quotes need to be protected from the shell.  Some
+conventional values include 0, 1, 42, '', 'foo', and
+'Useless use of constant omitted' (which may need to be
+B<-sv"'Useless use of constant omitted'.">
+or something similar depending on your shell).  The default is '???'.
+If you're using B::Deparse on a module or other file that's require'd,
+you shouldn't use a value that evaluates to false, since the customary
+true constant at the end of a module will be in void context when the
+file is compiled as a main program.
+
+=back
+
+=item B<-x>I<LEVEL>
+
+Expand conventional syntax constructions into equivalent ones that expose
+their internal operation.  I<LEVEL> should be a digit, with higher values
+meaning more expansion.  As with B<-q>, this actually involves turning off
+special cases in B::Deparse's normal operations.
+
+If I<LEVEL> is at least 3, C<for> loops will be translated into equivalent
+while loops with continue blocks; for instance
+
+    for ($i = 0; $i < 10; ++$i) {
+        print $i;
+    }
+
+turns into
+
+    $i = 0;
+    while ($i < 10) {
+        print $i;
+    } continue {
+        ++$i
+    }
+
+Note that in a few cases this translation can't be perfectly carried back
+into the source code -- if the loop's initializer declares a my variable,
+for instance, it won't have the correct scope outside of the loop.
+
+If I<LEVEL> is at least 5, C<use> declarations will be translated into
+C<BEGIN> blocks containing calls to C<require> and C<import>; for
+instance,
+
+    use strict 'refs';
+
+turns into
+
+    sub BEGIN {
+        require strict;
+        do {
+            'strict'->import('refs')
+        };
+    }
+
+If I<LEVEL> is at least 7, C<if> statements will be translated into
+equivalent expressions using C<&&>, C<?:> and C<do {}>; for instance
+
+    print 'hi' if $nice;
+    if ($nice) {
+        print 'hi';
+    }
+    if ($nice) {
+        print 'hi';
+    } else {
+        print 'bye';
+    }
+
+turns into
+
+    $nice and print 'hi';
+    $nice and do { print 'hi' };
+    $nice ? do { print 'hi' } : do { print 'bye' };
+
+Long sequences of elsifs will turn into nested ternary operators, which
+B::Deparse doesn't know how to indent nicely.
+
+=back
+
+=head1 USING B::Deparse AS A MODULE
+
+=head2 Synopsis
+
+    use B::Deparse;
+    $deparse = B::Deparse->new("-p", "-sC");
+    $body = $deparse->coderef2text(\&func);
+    eval "sub func $body"; # the inverse operation
+
+=head2 Description
+
+B::Deparse can also be used on a sub-by-sub basis from other perl
+programs.
+
+=head2 new
+
+    $deparse = B::Deparse->new(OPTIONS)
+
+Create an object to store the state of a deparsing operation and any
+options.  The options are the same as those that can be given on the
+command line (see L</OPTIONS>); options that are separated by commas
+after B<-MO=Deparse> should be given as separate strings.
+
+=head2 ambient_pragmas
+
+    $deparse->ambient_pragmas(strict => 'all', '$[' => $[);
+
+The compilation of a subroutine can be affected by a few compiler
+directives, B<pragmas>.  These are:
+
+=over 4
+
+=item *
+
+use strict;
+
+=item *
+
+use warnings;
+
+=item *
+
+Assigning to the special variable $[
+
+=item *
+
+use integer;
+
+=item *
+
+use bytes;
+
+=item *
+
+use utf8;
+
+=item *
+
+use re;
+
+=back
+
+Ordinarily, if you use B::Deparse on a subroutine which has
+been compiled in the presence of one or more of these pragmas,
+the output will include statements to turn on the appropriate
+directives.  So if you then compile the code returned by coderef2text,
+it will behave the same way as the subroutine which you deparsed.
+
+However, you may know that you intend to use the results in a
+particular context, where some pragmas are already in scope.  In
+this case, you use the B<ambient_pragmas> method to describe the
+assumptions you wish to make.
+
+Not all of the options currently have any useful effect.  See
+L</BUGS> for more details.

@@ -1,0 +1,1000 @@
+
+As you can see, I<call_sv> gives you much greater flexibility in
+how you can specify the Perl subroutine.
+
+You should note that, if it is necessary to store the SV (C<name> in the
+example above) which corresponds to the Perl subroutine so that it can
+be used later in the program, it not enough just to store a copy of the
+pointer to the SV. Say the code above had been like this:
+
+    static SV * rememberSub;
+
+    void
+    SaveSub1(name)
+    	SV *	name
+    	CODE:
+	rememberSub = name;
+
+    void
+    CallSavedSub1()
+    	CODE:
+	PUSHMARK(SP);
+	call_sv(rememberSub, G_DISCARD|G_NOARGS);
+
+The reason this is wrong is that, by the time you come to use the
+pointer C<rememberSub> in C<CallSavedSub1>, it may or may not still refer
+to the Perl subroutine that was recorded in C<SaveSub1>.  This is
+particularly true for these cases:
+
+    SaveSub1(\&fred);
+    CallSavedSub1();
+
+    SaveSub1( sub { print "Hello there\n" } );
+    CallSavedSub1();
+
+By the time each of the C<SaveSub1> statements above has been executed,
+the SV*s which corresponded to the parameters will no longer exist.
+Expect an error message from Perl of the form
+
+    Can't use an undefined value as a subroutine reference at ...
+
+for each of the C<CallSavedSub1> lines.
+
+Similarly, with this code
+
+    $ref = \&fred;
+    SaveSub1($ref);
+    $ref = 47;
+    CallSavedSub1();
+
+you can expect one of these messages (which you actually get is dependent on
+the version of Perl you are using)
+
+    Not a CODE reference at ...
+    Undefined subroutine &main::47 called ...
+
+The variable $ref may have referred to the subroutine C<fred>
+whenever the call to C<SaveSub1> was made but by the time
+C<CallSavedSub1> gets called it now holds the number C<47>. Because we
+saved only a pointer to the original SV in C<SaveSub1>, any changes to
+$ref will be tracked by the pointer C<rememberSub>. This means that
+whenever C<CallSavedSub1> gets called, it will attempt to execute the
+code which is referenced by the SV* C<rememberSub>.  In this case
+though, it now refers to the integer C<47>, so expect Perl to complain
+loudly.
+
+A similar but more subtle problem is illustrated with this code:
+
+    $ref = \&fred;
+    SaveSub1($ref);
+    $ref = \&joe;
+    CallSavedSub1();
+
+This time whenever C<CallSavedSub1> gets called it will execute the Perl
+subroutine C<joe> (assuming it exists) rather than C<fred> as was
+originally requested in the call to C<SaveSub1>.
+
+To get around these problems it is necessary to take a full copy of the
+SV.  The code below shows C<SaveSub2> modified to do that.
+
+    /* this isn't thread-safe */
+    static SV * keepSub = (SV*)NULL;
+
+    void
+    SaveSub2(name)
+        SV *	name
+    	CODE:
+     	/* Take a copy of the callback */
+    	if (keepSub == (SV*)NULL)
+    	    /* First time, so create a new SV */
+	    keepSub = newSVsv(name);
+    	else
+    	    /* Been here before, so overwrite */
+	    SvSetSV(keepSub, name);
+
+    void
+    CallSavedSub2()
+    	CODE:
+	PUSHMARK(SP);
+	call_sv(keepSub, G_DISCARD|G_NOARGS);
+
+To avoid creating a new SV every time C<SaveSub2> is called,
+the function first checks to see if it has been called before.  If not,
+then space for a new SV is allocated and the reference to the Perl
+subroutine C<name> is copied to the variable C<keepSub> in one
+operation using C<newSVsv>.  Thereafter, whenever C<SaveSub2> is called,
+the existing SV, C<keepSub>, is overwritten with the new value using
+C<SvSetSV>.
+
+Note: using a static or global variable to store the SV isn't
+thread-safe.  You can either use the C<MY_CXT> mechanism documented in
+L<perlxs/Safely Storing Static Data in XS> which is fast, or store the
+values in perl global variables, using get_sv(), which is much slower.
+
+=head2 Using call_argv
+
+Here is a Perl subroutine which prints whatever parameters are passed
+to it.
+
+    sub PrintList
+    {
+        my(@list) = @_;
+
+        foreach (@list) { print "$_\n" }
+    }
+
+And here is an example of I<call_argv> which will call
+I<PrintList>.
+
+    static char * words[] = {"alpha", "beta", "gamma", "delta", NULL};
+
+    static void
+    call_PrintList()
+    {
+        call_argv("PrintList", G_DISCARD, words);
+    }
+
+Note that it is not necessary to call C<PUSHMARK> in this instance.
+This is because I<call_argv> will do it for you.
+
+=head2 Using call_method
+
+Consider the following Perl code:
+
+    {
+        package Mine;
+
+        sub new
+        {
+            my($type) = shift;
+            bless [@_]
+        }
+
+        sub Display
+        {
+            my ($self, $index) = @_;
+            print "$index: $$self[$index]\n";
+        }
+
+        sub PrintID
+        {
+            my($class) = @_;
+            print "This is Class $class version 1.0\n";
+        }
+    }
+
+It implements just a very simple class to manage an array.  Apart from
+the constructor, C<new>, it declares methods, one static and one
+virtual. The static method, C<PrintID>, prints out simply the class
+name and a version number. The virtual method, C<Display>, prints out a
+single element of the array.  Here is an all-Perl example of using it.
+
+    $x = Mine->new('red', 'green', 'blue');
+    $x->Display(1);
+    Mine->PrintID;
+
+will print
+
+    1: green
+    This is Class Mine version 1.0
+
+Calling a Perl method from C is fairly straightforward. The following
+things are required:
+
+=over 5
+
+=item *
+
+A reference to the object for a virtual method or the name of the class
+for a static method
+
+=item *
+
+The name of the method
+
+=item *
+
+Any other parameters specific to the method
+
+=back
+
+Here is a simple XSUB which illustrates the mechanics of calling both
+the C<PrintID> and C<Display> methods from C.
+
+    void
+    call_Method(ref, method, index)
+        SV *	ref
+        char *	method
+        int		index
+        CODE:
+        PUSHMARK(SP);
+        EXTEND(SP, 2);
+        PUSHs(ref);
+        PUSHs(sv_2mortal(newSViv(index)));
+        PUTBACK;
+
+        call_method(method, G_DISCARD);
+
+    void
+    call_PrintID(class, method)
+        char *	class
+        char *	method
+        CODE:
+        PUSHMARK(SP);
+        XPUSHs(sv_2mortal(newSVpv(class, 0)));
+        PUTBACK;
+
+        call_method(method, G_DISCARD);
+
+
+So the methods C<PrintID> and C<Display> can be invoked like this:
+
+    $x = Mine->new('red', 'green', 'blue');
+    call_Method($x, 'Display', 1);
+    call_PrintID('Mine', 'PrintID');
+
+The only thing to note is that, in both the static and virtual methods,
+the method name is not passed via the stack--it is used as the first
+parameter to I<call_method>.
+
+=head2 Using GIMME_V
+
+Here is a trivial XSUB which prints the context in which it is
+currently executing.
+
+    void
+    PrintContext()
+        CODE:
+        U8 gimme = GIMME_V;
+        if (gimme == G_VOID)
+            printf ("Context is Void\n");
+        else if (gimme == G_SCALAR)
+            printf ("Context is Scalar\n");
+        else
+            printf ("Context is Array\n");
+
+And here is some Perl to test it.
+
+    PrintContext;
+    $x = PrintContext;
+    @a = PrintContext;
+
+The output from that will be
+
+    Context is Void
+    Context is Scalar
+    Context is Array
+
+=head2 Using Perl to Dispose of Temporaries
+
+In the examples given to date, any temporaries created in the callback
+(i.e., parameters passed on the stack to the I<call_*> function or
+values returned via the stack) have been freed by one of these methods:
+
+=over 5
+
+=item *
+
+Specifying the G_DISCARD flag with I<call_*>
+
+=item *
+
+Explicitly using the C<ENTER>/C<SAVETMPS>--C<FREETMPS>/C<LEAVE> pairing
+
+=back
+
+There is another method which can be used, namely letting Perl do it
+for you automatically whenever it regains control after the callback
+has terminated.  This is done by simply not using the
+
+    ENTER;
+    SAVETMPS;
+    ...
+    FREETMPS;
+    LEAVE;
+
+sequence in the callback (and not, of course, specifying the G_DISCARD
+flag).
+
+If you are going to use this method you have to be aware of a possible
+memory leak which can arise under very specific circumstances.  To
+explain these circumstances you need to know a bit about the flow of
+control between Perl and the callback routine.
+
+The examples given at the start of the document (an error handler and
+an event driven program) are typical of the two main sorts of flow
+control that you are likely to encounter with callbacks.  There is a
+very important distinction between them, so pay attention.
+
+In the first example, an error handler, the flow of control could be as
+follows.  You have created an interface to an external library.
+Control can reach the external library like this
+
+    perl --> XSUB --> external library
+
+Whilst control is in the library, an error condition occurs. You have
+previously set up a Perl callback to handle this situation, so it will
+get executed. Once the callback has finished, control will drop back to
+Perl again.  Here is what the flow of control will be like in that
+situation
+
+    perl --> XSUB --> external library
+                      ...
+                      error occurs
+                      ...
+                      external library --> call_* --> perl
+                                                          |
+    perl <-- XSUB <-- external library <-- call_* <----+
+
+After processing of the error using I<call_*> is completed,
+control reverts back to Perl more or less immediately.
+
+In the diagram, the further right you go the more deeply nested the
+scope is.  It is only when control is back with perl on the extreme
+left of the diagram that you will have dropped back to the enclosing
+scope and any temporaries you have left hanging around will be freed.
+
+In the second example, an event driven program, the flow of control
+will be more like this
+
+    perl --> XSUB --> event handler
+                      ...
+                      event handler --> call_* --> perl
+                                                       |
+                      event handler <-- call_* <----+
+                      ...
+                      event handler --> call_* --> perl
+                                                       |
+                      event handler <-- call_* <----+
+                      ...
+                      event handler --> call_* --> perl
+                                                       |
+                      event handler <-- call_* <----+
+
+In this case the flow of control can consist of only the repeated
+sequence
+
+    event handler --> call_* --> perl
+
+for practically the complete duration of the program.  This means that
+control may I<never> drop back to the surrounding scope in Perl at the
+extreme left.
+
+So what is the big problem? Well, if you are expecting Perl to tidy up
+those temporaries for you, you might be in for a long wait.  For Perl
+to dispose of your temporaries, control must drop back to the
+enclosing scope at some stage.  In the event driven scenario that may
+never happen.  This means that, as time goes on, your program will
+create more and more temporaries, none of which will ever be freed. As
+each of these temporaries consumes some memory your program will
+eventually consume all the available memory in your system--kapow!
+
+So here is the bottom line--if you are sure that control will revert
+back to the enclosing Perl scope fairly quickly after the end of your
+callback, then it isn't absolutely necessary to dispose explicitly of
+any temporaries you may have created. Mind you, if you are at all
+uncertain about what to do, it doesn't do any harm to tidy up anyway.
+
+
+=head2 Strategies for Storing Callback Context Information
+
+
+Potentially one of the trickiest problems to overcome when designing a
+callback interface can be figuring out how to store the mapping between
+the C callback function and the Perl equivalent.
+
+To help understand why this can be a real problem first consider how a
+callback is set up in an all C environment.  Typically a C API will
+provide a function to register a callback.  This will expect a pointer
+to a function as one of its parameters.  Below is a call to a
+hypothetical function C<register_fatal> which registers the C function
+to get called when a fatal error occurs.
+
+    register_fatal(cb1);
+
+The single parameter C<cb1> is a pointer to a function, so you must
+have defined C<cb1> in your code, say something like this
+
+    static void
+    cb1()
+    {
+        printf ("Fatal Error\n");
+        exit(1);
+    }
+
+Now change that to call a Perl subroutine instead
+
+    static SV * callback = (SV*)NULL;
+
+    static void
+    cb1()
+    {
+        dSP;
+
+        PUSHMARK(SP);
+
+        /* Call the Perl sub to process the callback */
+        call_sv(callback, G_DISCARD);
+    }
+
+
+    void
+    register_fatal(fn)
+        SV *	fn
+        CODE:
+        /* Remember the Perl sub */
+        if (callback == (SV*)NULL)
+            callback = newSVsv(fn);
+        else
+            SvSetSV(callback, fn);
+
+        /* register the callback with the external library */
+        register_fatal(cb1);
+
+where the Perl equivalent of C<register_fatal> and the callback it
+registers, C<pcb1>, might look like this
+
+    # Register the sub pcb1
+    register_fatal(\&pcb1);
+
+    sub pcb1
+    {
+        die "I'm dying...\n";
+    }
+
+The mapping between the C callback and the Perl equivalent is stored in
+the global variable C<callback>.
+
+This will be adequate if you ever need to have only one callback
+registered at any time. An example could be an error handler like the
+code sketched out above. Remember though, repeated calls to
+C<register_fatal> will replace the previously registered callback
+function with the new one.
+
+Say for example you want to interface to a library which allows asynchronous
+file i/o.  In this case you may be able to register a callback whenever
+a read operation has completed. To be of any use we want to be able to
+call separate Perl subroutines for each file that is opened.  As it
+stands, the error handler example above would not be adequate as it
+allows only a single callback to be defined at any time. What we
+require is a means of storing the mapping between the opened file and
+the Perl subroutine we want to be called for that file.
+
+Say the i/o library has a function C<asynch_read> which associates a C
+function C<ProcessRead> with a file handle C<fh>--this assumes that it
+has also provided some routine to open the file and so obtain the file
+handle.
+
+    asynch_read(fh, ProcessRead)
+
+This may expect the C I<ProcessRead> function of this form
+
+    void
+    ProcessRead(fh, buffer)
+    int	fh;
+    char *	buffer;
+    {
+         ...
+    }
+
+To provide a Perl interface to this library we need to be able to map
+between the C<fh> parameter and the Perl subroutine we want called.  A
+hash is a convenient mechanism for storing this mapping.  The code
+below shows a possible implementation
+
+    static HV * Mapping = (HV*)NULL;
+
+    void
+    asynch_read(fh, callback)
+        int	fh
+        SV *	callback
+        CODE:
+        /* If the hash doesn't already exist, create it */
+        if (Mapping == (HV*)NULL)
+            Mapping = newHV();
+
+        /* Save the fh -> callback mapping */
+        hv_store(Mapping, (char*)&fh, sizeof(fh), newSVsv(callback), 0);
+
+        /* Register with the C Library */
+        asynch_read(fh, asynch_read_if);
+
+and C<asynch_read_if> could look like this
+
+    static void
+    asynch_read_if(fh, buffer)
+    int	fh;
+    char *	buffer;
+    {
+        dSP;
+        SV ** sv;
+
+        /* Get the callback associated with fh */
+        sv =  hv_fetch(Mapping, (char*)&fh , sizeof(fh), FALSE);
+        if (sv == (SV**)NULL)
+            croak("Internal error...\n");
+
+        PUSHMARK(SP);
+        EXTEND(SP, 2);
+        PUSHs(sv_2mortal(newSViv(fh)));
+        PUSHs(sv_2mortal(newSVpv(buffer, 0)));
+        PUTBACK;
+
+        /* Call the Perl sub */
+        call_sv(*sv, G_DISCARD);
+    }
+
+For completeness, here is C<asynch_close>.  This shows how to remove
+the entry from the hash C<Mapping>.
+
+    void
+    asynch_close(fh)
+        int	fh
+        CODE:
+        /* Remove the entry from the hash */
+        (void) hv_delete(Mapping, (char*)&fh, sizeof(fh), G_DISCARD);
+
+        /* Now call the real asynch_close */
+        asynch_close(fh);
+
+So the Perl interface would look like this
+
+    sub callback1
+    {
+        my($handle, $buffer) = @_;
+    }
+
+    # Register the Perl callback
+    asynch_read($fh, \&callback1);
+
+    asynch_close($fh);
+
+The mapping between the C callback and Perl is stored in the global
+hash C<Mapping> this time. Using a hash has the distinct advantage that
+it allows an unlimited number of callbacks to be registered.
+
+What if the interface provided by the C callback doesn't contain a
+parameter which allows the file handle to Perl subroutine mapping?  Say
+in the asynchronous i/o package, the callback function gets passed only
+the C<buffer> parameter like this
+
+    void
+    ProcessRead(buffer)
+    char *	buffer;
+    {
+        ...
+    }
+
+Without the file handle there is no straightforward way to map from the
+C callback to the Perl subroutine.
+
+In this case a possible way around this problem is to predefine a
+series of C functions to act as the interface to Perl, thus
+
+    #define MAX_CB		3
+    #define NULL_HANDLE	-1
+    typedef void (*FnMap)();
+
+    struct MapStruct {
+        FnMap    Function;
+        SV *     PerlSub;
+        int      Handle;
+      };
+
+    static void  fn1();
+    static void  fn2();
+    static void  fn3();
+
+    static struct MapStruct Map [MAX_CB] =
+        {
+            { fn1, NULL, NULL_HANDLE },
+            { fn2, NULL, NULL_HANDLE },
+            { fn3, NULL, NULL_HANDLE }
+        };
+
+    static void
+    Pcb(index, buffer)
+    int index;
+    char * buffer;
+    {
+        dSP;
+
+        PUSHMARK(SP);
+        XPUSHs(sv_2mortal(newSVpv(buffer, 0)));
+        PUTBACK;
+
+        /* Call the Perl sub */
+        call_sv(Map[index].PerlSub, G_DISCARD);
+    }
+
+    static void
+    fn1(buffer)
+    char * buffer;
+    {
+        Pcb(0, buffer);
+    }
+
+    static void
+    fn2(buffer)
+    char * buffer;
+    {
+        Pcb(1, buffer);
+    }
+
+    static void
+    fn3(buffer)
+    char * buffer;
+    {
+        Pcb(2, buffer);
+    }
+
+    void
+    array_asynch_read(fh, callback)
+        int		fh
+        SV *	callback
+        CODE:
+        int index;
+        int null_index = MAX_CB;
+
+        /* Find the same handle or an empty entry */
+        for (index = 0; index < MAX_CB; ++index)
+        {
+            if (Map[index].Handle == fh)
+                break;
+
+            if (Map[index].Handle == NULL_HANDLE)
+                null_index = index;
+        }
+
+        if (index == MAX_CB && null_index == MAX_CB)
+            croak ("Too many callback functions registered\n");
+
+        if (index == MAX_CB)
+            index = null_index;
+
+        /* Save the file handle */
+        Map[index].Handle = fh;
+
+        /* Remember the Perl sub */
+        if (Map[index].PerlSub == (SV*)NULL)
+            Map[index].PerlSub = newSVsv(callback);
+        else
+            SvSetSV(Map[index].PerlSub, callback);
+
+        asynch_read(fh, Map[index].Function);
+
+    void
+    array_asynch_close(fh)
+        int	fh
+        CODE:
+        int index;
+
+        /* Find the file handle */
+        for (index = 0; index < MAX_CB; ++ index)
+            if (Map[index].Handle == fh)
+                break;
+
+        if (index == MAX_CB)
+            croak ("could not close fh %d\n", fh);
+
+        Map[index].Handle = NULL_HANDLE;
+        SvREFCNT_dec(Map[index].PerlSub);
+        Map[index].PerlSub = (SV*)NULL;
+
+        asynch_close(fh);
+
+In this case the functions C<fn1>, C<fn2>, and C<fn3> are used to
+remember the Perl subroutine to be called. Each of the functions holds
+a separate hard-wired index which is used in the function C<Pcb> to
+access the C<Map> array and actually call the Perl subroutine.
+
+There are some obvious disadvantages with this technique.
+
+Firstly, the code is considerably more complex than with the previous
+example.
+
+Secondly, there is a hard-wired limit (in this case 3) to the number of
+callbacks that can exist simultaneously. The only way to increase the
+limit is by modifying the code to add more functions and then
+recompiling.  None the less, as long as the number of functions is
+chosen with some care, it is still a workable solution and in some
+cases is the only one available.
+
+To summarize, here are a number of possible methods for you to consider
+for storing the mapping between C and the Perl callback
+
+=over 5
+
+=item 1. Ignore the problem - Allow only 1 callback
+
+For a lot of situations, like interfacing to an error handler, this may
+be a perfectly adequate solution.
+
+=item 2. Create a sequence of callbacks - hard wired limit
+
+If it is impossible to tell from the parameters passed back from the C
+callback what the context is, then you may need to create a sequence of C
+callback interface functions, and store pointers to each in an array.
+
+=item 3. Use a parameter to map to the Perl callback
+
+A hash is an ideal mechanism to store the mapping between C and Perl.
+
+=back
+
+
+=head2 Alternate Stack Manipulation
+
+
+Although I have made use of only the C<POP*> macros to access values
+returned from Perl subroutines, it is also possible to bypass these
+macros and read the stack using the C<ST> macro (See L<perlxs> for a
+full description of the C<ST> macro).
+
+Most of the time the C<POP*> macros should be adequate; the main
+problem with them is that they force you to process the returned values
+in sequence. This may not be the most suitable way to process the
+values in some cases. What we want is to be able to access the stack in
+a random order. The C<ST> macro as used when coding an XSUB is ideal
+for this purpose.
+
+The code below is the example given in the section L</Returning a List
+of Values> recoded to use C<ST> instead of C<POP*>.
+
+    static void
+    call_AddSubtract2(a, b)
+    int a;
+    int b;
+    {
+        dSP;
+        I32 ax;
+        int count;
+
+        ENTER;
+        SAVETMPS;
+
+        PUSHMARK(SP);
+        EXTEND(SP, 2);
+        PUSHs(sv_2mortal(newSViv(a)));
+        PUSHs(sv_2mortal(newSViv(b)));
+        PUTBACK;
+
+        count = call_pv("AddSubtract", G_LIST);
+
+        SPAGAIN;
+        SP -= count;
+        ax = (SP - PL_stack_base) + 1;
+
+        if (count != 2)
+            croak("Big trouble\n");
+
+        printf ("%d + %d = %d\n", a, b, SvIV(ST(0)));
+        printf ("%d - %d = %d\n", a, b, SvIV(ST(1)));
+
+        PUTBACK;
+        FREETMPS;
+        LEAVE;
+    }
+
+Notes
+
+=over 5
+
+=item 1.
+
+Notice that it was necessary to define the variable C<ax>.  This is
+because the C<ST> macro expects it to exist.  If we were in an XSUB it
+would not be necessary to define C<ax> as it is already defined for
+us.
+
+=item 2.
+
+The code
+
+        SPAGAIN;
+        SP -= count;
+        ax = (SP - PL_stack_base) + 1;
+
+sets the stack up so that we can use the C<ST> macro.
+
+=item 3.
+
+Unlike the original coding of this example, the returned
+values are not accessed in reverse order.  So C<ST(0)> refers to the
+first value returned by the Perl subroutine and C<ST(count-1)>
+refers to the last.
+
+=back
+
+=head2 Creating and Calling an Anonymous Subroutine in C
+
+As we've already shown, C<call_sv> can be used to invoke an
+anonymous subroutine.  However, our example showed a Perl script
+invoking an XSUB to perform this operation.  Let's see how it can be
+done inside our C code:
+
+ ...
+
+ SV *cvrv
+    = eval_pv("sub {
+                print 'You will not find me cluttering any namespace!'
+               }", TRUE);
+
+ ...
+
+ call_sv(cvrv, G_VOID|G_NOARGS);
+
+C<eval_pv> is used to compile the anonymous subroutine, which
+will be the return value as well (read more about C<eval_pv> in
+L<perlapi/eval_pv>).  Once this code reference is in hand, it
+can be mixed in with all the previous examples we've shown.
+
+=head1 LIGHTWEIGHT CALLBACKS
+
+Sometimes you need to invoke the same subroutine repeatedly.
+This usually happens with a function that acts on a list of
+values, such as Perl's built-in sort(). You can pass a
+comparison function to sort(), which will then be invoked
+for every pair of values that needs to be compared. The first()
+and reduce() functions from L<List::Util> follow a similar
+pattern.
+
+In this case it is possible to speed up the routine (often
+quite substantially) by using the lightweight callback API.
+The idea is that the calling context only needs to be
+created and destroyed once, and the sub can be called
+arbitrarily many times in between.
+
+It is usual to pass parameters using global variables (typically
+$_ for one parameter, or $a and $b for two parameters) rather
+than via @_. (It is possible to use the @_ mechanism if you know
+what you're doing, though there is as yet no supported API for
+it. It's also inherently slower.)
+
+The pattern of macro calls is like this:
+
+    dMULTICALL;			/* Declare local variables */
+    U8 gimme = G_SCALAR;	/* context of the call: G_SCALAR,
+				 * G_LIST, or G_VOID */
+
+    PUSH_MULTICALL(cv);		/* Set up the context for calling cv,
+				   and set local vars appropriately */
+
+    /* loop */ {
+        /* set the value(s) af your parameter variables */
+        MULTICALL;		/* Make the actual call */
+    } /* end of loop */
+
+    POP_MULTICALL;		/* Tear down the calling context */
+
+For some concrete examples, see the implementation of the
+first() and reduce() functions of List::Util 1.18. There you
+will also find a header file that emulates the multicall API
+on older versions of perl.
+
+=head1 SEE ALSO
+
+L<perlxs>, L<perlguts>, L<perlembed>
+
+=head1 AUTHOR
+
+Paul Marquess 
+
+Special thanks to the following people who assisted in the creation of
+the document.
+
+Jeff Okamoto, Tim Bunce, Nick Gianniotis, Steve Kelem, Gurusamy Sarathy
+and Larry Wall.
+
+=head1 DATE
+
+Last updated for perl 5.23.1.
+                                                                                                                                                                                                                                                                                                                                                              usr/local/lib/perl5/5.40.0/pod/perlcheat.pod                                                        0000644 0000000 0000000 00000010600 14714567415 016740  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        =head1 NAME
+
+perlcheat - Perl 5 Cheat Sheet
+
+=head1 DESCRIPTION
+
+This 'cheat sheet' is a handy reference, meant for beginning Perl
+programmers. Not everything is mentioned, but 195 features may
+already be overwhelming.
+
+=head2 The sheet
+
+  CONTEXTS  SIGILS  ref        ARRAYS        HASHES
+  void      $scalar SCALAR     @array        %hash
+  scalar    @array  ARRAY      @array[0, 2]  @hash{'a', 'b'}
+  list      %hash   HASH       $array[0]     $hash{'a'}
+            &sub    CODE
+            *glob   GLOB       SCALAR VALUES
+                    FORMAT     number, string, ref, glob, undef
+  REFERENCES
+  \      reference       $$foo[1]       aka $foo->[1]
+  $@%&*  dereference     $$foo{bar}     aka $foo->{bar}
+  []     anon. arrayref  ${$$foo[1]}[2] aka $foo->[1]->[2]
+  {}     anon. hashref   ${$$foo[1]}[2] aka $foo->[1][2]
+  \()    list of refs
+                         SYNTAX
+  OPERATOR PRECEDENCE    foreach (LIST) { }     for (a;b;c) { }
+  ->                     while   (e) { }        until (e)   { }
+  ++ --                  if      (e) { } elsif (e) { } else { }
+  **                     unless  (e) { } elsif (e) { } else { }
+  ! ~ \ u+ u-            given   (e) { when (e) {} default {} }
+  =~ !~
+  * / % x                 NUMBERS vs STRINGS  FALSE vs TRUE
+  + - .                   =          =        undef, "", 0, "0"
+  << >>                   +          .        anything else
+  named uops              == !=      eq ne
+  < > <= >= lt gt le ge   < > <= >=  lt gt le ge
+  == != <=> eq ne cmp ~~  <=>        cmp
+  &
+  | ^             REGEX MODIFIERS       REGEX METACHARS
+  &&              /i case insensitive   ^      string begin
+  || //           /m line based ^$      $      str end (bfr \n)
+  .. ...          /s . includes \n      +      one or more
+  ?:              /x /xx ign. wh.space  *      zero or more
+  = += last goto  /p preserve           ?      zero or one
+  , =>            /a ASCII    /aa safe  {3,7}  repeat in range
+  list ops        /l locale   /d  dual  |      alternation
+  not             /u Unicode            []     character class
+  and             /e evaluate /ee rpts  \b     boundary
+  or xor          /g global             \z     string end
+                  /o compile pat once   ()     capture
+  DEBUG                                 (?:p)  no capture
+  -MO=Deparse     REGEX CHARCLASSES     (?#t)  comment
+  -MO=Terse       .   [^\n]             (?=p)  ZW pos ahead
+  -D##            \s  whitespace        (?!p)  ZW neg ahead
+  -d:Trace        \w  word chars        (?<=p) ZW pos behind \K
+                  \d  digits            (?<!p) ZW neg behind
+  CONFIGURATION   \pP named property    (?>p)  no backtrack
+  perl -V:ivsize  \h  horiz.wh.space    (?|p|p)branch reset
+                  \R  linebreak         (?<n>p)named capture
+                  \S \W \D \H negate    \g{n}  ref to named cap
+                                        \K     keep left part
+  FUNCTION RETURN LISTS
+  stat      localtime    caller         SPECIAL VARIABLES
+   0 dev    0 second      0 package     $_    default variable
+   1 ino    1 minute      1 filename    $0    program name
+   2 mode   2 hour        2 line        $/    input separator
+   3 nlink  3 day         3 subroutine  $\    output separator
+   4 uid    4 month-1     4 hasargs     $|    autoflush
+   5 gid    5 year-1900   5 wantarray   $!    sys/libcall error
+   6 rdev   6 weekday     6 evaltext    $@    eval error
+   7 size   7 yearday     7 is_require  $$    process ID
+   8 atime  8 is_dst      8 hints       $.    line number
+   9 mtime                9 bitmask     @ARGV command line args
+  10 ctime               10 hinthash    @INC  include paths
+  11 blksz               3..10 only     @_    subroutine args
+  12 blcks               with EXPR      %ENV  environment
+
+=head1 ACKNOWLEDGEMENTS
+
+The first version of this document appeared on Perl Monks, where several
+people had useful suggestions. Thank you, Perl Monks.
+
+A special thanks to Damian Conway, who didn't only suggest important changes,
+but also took the time to count the number of listed features and make a
+Raku version to show that Perl will stay Perl.
+
+=head1 AUTHOR
+
+Juerd Waalboer <#####@juerd.nl>, with the help of many Perl Monks.
+
+=head1 SEE ALSO
+
+=over 4
+
+=item *
+
+L<https://perlmonks.org/?node_id=216602> - the original PM post
+
+=item *
+
+L<https://perlmonks.org/?node_id=238031> - Damian Conway's Raku version
+
+=item *
+
+L<https://juerd.nl/site.plp/perlcheat> - home of the Perl Cheat Sheet
+
+=back
+                                                                                                                                usr/local/lib/perl5/5.40.0/pod/perlclass.pod                                                        0000644 0000000 0000000 00000030571 14714567415 016772  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        =head1 NAME

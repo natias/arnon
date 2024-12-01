@@ -1,0 +1,1000 @@
+        if not self.local():
+            return False
+        if not self.publishing():
+            return True
+        # if publishing we can't copy if there is filtered content
+        return not self.filtered(b'visible').changelog.filteredrevs
+
+    def shared(self):
+        '''the type of shared repository (None if not shared)'''
+        if self.sharedpath != self.path:
+            return b'store'
+        return None
+
+    def wjoin(self, f, *insidef):
+        return self.vfs.reljoin(self.root, f, *insidef)
+
+    def setparents(self, p1, p2=None):
+        if p2 is None:
+            p2 = self.nullid
+        self[None].setparents(p1, p2)
+        self._quick_access_changeid_invalidate()
+
+    def filectx(self, path, changeid=None, fileid=None, changectx=None):
+        """changeid must be a changeset revision, if specified.
+        fileid can be a file revision or node."""
+        return context.filectx(
+            self, path, changeid, fileid, changectx=changectx
+        )
+
+    def getcwd(self):
+        return self.dirstate.getcwd()
+
+    def pathto(self, f, cwd=None):
+        return self.dirstate.pathto(f, cwd)
+
+    def _loadfilter(self, filter):
+        if filter not in self._filterpats:
+            l = []
+            for pat, cmd in self.ui.configitems(filter):
+                if cmd == b'!':
+                    continue
+                mf = matchmod.match(self.root, b'', [pat])
+                fn = None
+                params = cmd
+                for name, filterfn in self._datafilters.items():
+                    if cmd.startswith(name):
+                        fn = filterfn
+                        params = cmd[len(name) :].lstrip()
+                        break
+                if not fn:
+                    fn = lambda s, c, **kwargs: procutil.filter(s, c)
+                    fn.__name__ = 'commandfilter'
+                # Wrap old filters not supporting keyword arguments
+                if not pycompat.getargspec(fn)[2]:
+                    oldfn = fn
+                    fn = lambda s, c, oldfn=oldfn, **kwargs: oldfn(s, c)
+                    fn.__name__ = 'compat-' + oldfn.__name__
+                l.append((mf, fn, params))
+            self._filterpats[filter] = l
+        return self._filterpats[filter]
+
+    def _filter(self, filterpats, filename, data):
+        for mf, fn, cmd in filterpats:
+            if mf(filename):
+                self.ui.debug(
+                    b"filtering %s through %s\n"
+                    % (filename, cmd or pycompat.sysbytes(fn.__name__))
+                )
+                data = fn(data, cmd, ui=self.ui, repo=self, filename=filename)
+                break
+
+        return data
+
+    @unfilteredpropertycache
+    def _encodefilterpats(self):
+        return self._loadfilter(b'encode')
+
+    @unfilteredpropertycache
+    def _decodefilterpats(self):
+        return self._loadfilter(b'decode')
+
+    def adddatafilter(self, name, filter):
+        self._datafilters[name] = filter
+
+    def wread(self, filename):
+        if self.wvfs.islink(filename):
+            data = self.wvfs.readlink(filename)
+        else:
+            data = self.wvfs.read(filename)
+        return self._filter(self._encodefilterpats, filename, data)
+
+    def wwrite(self, filename, data, flags, backgroundclose=False, **kwargs):
+        """write ``data`` into ``filename`` in the working directory
+
+        This returns length of written (maybe decoded) data.
+        """
+        data = self._filter(self._decodefilterpats, filename, data)
+        if b'l' in flags:
+            self.wvfs.symlink(data, filename)
+        else:
+            self.wvfs.write(
+                filename, data, backgroundclose=backgroundclose, **kwargs
+            )
+            if b'x' in flags:
+                self.wvfs.setflags(filename, False, True)
+            else:
+                self.wvfs.setflags(filename, False, False)
+        return len(data)
+
+    def wwritedata(self, filename, data):
+        return self._filter(self._decodefilterpats, filename, data)
+
+    def currenttransaction(self):
+        """return the current transaction or None if non exists"""
+        if self._transref:
+            tr = self._transref()
+        else:
+            tr = None
+
+        if tr and tr.running():
+            return tr
+        return None
+
+    def transaction(self, desc, report=None):
+        if self.ui.configbool(b'devel', b'all-warnings') or self.ui.configbool(
+            b'devel', b'check-locks'
+        ):
+            if self._currentlock(self._lockref) is None:
+                raise error.ProgrammingError(b'transaction requires locking')
+        tr = self.currenttransaction()
+        if tr is not None:
+            return tr.nest(name=desc)
+
+        # abort here if the journal already exists
+        if self.svfs.exists(b"journal"):
+            raise error.RepoError(
+                _(b"abandoned transaction found"),
+                hint=_(b"run 'hg recover' to clean up transaction"),
+            )
+
+        idbase = b"%.40f#%f" % (random.random(), time.time())
+        ha = hex(hashutil.sha1(idbase).digest())
+        txnid = b'TXN:' + ha
+        self.hook(b'pretxnopen', throw=True, txnname=desc, txnid=txnid)
+
+        self._writejournal(desc)
+        renames = [(vfs, x, undoname(x)) for vfs, x in self._journalfiles()]
+        if report:
+            rp = report
+        else:
+            rp = self.ui.warn
+        vfsmap = {b'plain': self.vfs, b'store': self.svfs}  # root of .hg/
+        # we must avoid cyclic reference between repo and transaction.
+        reporef = weakref.ref(self)
+        # Code to track tag movement
+        #
+        # Since tags are all handled as file content, it is actually quite hard
+        # to track these movement from a code perspective. So we fallback to a
+        # tracking at the repository level. One could envision to track changes
+        # to the '.hgtags' file through changegroup apply but that fails to
+        # cope with case where transaction expose new heads without changegroup
+        # being involved (eg: phase movement).
+        #
+        # For now, We gate the feature behind a flag since this likely comes
+        # with performance impacts. The current code run more often than needed
+        # and do not use caches as much as it could.  The current focus is on
+        # the behavior of the feature so we disable it by default. The flag
+        # will be removed when we are happy with the performance impact.
+        #
+        # Once this feature is no longer experimental move the following
+        # documentation to the appropriate help section:
+        #
+        # The ``HG_TAG_MOVED`` variable will be set if the transaction touched
+        # tags (new or changed or deleted tags). In addition the details of
+        # these changes are made available in a file at:
+        #     ``REPOROOT/.hg/changes/tags.changes``.
+        # Make sure you check for HG_TAG_MOVED before reading that file as it
+        # might exist from a previous transaction even if no tag were touched
+        # in this one. Changes are recorded in a line base format::
+        #
+        #     <action> <hex-node> <tag-name>\n
+        #
+        # Actions are defined as follow:
+        #   "-R": tag is removed,
+        #   "+A": tag is added,
+        #   "-M": tag is moved (old value),
+        #   "+M": tag is moved (new value),
+        tracktags = lambda x: None
+        # experimental config: experimental.hook-track-tags
+        shouldtracktags = self.ui.configbool(
+            b'experimental', b'hook-track-tags'
+        )
+        if desc != b'strip' and shouldtracktags:
+            oldheads = self.changelog.headrevs()
+
+            def tracktags(tr2):
+                repo = reporef()
+                assert repo is not None  # help pytype
+                oldfnodes = tagsmod.fnoderevs(repo.ui, repo, oldheads)
+                newheads = repo.changelog.headrevs()
+                newfnodes = tagsmod.fnoderevs(repo.ui, repo, newheads)
+                # notes: we compare lists here.
+                # As we do it only once buiding set would not be cheaper
+                changes = tagsmod.difftags(repo.ui, repo, oldfnodes, newfnodes)
+                if changes:
+                    tr2.hookargs[b'tag_moved'] = b'1'
+                    with repo.vfs(
+                        b'changes/tags.changes', b'w', atomictemp=True
+                    ) as changesfile:
+                        # note: we do not register the file to the transaction
+                        # because we needs it to still exist on the transaction
+                        # is close (for txnclose hooks)
+                        tagsmod.writediff(changesfile, changes)
+
+        def validate(tr2):
+            """will run pre-closing hooks"""
+            # XXX the transaction API is a bit lacking here so we take a hacky
+            # path for now
+            #
+            # We cannot add this as a "pending" hooks since the 'tr.hookargs'
+            # dict is copied before these run. In addition we needs the data
+            # available to in memory hooks too.
+            #
+            # Moreover, we also need to make sure this runs before txnclose
+            # hooks and there is no "pending" mechanism that would execute
+            # logic only if hooks are about to run.
+            #
+            # Fixing this limitation of the transaction is also needed to track
+            # other families of changes (bookmarks, phases, obsolescence).
+            #
+            # This will have to be fixed before we remove the experimental
+            # gating.
+            tracktags(tr2)
+            repo = reporef()
+            assert repo is not None  # help pytype
+
+            singleheadopt = (b'experimental', b'single-head-per-branch')
+            singlehead = repo.ui.configbool(*singleheadopt)
+            if singlehead:
+                singleheadsub = repo.ui.configsuboptions(*singleheadopt)[1]
+                accountclosed = singleheadsub.get(
+                    b"account-closed-heads", False
+                )
+                if singleheadsub.get(b"public-changes-only", False):
+                    filtername = b"immutable"
+                else:
+                    filtername = b"visible"
+                scmutil.enforcesinglehead(
+                    repo, tr2, desc, accountclosed, filtername
+                )
+            if hook.hashook(repo.ui, b'pretxnclose-bookmark'):
+                for name, (old, new) in sorted(
+                    tr.changes[b'bookmarks'].items()
+                ):
+                    args = tr.hookargs.copy()
+                    args.update(bookmarks.preparehookargs(name, old, new))
+                    repo.hook(
+                        b'pretxnclose-bookmark',
+                        throw=True,
+                        **pycompat.strkwargs(args)
+                    )
+            if hook.hashook(repo.ui, b'pretxnclose-phase'):
+                cl = repo.unfiltered().changelog
+                for revs, (old, new) in tr.changes[b'phases']:
+                    for rev in revs:
+                        args = tr.hookargs.copy()
+                        node = hex(cl.node(rev))
+                        args.update(phases.preparehookargs(node, old, new))
+                        repo.hook(
+                            b'pretxnclose-phase',
+                            throw=True,
+                            **pycompat.strkwargs(args)
+                        )
+
+            repo.hook(
+                b'pretxnclose', throw=True, **pycompat.strkwargs(tr.hookargs)
+            )
+
+        def releasefn(tr, success):
+            repo = reporef()
+            if repo is None:
+                # If the repo has been GC'd (and this release function is being
+                # called from transaction.__del__), there's not much we can do,
+                # so just leave the unfinished transaction there and let the
+                # user run `hg recover`.
+                return
+            if success:
+                # this should be explicitly invoked here, because
+                # in-memory changes aren't written out at closing
+                # transaction, if tr.addfilegenerator (via
+                # dirstate.write or so) isn't invoked while
+                # transaction running
+                repo.dirstate.write(None)
+            else:
+                # discard all changes (including ones already written
+                # out) in this transaction
+                narrowspec.restorebackup(self, b'journal.narrowspec')
+                narrowspec.restorewcbackup(self, b'journal.narrowspec.dirstate')
+                repo.dirstate.restorebackup(None, b'journal.dirstate')
+
+                repo.invalidate(clearfilecache=True)
+
+        tr = transaction.transaction(
+            rp,
+            self.svfs,
+            vfsmap,
+            b"journal",
+            b"undo",
+            aftertrans(renames),
+            self.store.createmode,
+            validator=validate,
+            releasefn=releasefn,
+            checkambigfiles=_cachedfiles,
+            name=desc,
+        )
+        tr.changes[b'origrepolen'] = len(self)
+        tr.changes[b'obsmarkers'] = set()
+        tr.changes[b'phases'] = []
+        tr.changes[b'bookmarks'] = {}
+
+        tr.hookargs[b'txnid'] = txnid
+        tr.hookargs[b'txnname'] = desc
+        tr.hookargs[b'changes'] = tr.changes
+        # note: writing the fncache only during finalize mean that the file is
+        # outdated when running hooks. As fncache is used for streaming clone,
+        # this is not expected to break anything that happen during the hooks.
+        tr.addfinalize(b'flush-fncache', self.store.write)
+
+        def txnclosehook(tr2):
+            """To be run if transaction is successful, will schedule a hook run"""
+            # Don't reference tr2 in hook() so we don't hold a reference.
+            # This reduces memory consumption when there are multiple
+            # transactions per lock. This can likely go away if issue5045
+            # fixes the function accumulation.
+            hookargs = tr2.hookargs
+
+            def hookfunc(unused_success):
+                repo = reporef()
+                assert repo is not None  # help pytype
+
+                if hook.hashook(repo.ui, b'txnclose-bookmark'):
+                    bmchanges = sorted(tr.changes[b'bookmarks'].items())
+                    for name, (old, new) in bmchanges:
+                        args = tr.hookargs.copy()
+                        args.update(bookmarks.preparehookargs(name, old, new))
+                        repo.hook(
+                            b'txnclose-bookmark',
+                            throw=False,
+                            **pycompat.strkwargs(args)
+                        )
+
+                if hook.hashook(repo.ui, b'txnclose-phase'):
+                    cl = repo.unfiltered().changelog
+                    phasemv = sorted(
+                        tr.changes[b'phases'], key=lambda r: r[0][0]
+                    )
+                    for revs, (old, new) in phasemv:
+                        for rev in revs:
+                            args = tr.hookargs.copy()
+                            node = hex(cl.node(rev))
+                            args.update(phases.preparehookargs(node, old, new))
+                            repo.hook(
+                                b'txnclose-phase',
+                                throw=False,
+                                **pycompat.strkwargs(args)
+                            )
+
+                repo.hook(
+                    b'txnclose', throw=False, **pycompat.strkwargs(hookargs)
+                )
+
+            repo = reporef()
+            assert repo is not None  # help pytype
+            repo._afterlock(hookfunc)
+
+        tr.addfinalize(b'txnclose-hook', txnclosehook)
+        # Include a leading "-" to make it happen before the transaction summary
+        # reports registered via scmutil.registersummarycallback() whose names
+        # are 00-txnreport etc. That way, the caches will be warm when the
+        # callbacks run.
+        tr.addpostclose(b'-warm-cache', self._buildcacheupdater(tr))
+
+        def txnaborthook(tr2):
+            """To be run if transaction is aborted"""
+            repo = reporef()
+            assert repo is not None  # help pytype
+            repo.hook(
+                b'txnabort', throw=False, **pycompat.strkwargs(tr2.hookargs)
+            )
+
+        tr.addabort(b'txnabort-hook', txnaborthook)
+        # avoid eager cache invalidation. in-memory data should be identical
+        # to stored data if transaction has no error.
+        tr.addpostclose(b'refresh-filecachestats', self._refreshfilecachestats)
+        self._transref = weakref.ref(tr)
+        scmutil.registersummarycallback(self, tr, desc)
+        return tr
+
+    def _journalfiles(self):
+        first = (
+            (self.svfs, b'journal'),
+            (self.svfs, b'journal.narrowspec'),
+            (self.vfs, b'journal.narrowspec.dirstate'),
+            (self.vfs, b'journal.dirstate'),
+        )
+        middle = []
+        dirstate_data = self.dirstate.data_backup_filename(b'journal.dirstate')
+        if dirstate_data is not None:
+            middle.append((self.vfs, dirstate_data))
+        end = (
+            (self.vfs, b'journal.branch'),
+            (self.vfs, b'journal.desc'),
+            (bookmarks.bookmarksvfs(self), b'journal.bookmarks'),
+            (self.svfs, b'journal.phaseroots'),
+        )
+        return first + tuple(middle) + end
+
+    def undofiles(self):
+        return [(vfs, undoname(x)) for vfs, x in self._journalfiles()]
+
+    @unfilteredmethod
+    def _writejournal(self, desc):
+        self.dirstate.savebackup(None, b'journal.dirstate')
+        narrowspec.savewcbackup(self, b'journal.narrowspec.dirstate')
+        narrowspec.savebackup(self, b'journal.narrowspec')
+        self.vfs.write(
+            b"journal.branch", encoding.fromlocal(self.dirstate.branch())
+        )
+        self.vfs.write(b"journal.desc", b"%d\n%s\n" % (len(self), desc))
+        bookmarksvfs = bookmarks.bookmarksvfs(self)
+        bookmarksvfs.write(
+            b"journal.bookmarks", bookmarksvfs.tryread(b"bookmarks")
+        )
+        self.svfs.write(b"journal.phaseroots", self.svfs.tryread(b"phaseroots"))
+
+    def recover(self):
+        with self.lock():
+            if self.svfs.exists(b"journal"):
+                self.ui.status(_(b"rolling back interrupted transaction\n"))
+                vfsmap = {
+                    b'': self.svfs,
+                    b'plain': self.vfs,
+                }
+                transaction.rollback(
+                    self.svfs,
+                    vfsmap,
+                    b"journal",
+                    self.ui.warn,
+                    checkambigfiles=_cachedfiles,
+                )
+                self.invalidate()
+                return True
+            else:
+                self.ui.warn(_(b"no interrupted transaction available\n"))
+                return False
+
+    def rollback(self, dryrun=False, force=False):
+        wlock = lock = dsguard = None
+        try:
+            wlock = self.wlock()
+            lock = self.lock()
+            if self.svfs.exists(b"undo"):
+                dsguard = dirstateguard.dirstateguard(self, b'rollback')
+
+                return self._rollback(dryrun, force, dsguard)
+            else:
+                self.ui.warn(_(b"no rollback information available\n"))
+                return 1
+        finally:
+            release(dsguard, lock, wlock)
+
+    @unfilteredmethod  # Until we get smarter cache management
+    def _rollback(self, dryrun, force, dsguard):
+        ui = self.ui
+        try:
+            args = self.vfs.read(b'undo.desc').splitlines()
+            (oldlen, desc, detail) = (int(args[0]), args[1], None)
+            if len(args) >= 3:
+                detail = args[2]
+            oldtip = oldlen - 1
+
+            if detail and ui.verbose:
+                msg = _(
+                    b'repository tip rolled back to revision %d'
+                    b' (undo %s: %s)\n'
+                ) % (oldtip, desc, detail)
+            else:
+                msg = _(
+                    b'repository tip rolled back to revision %d (undo %s)\n'
+                ) % (oldtip, desc)
+        except IOError:
+            msg = _(b'rolling back unknown transaction\n')
+            desc = None
+
+        if not force and self[b'.'] != self[b'tip'] and desc == b'commit':
+            raise error.Abort(
+                _(
+                    b'rollback of last commit while not checked out '
+                    b'may lose data'
+                ),
+                hint=_(b'use -f to force'),
+            )
+
+        ui.status(msg)
+        if dryrun:
+            return 0
+
+        parents = self.dirstate.parents()
+        self.destroying()
+        vfsmap = {b'plain': self.vfs, b'': self.svfs}
+        transaction.rollback(
+            self.svfs, vfsmap, b'undo', ui.warn, checkambigfiles=_cachedfiles
+        )
+        bookmarksvfs = bookmarks.bookmarksvfs(self)
+        if bookmarksvfs.exists(b'undo.bookmarks'):
+            bookmarksvfs.rename(
+                b'undo.bookmarks', b'bookmarks', checkambig=True
+            )
+        if self.svfs.exists(b'undo.phaseroots'):
+            self.svfs.rename(b'undo.phaseroots', b'phaseroots', checkambig=True)
+        self.invalidate()
+
+        has_node = self.changelog.index.has_node
+        parentgone = any(not has_node(p) for p in parents)
+        if parentgone:
+            # prevent dirstateguard from overwriting already restored one
+            dsguard.close()
+
+            narrowspec.restorebackup(self, b'undo.narrowspec')
+            narrowspec.restorewcbackup(self, b'undo.narrowspec.dirstate')
+            self.dirstate.restorebackup(None, b'undo.dirstate')
+            try:
+                branch = self.vfs.read(b'undo.branch')
+                self.dirstate.setbranch(encoding.tolocal(branch))
+            except IOError:
+                ui.warn(
+                    _(
+                        b'named branch could not be reset: '
+                        b'current branch is still \'%s\'\n'
+                    )
+                    % self.dirstate.branch()
+                )
+
+            parents = tuple([p.rev() for p in self[None].parents()])
+            if len(parents) > 1:
+                ui.status(
+                    _(
+                        b'working directory now based on '
+                        b'revisions %d and %d\n'
+                    )
+                    % parents
+                )
+            else:
+                ui.status(
+                    _(b'working directory now based on revision %d\n') % parents
+                )
+            mergestatemod.mergestate.clean(self)
+
+        # TODO: if we know which new heads may result from this rollback, pass
+        # them to destroy(), which will prevent the branchhead cache from being
+        # invalidated.
+        self.destroyed()
+        return 0
+
+    def _buildcacheupdater(self, newtransaction):
+        """called during transaction to build the callback updating cache
+
+        Lives on the repository to help extension who might want to augment
+        this logic. For this purpose, the created transaction is passed to the
+        method.
+        """
+        # we must avoid cyclic reference between repo and transaction.
+        reporef = weakref.ref(self)
+
+        def updater(tr):
+            repo = reporef()
+            assert repo is not None  # help pytype
+            repo.updatecaches(tr)
+
+        return updater
+
+    @unfilteredmethod
+    def updatecaches(self, tr=None, full=False, caches=None):
+        """warm appropriate caches
+
+        If this function is called after a transaction closed. The transaction
+        will be available in the 'tr' argument. This can be used to selectively
+        update caches relevant to the changes in that transaction.
+
+        If 'full' is set, make sure all caches the function knows about have
+        up-to-date data. Even the ones usually loaded more lazily.
+
+        The `full` argument can take a special "post-clone" value. In this case
+        the cache warming is made after a clone and of the slower cache might
+        be skipped, namely the `.fnodetags` one. This argument is 5.8 specific
+        as we plan for a cleaner way to deal with this for 5.9.
+        """
+        if tr is not None and tr.hookargs.get(b'source') == b'strip':
+            # During strip, many caches are invalid but
+            # later call to `destroyed` will refresh them.
+            return
+
+        unfi = self.unfiltered()
+
+        if full:
+            msg = (
+                "`full` argument for `repo.updatecaches` is deprecated\n"
+                "(use `caches=repository.CACHE_ALL` instead)"
+            )
+            self.ui.deprecwarn(msg, b"5.9")
+            caches = repository.CACHES_ALL
+            if full == b"post-clone":
+                caches = repository.CACHES_POST_CLONE
+            caches = repository.CACHES_ALL
+        elif caches is None:
+            caches = repository.CACHES_DEFAULT
+
+        if repository.CACHE_BRANCHMAP_SERVED in caches:
+            if tr is None or tr.changes[b'origrepolen'] < len(self):
+                # accessing the 'served' branchmap should refresh all the others,
+                self.ui.debug(b'updating the branch cache\n')
+                self.filtered(b'served').branchmap()
+                self.filtered(b'served.hidden').branchmap()
+                # flush all possibly delayed write.
+                self._branchcaches.write_delayed(self)
+
+        if repository.CACHE_CHANGELOG_CACHE in caches:
+            self.changelog.update_caches(transaction=tr)
+
+        if repository.CACHE_MANIFESTLOG_CACHE in caches:
+            self.manifestlog.update_caches(transaction=tr)
+
+        if repository.CACHE_REV_BRANCH in caches:
+            rbc = unfi.revbranchcache()
+            for r in unfi.changelog:
+                rbc.branchinfo(r)
+            rbc.write()
+
+        if repository.CACHE_FULL_MANIFEST in caches:
+            # ensure the working copy parents are in the manifestfulltextcache
+            for ctx in self[b'.'].parents():
+                ctx.manifest()  # accessing the manifest is enough
+
+        if repository.CACHE_FILE_NODE_TAGS in caches:
+            # accessing fnode cache warms the cache
+            tagsmod.fnoderevs(self.ui, unfi, unfi.changelog.revs())
+
+        if repository.CACHE_TAGS_DEFAULT in caches:
+            # accessing tags warm the cache
+            self.tags()
+        if repository.CACHE_TAGS_SERVED in caches:
+            self.filtered(b'served').tags()
+
+        if repository.CACHE_BRANCHMAP_ALL in caches:
+            # The CACHE_BRANCHMAP_ALL updates lazily-loaded caches immediately,
+            # so we're forcing a write to cause these caches to be warmed up
+            # even if they haven't explicitly been requested yet (if they've
+            # never been used by hg, they won't ever have been written, even if
+            # they're a subset of another kind of cache that *has* been used).
+            for filt in repoview.filtertable.keys():
+                filtered = self.filtered(filt)
+                filtered.branchmap().write(filtered)
+
+    def invalidatecaches(self):
+
+        if '_tagscache' in vars(self):
+            # can't use delattr on proxy
+            del self.__dict__['_tagscache']
+
+        self._branchcaches.clear()
+        self.invalidatevolatilesets()
+        self._sparsesignaturecache.clear()
+
+    def invalidatevolatilesets(self):
+        self.filteredrevcache.clear()
+        obsolete.clearobscaches(self)
+        self._quick_access_changeid_invalidate()
+
+    def invalidatedirstate(self):
+        """Invalidates the dirstate, causing the next call to dirstate
+        to check if it was modified since the last time it was read,
+        rereading it if it has.
+
+        This is different to dirstate.invalidate() that it doesn't always
+        rereads the dirstate. Use dirstate.invalidate() if you want to
+        explicitly read the dirstate again (i.e. restoring it to a previous
+        known good state)."""
+        if hasunfilteredcache(self, 'dirstate'):
+            for k in self.dirstate._filecache:
+                try:
+                    delattr(self.dirstate, k)
+                except AttributeError:
+                    pass
+            delattr(self.unfiltered(), 'dirstate')
+
+    def invalidate(self, clearfilecache=False):
+        """Invalidates both store and non-store parts other than dirstate
+
+        If a transaction is running, invalidation of store is omitted,
+        because discarding in-memory changes might cause inconsistency
+        (e.g. incomplete fncache causes unintentional failure, but
+        redundant one doesn't).
+        """
+        unfiltered = self.unfiltered()  # all file caches are stored unfiltered
+        for k in list(self._filecache.keys()):
+            # dirstate is invalidated separately in invalidatedirstate()
+            if k == b'dirstate':
+                continue
+            if (
+                k == b'changelog'
+                and self.currenttransaction()
+                and self.changelog._delayed
+            ):
+                # The changelog object may store unwritten revisions. We don't
+                # want to lose them.
+                # TODO: Solve the problem instead of working around it.
+                continue
+
+            if clearfilecache:
+                del self._filecache[k]
+            try:
+                delattr(unfiltered, k)
+            except AttributeError:
+                pass
+        self.invalidatecaches()
+        if not self.currenttransaction():
+            # TODO: Changing contents of store outside transaction
+            # causes inconsistency. We should make in-memory store
+            # changes detectable, and abort if changed.
+            self.store.invalidatecaches()
+
+    def invalidateall(self):
+        """Fully invalidates both store and non-store parts, causing the
+        subsequent operation to reread any outside changes."""
+        # extension should hook this to invalidate its caches
+        self.invalidate()
+        self.invalidatedirstate()
+
+    @unfilteredmethod
+    def _refreshfilecachestats(self, tr):
+        """Reload stats of cached files so that they are flagged as valid"""
+        for k, ce in self._filecache.items():
+            k = pycompat.sysstr(k)
+            if k == 'dirstate' or k not in self.__dict__:
+                continue
+            ce.refresh()
+
+    def _lock(
+        self,
+        vfs,
+        lockname,
+        wait,
+        releasefn,
+        acquirefn,
+        desc,
+    ):
+        timeout = 0
+        warntimeout = 0
+        if wait:
+            timeout = self.ui.configint(b"ui", b"timeout")
+            warntimeout = self.ui.configint(b"ui", b"timeout.warn")
+        # internal config: ui.signal-safe-lock
+        signalsafe = self.ui.configbool(b'ui', b'signal-safe-lock')
+
+        l = lockmod.trylock(
+            self.ui,
+            vfs,
+            lockname,
+            timeout,
+            warntimeout,
+            releasefn=releasefn,
+            acquirefn=acquirefn,
+            desc=desc,
+            signalsafe=signalsafe,
+        )
+        return l
+
+    def _afterlock(self, callback):
+        """add a callback to be run when the repository is fully unlocked
+
+        The callback will be executed when the outermost lock is released
+        (with wlock being higher level than 'lock')."""
+        for ref in (self._wlockref, self._lockref):
+            l = ref and ref()
+            if l and l.held:
+                l.postrelease.append(callback)
+                break
+        else:  # no lock have been found.
+            callback(True)
+
+    def lock(self, wait=True):
+        """Lock the repository store (.hg/store) and return a weak reference
+        to the lock. Use this before modifying the store (e.g. committing or
+        stripping). If you are opening a transaction, get a lock as well.)
+
+        If both 'lock' and 'wlock' must be acquired, ensure you always acquires
+        'wlock' first to avoid a dead-lock hazard."""
+        l = self._currentlock(self._lockref)
+        if l is not None:
+            l.lock()
+            return l
+
+        l = self._lock(
+            vfs=self.svfs,
+            lockname=b"lock",
+            wait=wait,
+            releasefn=None,
+            acquirefn=self.invalidate,
+            desc=_(b'repository %s') % self.origroot,
+        )
+        self._lockref = weakref.ref(l)
+        return l
+
+    def wlock(self, wait=True):
+        """Lock the non-store parts of the repository (everything under
+        .hg except .hg/store) and return a weak reference to the lock.
+
+        Use this before modifying files in .hg.
+
+        If both 'lock' and 'wlock' must be acquired, ensure you always acquires
+        'wlock' first to avoid a dead-lock hazard."""
+        l = self._wlockref() if self._wlockref else None
+        if l is not None and l.held:
+            l.lock()
+            return l
+
+        # We do not need to check for non-waiting lock acquisition.  Such
+        # acquisition would not cause dead-lock as they would just fail.
+        if wait and (
+            self.ui.configbool(b'devel', b'all-warnings')
+            or self.ui.configbool(b'devel', b'check-locks')
+        ):
+            if self._currentlock(self._lockref) is not None:
+                self.ui.develwarn(b'"wlock" acquired after "lock"')
+
+        def unlock():
+            if self.dirstate.pendingparentchange():
+                self.dirstate.invalidate()
+            else:
+                self.dirstate.write(None)
+
+            self._filecache[b'dirstate'].refresh()
+
+        l = self._lock(
+            self.vfs,
+            b"wlock",
+            wait,
+            unlock,
+            self.invalidatedirstate,
+            _(b'working directory of %s') % self.origroot,
+        )
+        self._wlockref = weakref.ref(l)
+        return l
+
+    def _currentlock(self, lockref):
+        """Returns the lock if it's held, or None if it's not."""
+        if lockref is None:
+            return None
+        l = lockref()
+        if l is None or not l.held:
+            return None
+        return l
+
+    def currentwlock(self):
+        """Returns the wlock if it's held, or None if it's not."""
+        return self._currentlock(self._wlockref)
+
+    def checkcommitpatterns(self, wctx, match, status, fail):
+        """check for commit arguments that aren't committable"""
+        if match.isexact() or match.prefix():
+            matched = set(status.modified + status.added + status.removed)
+
+            for f in match.files():
+                f = self.dirstate.normalize(f)
+                if f == b'.' or f in matched or f in wctx.substate:
+                    continue
+                if f in status.deleted:
+                    fail(f, _(b'file not found!'))
+                # Is it a directory that exists or used to exist?
+                if self.wvfs.isdir(f) or wctx.p1().hasdir(f):
+                    d = f + b'/'
+                    for mf in matched:
+                        if mf.startswith(d):
+                            break
+                    else:
+                        fail(f, _(b"no match under directory!"))
+                elif f not in self.dirstate:
+                    fail(f, _(b"file not tracked!"))
+
+    @unfilteredmethod
+    def commit(
+        self,
+        text=b"",
+        user=None,
+        date=None,
+        match=None,
+        force=False,
+        editor=None,
+        extra=None,
+    ):
+        """Add a new revision to current repository.
+
+        Revision information is gathered from the working directory,
+        match can be used to filter the committed files. If editor is
+        supplied, it is called to get a commit message.
+        """
+        if extra is None:
+            extra = {}
+
+        def fail(f, msg):
+            raise error.InputError(b'%s: %s' % (f, msg))
+
+        if not match:
+            match = matchmod.always()
+
+        if not force:
+            match.bad = fail
+
+        # lock() for recent changelog (see issue4368)
+        with self.wlock(), self.lock():
+            wctx = self[None]
+            merge = len(wctx.parents()) > 1
+
+            if not force and merge and not match.always():
+                raise error.Abort(
+                    _(
+                        b'cannot partially commit a merge '
+                        b'(do not specify files or patterns)'
+                    )
+                )
+
+            status = self.status(match=match, clean=force)
+            if force:
+                status.modified.extend(
+                    status.clean
+                )  # mq may commit clean files
+
+            # check subrepos
+            subs, commitsubs, newstate = subrepoutil.precommit(
+                self.ui, wctx, status, match, force=force
+            )
+
+            # make sure all explicit patterns are matched
+            if not force:
+                self.checkcommitpatterns(wctx, match, status, fail)
+
+            cctx = context.workingcommitctx(
+                self, status, text, user, date, extra
+            )
+
+            ms = mergestatemod.mergestate.read(self)
+            mergeutil.checkunresolved(ms)
+
+            # internal config: ui.allowemptycommit
+            if cctx.isempty() and not self.ui.configbool(
+                b'ui', b'allowemptycommit'
+            ):
+                self.ui.debug(b'nothing to commit, clearing merge state\n')
+                ms.reset()
+                return None
+
+            if merge and cctx.deleted():
+                raise error.Abort(_(b"cannot commit merge with missing files"))
+
+            if editor:
+                cctx._text = editor(self, cctx, subs)
+            edited = text != cctx._text
+
+            # Save commit message in case this transaction gets rolled back
+            # (e.g. by a pretxncommit hook).  Leave the content alone on
+            # the assumption that the user will use the same editor again.
+            msg_path = self.savecommitmessage(cctx._text)
+
+            # commit subs and write new state
+            if subs:
+                uipathfn = scmutil.getuipathfn(self)
+                for s in sorted(commitsubs):
+                    sub = wctx.sub(s)
+                    self.ui.status(
+                        _(b'committing subrepository %s\n')
+                        % uipathfn(subrepoutil.subrelpath(sub))
+                    )
+                    sr = sub.commit(cctx._text, user, date)
+                    newstate[s] = (newstate[s][0], sr)
+                subrepoutil.writestate(self, newstate)
+
+            p1, p2 = self.dirstate.parents()
+            hookp1, hookp2 = hex(p1), (p2 != self.nullid and hex(p2) or b'')
+            try:
+                self.hook(
+                    b"precommit", throw=True, parent1=hookp1, parent2=hookp2
+                )
+                with self.transaction(b'commit'):
+                    ret = self.commitctx(cctx, True)
+                    # update bookmarks, dirstate and mergestate
+                    bookmarks.update(self, [p1, p2], ret)
+                    cctx.markcommitted(ret)
+                    ms.reset()
+            except:  # re-raises
+                if edited:

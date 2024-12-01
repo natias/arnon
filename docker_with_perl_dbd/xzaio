@@ -1,0 +1,1000 @@
+                        err_filename = cwd
+                    else:
+                        err_filename = orig_executable
+                    if errno_num != 0:
+                        err_msg = os.strerror(errno_num)
+                    raise child_exception_type(errno_num, err_msg, err_filename)
+                raise child_exception_type(err_msg)
+
+
+        def _handle_exitstatus(self, sts,
+                               _waitstatus_to_exitcode=_waitstatus_to_exitcode,
+                               _WIFSTOPPED=_WIFSTOPPED,
+                               _WSTOPSIG=_WSTOPSIG):
+            """All callers to this function MUST hold self._waitpid_lock."""
+            # This method is called (indirectly) by __del__, so it cannot
+            # refer to anything outside of its local scope.
+            if _WIFSTOPPED(sts):
+                self.returncode = -_WSTOPSIG(sts)
+            else:
+                self.returncode = _waitstatus_to_exitcode(sts)
+
+        def _internal_poll(self, _deadstate=None, _waitpid=_waitpid,
+                _WNOHANG=_WNOHANG, _ECHILD=errno.ECHILD):
+            """Check if child process has terminated.  Returns returncode
+            attribute.
+
+            This method is called by __del__, so it cannot reference anything
+            outside of the local scope (nor can any methods it calls).
+
+            """
+            if self.returncode is None:
+                if not self._waitpid_lock.acquire(False):
+                    # Something else is busy calling waitpid.  Don't allow two
+                    # at once.  We know nothing yet.
+                    return None
+                try:
+                    if self.returncode is not None:
+                        return self.returncode  # Another thread waited.
+                    pid, sts = _waitpid(self.pid, _WNOHANG)
+                    if pid == self.pid:
+                        self._handle_exitstatus(sts)
+                except OSError as e:
+                    if _deadstate is not None:
+                        self.returncode = _deadstate
+                    elif e.errno == _ECHILD:
+                        # This happens if SIGCLD is set to be ignored or
+                        # waiting for child processes has otherwise been
+                        # disabled for our process.  This child is dead, we
+                        # can't get the status.
+                        # http://bugs.python.org/issue15756
+                        self.returncode = 0
+                finally:
+                    self._waitpid_lock.release()
+            return self.returncode
+
+
+        def _try_wait(self, wait_flags):
+            """All callers to this function MUST hold self._waitpid_lock."""
+            try:
+                (pid, sts) = os.waitpid(self.pid, wait_flags)
+            except ChildProcessError:
+                # This happens if SIGCLD is set to be ignored or waiting
+                # for child processes has otherwise been disabled for our
+                # process.  This child is dead, we can't get the status.
+                pid = self.pid
+                sts = 0
+            return (pid, sts)
+
+
+        def _wait(self, timeout):
+            """Internal implementation of wait() on POSIX."""
+            if self.returncode is not None:
+                return self.returncode
+
+            if timeout is not None:
+                endtime = _time() + timeout
+                # Enter a busy loop if we have a timeout.  This busy loop was
+                # cribbed from Lib/threading.py in Thread.wait() at r71065.
+                delay = 0.0005 # 500 us -> initial delay of 1 ms
+                while True:
+                    if self._waitpid_lock.acquire(False):
+                        try:
+                            if self.returncode is not None:
+                                break  # Another thread waited.
+                            (pid, sts) = self._try_wait(os.WNOHANG)
+                            assert pid == self.pid or pid == 0
+                            if pid == self.pid:
+                                self._handle_exitstatus(sts)
+                                break
+                        finally:
+                            self._waitpid_lock.release()
+                    remaining = self._remaining_time(endtime)
+                    if remaining <= 0:
+                        raise TimeoutExpired(self.args, timeout)
+                    delay = min(delay * 2, remaining, .05)
+                    time.sleep(delay)
+            else:
+                while self.returncode is None:
+                    with self._waitpid_lock:
+                        if self.returncode is not None:
+                            break  # Another thread waited.
+                        (pid, sts) = self._try_wait(0)
+                        # Check the pid and loop as waitpid has been known to
+                        # return 0 even without WNOHANG in odd situations.
+                        # http://bugs.python.org/issue14396.
+                        if pid == self.pid:
+                            self._handle_exitstatus(sts)
+            return self.returncode
+
+
+        def _communicate(self, input, endtime, orig_timeout):
+            if self.stdin and not self._communication_started:
+                # Flush stdio buffer.  This might block, if the user has
+                # been writing to .stdin in an uncontrolled fashion.
+                try:
+                    self.stdin.flush()
+                except BrokenPipeError:
+                    pass  # communicate() must ignore BrokenPipeError.
+                if not input:
+                    try:
+                        self.stdin.close()
+                    except BrokenPipeError:
+                        pass  # communicate() must ignore BrokenPipeError.
+
+            stdout = None
+            stderr = None
+
+            # Only create this mapping if we haven't already.
+            if not self._communication_started:
+                self._fileobj2output = {}
+                if self.stdout:
+                    self._fileobj2output[self.stdout] = []
+                if self.stderr:
+                    self._fileobj2output[self.stderr] = []
+
+            if self.stdout:
+                stdout = self._fileobj2output[self.stdout]
+            if self.stderr:
+                stderr = self._fileobj2output[self.stderr]
+
+            self._save_input(input)
+
+            if self._input:
+                input_view = memoryview(self._input)
+
+            with _PopenSelector() as selector:
+                if self.stdin and input:
+                    selector.register(self.stdin, selectors.EVENT_WRITE)
+                if self.stdout and not self.stdout.closed:
+                    selector.register(self.stdout, selectors.EVENT_READ)
+                if self.stderr and not self.stderr.closed:
+                    selector.register(self.stderr, selectors.EVENT_READ)
+
+                while selector.get_map():
+                    timeout = self._remaining_time(endtime)
+                    if timeout is not None and timeout < 0:
+                        self._check_timeout(endtime, orig_timeout,
+                                            stdout, stderr,
+                                            skip_check_and_raise=True)
+                        raise RuntimeError(  # Impossible :)
+                            '_check_timeout(..., skip_check_and_raise=True) '
+                            'failed to raise TimeoutExpired.')
+
+                    ready = selector.select(timeout)
+                    self._check_timeout(endtime, orig_timeout, stdout, stderr)
+
+                    # XXX Rewrite these to use non-blocking I/O on the file
+                    # objects; they are no longer using C stdio!
+
+                    for key, events in ready:
+                        if key.fileobj is self.stdin:
+                            chunk = input_view[self._input_offset :
+                                               self._input_offset + _PIPE_BUF]
+                            try:
+                                self._input_offset += os.write(key.fd, chunk)
+                            except BrokenPipeError:
+                                selector.unregister(key.fileobj)
+                                key.fileobj.close()
+                            else:
+                                if self._input_offset >= len(self._input):
+                                    selector.unregister(key.fileobj)
+                                    key.fileobj.close()
+                        elif key.fileobj in (self.stdout, self.stderr):
+                            data = os.read(key.fd, 32768)
+                            if not data:
+                                selector.unregister(key.fileobj)
+                                key.fileobj.close()
+                            self._fileobj2output[key.fileobj].append(data)
+
+            self.wait(timeout=self._remaining_time(endtime))
+
+            # All data exchanged.  Translate lists into strings.
+            if stdout is not None:
+                stdout = b''.join(stdout)
+            if stderr is not None:
+                stderr = b''.join(stderr)
+
+            # Translate newlines, if requested.
+            # This also turns bytes into strings.
+            if self.text_mode:
+                if stdout is not None:
+                    stdout = self._translate_newlines(stdout,
+                                                      self.stdout.encoding,
+                                                      self.stdout.errors)
+                if stderr is not None:
+                    stderr = self._translate_newlines(stderr,
+                                                      self.stderr.encoding,
+                                                      self.stderr.errors)
+
+            return (stdout, stderr)
+
+
+        def _save_input(self, input):
+            # This method is called from the _communicate_with_*() methods
+            # so that if we time out while communicating, we can continue
+            # sending input if we retry.
+            if self.stdin and self._input is None:
+                self._input_offset = 0
+                self._input = input
+                if input is not None and self.text_mode:
+                    self._input = self._input.encode(self.stdin.encoding,
+                                                     self.stdin.errors)
+
+
+        def send_signal(self, sig):
+            """Send a signal to the process."""
+            # bpo-38630: Polling reduces the risk of sending a signal to the
+            # wrong process if the process completed, the Popen.returncode
+            # attribute is still None, and the pid has been reassigned
+            # (recycled) to a new different process. This race condition can
+            # happens in two cases.
+            #
+            # Case 1. Thread A calls Popen.poll(), thread B calls
+            # Popen.send_signal(). In thread A, waitpid() succeed and returns
+            # the exit status. Thread B calls kill() because poll() in thread A
+            # did not set returncode yet. Calling poll() in thread B prevents
+            # the race condition thanks to Popen._waitpid_lock.
+            #
+            # Case 2. waitpid(pid, 0) has been called directly, without
+            # using Popen methods: returncode is still None is this case.
+            # Calling Popen.poll() will set returncode to a default value,
+            # since waitpid() fails with ProcessLookupError.
+            self.poll()
+            if self.returncode is not None:
+                # Skip signalling a process that we know has already died.
+                return
+
+            # The race condition can still happen if the race condition
+            # described above happens between the returncode test
+            # and the kill() call.
+            try:
+                os.kill(self.pid, sig)
+            except ProcessLookupError:
+                # Suppress the race condition error; bpo-40550.
+                pass
+
+        def terminate(self):
+            """Terminate the process with SIGTERM
+            """
+            self.send_signal(signal.SIGTERM)
+
+        def kill(self):
+            """Kill the process with SIGKILL
+            """
+            self.send_signal(signal.SIGKILL)
+                                                                                                                                                                                                                                                                              usr/lib/python3.11/sunau.py                                                                         0000644 0000000 0000000 00000044060 14671176116 014172  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        """Stuff to parse Sun and NeXT audio files.
+
+An audio file consists of a header followed by the data.  The structure
+of the header is as follows.
+
+        +---------------+
+        | magic word    |
+        +---------------+
+        | header size   |
+        +---------------+
+        | data size     |
+        +---------------+
+        | encoding      |
+        +---------------+
+        | sample rate   |
+        +---------------+
+        | # of channels |
+        +---------------+
+        | info          |
+        |               |
+        +---------------+
+
+The magic word consists of the 4 characters '.snd'.  Apart from the
+info field, all header fields are 4 bytes in size.  They are all
+32-bit unsigned integers encoded in big-endian byte order.
+
+The header size really gives the start of the data.
+The data size is the physical size of the data.  From the other
+parameters the number of frames can be calculated.
+The encoding gives the way in which audio samples are encoded.
+Possible values are listed below.
+The info field currently consists of an ASCII string giving a
+human-readable description of the audio file.  The info field is
+padded with NUL bytes to the header size.
+
+Usage.
+
+Reading audio files:
+        f = sunau.open(file, 'r')
+where file is either the name of a file or an open file pointer.
+The open file pointer must have methods read(), seek(), and close().
+When the setpos() and rewind() methods are not used, the seek()
+method is not  necessary.
+
+This returns an instance of a class with the following public methods:
+        getnchannels()  -- returns number of audio channels (1 for
+                           mono, 2 for stereo)
+        getsampwidth()  -- returns sample width in bytes
+        getframerate()  -- returns sampling frequency
+        getnframes()    -- returns number of audio frames
+        getcomptype()   -- returns compression type ('NONE' or 'ULAW')
+        getcompname()   -- returns human-readable version of
+                           compression type ('not compressed' matches 'NONE')
+        getparams()     -- returns a namedtuple consisting of all of the
+                           above in the above order
+        getmarkers()    -- returns None (for compatibility with the
+                           aifc module)
+        getmark(id)     -- raises an error since the mark does not
+                           exist (for compatibility with the aifc module)
+        readframes(n)   -- returns at most n frames of audio
+        rewind()        -- rewind to the beginning of the audio stream
+        setpos(pos)     -- seek to the specified position
+        tell()          -- return the current position
+        close()         -- close the instance (make it unusable)
+The position returned by tell() and the position given to setpos()
+are compatible and have nothing to do with the actual position in the
+file.
+The close() method is called automatically when the class instance
+is destroyed.
+
+Writing audio files:
+        f = sunau.open(file, 'w')
+where file is either the name of a file or an open file pointer.
+The open file pointer must have methods write(), tell(), seek(), and
+close().
+
+This returns an instance of a class with the following public methods:
+        setnchannels(n) -- set the number of channels
+        setsampwidth(n) -- set the sample width
+        setframerate(n) -- set the frame rate
+        setnframes(n)   -- set the number of frames
+        setcomptype(type, name)
+                        -- set the compression type and the
+                           human-readable compression type
+        setparams(tuple)-- set all parameters at once
+        tell()          -- return current position in output file
+        writeframesraw(data)
+                        -- write audio frames without pathing up the
+                           file header
+        writeframes(data)
+                        -- write audio frames and patch up the file header
+        close()         -- patch up the file header and close the
+                           output file
+You should set the parameters before the first writeframesraw or
+writeframes.  The total number of frames does not need to be set,
+but when it is set to the correct value, the header does not have to
+be patched up.
+It is best to first set all parameters, perhaps possibly the
+compression type, and then write audio frames using writeframesraw.
+When all frames have been written, either call writeframes(b'') or
+close() to patch up the sizes in the header.
+The close() method is called automatically when the class instance
+is destroyed.
+"""
+
+from collections import namedtuple
+import warnings
+
+warnings._deprecated(__name__, remove=(3, 13))
+
+
+_sunau_params = namedtuple('_sunau_params',
+                           'nchannels sampwidth framerate nframes comptype compname')
+
+# from <multimedia/audio_filehdr.h>
+AUDIO_FILE_MAGIC = 0x2e736e64
+AUDIO_FILE_ENCODING_MULAW_8 = 1
+AUDIO_FILE_ENCODING_LINEAR_8 = 2
+AUDIO_FILE_ENCODING_LINEAR_16 = 3
+AUDIO_FILE_ENCODING_LINEAR_24 = 4
+AUDIO_FILE_ENCODING_LINEAR_32 = 5
+AUDIO_FILE_ENCODING_FLOAT = 6
+AUDIO_FILE_ENCODING_DOUBLE = 7
+AUDIO_FILE_ENCODING_ADPCM_G721 = 23
+AUDIO_FILE_ENCODING_ADPCM_G722 = 24
+AUDIO_FILE_ENCODING_ADPCM_G723_3 = 25
+AUDIO_FILE_ENCODING_ADPCM_G723_5 = 26
+AUDIO_FILE_ENCODING_ALAW_8 = 27
+
+# from <multimedia/audio_hdr.h>
+AUDIO_UNKNOWN_SIZE = 0xFFFFFFFF        # ((unsigned)(~0))
+
+_simple_encodings = [AUDIO_FILE_ENCODING_MULAW_8,
+                     AUDIO_FILE_ENCODING_LINEAR_8,
+                     AUDIO_FILE_ENCODING_LINEAR_16,
+                     AUDIO_FILE_ENCODING_LINEAR_24,
+                     AUDIO_FILE_ENCODING_LINEAR_32,
+                     AUDIO_FILE_ENCODING_ALAW_8]
+
+class Error(Exception):
+    pass
+
+def _read_u32(file):
+    x = 0
+    for i in range(4):
+        byte = file.read(1)
+        if not byte:
+            raise EOFError
+        x = x*256 + ord(byte)
+    return x
+
+def _write_u32(file, x):
+    data = []
+    for i in range(4):
+        d, m = divmod(x, 256)
+        data.insert(0, int(m))
+        x = d
+    file.write(bytes(data))
+
+class Au_read:
+
+    def __init__(self, f):
+        if type(f) == type(''):
+            import builtins
+            f = builtins.open(f, 'rb')
+            self._opened = True
+        else:
+            self._opened = False
+        self.initfp(f)
+
+    def __del__(self):
+        if self._file:
+            self.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.close()
+
+    def initfp(self, file):
+        self._file = file
+        self._soundpos = 0
+        magic = int(_read_u32(file))
+        if magic != AUDIO_FILE_MAGIC:
+            raise Error('bad magic number')
+        self._hdr_size = int(_read_u32(file))
+        if self._hdr_size < 24:
+            raise Error('header size too small')
+        if self._hdr_size > 100:
+            raise Error('header size ridiculously large')
+        self._data_size = _read_u32(file)
+        if self._data_size != AUDIO_UNKNOWN_SIZE:
+            self._data_size = int(self._data_size)
+        self._encoding = int(_read_u32(file))
+        if self._encoding not in _simple_encodings:
+            raise Error('encoding not (yet) supported')
+        if self._encoding in (AUDIO_FILE_ENCODING_MULAW_8,
+                  AUDIO_FILE_ENCODING_ALAW_8):
+            self._sampwidth = 2
+            self._framesize = 1
+        elif self._encoding == AUDIO_FILE_ENCODING_LINEAR_8:
+            self._framesize = self._sampwidth = 1
+        elif self._encoding == AUDIO_FILE_ENCODING_LINEAR_16:
+            self._framesize = self._sampwidth = 2
+        elif self._encoding == AUDIO_FILE_ENCODING_LINEAR_24:
+            self._framesize = self._sampwidth = 3
+        elif self._encoding == AUDIO_FILE_ENCODING_LINEAR_32:
+            self._framesize = self._sampwidth = 4
+        else:
+            raise Error('unknown encoding')
+        self._framerate = int(_read_u32(file))
+        self._nchannels = int(_read_u32(file))
+        if not self._nchannels:
+            raise Error('bad # of channels')
+        self._framesize = self._framesize * self._nchannels
+        if self._hdr_size > 24:
+            self._info = file.read(self._hdr_size - 24)
+            self._info, _, _ = self._info.partition(b'\0')
+        else:
+            self._info = b''
+        try:
+            self._data_pos = file.tell()
+        except (AttributeError, OSError):
+            self._data_pos = None
+
+    def getfp(self):
+        return self._file
+
+    def getnchannels(self):
+        return self._nchannels
+
+    def getsampwidth(self):
+        return self._sampwidth
+
+    def getframerate(self):
+        return self._framerate
+
+    def getnframes(self):
+        if self._data_size == AUDIO_UNKNOWN_SIZE:
+            return AUDIO_UNKNOWN_SIZE
+        if self._encoding in _simple_encodings:
+            return self._data_size // self._framesize
+        return 0                # XXX--must do some arithmetic here
+
+    def getcomptype(self):
+        if self._encoding == AUDIO_FILE_ENCODING_MULAW_8:
+            return 'ULAW'
+        elif self._encoding == AUDIO_FILE_ENCODING_ALAW_8:
+            return 'ALAW'
+        else:
+            return 'NONE'
+
+    def getcompname(self):
+        if self._encoding == AUDIO_FILE_ENCODING_MULAW_8:
+            return 'CCITT G.711 u-law'
+        elif self._encoding == AUDIO_FILE_ENCODING_ALAW_8:
+            return 'CCITT G.711 A-law'
+        else:
+            return 'not compressed'
+
+    def getparams(self):
+        return _sunau_params(self.getnchannels(), self.getsampwidth(),
+                  self.getframerate(), self.getnframes(),
+                  self.getcomptype(), self.getcompname())
+
+    def getmarkers(self):
+        return None
+
+    def getmark(self, id):
+        raise Error('no marks')
+
+    def readframes(self, nframes):
+        if self._encoding in _simple_encodings:
+            if nframes == AUDIO_UNKNOWN_SIZE:
+                data = self._file.read()
+            else:
+                data = self._file.read(nframes * self._framesize)
+            self._soundpos += len(data) // self._framesize
+            if self._encoding == AUDIO_FILE_ENCODING_MULAW_8:
+                with warnings.catch_warnings():
+                    warnings.simplefilter('ignore', category=DeprecationWarning)
+                    import audioop
+                data = audioop.ulaw2lin(data, self._sampwidth)
+            return data
+        return None             # XXX--not implemented yet
+
+    def rewind(self):
+        if self._data_pos is None:
+            raise OSError('cannot seek')
+        self._file.seek(self._data_pos)
+        self._soundpos = 0
+
+    def tell(self):
+        return self._soundpos
+
+    def setpos(self, pos):
+        if pos < 0 or pos > self.getnframes():
+            raise Error('position not in range')
+        if self._data_pos is None:
+            raise OSError('cannot seek')
+        self._file.seek(self._data_pos + pos * self._framesize)
+        self._soundpos = pos
+
+    def close(self):
+        file = self._file
+        if file:
+            self._file = None
+            if self._opened:
+                file.close()
+
+class Au_write:
+
+    def __init__(self, f):
+        if type(f) == type(''):
+            import builtins
+            f = builtins.open(f, 'wb')
+            self._opened = True
+        else:
+            self._opened = False
+        self.initfp(f)
+
+    def __del__(self):
+        if self._file:
+            self.close()
+        self._file = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.close()
+
+    def initfp(self, file):
+        self._file = file
+        self._framerate = 0
+        self._nchannels = 0
+        self._sampwidth = 0
+        self._framesize = 0
+        self._nframes = AUDIO_UNKNOWN_SIZE
+        self._nframeswritten = 0
+        self._datawritten = 0
+        self._datalength = 0
+        self._info = b''
+        self._comptype = 'ULAW' # default is U-law
+
+    def setnchannels(self, nchannels):
+        if self._nframeswritten:
+            raise Error('cannot change parameters after starting to write')
+        if nchannels not in (1, 2, 4):
+            raise Error('only 1, 2, or 4 channels supported')
+        self._nchannels = nchannels
+
+    def getnchannels(self):
+        if not self._nchannels:
+            raise Error('number of channels not set')
+        return self._nchannels
+
+    def setsampwidth(self, sampwidth):
+        if self._nframeswritten:
+            raise Error('cannot change parameters after starting to write')
+        if sampwidth not in (1, 2, 3, 4):
+            raise Error('bad sample width')
+        self._sampwidth = sampwidth
+
+    def getsampwidth(self):
+        if not self._framerate:
+            raise Error('sample width not specified')
+        return self._sampwidth
+
+    def setframerate(self, framerate):
+        if self._nframeswritten:
+            raise Error('cannot change parameters after starting to write')
+        self._framerate = framerate
+
+    def getframerate(self):
+        if not self._framerate:
+            raise Error('frame rate not set')
+        return self._framerate
+
+    def setnframes(self, nframes):
+        if self._nframeswritten:
+            raise Error('cannot change parameters after starting to write')
+        if nframes < 0:
+            raise Error('# of frames cannot be negative')
+        self._nframes = nframes
+
+    def getnframes(self):
+        return self._nframeswritten
+
+    def setcomptype(self, type, name):
+        if type in ('NONE', 'ULAW'):
+            self._comptype = type
+        else:
+            raise Error('unknown compression type')
+
+    def getcomptype(self):
+        return self._comptype
+
+    def getcompname(self):
+        if self._comptype == 'ULAW':
+            return 'CCITT G.711 u-law'
+        elif self._comptype == 'ALAW':
+            return 'CCITT G.711 A-law'
+        else:
+            return 'not compressed'
+
+    def setparams(self, params):
+        nchannels, sampwidth, framerate, nframes, comptype, compname = params
+        self.setnchannels(nchannels)
+        self.setsampwidth(sampwidth)
+        self.setframerate(framerate)
+        self.setnframes(nframes)
+        self.setcomptype(comptype, compname)
+
+    def getparams(self):
+        return _sunau_params(self.getnchannels(), self.getsampwidth(),
+                  self.getframerate(), self.getnframes(),
+                  self.getcomptype(), self.getcompname())
+
+    def tell(self):
+        return self._nframeswritten
+
+    def writeframesraw(self, data):
+        if not isinstance(data, (bytes, bytearray)):
+            data = memoryview(data).cast('B')
+        self._ensure_header_written()
+        if self._comptype == 'ULAW':
+            with warnings.catch_warnings():
+                warnings.simplefilter('ignore', category=DeprecationWarning)
+                import audioop
+            data = audioop.lin2ulaw(data, self._sampwidth)
+        nframes = len(data) // self._framesize
+        self._file.write(data)
+        self._nframeswritten = self._nframeswritten + nframes
+        self._datawritten = self._datawritten + len(data)
+
+    def writeframes(self, data):
+        self.writeframesraw(data)
+        if self._nframeswritten != self._nframes or \
+                  self._datalength != self._datawritten:
+            self._patchheader()
+
+    def close(self):
+        if self._file:
+            try:
+                self._ensure_header_written()
+                if self._nframeswritten != self._nframes or \
+                        self._datalength != self._datawritten:
+                    self._patchheader()
+                self._file.flush()
+            finally:
+                file = self._file
+                self._file = None
+                if self._opened:
+                    file.close()
+
+    #
+    # private methods
+    #
+
+    def _ensure_header_written(self):
+        if not self._nframeswritten:
+            if not self._nchannels:
+                raise Error('# of channels not specified')
+            if not self._sampwidth:
+                raise Error('sample width not specified')
+            if not self._framerate:
+                raise Error('frame rate not specified')
+            self._write_header()
+
+    def _write_header(self):
+        if self._comptype == 'NONE':
+            if self._sampwidth == 1:
+                encoding = AUDIO_FILE_ENCODING_LINEAR_8
+                self._framesize = 1
+            elif self._sampwidth == 2:
+                encoding = AUDIO_FILE_ENCODING_LINEAR_16
+                self._framesize = 2
+            elif self._sampwidth == 3:
+                encoding = AUDIO_FILE_ENCODING_LINEAR_24
+                self._framesize = 3
+            elif self._sampwidth == 4:
+                encoding = AUDIO_FILE_ENCODING_LINEAR_32
+                self._framesize = 4
+            else:
+                raise Error('internal error')
+        elif self._comptype == 'ULAW':
+            encoding = AUDIO_FILE_ENCODING_MULAW_8
+            self._framesize = 1
+        else:
+            raise Error('internal error')
+        self._framesize = self._framesize * self._nchannels
+        _write_u32(self._file, AUDIO_FILE_MAGIC)
+        header_size = 25 + len(self._info)
+        header_size = (header_size + 7) & ~7
+        _write_u32(self._file, header_size)
+        if self._nframes == AUDIO_UNKNOWN_SIZE:
+            length = AUDIO_UNKNOWN_SIZE
+        else:
+            length = self._nframes * self._framesize
+        try:
+            self._form_length_pos = self._file.tell()
+        except (AttributeError, OSError):
+            self._form_length_pos = None
+        _write_u32(self._file, length)
+        self._datalength = length
+        _write_u32(self._file, encoding)
+        _write_u32(self._file, self._framerate)
+        _write_u32(self._file, self._nchannels)
+        self._file.write(self._info)
+        self._file.write(b'\0'*(header_size - len(self._info) - 24))
+
+    def _patchheader(self):
+        if self._form_length_pos is None:
+            raise OSError('cannot seek')
+        self._file.seek(self._form_length_pos)
+        _write_u32(self._file, self._datawritten)
+        self._datalength = self._datawritten
+        self._file.seek(0, 2)
+
+def open(f, mode=None):
+    if mode is None:
+        if hasattr(f, 'mode'):
+            mode = f.mode
+        else:
+            mode = 'rb'
+    if mode in ('r', 'rb'):
+        return Au_read(f)
+    elif mode in ('w', 'wb'):
+        return Au_write(f)
+    else:
+        raise Error("mode must be 'r', 'rb', 'w', or 'wb'")
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                usr/lib/python3.11/symtable.py                                                                      0000644 0000000 0000000 00000024200 14671176116 014651  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        """Interface to the compiler's internal symbol tables"""
+
+import _symtable
+from _symtable import (USE, DEF_GLOBAL, DEF_NONLOCAL, DEF_LOCAL, DEF_PARAM,
+     DEF_IMPORT, DEF_BOUND, DEF_ANNOT, SCOPE_OFF, SCOPE_MASK, FREE,
+     LOCAL, GLOBAL_IMPLICIT, GLOBAL_EXPLICIT, CELL)
+
+import weakref
+
+__all__ = ["symtable", "SymbolTable", "Class", "Function", "Symbol"]
+
+def symtable(code, filename, compile_type):
+    """ Return the toplevel *SymbolTable* for the source code.
+
+    *filename* is the name of the file with the code
+    and *compile_type* is the *compile()* mode argument.
+    """
+    top = _symtable.symtable(code, filename, compile_type)
+    return _newSymbolTable(top, filename)
+
+class SymbolTableFactory:
+    def __init__(self):
+        self.__memo = weakref.WeakValueDictionary()
+
+    def new(self, table, filename):
+        if table.type == _symtable.TYPE_FUNCTION:
+            return Function(table, filename)
+        if table.type == _symtable.TYPE_CLASS:
+            return Class(table, filename)
+        return SymbolTable(table, filename)
+
+    def __call__(self, table, filename):
+        key = table, filename
+        obj = self.__memo.get(key, None)
+        if obj is None:
+            obj = self.__memo[key] = self.new(table, filename)
+        return obj
+
+_newSymbolTable = SymbolTableFactory()
+
+
+class SymbolTable:
+
+    def __init__(self, raw_table, filename):
+        self._table = raw_table
+        self._filename = filename
+        self._symbols = {}
+
+    def __repr__(self):
+        if self.__class__ == SymbolTable:
+            kind = ""
+        else:
+            kind = "%s " % self.__class__.__name__
+
+        if self._table.name == "top":
+            return "<{0}SymbolTable for module {1}>".format(kind, self._filename)
+        else:
+            return "<{0}SymbolTable for {1} in {2}>".format(kind,
+                                                            self._table.name,
+                                                            self._filename)
+
+    def get_type(self):
+        """Return the type of the symbol table.
+
+        The values returned are 'class', 'module' and
+        'function'.
+        """
+        if self._table.type == _symtable.TYPE_MODULE:
+            return "module"
+        if self._table.type == _symtable.TYPE_FUNCTION:
+            return "function"
+        if self._table.type == _symtable.TYPE_CLASS:
+            return "class"
+        assert self._table.type in (1, 2, 3), \
+               "unexpected type: {0}".format(self._table.type)
+
+    def get_id(self):
+        """Return an identifier for the table.
+        """
+        return self._table.id
+
+    def get_name(self):
+        """Return the table's name.
+
+        This corresponds to the name of the class, function
+        or 'top' if the table is for a class, function or
+        global respectively.
+        """
+        return self._table.name
+
+    def get_lineno(self):
+        """Return the number of the first line in the
+        block for the table.
+        """
+        return self._table.lineno
+
+    def is_optimized(self):
+        """Return *True* if the locals in the table
+        are optimizable.
+        """
+        return bool(self._table.type == _symtable.TYPE_FUNCTION)
+
+    def is_nested(self):
+        """Return *True* if the block is a nested class
+        or function."""
+        return bool(self._table.nested)
+
+    def has_children(self):
+        """Return *True* if the block has nested namespaces.
+        """
+        return bool(self._table.children)
+
+    def get_identifiers(self):
+        """Return a view object containing the names of symbols in the table.
+        """
+        return self._table.symbols.keys()
+
+    def lookup(self, name):
+        """Lookup a *name* in the table.
+
+        Returns a *Symbol* instance.
+        """
+        sym = self._symbols.get(name)
+        if sym is None:
+            flags = self._table.symbols[name]
+            namespaces = self.__check_children(name)
+            module_scope = (self._table.name == "top")
+            sym = self._symbols[name] = Symbol(name, flags, namespaces,
+                                               module_scope=module_scope)
+        return sym
+
+    def get_symbols(self):
+        """Return a list of *Symbol* instances for
+        names in the table.
+        """
+        return [self.lookup(ident) for ident in self.get_identifiers()]
+
+    def __check_children(self, name):
+        return [_newSymbolTable(st, self._filename)
+                for st in self._table.children
+                if st.name == name]
+
+    def get_children(self):
+        """Return a list of the nested symbol tables.
+        """
+        return [_newSymbolTable(st, self._filename)
+                for st in self._table.children]
+
+
+class Function(SymbolTable):
+
+    # Default values for instance variables
+    __params = None
+    __locals = None
+    __frees = None
+    __globals = None
+    __nonlocals = None
+
+    def __idents_matching(self, test_func):
+        return tuple(ident for ident in self.get_identifiers()
+                     if test_func(self._table.symbols[ident]))
+
+    def get_parameters(self):
+        """Return a tuple of parameters to the function.
+        """
+        if self.__params is None:
+            self.__params = self.__idents_matching(lambda x:x & DEF_PARAM)
+        return self.__params
+
+    def get_locals(self):
+        """Return a tuple of locals in the function.
+        """
+        if self.__locals is None:
+            locs = (LOCAL, CELL)
+            test = lambda x: ((x >> SCOPE_OFF) & SCOPE_MASK) in locs
+            self.__locals = self.__idents_matching(test)
+        return self.__locals
+
+    def get_globals(self):
+        """Return a tuple of globals in the function.
+        """
+        if self.__globals is None:
+            glob = (GLOBAL_IMPLICIT, GLOBAL_EXPLICIT)
+            test = lambda x:((x >> SCOPE_OFF) & SCOPE_MASK) in glob
+            self.__globals = self.__idents_matching(test)
+        return self.__globals
+
+    def get_nonlocals(self):
+        """Return a tuple of nonlocals in the function.
+        """
+        if self.__nonlocals is None:
+            self.__nonlocals = self.__idents_matching(lambda x:x & DEF_NONLOCAL)
+        return self.__nonlocals
+
+    def get_frees(self):
+        """Return a tuple of free variables in the function.
+        """
+        if self.__frees is None:
+            is_free = lambda x:((x >> SCOPE_OFF) & SCOPE_MASK) == FREE
+            self.__frees = self.__idents_matching(is_free)
+        return self.__frees
+

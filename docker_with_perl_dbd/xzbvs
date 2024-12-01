@@ -1,0 +1,1000 @@
+  my $oneliner = $MM->oneliner($perl_code, \@switches);
+
+This will generate a perl one-liner safe for the particular platform
+you're on based on the given $perl_code and @switches (a -e is
+assumed) suitable for using in a make target.  It will use the proper
+shell quoting and escapes.
+
+$(PERLRUN) will be used as perl.
+
+Any newlines in $perl_code will be escaped.  Leading and trailing
+newlines will be stripped.  Makes this idiom much easier:
+
+    my $code = $MM->oneliner(<<'CODE', [...switches...]);
+some code here
+another line here
+CODE
+
+Usage might be something like:
+
+    # an echo emulation
+    $oneliner = $MM->oneliner('print "Foo\n"');
+    $make = '$oneliner > somefile';
+
+Dollar signs in the $perl_code will be protected from make using the
+C<quote_literal> method, unless they are recognised as being a make
+variable, C<$(varname)>, in which case they will be left for make
+to expand. Remember to quote make macros else it might be used as a
+bareword. For example:
+
+    # Assign the value of the $(VERSION_FROM) make macro to $vf.
+    $oneliner = $MM->oneliner('$vf = "$(VERSION_FROM)"');
+
+Its currently very simple and may be expanded sometime in the figure
+to include more flexible code and switches.
+
+
+=head3 quote_literal  I<Abstract>
+
+    my $safe_text = $MM->quote_literal($text);
+    my $safe_text = $MM->quote_literal($text, \%options);
+
+This will quote $text so it is interpreted literally in the shell.
+
+For example, on Unix this would escape any single-quotes in $text and
+put single-quotes around the whole thing.
+
+If $options{allow_variables} is true it will leave C<'$(FOO)'> make
+variables untouched.  If false they will be escaped like any other
+C<$>.  Defaults to true.
+
+=head3 escape_dollarsigns
+
+    my $escaped_text = $MM->escape_dollarsigns($text);
+
+Escapes stray C<$> so they are not interpreted as make variables.
+
+It lets by C<$(...)>.
+
+=cut
+
+sub escape_dollarsigns {
+    my($self, $text) = @_;
+
+    # Escape dollar signs which are not starting a variable
+    $text =~ s{\$ (?!\() }{\$\$}gx;
+
+    return $text;
+}
+
+
+=head3 escape_all_dollarsigns
+
+    my $escaped_text = $MM->escape_all_dollarsigns($text);
+
+Escapes all C<$> so they are not interpreted as make variables.
+
+=cut
+
+sub escape_all_dollarsigns {
+    my($self, $text) = @_;
+
+    # Escape dollar signs
+    $text =~ s{\$}{\$\$}gx;
+
+    return $text;
+}
+
+
+=head3 escape_newlines  I<Abstract>
+
+    my $escaped_text = $MM->escape_newlines($text);
+
+Shell escapes newlines in $text.
+
+
+=head3 max_exec_len  I<Abstract>
+
+    my $max_exec_len = $MM->max_exec_len;
+
+Calculates the maximum command size the OS can exec.  Effectively,
+this is the max size of a shell command line.
+
+=for _private
+$self->{_MAX_EXEC_LEN} is set by this method, but only for testing purposes.
+
+
+=head3 make
+
+    my $make = $MM->make;
+
+Returns the make variant we're generating the Makefile for.  This attempts
+to do some normalization on the information from %Config or the user.
+
+=cut
+
+sub make {
+    my $self = shift;
+
+    my $make = lc $self->{MAKE};
+
+    # Truncate anything like foomake6 to just foomake.
+    $make =~ s/^(\w+make).*/$1/;
+
+    # Turn gnumake into gmake.
+    $make =~ s/^gnu/g/;
+
+    return $make;
+}
+
+
+=head2 Targets
+
+These are methods which produce make targets.
+
+
+=head3 all_target
+
+Generate the default target 'all'.
+
+=cut
+
+sub all_target {
+    my $self = shift;
+
+    return <<'MAKE_EXT';
+all :: pure_all
+	$(NOECHO) $(NOOP)
+MAKE_EXT
+
+}
+
+
+=head3 blibdirs_target
+
+    my $make_frag = $mm->blibdirs_target;
+
+Creates the blibdirs target which creates all the directories we use
+in blib/.
+
+The blibdirs.ts target is deprecated.  Depend on blibdirs instead.
+
+
+=cut
+
+sub _xs_list_basenames {
+    my ($self) = @_;
+    map { (my $b = $_) =~ s/\.xs$//; $b } sort keys %{ $self->{XS} };
+}
+
+sub blibdirs_target {
+    my $self = shift;
+
+    my @dirs = map { uc "\$(INST_$_)" } qw(libdir archlib
+                                           autodir archautodir
+                                           bin script
+                                           man1dir man3dir
+                                          );
+    if ($self->{XSMULTI}) {
+        for my $ext ($self->_xs_list_basenames) {
+            my ($v, $d, $f) = File::Spec->splitpath($ext);
+            my @d = File::Spec->splitdir($d);
+            shift @d if $d[0] eq 'lib';
+            push @dirs, $self->catdir('$(INST_ARCHLIB)', 'auto', @d, $f);
+	}
+    }
+
+    my @exists = map { $_.'$(DFSEP).exists' } @dirs;
+
+    my $make = sprintf <<'MAKE', join(' ', @exists);
+blibdirs : %s
+	$(NOECHO) $(NOOP)
+
+# Backwards compat with 6.18 through 6.25
+blibdirs.ts : blibdirs
+	$(NOECHO) $(NOOP)
+
+MAKE
+
+    $make .= $self->dir_target(@dirs);
+
+    return $make;
+}
+
+
+=head3 clean (o)
+
+Defines the clean target.
+
+=cut
+
+sub clean {
+# --- Cleanup and Distribution Sections ---
+
+    my($self, %attribs) = @_;
+    my @m;
+    push(@m, '
+# Delete temporary files but do not touch installed files. We don\'t delete
+# the Makefile here so a later make realclean still has a makefile to use.
+
+clean :: clean_subdirs
+');
+
+    my @files = sort values %{$self->{XS}}; # .c files from *.xs files
+    push @files, map {
+	my $file = $_;
+	map { $file.$_ } $self->{OBJ_EXT}, qw(.def _def.old .bs .bso .exp .base);
+    } $self->_xs_list_basenames;
+    my @dirs  = qw(blib);
+
+    # Normally these are all under blib but they might have been
+    # redefined.
+    # XXX normally this would be a good idea, but the Perl core sets
+    # INST_LIB = ../../lib rather than actually installing the files.
+    # So a "make clean" in an ext/ directory would blow away lib.
+    # Until the core is adjusted let's leave this out.
+#     push @dirs, qw($(INST_ARCHLIB) $(INST_LIB)
+#                    $(INST_BIN) $(INST_SCRIPT)
+#                    $(INST_MAN1DIR) $(INST_MAN3DIR)
+#                    $(INST_LIBDIR) $(INST_ARCHLIBDIR) $(INST_AUTODIR)
+#                    $(INST_STATIC) $(INST_DYNAMIC)
+#                 );
+
+
+    if( $attribs{FILES} ) {
+        # Use @dirs because we don't know what's in here.
+        push @dirs, ref $attribs{FILES}                ?
+                        @{$attribs{FILES}}             :
+                        split /\s+/, $attribs{FILES}   ;
+    }
+
+    push(@files, qw[$(MAKE_APERL_FILE)
+                    MYMETA.json MYMETA.yml perlmain.c tmon.out mon.out so_locations
+                    blibdirs.ts pm_to_blib pm_to_blib.ts
+                    *$(OBJ_EXT) *$(LIB_EXT) perl.exe perl perl$(EXE_EXT)
+                    $(BOOTSTRAP) $(BASEEXT).bso
+                    $(BASEEXT).def lib$(BASEEXT).def
+                    $(BASEEXT).exp $(BASEEXT).x
+                   ]);
+
+    push(@files, $self->catfile('$(INST_ARCHAUTODIR)','extralibs.all'));
+    push(@files, $self->catfile('$(INST_ARCHAUTODIR)','extralibs.ld'));
+
+    # core files
+    if ($^O eq 'vos') {
+        push(@files, qw[perl*.kp]);
+    }
+    else {
+        push(@files, qw[core core.*perl.*.? *perl.core]);
+    }
+
+    push(@files, map { "core." . "[0-9]"x$_ } (1..5));
+
+    # OS specific things to clean up.  Use @dirs since we don't know
+    # what might be in here.
+    push @dirs, $self->extra_clean_files;
+
+    # Occasionally files are repeated several times from different sources
+    { my(%f) = map { ($_ => 1) } @files; @files = sort keys %f; }
+    { my(%d) = map { ($_ => 1) } @dirs;  @dirs  = sort keys %d; }
+
+    push @m, map "\t$_\n", $self->split_command('- $(RM_F)',  @files);
+    push @m, map "\t$_\n", $self->split_command('- $(RM_RF)', @dirs);
+
+    # Leave Makefile.old around for realclean
+    push @m, <<'MAKE';
+	  $(NOECHO) $(RM_F) $(MAKEFILE_OLD)
+	- $(MV) $(FIRST_MAKEFILE) $(MAKEFILE_OLD) $(DEV_NULL)
+MAKE
+
+    push(@m, "\t$attribs{POSTOP}\n")   if $attribs{POSTOP};
+
+    join("", @m);
+}
+
+
+=head3 clean_subdirs_target
+
+  my $make_frag = $MM->clean_subdirs_target;
+
+Returns the clean_subdirs target.  This is used by the clean target to
+call clean on any subdirectories which contain Makefiles.
+
+=cut
+
+sub clean_subdirs_target {
+    my($self) = shift;
+
+    # No subdirectories, no cleaning.
+    return <<'NOOP_FRAG' unless @{$self->{DIR}};
+clean_subdirs :
+	$(NOECHO) $(NOOP)
+NOOP_FRAG
+
+
+    my $clean = "clean_subdirs :\n";
+
+    for my $dir (@{$self->{DIR}}) {
+        my $subclean = $self->oneliner(sprintf <<'CODE', $dir);
+exit 0 unless chdir '%s';  system '$(MAKE) clean' if -f '$(FIRST_MAKEFILE)';
+CODE
+
+        $clean .= "\t$subclean\n";
+    }
+
+    return $clean;
+}
+
+
+=head3 dir_target
+
+    my $make_frag = $mm->dir_target(@directories);
+
+Generates targets to create the specified directories and set its
+permission to PERM_DIR.
+
+Because depending on a directory to just ensure it exists doesn't work
+too well (the modified time changes too often) dir_target() creates a
+.exists file in the created directory.  It is this you should depend on.
+For portability purposes you should use the $(DIRFILESEP) macro rather
+than a '/' to separate the directory from the file.
+
+    yourdirectory$(DIRFILESEP).exists
+
+=cut
+
+sub dir_target {
+    my($self, @dirs) = @_;
+
+    my $make = '';
+    foreach my $dir (@dirs) {
+        $make .= sprintf <<'MAKE', ($dir) x 4;
+%s$(DFSEP).exists :: Makefile.PL
+	$(NOECHO) $(MKPATH) %s
+	$(NOECHO) $(CHMOD) $(PERM_DIR) %s
+	$(NOECHO) $(TOUCH) %s$(DFSEP).exists
+
+MAKE
+
+    }
+
+    return $make;
+}
+
+
+=head3 distdir
+
+Defines the scratch directory target that will hold the distribution
+before tar-ing (or shar-ing).
+
+=cut
+
+# For backwards compatibility.
+*dist_dir = *distdir;
+
+sub distdir {
+    my($self) = shift;
+
+    my $meta_target = $self->{NO_META} ? '' : 'distmeta';
+    my $sign_target = !$self->{SIGN}   ? '' : 'distsignature';
+
+    return sprintf <<'MAKE_FRAG', $meta_target, $sign_target;
+create_distdir :
+	$(RM_RF) $(DISTVNAME)
+	$(PERLRUN) "-MExtUtils::Manifest=manicopy,maniread" \
+		-e "manicopy(maniread(),'$(DISTVNAME)', '$(DIST_CP)');"
+
+distdir : create_distdir %s %s
+	$(NOECHO) $(NOOP)
+
+MAKE_FRAG
+
+}
+
+
+=head3 dist_test
+
+Defines a target that produces the distribution in the
+scratch directory, and runs 'perl Makefile.PL; make ;make test' in that
+subdirectory.
+
+=cut
+
+sub dist_test {
+    my($self) = shift;
+
+    my $mpl_args = join " ", map qq["$_"], @ARGV;
+
+    my $test = $self->cd('$(DISTVNAME)',
+                         '$(ABSPERLRUN) Makefile.PL '.$mpl_args,
+                         '$(MAKE) $(PASTHRU)',
+                         '$(MAKE) test $(PASTHRU)'
+                        );
+
+    return sprintf <<'MAKE_FRAG', $test;
+disttest : distdir
+	%s
+
+MAKE_FRAG
+
+
+}
+
+
+=head3 xs_dlsyms_arg
+
+Returns command-line arg(s) to linker for file listing dlsyms to export.
+Defaults to returning empty string, can be overridden by e.g. AIX.
+
+=cut
+
+sub xs_dlsyms_arg {
+    return '';
+}
+
+=head3 xs_dlsyms_ext
+
+Returns file-extension for C<xs_make_dlsyms> method's output file,
+including any "." character.
+
+=cut
+
+sub xs_dlsyms_ext {
+    die "Pure virtual method";
+}
+
+=head3 xs_dlsyms_extra
+
+Returns any extra text to be prepended to the C<$extra> argument of
+C<xs_make_dlsyms>.
+
+=cut
+
+sub xs_dlsyms_extra {
+    '';
+}
+
+=head3 xs_dlsyms_iterator
+
+Iterates over necessary shared objects, calling C<xs_make_dlsyms> method
+for each with appropriate arguments.
+
+=cut
+
+sub xs_dlsyms_iterator {
+    my ($self, $attribs) = @_;
+    if ($self->{XSMULTI}) {
+        my @m;
+        for my $ext ($self->_xs_list_basenames) {
+            my @parts = File::Spec->splitdir($ext);
+            shift @parts if $parts[0] eq 'lib';
+            my $name = join '::', @parts;
+            push @m, $self->xs_make_dlsyms(
+                $attribs,
+                $ext . $self->xs_dlsyms_ext,
+                "$ext.xs",
+                $name,
+                $parts[-1],
+                {}, [], {}, [],
+                $self->xs_dlsyms_extra . q!, 'FILE' => ! . neatvalue($ext),
+            );
+        }
+        return join "\n", @m;
+    } else {
+        return $self->xs_make_dlsyms(
+            $attribs,
+            $self->{BASEEXT} . $self->xs_dlsyms_ext,
+            'Makefile.PL',
+            $self->{NAME},
+            $self->{DLBASE},
+            $attribs->{DL_FUNCS} || $self->{DL_FUNCS} || {},
+            $attribs->{FUNCLIST} || $self->{FUNCLIST} || [],
+            $attribs->{IMPORTS} || $self->{IMPORTS} || {},
+            $attribs->{DL_VARS} || $self->{DL_VARS} || [],
+            $self->xs_dlsyms_extra,
+        );
+    }
+}
+
+=head3 xs_make_dlsyms
+
+    $self->xs_make_dlsyms(
+        \%attribs, # hashref from %attribs in caller
+        "$self->{BASEEXT}.def", # output file for Makefile target
+        'Makefile.PL', # dependency
+        $self->{NAME}, # shared object's "name"
+        $self->{DLBASE}, # last ::-separated part of name
+        $attribs{DL_FUNCS} || $self->{DL_FUNCS} || {}, # various params
+        $attribs{FUNCLIST} || $self->{FUNCLIST} || [],
+        $attribs{IMPORTS} || $self->{IMPORTS} || {},
+        $attribs{DL_VARS} || $self->{DL_VARS} || [],
+        # optional extra param that will be added as param to Mksymlists
+    );
+
+Utility method that returns Makefile snippet to call C<Mksymlists>.
+
+=cut
+
+sub xs_make_dlsyms {
+    my ($self, $attribs, $target, $dep, $name, $dlbase, $funcs, $funclist, $imports, $vars, $extra) = @_;
+    my @m = (
+     "\n$target: $dep\n",
+     q!	$(PERLRUN) -MExtUtils::Mksymlists \\
+     -e "Mksymlists('NAME'=>\"!, $name,
+     q!\", 'DLBASE' => '!,$dlbase,
+     # The above two lines quoted differently to work around
+     # a bug in the 4DOS/4NT command line interpreter.  The visible
+     # result of the bug was files named q('extension_name',) *with the
+     # single quotes and the comma* in the extension build directories.
+     q!', 'DL_FUNCS' => !,neatvalue($funcs),
+     q!, 'FUNCLIST' => !,neatvalue($funclist),
+     q!, 'IMPORTS' => !,neatvalue($imports),
+     q!, 'DL_VARS' => !, neatvalue($vars)
+    );
+    push @m, $extra if defined $extra;
+    push @m, qq!);"\n!;
+    join '', @m;
+}
+
+=head3 dynamic (o)
+
+Defines the dynamic target.
+
+=cut
+
+sub dynamic {
+# --- Dynamic Loading Sections ---
+
+    my($self) = shift;
+    '
+dynamic :: $(FIRST_MAKEFILE) config $(INST_BOOT) $(INST_DYNAMIC)
+	$(NOECHO) $(NOOP)
+';
+}
+
+
+=head3 makemakerdflt_target
+
+  my $make_frag = $mm->makemakerdflt_target
+
+Returns a make fragment with the makemakerdeflt_target specified.
+This target is the first target in the Makefile, is the default target
+and simply points off to 'all' just in case any make variant gets
+confused or something gets snuck in before the real 'all' target.
+
+=cut
+
+sub makemakerdflt_target {
+    return <<'MAKE_FRAG';
+makemakerdflt : all
+	$(NOECHO) $(NOOP)
+MAKE_FRAG
+
+}
+
+
+=head3 manifypods_target
+
+  my $manifypods_target = $self->manifypods_target;
+
+Generates the manifypods target.  This target generates man pages from
+all POD files in MAN1PODS and MAN3PODS.
+
+=cut
+
+sub manifypods_target {
+    my($self) = shift;
+
+    my $man1pods      = '';
+    my $man3pods      = '';
+    my $dependencies  = '';
+
+    # populate manXpods & dependencies:
+    foreach my $name (sort keys %{$self->{MAN1PODS}}, sort keys %{$self->{MAN3PODS}}) {
+        $dependencies .= " \\\n\t$name";
+    }
+
+    my $manify = <<END;
+manifypods : pure_all config $dependencies
+END
+
+    my @man_cmds;
+    foreach my $num (qw(1 3)) {
+        my $pods = $self->{"MAN${num}PODS"};
+        my $p2m = sprintf <<'CMD', "\$(MAN${num}EXT)", "$]" > 5.008 ? " -u" : "";
+	$(NOECHO) $(POD2MAN) --section=%s --perm_rw=$(PERM_RW)%s
+CMD
+        push @man_cmds, $self->split_command($p2m, map {($_,$pods->{$_})} sort keys %$pods);
+    }
+
+    $manify .= "\t\$(NOECHO) \$(NOOP)\n" unless @man_cmds;
+    $manify .= join '', map { "$_\n" } @man_cmds;
+
+    return $manify;
+}
+
+{
+    my $has_cpan_meta;
+    sub _has_cpan_meta {
+        return $has_cpan_meta if defined $has_cpan_meta;
+        return $has_cpan_meta = !!eval {
+            require CPAN::Meta;
+            CPAN::Meta->VERSION(2.112150);
+            1;
+        };
+    }
+}
+
+=head3 metafile_target
+
+    my $target = $mm->metafile_target;
+
+Generate the metafile target.
+
+Writes the file META.yml (YAML encoded meta-data) and META.json
+(JSON encoded meta-data) about the module in the distdir.
+The format follows Module::Build's as closely as possible.
+
+=cut
+
+sub metafile_target {
+    my $self = shift;
+    return <<'MAKE_FRAG' if $self->{NO_META} or ! _has_cpan_meta();
+metafile :
+	$(NOECHO) $(NOOP)
+MAKE_FRAG
+
+    my $metadata   = $self->metafile_data(
+        $self->{META_ADD}   || {},
+        $self->{META_MERGE} || {},
+    );
+
+    my $meta = $self->_fix_metadata_before_conversion( $metadata );
+
+    my @write_metayml = $self->stashmeta(
+      $meta->as_string({version => "1.4"}), 'META_new.yml'
+    );
+    my @write_metajson = $self->stashmeta(
+      $meta->as_string({version => "2.0"}), 'META_new.json'
+    );
+
+    my $metayml = join("\n\t", @write_metayml);
+    my $metajson = join("\n\t", @write_metajson);
+    return sprintf <<'MAKE_FRAG', $metayml, $metajson;
+metafile : create_distdir
+	$(NOECHO) $(ECHO) Generating META.yml
+	%s
+	-$(NOECHO) $(MV) META_new.yml $(DISTVNAME)/META.yml
+	$(NOECHO) $(ECHO) Generating META.json
+	%s
+	-$(NOECHO) $(MV) META_new.json $(DISTVNAME)/META.json
+MAKE_FRAG
+
+}
+
+=begin private
+
+=head3 _fix_metadata_before_conversion
+
+    $mm->_fix_metadata_before_conversion( \%metadata );
+
+Fixes errors in the metadata before it's handed off to L<CPAN::Meta> for
+conversion. This hopefully results in something that can be used further
+on, no guarantee is made though.
+
+=end private
+
+=cut
+
+sub _fix_metadata_before_conversion {
+    my ( $self, $metadata ) = @_;
+
+    # we should never be called unless this already passed but
+    # prefer to be defensive in case somebody else calls this
+
+    return unless _has_cpan_meta;
+
+    my $bad_version = $metadata->{version} &&
+                      !CPAN::Meta::Validator->new->version( 'version', $metadata->{version} );
+    # just delete all invalid versions
+    if( $bad_version ) {
+        warn "Can't parse version '$metadata->{version}'\n";
+        $metadata->{version} = '';
+    }
+
+    my $validator2 = CPAN::Meta::Validator->new( $metadata );
+    my @errors;
+    push @errors, $validator2->errors if !$validator2->is_valid;
+    my $validator14 = CPAN::Meta::Validator->new(
+        {
+            %$metadata,
+            'meta-spec' => { version => 1.4 },
+        }
+    );
+    push @errors, $validator14->errors if !$validator14->is_valid;
+    # fix non-camelcase custom resource keys (only other trick we know)
+    for my $error ( @errors ) {
+        my ( $key ) = ( $error =~ /Custom resource '(.*)' must be in CamelCase./ );
+        next if !$key;
+
+        # first try to remove all non-alphabetic chars
+        ( my $new_key = $key ) =~ s/[^_a-zA-Z]//g;
+
+        # if that doesn't work, uppercase first one
+        $new_key = ucfirst $new_key if !$validator14->custom_1( $new_key );
+
+        # copy to new key if that worked
+        $metadata->{resources}{$new_key} = $metadata->{resources}{$key}
+          if $validator14->custom_1( $new_key );
+
+        # and delete old one in any case
+        delete $metadata->{resources}{$key};
+    }
+
+    # paper over validation issues, but still complain, necessary because
+    # there's no guarantee that the above will fix ALL errors
+    my $meta = eval { CPAN::Meta->create( $metadata, { lazy_validation => 1 } ) };
+    warn $@ if $@ and
+               $@ !~ /encountered CODE.*, but JSON can only represent references to arrays or hashes/;
+
+    # use the original metadata straight if the conversion failed
+    # or if it can't be stringified.
+    if( !$meta                                                  ||
+        !eval { $meta->as_string( { version => $METASPEC_V } ) }      ||
+        !eval { $meta->as_string }
+    ) {
+        $meta = bless $metadata, 'CPAN::Meta';
+    }
+
+    my $now_license = $meta->as_struct({ version => 2 })->{license};
+    if ($self->{LICENSE} and $self->{LICENSE} ne 'unknown' and
+        @{$now_license} == 1 and $now_license->[0] eq 'unknown'
+    ) {
+        warn "Invalid LICENSE value '$self->{LICENSE}' ignored\n";
+    }
+
+    $meta;
+}
+
+
+=begin private
+
+=head3 _sort_pairs
+
+    my @pairs = _sort_pairs($sort_sub, \%hash);
+
+Sorts the pairs of a hash based on keys ordered according
+to C<$sort_sub>.
+
+=end private
+
+=cut
+
+sub _sort_pairs {
+    my $sort  = shift;
+    my $pairs = shift;
+    return map  { $_ => $pairs->{$_} }
+           sort $sort
+           keys %$pairs;
+}
+
+
+# Taken from Module::Build::Base
+sub _hash_merge {
+    my ($self, $h, $k, $v) = @_;
+    if (ref $h->{$k} eq 'ARRAY') {
+        push @{$h->{$k}}, ref $v ? @$v : $v;
+    } elsif (ref $h->{$k} eq 'HASH') {
+        $self->_hash_merge($h->{$k}, $_, $v->{$_}) foreach keys %$v;
+    } else {
+        $h->{$k} = $v;
+    }
+}
+
+
+=head3 metafile_data
+
+    my $metadata_hashref = $mm->metafile_data(\%meta_add, \%meta_merge);
+
+Returns the data which MakeMaker turns into the META.yml file 
+and the META.json file. It is always in version 2.0 of the format.
+
+Values of %meta_add will overwrite any existing metadata in those
+keys.  %meta_merge will be merged with them.
+
+=cut
+
+sub metafile_data {
+    my $self = shift;
+    my($meta_add, $meta_merge) = @_;
+
+    $meta_add ||= {};
+    $meta_merge ||= {};
+
+    my $version = _normalize_version($self->{VERSION});
+    my $release_status = ($version =~ /_/) ? 'unstable' : 'stable';
+    my %meta = (
+        # required
+        abstract     => $self->{ABSTRACT} || 'unknown',
+        author       => defined($self->{AUTHOR}) ? $self->{AUTHOR} : ['unknown'],
+        dynamic_config => 1,
+        generated_by => "ExtUtils::MakeMaker version $ExtUtils::MakeMaker::VERSION",
+        license      => [ $self->{LICENSE} || 'unknown' ],
+        'meta-spec'  => {
+            url         => $METASPEC_URL,
+            version     => $METASPEC_V,
+        },
+        name         => $self->{DISTNAME},
+        release_status => $release_status,
+        version      => $version,
+
+        # optional
+        no_index     => { directory => [qw(t inc)] },
+    );
+    $self->_add_requirements_to_meta(\%meta);
+
+    if (!eval { require JSON::PP; require CPAN::Meta::Converter; CPAN::Meta::Converter->VERSION(2.141170) }) {
+      return \%meta;
+    }
+
+    # needs to be based on the original version
+    my $v1_add = _metaspec_version($meta_add) !~ /^2/;
+
+    my ($add_v, $merge_v) = map _metaspec_version($_), $meta_add, $meta_merge;
+    for my $frag ($meta_add, $meta_merge) {
+        my $def_v = $frag == $meta_add ? $merge_v : $add_v;
+        $frag = CPAN::Meta::Converter->new($frag, default_version => $def_v)->upgrade_fragment;
+    }
+
+    # if we upgraded a 1.x _ADD fragment, we gave it a prereqs key that
+    # will override all prereqs, which is more than the user asked for;
+    # instead, we'll go inside the prereqs and override all those
+    while( my($key, $val) = each %$meta_add ) {
+        if ($v1_add and $key eq 'prereqs') {
+            $meta{$key}{$_} = $val->{$_} for keys %$val;
+        } elsif ($key ne 'meta-spec') {
+            $meta{$key} = $val;
+        }
+    }
+
+    while( my($key, $val) = each %$meta_merge ) {
+        next if $key eq 'meta-spec';
+        $self->_hash_merge(\%meta, $key, $val);
+    }
+
+    return \%meta;
+}
+
+
+=begin private
+
+=cut
+
+sub _add_requirements_to_meta {
+    my ( $self, $meta ) = @_;
+    # Check the original args so we can tell between the user setting it
+    # to an empty hash and it just being initialized.
+    $meta->{prereqs}{configure}{requires} = $self->{ARGS}{CONFIGURE_REQUIRES}
+        ? $self->{CONFIGURE_REQUIRES}
+        : { 'ExtUtils::MakeMaker' => 0, };
+    $meta->{prereqs}{build}{requires} = $self->{ARGS}{BUILD_REQUIRES}
+        ? $self->{BUILD_REQUIRES}
+        : { 'ExtUtils::MakeMaker' => 0, };
+    $meta->{prereqs}{test}{requires} = $self->{TEST_REQUIRES}
+        if $self->{ARGS}{TEST_REQUIRES};
+    $meta->{prereqs}{runtime}{requires} = $self->{PREREQ_PM}
+        if $self->{ARGS}{PREREQ_PM};
+    $meta->{prereqs}{runtime}{requires}{perl} = _normalize_version($self->{MIN_PERL_VERSION})
+        if $self->{MIN_PERL_VERSION};
+}
+
+# spec version of given fragment - if not given, assume 1.4
+sub _metaspec_version {
+  my ( $meta ) = @_;
+  return $meta->{'meta-spec'}->{version}
+    if defined $meta->{'meta-spec'}
+       and defined $meta->{'meta-spec'}->{version};
+  return '1.4';
+}
+
+sub _add_requirements_to_meta_v1_4 {
+    my ( $self, $meta ) = @_;
+    # Check the original args so we can tell between the user setting it
+    # to an empty hash and it just being initialized.
+    if( $self->{ARGS}{CONFIGURE_REQUIRES} ) {
+        $meta->{configure_requires} = $self->{CONFIGURE_REQUIRES};
+    } else {
+        $meta->{configure_requires} = {
+            'ExtUtils::MakeMaker'       => 0,
+        };
+    }
+    if( $self->{ARGS}{BUILD_REQUIRES} ) {
+        $meta->{build_requires} = $self->{BUILD_REQUIRES};
+    } else {
+        $meta->{build_requires} = {
+            'ExtUtils::MakeMaker'       => 0,
+        };
+    }
+    if( $self->{ARGS}{TEST_REQUIRES} ) {
+        $meta->{build_requires} = {
+          %{ $meta->{build_requires} },
+          %{ $self->{TEST_REQUIRES} },
+        };
+    }
+    $meta->{requires} = $self->{PREREQ_PM}
+        if defined $self->{PREREQ_PM};
+    $meta->{requires}{perl} = _normalize_version($self->{MIN_PERL_VERSION})
+        if $self->{MIN_PERL_VERSION};
+}
+
+# Adapted from Module::Build::Base
+sub _normalize_version {
+  my ($version) = @_;
+  $version = 0 unless defined $version;
+
+  if ( ref $version eq 'version' ) { # version objects
+    $version = $version->stringify;
+  }
+  elsif ( $version =~ /^[^v][^.]*\.[^.]+\./ ) { # no leading v, multiple dots
+    # normalize string tuples without "v": "1.2.3" -> "v1.2.3"
+    $version = "v$version";
+  }
+  else {
+    # leave alone
+  }
+  return $version;
+}
+
+=head3 _dump_hash
+
+    $yaml = _dump_hash(\%options, %hash);
+
+Implements a fake YAML dumper for a hash given
+as a list of pairs. No quoting/escaping is done. Keys
+are supposed to be strings. Values are undef, strings,
+hash refs or array refs of strings.
+
+Supported options are:
+
+    delta => STR - indentation delta
+    use_header => BOOL - whether to include a YAML header
+    indent => STR - a string of spaces
+          default: ''
+
+    max_key_length => INT - maximum key length used to align
+        keys and values of the same hash
+        default: 20
+    key_sort => CODE - a sort sub
+            It may be undef, which means no sorting by keys
+        default: sub { lc $a cmp lc $b }
+
+    customs => HASH - special options for certain keys
+           (whose values are hashes themselves)
+        may contain: max_key_length, key_sort, customs
+
+=end private
+
+=cut
+
+sub _dump_hash {
+    croak "first argument should be a hash ref" unless ref $_[0] eq 'HASH';
+    my $options = shift;
+    my %hash = @_;
+
+    # Use a list to preserve order.
+    my @pairs;
+
+    my $k_sort
+        = exists $options->{key_sort} ? $options->{key_sort}
+                                      : sub { lc $a cmp lc $b };
+    if ($k_sort) {
+        croak "'key_sort' should be a coderef" unless ref $k_sort eq 'CODE';
+        @pairs = _sort_pairs($k_sort, \%hash);
+    } else { # list of pairs, no sorting
+        @pairs = @_;
+    }
+
+    my $yaml     = $options->{use_header} ? "--- #YAML:1.0\n" : '';
+    my $indent   = $options->{indent} || '';
+    my $k_length = min(
+        ($options->{max_key_length} || 20),

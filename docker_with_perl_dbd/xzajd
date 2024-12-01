@@ -1,0 +1,1000 @@
+    """
+    if ignore:
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", ".+ (module|package)",
+                                    DeprecationWarning)
+            yield
+    else:
+        yield
+
+
+def unload(name):
+    try:
+        del sys.modules[name]
+    except KeyError:
+        pass
+
+
+def forget(modname):
+    """'Forget' a module was ever imported.
+
+    This removes the module from sys.modules and deletes any PEP 3147/488 or
+    legacy .pyc files.
+    """
+    unload(modname)
+    for dirname in sys.path:
+        source = os.path.join(dirname, modname + '.py')
+        # It doesn't matter if they exist or not, unlink all possible
+        # combinations of PEP 3147/488 and legacy pyc files.
+        unlink(source + 'c')
+        for opt in ('', 1, 2):
+            unlink(importlib.util.cache_from_source(source, optimization=opt))
+
+
+def make_legacy_pyc(source):
+    """Move a PEP 3147/488 pyc file to its legacy pyc location.
+
+    :param source: The file system path to the source file.  The source file
+        does not need to exist, however the PEP 3147/488 pyc file must exist.
+    :return: The file system path to the legacy pyc file.
+    """
+    pyc_file = importlib.util.cache_from_source(source)
+    up_one = os.path.dirname(os.path.abspath(source))
+    legacy_pyc = os.path.join(up_one, source + 'c')
+    shutil.move(pyc_file, legacy_pyc)
+    return legacy_pyc
+
+
+def import_module(name, deprecated=False, *, required_on=()):
+    """Import and return the module to be tested, raising SkipTest if
+    it is not available.
+
+    If deprecated is True, any module or package deprecation messages
+    will be suppressed. If a module is required on a platform but optional for
+    others, set required_on to an iterable of platform prefixes which will be
+    compared against sys.platform.
+    """
+    with _ignore_deprecated_imports(deprecated):
+        try:
+            return importlib.import_module(name)
+        except ImportError as msg:
+            if sys.platform.startswith(tuple(required_on)):
+                raise
+            raise unittest.SkipTest(str(msg))
+
+
+def _save_and_remove_modules(names):
+    orig_modules = {}
+    prefixes = tuple(name + '.' for name in names)
+    for modname in list(sys.modules):
+        if modname in names or modname.startswith(prefixes):
+            orig_modules[modname] = sys.modules.pop(modname)
+    return orig_modules
+
+
+@contextlib.contextmanager
+def frozen_modules(enabled=True):
+    """Force frozen modules to be used (or not).
+
+    This only applies to modules that haven't been imported yet.
+    Also, some essential modules will always be imported frozen.
+    """
+    _imp._override_frozen_modules_for_tests(1 if enabled else -1)
+    try:
+        yield
+    finally:
+        _imp._override_frozen_modules_for_tests(0)
+
+
+def import_fresh_module(name, fresh=(), blocked=(), *,
+                        deprecated=False,
+                        usefrozen=False,
+                        ):
+    """Import and return a module, deliberately bypassing sys.modules.
+
+    This function imports and returns a fresh copy of the named Python module
+    by removing the named module from sys.modules before doing the import.
+    Note that unlike reload, the original module is not affected by
+    this operation.
+
+    *fresh* is an iterable of additional module names that are also removed
+    from the sys.modules cache before doing the import. If one of these
+    modules can't be imported, None is returned.
+
+    *blocked* is an iterable of module names that are replaced with None
+    in the module cache during the import to ensure that attempts to import
+    them raise ImportError.
+
+    The named module and any modules named in the *fresh* and *blocked*
+    parameters are saved before starting the import and then reinserted into
+    sys.modules when the fresh import is complete.
+
+    Module and package deprecation messages are suppressed during this import
+    if *deprecated* is True.
+
+    This function will raise ImportError if the named module cannot be
+    imported.
+
+    If "usefrozen" is False (the default) then the frozen importer is
+    disabled (except for essential modules like importlib._bootstrap).
+    """
+    # NOTE: test_heapq, test_json and test_warnings include extra sanity checks
+    # to make sure that this utility function is working as expected
+    with _ignore_deprecated_imports(deprecated):
+        # Keep track of modules saved for later restoration as well
+        # as those which just need a blocking entry removed
+        fresh = list(fresh)
+        blocked = list(blocked)
+        names = {name, *fresh, *blocked}
+        orig_modules = _save_and_remove_modules(names)
+        for modname in blocked:
+            sys.modules[modname] = None
+
+        try:
+            with frozen_modules(usefrozen):
+                # Return None when one of the "fresh" modules can not be imported.
+                try:
+                    for modname in fresh:
+                        __import__(modname)
+                except ImportError:
+                    return None
+                return importlib.import_module(name)
+        finally:
+            _save_and_remove_modules(names)
+            sys.modules.update(orig_modules)
+
+
+class CleanImport(object):
+    """Context manager to force import to return a new module reference.
+
+    This is useful for testing module-level behaviours, such as
+    the emission of a DeprecationWarning on import.
+
+    Use like this:
+
+        with CleanImport("foo"):
+            importlib.import_module("foo") # new reference
+
+    If "usefrozen" is False (the default) then the frozen importer is
+    disabled (except for essential modules like importlib._bootstrap).
+    """
+
+    def __init__(self, *module_names, usefrozen=False):
+        self.original_modules = sys.modules.copy()
+        for module_name in module_names:
+            if module_name in sys.modules:
+                module = sys.modules[module_name]
+                # It is possible that module_name is just an alias for
+                # another module (e.g. stub for modules renamed in 3.x).
+                # In that case, we also need delete the real module to clear
+                # the import cache.
+                if module.__name__ != module_name:
+                    del sys.modules[module.__name__]
+                del sys.modules[module_name]
+        self._frozen_modules = frozen_modules(usefrozen)
+
+    def __enter__(self):
+        self._frozen_modules.__enter__()
+        return self
+
+    def __exit__(self, *ignore_exc):
+        sys.modules.update(self.original_modules)
+        self._frozen_modules.__exit__(*ignore_exc)
+
+
+class DirsOnSysPath(object):
+    """Context manager to temporarily add directories to sys.path.
+
+    This makes a copy of sys.path, appends any directories given
+    as positional arguments, then reverts sys.path to the copied
+    settings when the context ends.
+
+    Note that *all* sys.path modifications in the body of the
+    context manager, including replacement of the object,
+    will be reverted at the end of the block.
+    """
+
+    def __init__(self, *paths):
+        self.original_value = sys.path[:]
+        self.original_object = sys.path
+        sys.path.extend(paths)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *ignore_exc):
+        sys.path = self.original_object
+        sys.path[:] = self.original_value
+
+
+def modules_setup():
+    return sys.modules.copy(),
+
+
+def modules_cleanup(oldmodules):
+    # Encoders/decoders are registered permanently within the internal
+    # codec cache. If we destroy the corresponding modules their
+    # globals will be set to None which will trip up the cached functions.
+    encodings = [(k, v) for k, v in sys.modules.items()
+                 if k.startswith('encodings.')]
+    sys.modules.clear()
+    sys.modules.update(encodings)
+    # XXX: This kind of problem can affect more than just encodings.
+    # In particular extension modules (such as _ssl) don't cope
+    # with reloading properly. Really, test modules should be cleaning
+    # out the test specific modules they know they added (ala test_runpy)
+    # rather than relying on this function (as test_importhooks and test_pkg
+    # do currently). Implicitly imported *real* modules should be left alone
+    # (see issue 10556).
+    sys.modules.update(oldmodules)
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                usr/lib/python3.11/test/support/interpreters.py                                                     0000644 0000000 0000000 00000013305 14671176116 020256  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        """Subinterpreters High Level Module."""
+
+import time
+import _xxsubinterpreters as _interpreters
+
+# aliases:
+from _xxsubinterpreters import (
+    ChannelError, ChannelNotFoundError, ChannelEmptyError,
+    is_shareable,
+)
+
+
+__all__ = [
+    'Interpreter', 'get_current', 'get_main', 'create', 'list_all',
+    'SendChannel', 'RecvChannel',
+    'create_channel', 'list_all_channels', 'is_shareable',
+    'ChannelError', 'ChannelNotFoundError',
+    'ChannelEmptyError',
+    ]
+
+
+def create(*, isolated=True):
+    """Return a new (idle) Python interpreter."""
+    id = _interpreters.create(isolated=isolated)
+    return Interpreter(id, isolated=isolated)
+
+
+def list_all():
+    """Return all existing interpreters."""
+    return [Interpreter(id) for id in _interpreters.list_all()]
+
+
+def get_current():
+    """Return the currently running interpreter."""
+    id = _interpreters.get_current()
+    return Interpreter(id)
+
+
+def get_main():
+    """Return the main interpreter."""
+    id = _interpreters.get_main()
+    return Interpreter(id)
+
+
+class Interpreter:
+    """A single Python interpreter."""
+
+    def __init__(self, id, *, isolated=None):
+        if not isinstance(id, (int, _interpreters.InterpreterID)):
+            raise TypeError(f'id must be an int, got {id!r}')
+        self._id = id
+        self._isolated = isolated
+
+    def __repr__(self):
+        data = dict(id=int(self._id), isolated=self._isolated)
+        kwargs = (f'{k}={v!r}' for k, v in data.items())
+        return f'{type(self).__name__}({", ".join(kwargs)})'
+
+    def __hash__(self):
+        return hash(self._id)
+
+    def __eq__(self, other):
+        if not isinstance(other, Interpreter):
+            return NotImplemented
+        else:
+            return other._id == self._id
+
+    @property
+    def id(self):
+        return self._id
+
+    @property
+    def isolated(self):
+        if self._isolated is None:
+            # XXX The low-level function has not been added yet.
+            # See bpo-....
+            self._isolated = _interpreters.is_isolated(self._id)
+        return self._isolated
+
+    def is_running(self):
+        """Return whether or not the identified interpreter is running."""
+        return _interpreters.is_running(self._id)
+
+    def close(self):
+        """Finalize and destroy the interpreter.
+
+        Attempting to destroy the current interpreter results
+        in a RuntimeError.
+        """
+        return _interpreters.destroy(self._id)
+
+    def run(self, src_str, /, *, channels=None):
+        """Run the given source code in the interpreter.
+
+        This blocks the current Python thread until done.
+        """
+        _interpreters.run_string(self._id, src_str, channels)
+
+
+def create_channel():
+    """Return (recv, send) for a new cross-interpreter channel.
+
+    The channel may be used to pass data safely between interpreters.
+    """
+    cid = _interpreters.channel_create()
+    recv, send = RecvChannel(cid), SendChannel(cid)
+    return recv, send
+
+
+def list_all_channels():
+    """Return a list of (recv, send) for all open channels."""
+    return [(RecvChannel(cid), SendChannel(cid))
+            for cid in _interpreters.channel_list_all()]
+
+
+class _ChannelEnd:
+    """The base class for RecvChannel and SendChannel."""
+
+    def __init__(self, id):
+        if not isinstance(id, (int, _interpreters.ChannelID)):
+            raise TypeError(f'id must be an int, got {id!r}')
+        self._id = id
+
+    def __repr__(self):
+        return f'{type(self).__name__}(id={int(self._id)})'
+
+    def __hash__(self):
+        return hash(self._id)
+
+    def __eq__(self, other):
+        if isinstance(self, RecvChannel):
+            if not isinstance(other, RecvChannel):
+                return NotImplemented
+        elif not isinstance(other, SendChannel):
+            return NotImplemented
+        return other._id == self._id
+
+    @property
+    def id(self):
+        return self._id
+
+
+_NOT_SET = object()
+
+
+class RecvChannel(_ChannelEnd):
+    """The receiving end of a cross-interpreter channel."""
+
+    def recv(self, *, _sentinel=object(), _delay=10 / 1000):  # 10 milliseconds
+        """Return the next object from the channel.
+
+        This blocks until an object has been sent, if none have been
+        sent already.
+        """
+        obj = _interpreters.channel_recv(self._id, _sentinel)
+        while obj is _sentinel:
+            time.sleep(_delay)
+            obj = _interpreters.channel_recv(self._id, _sentinel)
+        return obj
+
+    def recv_nowait(self, default=_NOT_SET):
+        """Return the next object from the channel.
+
+        If none have been sent then return the default if one
+        is provided or fail with ChannelEmptyError.  Otherwise this
+        is the same as recv().
+        """
+        if default is _NOT_SET:
+            return _interpreters.channel_recv(self._id)
+        else:
+            return _interpreters.channel_recv(self._id, default)
+
+
+class SendChannel(_ChannelEnd):
+    """The sending end of a cross-interpreter channel."""
+
+    def send(self, obj):
+        """Send the object (i.e. its data) to the channel's receiving end.
+
+        This blocks until the object is received.
+        """
+        _interpreters.channel_send(self._id, obj)
+        # XXX We are missing a low-level channel_send_wait().
+        # See bpo-32604 and gh-19829.
+        # Until that shows up we fake it:
+        time.sleep(2)
+
+    def send_nowait(self, obj):
+        """Send the object to the channel's receiving end.
+
+        If the object is immediately received then return True
+        (else False).  Otherwise this is the same as send().
+        """
+        # XXX Note that at the moment channel_send() only ever returns
+        # None.  This should be fixed when channel_send_wait() is added.
+        # See bpo-32604 and gh-19829.
+        return _interpreters.channel_send(self._id, obj)
+                                                                                                                                                                                                                                                                                                                           usr/lib/python3.11/test/support/logging_helper.py                                                   0000644 0000000 0000000 00000001624 14671176116 020516  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        import logging.handlers
+
+class TestHandler(logging.handlers.BufferingHandler):
+    def __init__(self, matcher):
+        # BufferingHandler takes a "capacity" argument
+        # so as to know when to flush. As we're overriding
+        # shouldFlush anyway, we can set a capacity of zero.
+        # You can call flush() manually to clear out the
+        # buffer.
+        logging.handlers.BufferingHandler.__init__(self, 0)
+        self.matcher = matcher
+
+    def shouldFlush(self):
+        return False
+
+    def emit(self, record):
+        self.format(record)
+        self.buffer.append(record.__dict__)
+
+    def matches(self, **kwargs):
+        """
+        Look for a saved dict whose keys/values match the supplied arguments.
+        """
+        result = False
+        for d in self.buffer:
+            if self.matcher.matches(d, **kwargs):
+                result = True
+                break
+        return result
+                                                                                                            usr/lib/python3.11/test/support/os_helper.py                                                        0000644 0000000 0000000 00000054143 14671176116 017515  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        import collections.abc
+import contextlib
+import errno
+import os
+import re
+import stat
+import sys
+import time
+import unittest
+import warnings
+
+
+# Filename used for testing
+if os.name == 'java':
+    # Jython disallows @ in module names
+    TESTFN_ASCII = '$test'
+else:
+    TESTFN_ASCII = '@test'
+
+# Disambiguate TESTFN for parallel testing, while letting it remain a valid
+# module name.
+TESTFN_ASCII = "{}_{}_tmp".format(TESTFN_ASCII, os.getpid())
+
+# TESTFN_UNICODE is a non-ascii filename
+TESTFN_UNICODE = TESTFN_ASCII + "-\xe0\xf2\u0258\u0141\u011f"
+if sys.platform == 'darwin':
+    # In Mac OS X's VFS API file names are, by definition, canonically
+    # decomposed Unicode, encoded using UTF-8. See QA1173:
+    # http://developer.apple.com/mac/library/qa/qa2001/qa1173.html
+    import unicodedata
+    TESTFN_UNICODE = unicodedata.normalize('NFD', TESTFN_UNICODE)
+
+# TESTFN_UNENCODABLE is a filename (str type) that should *not* be able to be
+# encoded by the filesystem encoding (in strict mode). It can be None if we
+# cannot generate such filename.
+TESTFN_UNENCODABLE = None
+if os.name == 'nt':
+    # skip win32s (0) or Windows 9x/ME (1)
+    if sys.getwindowsversion().platform >= 2:
+        # Different kinds of characters from various languages to minimize the
+        # probability that the whole name is encodable to MBCS (issue #9819)
+        TESTFN_UNENCODABLE = TESTFN_ASCII + "-\u5171\u0141\u2661\u0363\uDC80"
+        try:
+            TESTFN_UNENCODABLE.encode(sys.getfilesystemencoding())
+        except UnicodeEncodeError:
+            pass
+        else:
+            print('WARNING: The filename %r CAN be encoded by the filesystem '
+                  'encoding (%s). Unicode filename tests may not be effective'
+                  % (TESTFN_UNENCODABLE, sys.getfilesystemencoding()))
+            TESTFN_UNENCODABLE = None
+# macOS and Emscripten deny unencodable filenames (invalid utf-8)
+elif sys.platform not in {'darwin', 'emscripten', 'wasi'}:
+    try:
+        # ascii and utf-8 cannot encode the byte 0xff
+        b'\xff'.decode(sys.getfilesystemencoding())
+    except UnicodeDecodeError:
+        # 0xff will be encoded using the surrogate character u+DCFF
+        TESTFN_UNENCODABLE = TESTFN_ASCII \
+            + b'-\xff'.decode(sys.getfilesystemencoding(), 'surrogateescape')
+    else:
+        # File system encoding (eg. ISO-8859-* encodings) can encode
+        # the byte 0xff. Skip some unicode filename tests.
+        pass
+
+# FS_NONASCII: non-ASCII character encodable by os.fsencode(),
+# or an empty string if there is no such character.
+FS_NONASCII = ''
+for character in (
+    # First try printable and common characters to have a readable filename.
+    # For each character, the encoding list are just example of encodings able
+    # to encode the character (the list is not exhaustive).
+
+    # U+00E6 (Latin Small Letter Ae): cp1252, iso-8859-1
+    '\u00E6',
+    # U+0130 (Latin Capital Letter I With Dot Above): cp1254, iso8859_3
+    '\u0130',
+    # U+0141 (Latin Capital Letter L With Stroke): cp1250, cp1257
+    '\u0141',
+    # U+03C6 (Greek Small Letter Phi): cp1253
+    '\u03C6',
+    # U+041A (Cyrillic Capital Letter Ka): cp1251
+    '\u041A',
+    # U+05D0 (Hebrew Letter Alef): Encodable to cp424
+    '\u05D0',
+    # U+060C (Arabic Comma): cp864, cp1006, iso8859_6, mac_arabic
+    '\u060C',
+    # U+062A (Arabic Letter Teh): cp720
+    '\u062A',
+    # U+0E01 (Thai Character Ko Kai): cp874
+    '\u0E01',
+
+    # Then try more "special" characters. "special" because they may be
+    # interpreted or displayed differently depending on the exact locale
+    # encoding and the font.
+
+    # U+00A0 (No-Break Space)
+    '\u00A0',
+    # U+20AC (Euro Sign)
+    '\u20AC',
+):
+    try:
+        # If Python is set up to use the legacy 'mbcs' in Windows,
+        # 'replace' error mode is used, and encode() returns b'?'
+        # for characters missing in the ANSI codepage
+        if os.fsdecode(os.fsencode(character)) != character:
+            raise UnicodeError
+    except UnicodeError:
+        pass
+    else:
+        FS_NONASCII = character
+        break
+
+# Save the initial cwd
+SAVEDCWD = os.getcwd()
+
+# TESTFN_UNDECODABLE is a filename (bytes type) that should *not* be able to be
+# decoded from the filesystem encoding (in strict mode). It can be None if we
+# cannot generate such filename (ex: the latin1 encoding can decode any byte
+# sequence). On UNIX, TESTFN_UNDECODABLE can be decoded by os.fsdecode() thanks
+# to the surrogateescape error handler (PEP 383), but not from the filesystem
+# encoding in strict mode.
+TESTFN_UNDECODABLE = None
+for name in (
+    # b'\xff' is not decodable by os.fsdecode() with code page 932. Windows
+    # accepts it to create a file or a directory, or don't accept to enter to
+    # such directory (when the bytes name is used). So test b'\xe7' first:
+    # it is not decodable from cp932.
+    b'\xe7w\xf0',
+    # undecodable from ASCII, UTF-8
+    b'\xff',
+    # undecodable from iso8859-3, iso8859-6, iso8859-7, cp424, iso8859-8, cp856
+    # and cp857
+    b'\xae\xd5'
+    # undecodable from UTF-8 (UNIX and Mac OS X)
+    b'\xed\xb2\x80', b'\xed\xb4\x80',
+    # undecodable from shift_jis, cp869, cp874, cp932, cp1250, cp1251, cp1252,
+    # cp1253, cp1254, cp1255, cp1257, cp1258
+    b'\x81\x98',
+):
+    try:
+        name.decode(sys.getfilesystemencoding())
+    except UnicodeDecodeError:
+        TESTFN_UNDECODABLE = os.fsencode(TESTFN_ASCII) + name
+        break
+
+if FS_NONASCII:
+    TESTFN_NONASCII = TESTFN_ASCII + FS_NONASCII
+else:
+    TESTFN_NONASCII = None
+TESTFN = TESTFN_NONASCII or TESTFN_ASCII
+
+
+def make_bad_fd():
+    """
+    Create an invalid file descriptor by opening and closing a file and return
+    its fd.
+    """
+    file = open(TESTFN, "wb")
+    try:
+        return file.fileno()
+    finally:
+        file.close()
+        unlink(TESTFN)
+
+
+_can_symlink = None
+
+
+def can_symlink():
+    global _can_symlink
+    if _can_symlink is not None:
+        return _can_symlink
+    # WASI / wasmtime prevents symlinks with absolute paths, see man
+    # openat2(2) RESOLVE_BENEATH. Almost all symlink tests use absolute
+    # paths. Skip symlink tests on WASI for now.
+    src = os.path.abspath(TESTFN)
+    symlink_path = src + "can_symlink"
+    try:
+        os.symlink(src, symlink_path)
+        can = True
+    except (OSError, NotImplementedError, AttributeError):
+        can = False
+    else:
+        os.remove(symlink_path)
+    _can_symlink = can
+    return can
+
+
+def skip_unless_symlink(test):
+    """Skip decorator for tests that require functional symlink"""
+    ok = can_symlink()
+    msg = "Requires functional symlink implementation"
+    return test if ok else unittest.skip(msg)(test)
+
+
+_can_xattr = None
+
+
+def can_xattr():
+    import tempfile
+    global _can_xattr
+    if _can_xattr is not None:
+        return _can_xattr
+    if not hasattr(os, "setxattr"):
+        can = False
+    else:
+        import platform
+        tmp_dir = tempfile.mkdtemp()
+        tmp_fp, tmp_name = tempfile.mkstemp(dir=tmp_dir)
+        try:
+            with open(TESTFN, "wb") as fp:
+                try:
+                    # TESTFN & tempfile may use different file systems with
+                    # different capabilities
+                    os.setxattr(tmp_fp, b"user.test", b"")
+                    os.setxattr(tmp_name, b"trusted.foo", b"42")
+                    os.setxattr(fp.fileno(), b"user.test", b"")
+                    # Kernels < 2.6.39 don't respect setxattr flags.
+                    kernel_version = platform.release()
+                    m = re.match(r"2.6.(\d{1,2})", kernel_version)
+                    can = m is None or int(m.group(1)) >= 39
+                except OSError:
+                    can = False
+        finally:
+            unlink(TESTFN)
+            unlink(tmp_name)
+            rmdir(tmp_dir)
+    _can_xattr = can
+    return can
+
+
+def skip_unless_xattr(test):
+    """Skip decorator for tests that require functional extended attributes"""
+    ok = can_xattr()
+    msg = "no non-broken extended attribute support"
+    return test if ok else unittest.skip(msg)(test)
+
+
+_can_chmod = None
+
+def can_chmod():
+    global _can_chmod
+    if _can_chmod is not None:
+        return _can_chmod
+    if not hasattr(os, "chown"):
+        _can_chmod = False
+        return _can_chmod
+    try:
+        with open(TESTFN, "wb") as f:
+            try:
+                os.chmod(TESTFN, 0o777)
+                mode1 = os.stat(TESTFN).st_mode
+                os.chmod(TESTFN, 0o666)
+                mode2 = os.stat(TESTFN).st_mode
+            except OSError as e:
+                can = False
+            else:
+                can = stat.S_IMODE(mode1) != stat.S_IMODE(mode2)
+    finally:
+        unlink(TESTFN)
+    _can_chmod = can
+    return can
+
+
+def skip_unless_working_chmod(test):
+    """Skip tests that require working os.chmod()
+
+    WASI SDK 15.0 cannot change file mode bits.
+    """
+    ok = can_chmod()
+    msg = "requires working os.chmod()"
+    return test if ok else unittest.skip(msg)(test)
+
+
+# Check whether the current effective user has the capability to override
+# DAC (discretionary access control). Typically user root is able to
+# bypass file read, write, and execute permission checks. The capability
+# is independent of the effective user. See capabilities(7).
+_can_dac_override = None
+
+def can_dac_override():
+    global _can_dac_override
+
+    if not can_chmod():
+        _can_dac_override = False
+    if _can_dac_override is not None:
+        return _can_dac_override
+
+    try:
+        with open(TESTFN, "wb") as f:
+            os.chmod(TESTFN, 0o400)
+            try:
+                with open(TESTFN, "wb"):
+                    pass
+            except OSError:
+                _can_dac_override = False
+            else:
+                _can_dac_override = True
+    finally:
+        unlink(TESTFN)
+
+    return _can_dac_override
+
+
+def skip_if_dac_override(test):
+    ok = not can_dac_override()
+    msg = "incompatible with CAP_DAC_OVERRIDE"
+    return test if ok else unittest.skip(msg)(test)
+
+
+def skip_unless_dac_override(test):
+    ok = can_dac_override()
+    msg = "requires CAP_DAC_OVERRIDE"
+    return test if ok else unittest.skip(msg)(test)
+
+
+def unlink(filename):
+    try:
+        _unlink(filename)
+    except (FileNotFoundError, NotADirectoryError):
+        pass
+
+
+if sys.platform.startswith("win"):
+    def _waitfor(func, pathname, waitall=False):
+        # Perform the operation
+        func(pathname)
+        # Now setup the wait loop
+        if waitall:
+            dirname = pathname
+        else:
+            dirname, name = os.path.split(pathname)
+            dirname = dirname or '.'
+        # Check for `pathname` to be removed from the filesystem.
+        # The exponential backoff of the timeout amounts to a total
+        # of ~1 second after which the deletion is probably an error
+        # anyway.
+        # Testing on an i7@4.3GHz shows that usually only 1 iteration is
+        # required when contention occurs.
+        timeout = 0.001
+        while timeout < 1.0:
+            # Note we are only testing for the existence of the file(s) in
+            # the contents of the directory regardless of any security or
+            # access rights.  If we have made it this far, we have sufficient
+            # permissions to do that much using Python's equivalent of the
+            # Windows API FindFirstFile.
+            # Other Windows APIs can fail or give incorrect results when
+            # dealing with files that are pending deletion.
+            L = os.listdir(dirname)
+            if not (L if waitall else name in L):
+                return
+            # Increase the timeout and try again
+            time.sleep(timeout)
+            timeout *= 2
+        warnings.warn('tests may fail, delete still pending for ' + pathname,
+                      RuntimeWarning, stacklevel=4)
+
+    def _unlink(filename):
+        _waitfor(os.unlink, filename)
+
+    def _rmdir(dirname):
+        _waitfor(os.rmdir, dirname)
+
+    def _rmtree(path):
+        from test.support import _force_run
+
+        def _rmtree_inner(path):
+            for name in _force_run(path, os.listdir, path):
+                fullname = os.path.join(path, name)
+                try:
+                    mode = os.lstat(fullname).st_mode
+                except OSError as exc:
+                    print("support.rmtree(): os.lstat(%r) failed with %s"
+                          % (fullname, exc),
+                          file=sys.__stderr__)
+                    mode = 0
+                if stat.S_ISDIR(mode):
+                    _waitfor(_rmtree_inner, fullname, waitall=True)
+                    _force_run(fullname, os.rmdir, fullname)
+                else:
+                    _force_run(fullname, os.unlink, fullname)
+        _waitfor(_rmtree_inner, path, waitall=True)
+        _waitfor(lambda p: _force_run(p, os.rmdir, p), path)
+
+    def _longpath(path):
+        try:
+            import ctypes
+        except ImportError:
+            # No ctypes means we can't expands paths.
+            pass
+        else:
+            buffer = ctypes.create_unicode_buffer(len(path) * 2)
+            length = ctypes.windll.kernel32.GetLongPathNameW(path, buffer,
+                                                             len(buffer))
+            if length:
+                return buffer[:length]
+        return path
+else:
+    _unlink = os.unlink
+    _rmdir = os.rmdir
+
+    def _rmtree(path):
+        import shutil
+        try:
+            shutil.rmtree(path)
+            return
+        except OSError:
+            pass
+
+        def _rmtree_inner(path):
+            from test.support import _force_run
+            for name in _force_run(path, os.listdir, path):
+                fullname = os.path.join(path, name)
+                try:
+                    mode = os.lstat(fullname).st_mode
+                except OSError:
+                    mode = 0
+                if stat.S_ISDIR(mode):
+                    _rmtree_inner(fullname)
+                    _force_run(path, os.rmdir, fullname)
+                else:
+                    _force_run(path, os.unlink, fullname)
+        _rmtree_inner(path)
+        os.rmdir(path)
+
+    def _longpath(path):
+        return path
+
+
+def rmdir(dirname):
+    try:
+        _rmdir(dirname)
+    except FileNotFoundError:
+        pass
+
+
+def rmtree(path):
+    try:
+        _rmtree(path)
+    except FileNotFoundError:
+        pass
+
+
+@contextlib.contextmanager
+def temp_dir(path=None, quiet=False):
+    """Return a context manager that creates a temporary directory.
+
+    Arguments:
+
+      path: the directory to create temporarily.  If omitted or None,
+        defaults to creating a temporary directory using tempfile.mkdtemp.
+
+      quiet: if False (the default), the context manager raises an exception
+        on error.  Otherwise, if the path is specified and cannot be
+        created, only a warning is issued.
+
+    """
+    import tempfile
+    dir_created = False
+    if path is None:
+        path = tempfile.mkdtemp()
+        dir_created = True
+        path = os.path.realpath(path)
+    else:
+        try:
+            os.mkdir(path)
+            dir_created = True
+        except OSError as exc:
+            if not quiet:
+                raise
+            warnings.warn(f'tests may fail, unable to create '
+                          f'temporary directory {path!r}: {exc}',
+                          RuntimeWarning, stacklevel=3)
+    if dir_created:
+        pid = os.getpid()
+    try:
+        yield path
+    finally:
+        # In case the process forks, let only the parent remove the
+        # directory. The child has a different process id. (bpo-30028)
+        if dir_created and pid == os.getpid():
+            rmtree(path)
+
+
+@contextlib.contextmanager
+def change_cwd(path, quiet=False):
+    """Return a context manager that changes the current working directory.
+
+    Arguments:
+
+      path: the directory to use as the temporary current working directory.
+
+      quiet: if False (the default), the context manager raises an exception
+        on error.  Otherwise, it issues only a warning and keeps the current
+        working directory the same.
+
+    """
+    saved_dir = os.getcwd()
+    try:
+        os.chdir(os.path.realpath(path))
+    except OSError as exc:
+        if not quiet:
+            raise
+        warnings.warn(f'tests may fail, unable to change the current working '
+                      f'directory to {path!r}: {exc}',
+                      RuntimeWarning, stacklevel=3)
+    try:
+        yield os.getcwd()
+    finally:
+        os.chdir(saved_dir)
+
+
+@contextlib.contextmanager
+def temp_cwd(name='tempcwd', quiet=False):
+    """
+    Context manager that temporarily creates and changes the CWD.
+
+    The function temporarily changes the current working directory
+    after creating a temporary directory in the current directory with
+    name *name*.  If *name* is None, the temporary directory is
+    created using tempfile.mkdtemp.
+
+    If *quiet* is False (default) and it is not possible to
+    create or change the CWD, an error is raised.  If *quiet* is True,
+    only a warning is raised and the original CWD is used.
+
+    """
+    with temp_dir(path=name, quiet=quiet) as temp_path:
+        with change_cwd(temp_path, quiet=quiet) as cwd_dir:
+            yield cwd_dir
+
+
+def create_empty_file(filename):
+    """Create an empty file. If the file already exists, truncate it."""
+    fd = os.open(filename, os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
+    os.close(fd)
+
+
+@contextlib.contextmanager
+def open_dir_fd(path):
+    """Open a file descriptor to a directory."""
+    assert os.path.isdir(path)
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):

@@ -1,0 +1,1000 @@
+" TODO: Needs to be adjusted to stop at [, <, and ].
+let s:token_pattern = '^[^[:space:]]\+'
+
+function s:lex1(input, start, ...)
+  let pattern = a:0 > 0 ? a:1 : s:token_pattern
+  let start = matchend(a:input, '^\_s*', a:start)
+  if start == -1
+    return ["", a:start]
+  endif
+  let end = matchend(a:input, pattern, start)
+  if end == -1
+    return ["", a:start]
+  endif
+  let token = strpart(a:input, start, end - start)
+  return [token, end]
+endfunction
+
+function s:lex(input, start, ...)
+  let pattern = a:0 > 0 ? a:1 : s:token_pattern
+  let info = s:lex1(a:input, a:start, pattern)
+  while info[0] == '--'
+    let info = s:lex1(a:input, info[1], pattern)
+    while info[0] != "" && info[0] != '--'
+      let info = s:lex1(a:input, info[1], pattern)
+    endwhile
+    if info[0] == ""
+      return info
+    endif
+    let info = s:lex1(a:input, info[1], pattern)
+  endwhile
+  return info
+endfunction
+
+function s:indent_to_innermost_parentheses(line, end)
+  let token = '('
+  let end = a:end
+  let parentheses = [end - 1]
+  while token != ""
+    let [token, end] = s:lex(a:line, end, '^\%([(),|]\|[A-Za-z0-9_-]\+\|#P\=CDATA\|%[A-Za-z0-9_-]\+;\)[?*+]\=')
+    if token[0] == '('
+      call add(parentheses, end - 1)
+    elseif token[0] == ')'
+      if len(parentheses) == 1
+        return [-1, end]
+      endif
+      call remove(parentheses, -1)
+    endif
+  endwhile
+  return [parentheses[-1] - strridx(a:line, "\n", parentheses[-1]), end]
+endfunction
+
+" TODO: Line and end could be script global (think OO members).
+function GetDTDIndent()
+  if v:lnum == 1
+    return 0
+  endif
+  
+  " Begin by searching back for a <! that isn’t inside a comment.
+  " From here, depending on what follows immediately after, parse to
+  " where we’re at to determine what to do.
+  if search('<!', 'bceW') == 0
+    return indent(v:lnum - 1)
+  endif
+  let lnum = line('.')
+  let col = col('.')
+  let indent = indent('.')
+  let line = lnum == v:lnum ? getline(lnum) : join(getline(lnum, v:lnum - 1), "\n")
+
+  let [declaration, end] = s:lex1(line, col)
+  if declaration == ""
+    return indent + shiftwidth()
+  elseif declaration == '--'
+    " We’re looking at a comment.  Now, simply determine if the comment is
+    " terminated or not.  If it isn’t, let Vim take care of that using
+    " 'comments' and 'autoindent'. Otherwise, indent to the first lines level.
+    while declaration != ""
+      let [declaration, end] = s:lex(line, end)
+      if declaration == "-->"
+        return indent
+      endif
+    endwhile
+    return -1
+  elseif declaration == 'ELEMENT'
+    " Check for element name.  If none exists, indent one level.
+    let [name, end] = s:lex(line, end)
+    if name == ""
+      return indent + shiftwidth()
+    endif
+
+    " Check for token following element name.  This can be a specification of
+    " whether the start or end tag may be omitted.  If nothing is found, indent
+    " one level.
+    let [token, end] = s:lex(line, end, '^\%([-O(]\|ANY\|EMPTY\)')
+    let n = 0
+    while token =~ '[-O]' && n < 2
+      let [token, end] = s:lex(line, end, '^\%([-O(]\|ANY\|EMPTY\)')
+      let n += 1
+    endwhile
+    if token == ""
+      return indent + shiftwidth()
+    endif
+
+    " Next comes the content model.  If the token we’ve found isn’t a
+    " parenthesis it must be either ANY, EMPTY or some random junk.  Either
+    " way, we’re done indenting this element, so set it to that of the first
+    " line so that the terminating “>” winds up having the same indentation.
+    if token != '('
+      return indent
+    endif
+
+    " Now go through the content model.  We need to keep track of the nesting
+    " of parentheses.  As soon as we hit 0 we’re done.  If that happens we must
+    " have a complete content model.  Thus set indentation to be the same as that
+    " of the first line so that the terminating “>” winds up having the same
+    " indentation.  Otherwise, we’ll indent to the innermost parentheses not yet
+    " matched.
+    let [indent_of_innermost, end] = s:indent_to_innermost_parentheses(line, end)
+    if indent_of_innermost != -1
+      return indent_of_innermost
+    endif
+
+    " Finally, look for any additions and/or exceptions to the content model.
+    " This is defined by a “+” or “-” followed by another content model
+    " declaration.
+    " TODO: Can the “-” be separated by whitespace from the “(”?
+    let seen = { '+(': 0, '-(': 0 }
+    while 1
+      let [additions_exceptions, end] = s:lex(line, end, '^[+-](')
+      if additions_exceptions != '+(' && additions_exceptions != '-('
+        let [token, end] = s:lex(line, end)
+        if token == '>'
+          return indent
+        endif
+        " TODO: Should use s:lex here on getline(v:lnum) and check for >.
+        return getline(v:lnum) =~ '^\s*>' || count(values(seen), 0) == 0 ? indent : (indent + shiftwidth())
+      endif
+
+      " If we’ve seen an addition or exception already and this is of the same
+      " kind, the user is writing a broken DTD.  Time to bail.
+      if seen[additions_exceptions]
+        return indent
+      endif
+      let seen[additions_exceptions] = 1
+
+      let [indent_of_innermost, end] = s:indent_to_innermost_parentheses(line, end)
+      if indent_of_innermost != -1
+        return indent_of_innermost
+      endif
+    endwhile
+  elseif declaration == 'ATTLIST'
+    " Check for element name.  If none exists, indent one level.
+    let [name, end] = s:lex(line, end)
+    if name == ""
+      return indent + shiftwidth()
+    endif
+
+    " Check for any number of attributes.
+    while 1
+      " Check for attribute name.  If none exists, indent one level, unless the
+      " current line is a lone “>”, in which case we indent to the same level
+      " as the first line.  Otherwise, if the attribute name is “>”, we have
+      " actually hit the end of the attribute list, in which case we indent to
+      " the same level as the first line.
+      let [name, end] = s:lex(line, end)
+      if name == ""
+        " TODO: Should use s:lex here on getline(v:lnum) and check for >.
+        return getline(v:lnum) =~ '^\s*>' ? indent : (indent + shiftwidth())
+      elseif name == ">"
+        return indent
+      endif
+
+      " Check for attribute value declaration.  If none exists, indent two
+      " levels.  Otherwise, if it’s an enumerated value, check for nested
+      " parentheses and indent to the innermost one if we don’t reach the end
+      " of the listc.  Otherwise, just continue with looking for the default
+      " attribute value.
+      " TODO: Do validation of keywords
+      " (CDATA|NMTOKEN|NMTOKENS|ID|IDREF|IDREFS|ENTITY|ENTITIES)?
+      let [value, end] = s:lex(line, end, '^\%((\|[^[:space:]]\+\)')
+      if value == ""
+        return indent + shiftwidth() * 2
+      elseif value == 'NOTATION'
+        " If this is a enumerated value based on notations, read another token
+        " for the actual value.  If it doesn’t exist, indent three levels.
+        " TODO: If validating according to above, value must be equal to '('.
+        let [value, end] = s:lex(line, end, '^\%((\|[^[:space:]]\+\)')
+        if value == ""
+          return indent + shiftwidth() * 3
+        endif
+      endif
+
+      if value == '('
+        let [indent_of_innermost, end] = s:indent_to_innermost_parentheses(line, end)
+        if indent_of_innermost != -1
+          return indent_of_innermost
+        endif
+      endif
+
+      " Finally look for the attribute’s default value.  If non exists, indent
+      " two levels.
+      let [default, end] = s:lex(line, end, '^\%("\_[^"]*"\|#\(REQUIRED\|IMPLIED\|FIXED\)\)')
+      if default == ""
+        return indent + shiftwidth() * 2
+      elseif default == '#FIXED'
+        " We need to look for the fixed value.  If non exists, indent three
+        " levels.
+        let [default, end] = s:lex(line, end, '^"\_[^"]*"')
+        if default == ""
+          return indent + shiftwidth() * 3
+        endif
+      endif
+    endwhile
+  elseif declaration == 'ENTITY'
+    " Check for entity name.  If none exists, indent one level.  Otherwise, if
+    " the name actually turns out to be a percent sign, “%”, this is a
+    " parameter entity.  Read another token to determine the entity name and,
+    " again, if none exists, indent one level.
+    let [name, end] = s:lex(line, end)
+    if name == ""
+      return indent + shiftwidth()
+    elseif name == '%'
+      let [name, end] = s:lex(line, end)
+      if name == ""
+        return indent + shiftwidth()
+      endif
+    endif
+
+    " Now check for the entity value.  If none exists, indent one level.  If it
+    " does exist, indent to same level as first line, as we’re now done with
+    " this entity.
+    "
+    " The entity value can be a string in single or double quotes (no escapes
+    " to worry about, as entities are used instead).  However, it can also be
+    " that this is an external unparsed entity.  In that case we have to look
+    " further for (possibly) a public ID and an URI followed by the NDATA
+    " keyword and the actual notation name.  For the public ID and URI, indent
+    " two levels, if they don’t exist.  If the NDATA keyword doesn’t exist,
+    " indent one level.  Otherwise, if the actual notation name doesn’t exist,
+    " indent two level.  If it does, indent to same level as first line, as
+    " we’re now done with this entity.
+    let [value, end] = s:lex(line, end)
+    if value == ""
+      return indent + shiftwidth()
+    elseif value == 'SYSTEM' || value == 'PUBLIC'
+      let [quoted_string, end] = s:lex(line, end, '\%("[^"]\+"\|''[^'']\+''\)')
+      if quoted_string == ""
+        return indent + shiftwidth() * 2
+      endif
+
+      if value == 'PUBLIC'
+        let [quoted_string, end] = s:lex(line, end, '\%("[^"]\+"\|''[^'']\+''\)')
+        if quoted_string == ""
+          return indent + shiftwidth() * 2
+        endif
+      endif
+
+      let [ndata, end] = s:lex(line, end)
+      if ndata == ""
+        return indent + shiftwidth()
+      endif
+
+      let [name, end] = s:lex(line, end)
+      return name == "" ? (indent + shiftwidth() * 2) : indent
+    else
+      return indent
+    endif
+  elseif declaration == 'NOTATION'
+    " Check for notation name.  If none exists, indent one level.
+    let [name, end] = s:lex(line, end)
+    if name == ""
+      return indent + shiftwidth()
+    endif
+
+    " Now check for the external ID.  If none exists, indent one level.
+    let [id, end] = s:lex(line, end)
+    if id == ""
+      return indent + shiftwidth()
+    elseif id == 'SYSTEM' || id == 'PUBLIC'
+      let [quoted_string, end] = s:lex(line, end, '\%("[^"]\+"\|''[^'']\+''\)')
+      if quoted_string == ""
+        return indent + shiftwidth() * 2
+      endif
+
+      if id == 'PUBLIC'
+        let [quoted_string, end] = s:lex(line, end, '\%("[^"]\+"\|''[^'']\+''\|>\)')
+        if quoted_string == ""
+          " TODO: Should use s:lex here on getline(v:lnum) and check for >.
+          return getline(v:lnum) =~ '^\s*>' ? indent : (indent + shiftwidth() * 2)
+        elseif quoted_string == '>'
+          return indent
+        endif
+      endif
+    endif
+
+    return indent
+  endif
+
+  " TODO: Processing directives could be indented I suppose.  But perhaps it’s
+  " just as well to let the user decide how to indent them (perhaps extending
+  " this function to include proper support for whatever processing directive
+  " language they want to use).
+
+  " Conditional sections are simply passed along to let Vim decide what to do
+  " (and hence the user).
+  return -1
+endfunction
+
+let &cpo = s:cpo_save
+unlet s:cpo_save
+                                                                                                                                                                                                                        usr/share/vim/vim90/indent/dtrace.vim                                                               0000644 0000000 0000000 00000000703 14424703754 016170  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        " Vim indent file
+" Language: D script as described in "Solaris Dynamic Tracing Guide",
+"           http://docs.sun.com/app/docs/doc/817-6223
+" Last Change: 2008/03/20
+" Version: 1.2
+" Maintainer: Nicolas Weber <nicolasweber@gmx.de>
+
+" Only load this indent file when no other was loaded.
+if exists("b:did_indent")
+   finish
+endif
+let b:did_indent = 1
+
+" Built-in C indenting works nicely for dtrace.
+setlocal cindent
+
+let b:undo_indent = "setl cin<"
+                                                             usr/share/vim/vim90/indent/dune.vim                                                                 0000644 0000000 0000000 00000000514 14424703754 015661  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        " Vim indent file
+" Language: dune
+" Maintainers:  Markus Mottl         <markus.mottl@gmail.com>
+" URL:          https://github.com/ocaml/vim-ocaml
+" Last Change:  2021 Jan 01
+
+if exists("b:did_indent")
+ finish
+endif
+let b:did_indent = 1
+
+" dune format-dune-file uses 1 space to indent
+setlocal softtabstop=1 shiftwidth=1 expandtab
+                                                                                                                                                                                    usr/share/vim/vim90/indent/dylan.vim                                                                0000644 0000000 0000000 00000005373 14424703754 016045  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        " Vim indent file
+" Language:	Dylan
+" Maintainer:	Brent A. Fulgham <bfulgham@debian.org> (Invalid email address)
+" 		Doug Kearns <dougkearns@gmail.com>
+" Version:	0.01
+" Last Change:	2022 Apr 06
+
+" Only load this indent file when no other was loaded.
+if exists("b:did_indent")
+  finish
+endif
+let b:did_indent = 1
+
+setlocal indentkeys+==~begin,=~block,=~case,=~cleanup,=~define,=~end,=~else,=~elseif,=~exception,=~for,=~finally,=~if,=~otherwise,=~select,=~unless,=~while
+
+" Define the appropriate indent function but only once
+setlocal indentexpr=DylanGetIndent()
+
+let b:undo_indent = "setl inde< indk<"
+
+if exists("*DylanGetIndent")
+  finish
+endif
+
+function DylanGetIndent()
+  " Get the line to be indented
+  let cline = getline(v:lnum)
+
+  " Don't reindent comments on first column
+  if cline =~ '^/\[/\*]'
+    return 0
+  endif
+
+  "Find the previous non-blank line
+  let lnum = prevnonblank(v:lnum - 1)
+  "Use zero indent at the top of the file
+  if lnum == 0
+    return 0
+  endif
+
+  let prevline=getline(lnum)
+  let ind = indent(lnum)
+  let chg = 0
+
+  " If previous line was a comment, use its indent
+  if prevline =~ '^\s*//'
+    return ind
+  endif
+
+  " If previous line was a 'define', indent
+  if prevline =~? '\(^\s*\(begin\|block\|case\|define\|else\|elseif\|for\|finally\|if\|select\|unless\|while\)\|\s*\S*\s*=>$\)'
+    let chg = shiftwidth()
+  " local methods indent the shift-width, plus 6 for the 'local'
+  elseif prevline =~? '^\s*local'
+    let chg = shiftwidth() + 6
+  " If previous line was a let with no closing semicolon, indent
+  elseif prevline =~? '^\s*let.*[^;]\s*$'
+    let chg = shiftwidth()
+  " If previous line opened a parenthesis, and did not close it, indent
+  elseif prevline =~ '^.*(\s*[^)]*\((.*)\)*[^)]*$'
+    return = match( prevline, '(.*\((.*)\|[^)]\)*.*$') + 1
+  "elseif prevline =~ '^.*(\s*[^)]*\((.*)\)*[^)]*$'
+  elseif prevline =~ '^[^(]*)\s*$'
+    " This line closes a parenthesis.  Find opening
+    let curr_line = prevnonblank(lnum - 1)
+    while curr_line >= 0
+      let str = getline(curr_line)
+      if str !~ '^.*(\s*[^)]*\((.*)\)*[^)]*$'
+	let curr_line = prevnonblank(curr_line - 1)
+      else
+	break
+      endif
+    endwhile
+    if curr_line < 0
+      return -1
+    endif
+    let ind = indent(curr_line)
+    " Although we found the closing parenthesis, make sure this
+    " line doesn't start with an indentable command:
+    let curr_str = getline(curr_line)
+    if curr_str =~? '^\s*\(begin\|block\|case\|define\|else\|elseif\|for\|finally\|if\|select\|unless\|while\)'
+      let chg = shiftwidth()
+    endif
+  endif
+
+  " If a line starts with end, un-indent (even if we just indented!)
+  if cline =~? '^\s*\(cleanup\|end\|else\|elseif\|exception\|finally\|otherwise\)'
+    let chg = chg - shiftwidth()
+  endif
+
+  return ind + chg
+endfunction
+
+" vim:sw=2 tw=130
+                                                                                                                                                                                                                                                                     usr/share/vim/vim90/indent/eiffel.vim                                                               0000644 0000000 0000000 00000006365 14424703754 016172  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        " Vim indent file
+" Language:	Eiffel
+" Maintainer:	Jocelyn Fiat <jfiat@eiffel.com>
+" Previous-Maintainer:	David Clarke <gadicath@dishevelled.net>
+" Contributions from: Takuya Fujiwara
+" Contributions from: Thilo Six
+" $Date: 2017/03/08 06:00:00 $
+" $Revision: 1.4 $
+" URL: https://github.com/eiffelhub/vim-eiffel
+
+" Only load this indent file when no other was loaded.
+if exists("b:did_indent")
+  finish
+endif
+let b:did_indent = 1
+
+setlocal indentexpr=GetEiffelIndent()
+setlocal nolisp
+setlocal nosmartindent
+setlocal nocindent
+setlocal autoindent
+setlocal comments=:--
+setlocal indentkeys+==end,=else,=ensure,=require,=check,=loop,=until
+setlocal indentkeys+==creation,=feature,=inherit,=class,=is,=redefine,=rename,=variant
+setlocal indentkeys+==invariant,=do,=local,=export
+
+let b:undo_indent = "setl smartindent< indentkeys< indentexpr< autoindent< comments< "
+
+" Define some stuff
+" keywords grouped by indenting
+let s:trust_user_indent = '\(+\)\(\s*\(--\).*\)\=$'
+let s:relative_indent = '^\s*\(deferred\|class\|feature\|creation\|inherit\|loop\|from\|across\|until\|if\|else\|elseif\|ensure\|require\|check\|do\|local\|invariant\|variant\|rename\|redefine\|do\|export\)\>'
+let s:outdent = '^\s*\(else\|invariant\|variant\|do\|require\|until\|loop\|local\)\>'
+let s:no_indent = '^\s*\(class\|feature\|creation\|inherit\)\>'
+let s:single_dent = '^[^-]\+[[:alnum:]]\+ is\(\s*\(--\).*\)\=$'
+let s:inheritance_dent = '\s*\(redefine\|rename\|export\)\>'
+
+
+" Only define the function once.
+if exists("*GetEiffelIndent")
+  finish
+endif
+
+let s:keepcpo= &cpo
+set cpo&vim
+
+function GetEiffelIndent()
+
+  " Eiffel Class indenting
+  "
+  " Find a non-blank line above the current line.
+  let lnum = prevnonblank(v:lnum - 1)
+
+  " At the start of the file use zero indent.
+  if lnum == 0
+    return 0
+  endif
+
+  " trust the user's indenting
+  if getline(lnum) =~ s:trust_user_indent
+    return -1
+  endif
+
+  " Add a 'shiftwidth' after lines that start with an indent word
+  let ind = indent(lnum)
+  if getline(lnum) =~ s:relative_indent
+    let ind = ind + shiftwidth()
+  endif
+
+  " Indent to single indent
+  if getline(v:lnum) =~ s:single_dent && getline(v:lnum) !~ s:relative_indent
+	   \ && getline(v:lnum) !~ '\s*\<\(and\|or\|implies\)\>'
+     let ind = shiftwidth()
+  endif
+
+  " Indent to double indent
+  if getline(v:lnum) =~ s:inheritance_dent
+     let ind = 2 * shiftwidth()
+  endif
+
+  " Indent line after the first line of the function definition
+  if getline(lnum) =~ s:single_dent
+     let ind = ind + shiftwidth()
+  endif
+
+  " The following should always be at the start of a line, no indenting
+  if getline(v:lnum) =~ s:no_indent
+     let ind = 0
+  endif
+
+  " Subtract a 'shiftwidth', if this isn't the first thing after the 'is'
+  " or first thing after the 'do'
+  if getline(v:lnum) =~ s:outdent && getline(v:lnum - 1) !~ s:single_dent
+	\ && getline(v:lnum - 1) !~ '^\s*do\>'
+    let ind = ind - shiftwidth()
+  endif
+
+  " Subtract a shiftwidth for end statements
+  if getline(v:lnum) =~ '^\s*end\>'
+    let ind = ind - shiftwidth()
+  endif
+
+  " set indent of zero end statements that are at an indent of 3, this should
+  " only ever be the class's end.
+  if getline(v:lnum) =~ '^\s*end\>' && ind == shiftwidth()
+    let ind = 0
+  endif
+
+  return ind
+endfunction
+
+let &cpo = s:keepcpo
+unlet s:keepcpo
+
+" vim:sw=2
+                                                                                                                                                                                                                                                                           usr/share/vim/vim90/indent/elm.vim                                                                  0000644 0000000 0000000 00000006315 14424703754 015510  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        " Elm indent plugin file
+" Language: Elm
+" Maintainer: Andreas Scharf <as@99n.de>
+" Original Author: Joseph Hager <ajhager@gmail.com>
+" Copyright: Joseph Hager <ajhager@gmail.com>
+" License: BSD3
+" Latest Revision: 2021-09-29
+
+" Only load this indent file when no other was loaded.
+if exists('b:did_indent')
+	finish
+endif
+let b:did_indent = 1
+
+" Local defaults
+setlocal expandtab
+setlocal indentexpr=GetElmIndent()
+setlocal indentkeys+=0=else,0=if,0=of,0=import,0=then,0=type,0\|,0},0\],0),=-},0=in
+setlocal nolisp
+setlocal nosmartindent
+
+let b:undo_indent = "setl et< inde< indk< lisp< si<"
+
+" Only define the function once.
+if exists('*GetElmIndent')
+	finish
+endif
+
+" Indent pairs
+function! s:FindPair(pstart, pmid, pend)
+	"call search(a:pend, 'bW')
+	return indent(searchpair(a:pstart, a:pmid, a:pend, 'bWn', 'synIDattr(synID(line("."), col("."), 0), "name") =~? "string\\|comment"'))
+endfunction
+
+function! GetElmIndent()
+	let l:lnum = v:lnum - 1
+
+	" Ident 0 if the first line of the file:
+	if l:lnum == 0
+		return 0
+	endif
+
+	let l:ind = indent(l:lnum)
+	let l:lline = getline(l:lnum)
+	let l:line = getline(v:lnum)
+
+	" Indent if current line begins with '}':
+	if l:line =~? '^\s*}'
+		return s:FindPair('{', '', '}')
+
+	" Indent if current line begins with 'else':
+	elseif l:line =~# '^\s*else\>'
+		if l:lline !~# '^\s*\(if\|then\)\>'
+			return s:FindPair('\<if\>', '', '\<else\>')
+		endif
+
+	" Indent if current line begins with 'then':
+	elseif l:line =~# '^\s*then\>'
+		if l:lline !~# '^\s*\(if\|else\)\>'
+			return s:FindPair('\<if\>', '', '\<then\>')
+		endif
+
+	" HACK: Indent lines in case with nearest case clause:
+	elseif l:line =~# '->' && l:line !~# ':' && l:line !~# '\\'
+		return indent(search('^\s*case', 'bWn')) + &shiftwidth
+
+	" HACK: Don't change the indentation if the last line is a comment.
+	elseif l:lline =~# '^\s*--'
+		return l:ind
+
+	" Align the end of block comments with the start
+	elseif l:line =~# '^\s*-}'
+		return indent(search('{-', 'bWn'))
+
+	" Indent double shift after let with an empty rhs
+	elseif l:lline =~# '\<let\>.*\s=$'
+		return l:ind + 4 + &shiftwidth
+
+	" Align 'in' with the parent let.
+	elseif l:line =~# '^\s*in\>'
+		return indent(search('^\s*let', 'bWn'))
+
+	" Align bindings with the parent let.
+	elseif l:lline =~# '\<let\>'
+		return l:ind + 4
+
+	" Align bindings with the parent in.
+	elseif l:lline =~# '^\s*in\>'
+		return l:ind
+
+	endif
+
+	" Add a 'shiftwidth' after lines ending with:
+	if l:lline =~# '\(|\|=\|->\|<-\|(\|\[\|{\|\<\(of\|else\|if\|then\)\)\s*$'
+		let l:ind = l:ind + &shiftwidth
+
+	" Add a 'shiftwidth' after lines starting with type ending with '=':
+	elseif l:lline =~# '^\s*type' && l:line =~# '^\s*='
+		let l:ind = l:ind + &shiftwidth
+
+	" Back to normal indent after comments:
+	elseif l:lline =~# '-}\s*$'
+		call search('-}', 'bW')
+		let l:ind = indent(searchpair('{-', '', '-}', 'bWn', 'synIDattr(synID(line("."), col("."), 0), "name") =~? "string"'))
+
+	" Ident some operators if there aren't any starting the last line.
+	elseif l:line =~# '^\s*\(!\|&\|(\|`\|+\||\|{\|[\|,\)=' && l:lline !~# '^\s*\(!\|&\|(\|`\|+\||\|{\|[\|,\)=' && l:lline !~# '^\s*$'
+		let l:ind = l:ind + &shiftwidth
+
+	elseif l:lline ==# '' && getline(l:lnum - 1) !=# ''
+		let l:ind = indent(search('^\s*\S+', 'bWn'))
+
+	endif
+
+	return l:ind
+endfunc
+                                                                                                                                                                                                                                                                                                                   usr/share/vim/vim90/indent/erlang.vim                                                               0000644 0000000 0000000 00000145363 14424703754 016212  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        " Vim indent file
+" Language:     Erlang (http://www.erlang.org)
+" Author:       Csaba Hoch <csaba.hoch@gmail.com>
+" Contributors: Edwin Fine <efine145_nospam01 at usa dot net>
+"               Pawel 'kTT' Salata <rockplayer.pl@gmail.com>
+"               Ricardo Catalinas Jiménez <jimenezrick@gmail.com>
+" Last Update:  2022-Sep-06
+" License:      Vim license
+" URL:          https://github.com/vim-erlang/vim-erlang-runtime
+
+" Note About Usage:
+"   This indentation script works best with the Erlang syntax file created by
+"   Kreąimir Marľić (Kresimir Marzic) and maintained by Csaba Hoch.
+
+" Notes About Implementation:
+"
+" - LTI = Line to indent.
+" - The index of the first line is 1, but the index of the first column is 0.
+
+
+" Initialization {{{1
+" ==============
+
+" Only load this indent file when no other was loaded
+" Vim 7 or later is needed
+if exists("b:did_indent") || version < 700
+  finish
+else
+  let b:did_indent = 1
+endif
+
+setlocal indentexpr=ErlangIndent()
+setlocal indentkeys+=0=end,0=of,0=catch,0=after,0=else,0=when,0=),0=],0=},0=>>
+
+let b:undo_indent = "setl inde< indk<"
+
+" Only define the functions once
+if exists("*ErlangIndent")
+  finish
+endif
+
+let s:cpo_save = &cpo
+set cpo&vim
+
+" Logging library {{{1
+" ===============
+
+" Purpose:
+"   Logs the given string using the ErlangIndentLog function if it exists.
+" Parameters:
+"   s: string
+function! s:Log(s)
+  if exists("*ErlangIndentLog")
+    call ErlangIndentLog(a:s)
+  endif
+endfunction
+
+" Line tokenizer library {{{1
+" ======================
+
+" Indtokens are "indentation tokens". See their exact format in the
+" documentation of the s:GetTokensFromLine function.
+
+" Purpose:
+"   Calculate the new virtual column after the given segment of a line.
+" Parameters:
+"   line: string
+"   first_index: integer -- the index of the first character of the segment
+"   last_index: integer -- the index of the last character of the segment
+"   vcol: integer -- the virtual column of the first character of the token
+"   tabstop: integer -- the value of the 'tabstop' option to be used
+" Returns:
+"   vcol: integer
+" Example:
+"   " index:    0 12 34567
+"   " vcol:     0 45 89
+"   s:CalcVCol("\t'\tx', b", 1, 4, 4)  -> 10
+function! s:CalcVCol(line, first_index, last_index, vcol, tabstop)
+
+  " We copy the relevant segment of the line, otherwise if the line were
+  " e.g. `"\t", term` then the else branch below would consume the `", term`
+  " part at once.
+  let line = a:line[a:first_index : a:last_index]
+
+  let i = 0
+  let last_index = a:last_index - a:first_index
+  let vcol = a:vcol
+
+  while 0 <= i && i <= last_index
+
+    if line[i] ==# "\t"
+      " Example (when tabstop == 4):
+      "
+      " vcol + tab -> next_vcol
+      " 0 + tab -> 4
+      " 1 + tab -> 4
+      " 2 + tab -> 4
+      " 3 + tab -> 4
+      " 4 + tab -> 8
+      "
+      " next_i - i == the number of tabs
+      let next_i = matchend(line, '\t*', i + 1)
+      let vcol = (vcol / a:tabstop + (next_i - i)) * a:tabstop
+      call s:Log('new vcol after tab: '. vcol)
+    else
+      let next_i = matchend(line, '[^\t]*', i + 1)
+      let vcol += next_i - i
+      call s:Log('new vcol after other: '. vcol)
+    endif
+    let i = next_i
+  endwhile
+
+  return vcol
+endfunction
+
+" Purpose:
+"   Go through the whole line and return the tokens in the line.
+" Parameters:
+"   line: string -- the line to be examined
+"   string_continuation: bool
+"   atom_continuation: bool
+" Returns:
+"   indtokens = [indtoken]
+"   indtoken = [token, vcol, col]
+"   token = string (examples: 'begin', '<quoted_atom>', '}')
+"   vcol = integer (the virtual column of the first character of the token;
+"                   counting starts from 0)
+"   col = integer (counting starts from 0)
+function! s:GetTokensFromLine(line, string_continuation, atom_continuation,
+                             \tabstop)
+
+  let linelen = strlen(a:line) " The length of the line
+  let i = 0 " The index of the current character in the line
+  let vcol = 0 " The virtual column of the current character
+  let indtokens = []
+
+  if a:string_continuation
+    let i = matchend(a:line, '^\%([^"\\]\|\\.\)*"', 0)
+    if i ==# -1
+      call s:Log('    Whole line is string continuation -> ignore')
+      return []
+    else
+      let vcol = s:CalcVCol(a:line, 0, i - 1, 0, a:tabstop)
+      call add(indtokens, ['<string_end>', vcol, i])
+    endif
+  elseif a:atom_continuation
+    let i = matchend(a:line, "^\\%([^'\\\\]\\|\\\\.\\)*'", 0)
+    if i ==# -1
+      call s:Log('    Whole line is quoted atom continuation -> ignore')
+      return []
+    else
+      let vcol = s:CalcVCol(a:line, 0, i - 1, 0, a:tabstop)
+      call add(indtokens, ['<quoted_atom_end>', vcol, i])
+    endif
+  endif
+
+  while 0 <= i && i < linelen
+
+    let next_vcol = ''
+
+    " Spaces
+    if a:line[i] ==# ' '
+      let next_i = matchend(a:line, ' *', i + 1)
+
+    " Tabs
+    elseif a:line[i] ==# "\t"
+      let next_i = matchend(a:line, '\t*', i + 1)
+
+      " See example in s:CalcVCol
+      let next_vcol = (vcol / a:tabstop + (next_i - i)) * a:tabstop
+
+    " Comment
+    elseif a:line[i] ==# '%'
+      let next_i = linelen
+
+    " String token: "..."
+    elseif a:line[i] ==# '"'
+      let next_i = matchend(a:line, '\%([^"\\]\|\\.\)*"', i + 1)
+      if next_i ==# -1
+        call add(indtokens, ['<string_start>', vcol, i])
+      else
+        let next_vcol = s:CalcVCol(a:line, i, next_i - 1, vcol, a:tabstop)
+        call add(indtokens, ['<string>', vcol, i])
+      endif
+
+    " Quoted atom token: '...'
+    elseif a:line[i] ==# "'"
+      let next_i = matchend(a:line, "\\%([^'\\\\]\\|\\\\.\\)*'", i + 1)
+      if next_i ==# -1
+        call add(indtokens, ['<quoted_atom_start>', vcol, i])
+      else
+        let next_vcol = s:CalcVCol(a:line, i, next_i - 1, vcol, a:tabstop)
+        call add(indtokens, ['<quoted_atom>', vcol, i])
+      endif
+
+    " Keyword or atom or variable token or number
+    elseif a:line[i] =~# '[a-zA-Z_@0-9]'
+      let next_i = matchend(a:line,
+                           \'[[:alnum:]_@:]*\%(\s*#\s*[[:alnum:]_@:]*\)\=',
+                           \i + 1)
+      call add(indtokens, [a:line[(i):(next_i - 1)], vcol, i])
+
+    " Character token: $<char> (as in: $a)
+    elseif a:line[i] ==# '$'
+      call add(indtokens, ['$.', vcol, i])
+      let next_i = i + 2
+
+    " Dot token: .
+    elseif a:line[i] ==# '.'
+
+      let next_i = i + 1
+
+      if i + 1 ==# linelen || a:line[i + 1] =~# '[[:blank:]%]'
+        " End of clause token: . (as in: f() -> ok.)
+        call add(indtokens, ['<end_of_clause>', vcol, i])
+
+      else
+        " Possibilities:
+        " - Dot token in float: . (as in: 3.14)
+        " - Dot token in record: . (as in: #myrec.myfield)
+        call add(indtokens, ['.', vcol, i])
+      endif
+
+    " Equal sign
+    elseif a:line[i] ==# '='
+      " This is handled separately so that "=<<" will be parsed as
+      " ['=', '<<'] instead of ['=<', '<']. Although Erlang parses it
+      " currently in the latter way, that may be fixed some day.
+      call add(indtokens, [a:line[i], vcol, i])
+      let next_i = i + 1
+
+    " Three-character tokens
+    elseif i + 1 < linelen &&
+         \ index(['=:=', '=/='], a:line[i : i + 1]) != -1
+      call add(indtokens, [a:line[i : i + 1], vcol, i])
+      let next_i = i + 2
+
+    " Two-character tokens
+    elseif i + 1 < linelen &&
+         \ index(['->', '<<', '>>', '||', '==', '/=', '=<', '>=', '?=', '++',
+         \        '--', '::'],
+         \       a:line[i : i + 1]) != -1
+      call add(indtokens, [a:line[i : i + 1], vcol, i])
+      let next_i = i + 2
+
+    " Other character: , ; < > ( ) [ ] { } # + - * / : ? = ! |
+    else
+      call add(indtokens, [a:line[i], vcol, i])
+      let next_i = i + 1
+
+    endif
+
+    if next_vcol ==# ''
+      let vcol += next_i - i
+    else
+      let vcol = next_vcol
+    endif
+
+    let i = next_i
+
+  endwhile
+
+  return indtokens
+
+endfunction
+
+" TODO: doc, handle "not found" case
+function! s:GetIndtokenAtCol(indtokens, col)
+  let i = 0
+  while i < len(a:indtokens)
+    if a:indtokens[i][2] ==# a:col
+      return [1, i]
+    elseif a:indtokens[i][2] > a:col
+      return [0, s:IndentError('No token at col ' . a:col . ', ' .
+                              \'indtokens = ' . string(a:indtokens),
+                              \'', '')]
+    endif
+    let i += 1
+  endwhile
+  return [0, s:IndentError('No token at col ' . a:col . ', ' .
+                           \'indtokens = ' . string(a:indtokens),
+                           \'', '')]
+endfunction
+
+" Stack library {{{1
+" =============
+
+" Purpose:
+"   Push a token onto the parser's stack.
+" Parameters:
+"   stack: [token]
+"   token: string
+function! s:Push(stack, token)
+  call s:Log('    Stack Push: "' . a:token . '" into ' . string(a:stack))
+  call insert(a:stack, a:token)
+endfunction
+
+" Purpose:
+"   Pop a token from the parser's stack.
+" Parameters:
+"   stack: [token]
+"   token: string
+" Returns:
+"   token: string -- the removed element
+function! s:Pop(stack)
+  let head = remove(a:stack, 0)
+  call s:Log('    Stack Pop: "' . head . '" from ' . string(a:stack))
+  return head
+endfunction
+
+" Library for accessing and storing tokenized lines {{{1
+" =================================================
+
+" The Erlang token cache: an `lnum -> indtokens` dictionary that stores the
+" tokenized lines.
+let s:all_tokens = {}
+let s:file_name = ''
+let s:last_changedtick = -1
+
+" Purpose:
+"   Clear the Erlang token cache if we have a different file or the file has
+"   been changed since the last indentation.
+function! s:ClearTokenCacheIfNeeded()
+  let file_name = expand('%:p')
+  if file_name != s:file_name ||
+   \ b:changedtick != s:last_changedtick
+    let s:file_name = file_name
+    let s:last_changedtick = b:changedtick
+    let s:all_tokens = {}
+  endif
+endfunction
+
+" Purpose:
+"   Return the tokens of line `lnum`, if that line is not empty. If it is
+"   empty, find the first non-empty line in the given `direction` and return
+"   the tokens of that line.

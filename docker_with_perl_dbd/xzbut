@@ -1,0 +1,1000 @@
+    }
+    return $self->{GTEST} = $success;
+}
+
+
+sub TIEHANDLE {
+    my($class,$file) = @_;
+    my $ret;
+    $class->debug("file[$file]");
+    my $self = $class->new($file);
+    if (0) {
+    } elsif (!$self->gtest) {
+        my $fh = FileHandle->new($file)
+            or $CPAN::Frontend->mydie("Could not open file[$file]: $!");
+        binmode $fh;
+        $self->{FH} = $fh;
+        $class->debug("via uncompressed FH");
+    } elsif ($file =~ /\.(?:bz2|tbz)$/ && $CPAN::META->has_inst("Compress::Bzip2")) {
+        my $gz = Compress::Bzip2::bzopen($file,"rb") or
+            $CPAN::Frontend->mydie("Could not bzopen $file");
+        $self->{GZ} = $gz;
+        $class->debug("via Compress::Bzip2");
+    } elsif ($file =~/\.(?:gz|tgz)$/ && _zlib_ok) {
+        my $gz = Compress::Zlib::gzopen($file,"rb") or
+            $CPAN::Frontend->mydie("Could not gzopen $file");
+        $self->{GZ} = $gz;
+        $class->debug("via Compress::Zlib");
+    } else {
+        my $gzip = CPAN::HandleConfig->safe_quote($self->{UNGZIPPRG});
+        my $pipe = "$gzip -d -c $file |";
+        my $fh = FileHandle->new($pipe) or $CPAN::Frontend->mydie("Could not pipe[$pipe]: $!");
+        binmode $fh;
+        $self->{FH} = $fh;
+        $class->debug("via external $gzip");
+    }
+    $self;
+}
+
+
+sub READLINE {
+    my($self) = @_;
+    if (exists $self->{GZ}) {
+        my $gz = $self->{GZ};
+        my($line,$bytesread);
+        $bytesread = $gz->gzreadline($line);
+        return undef if $bytesread <= 0;
+        return $line;
+    } else {
+        my $fh = $self->{FH};
+        return scalar <$fh>;
+    }
+}
+
+
+sub READ {
+    my($self,$ref,$length,$offset) = @_;
+    $CPAN::Frontend->mydie("read with offset not implemented") if defined $offset;
+    if (exists $self->{GZ}) {
+        my $gz = $self->{GZ};
+        my $byteread = $gz->gzread($$ref,$length);# 30eaf79e8b446ef52464b5422da328a8
+        return $byteread;
+    } else {
+        my $fh = $self->{FH};
+        return read($fh,$$ref,$length);
+    }
+}
+
+
+sub DESTROY {
+    my($self) = @_;
+    if (exists $self->{GZ}) {
+        my $gz = $self->{GZ};
+        $gz->gzclose() if defined $gz; # hard to say if it is allowed
+                                       # to be undef ever. AK, 2000-09
+    } else {
+        my $fh = $self->{FH};
+        $fh->close if defined $fh;
+    }
+    undef $self;
+}
+
+sub untar {
+    my($self) = @_;
+    my $file = $self->{FILE};
+    my($prefer) = 0;
+
+    my $exttar = $self->{TARPRG} || "";
+    $exttar = "" if $exttar =~ /^\s+$/; # user refuses to use it
+    my $extgzip = $self->{UNGZIPPRG} || "";
+    $extgzip = "" if $extgzip =~ /^\s+$/; # user refuses to use it
+
+    if (0) { # makes changing order easier
+    } elsif ($BUGHUNTING) {
+        $prefer=2;
+    } elsif ($CPAN::Config->{prefer_external_tar}) {
+        $prefer = 1;
+    } elsif (
+             $CPAN::META->has_usable("Archive::Tar")
+             &&
+             _zlib_ok ) {
+        my $prefer_external_tar = $CPAN::Config->{prefer_external_tar};
+        unless (defined $prefer_external_tar) {
+            if ($^O =~ /(MSWin32|solaris)/) {
+                $prefer_external_tar = 0;
+            } else {
+                $prefer_external_tar = 1;
+            }
+        }
+        $prefer = $prefer_external_tar ? 1 : 2;
+    } elsif ($exttar && $extgzip) {
+        # no modules and not bz2
+        $prefer = 1;
+        # but solaris binary tar is a problem
+        if ($^O eq 'solaris' && qx($exttar --version 2>/dev/null) !~ /gnu/i) {
+            $CPAN::Frontend->mywarn(<< 'END_WARN');
+
+WARNING: Many CPAN distributions were archived with GNU tar and some of
+them may be incompatible with Solaris tar.  We respectfully suggest you
+configure CPAN to use a GNU tar instead ("o conf init tar") or install
+a recent Archive::Tar instead;
+
+END_WARN
+        }
+    } else {
+        my $foundtar = $exttar ? "'$exttar'" : "nothing";
+        my $foundzip = $extgzip ? "'$extgzip'" : $foundtar ? "nothing" : "also nothing";
+        my $foundAT;
+        if ($CPAN::META->has_usable("Archive::Tar")) {
+            $foundAT = sprintf "'%s'", "Archive::Tar::"->VERSION;
+        } else {
+            $foundAT = "nothing";
+        }
+        my $foundCZ;
+        if (_zlib_ok) {
+            $foundCZ = sprintf "'%s'", "Compress::Zlib::"->VERSION;
+        } elsif ($foundAT) {
+            $foundCZ = "nothing";
+        } else {
+            $foundCZ = "also nothing";
+        }
+        $CPAN::Frontend->mydie(qq{
+
+CPAN.pm needs either the external programs tar and gzip -or- both
+modules Archive::Tar and Compress::Zlib installed.
+
+For tar I found $foundtar, for gzip $foundzip.
+
+For Archive::Tar I found $foundAT, for Compress::Zlib $foundCZ;
+
+Can't continue cutting file '$file'.
+});
+    }
+    my $tar_verb = "v";
+    if (defined $CPAN::Config->{tar_verbosity}) {
+        $tar_verb = $CPAN::Config->{tar_verbosity} eq "none" ? "" :
+            $CPAN::Config->{tar_verbosity};
+    }
+    if ($prefer==1) { # 1 => external gzip+tar
+        my($system);
+        my $is_compressed = $self->gtest();
+        my $tarcommand = CPAN::HandleConfig->safe_quote($exttar);
+        if ($is_compressed) {
+            my $command = CPAN::HandleConfig->safe_quote($extgzip);
+            $system = qq{$command -d -c }.
+                qq{< "$file" | $tarcommand x${tar_verb}f -};
+        } else {
+            $system = qq{$tarcommand x${tar_verb}f "$file"};
+        }
+        if (system($system) != 0) {
+            # people find the most curious tar binaries that cannot handle
+            # pipes
+            if ($is_compressed) {
+                (my $ungzf = $file) =~ s/\.gz(?!\n)\Z//;
+                $ungzf = basename $ungzf;
+                my $ct = CPAN::Tarzip->new($file);
+                if ($ct->gunzip($ungzf)) {
+                    $CPAN::Frontend->myprint(qq{Uncompressed $file successfully\n});
+                } else {
+                    $CPAN::Frontend->mydie(qq{Couldn\'t uncompress $file\n});
+                }
+                $file = $ungzf;
+            }
+            $system = qq{$tarcommand x${tar_verb}f "$file"};
+            $CPAN::Frontend->myprint(qq{Using Tar:$system:\n});
+            my $ret = system($system);
+            if ($ret==0) {
+                $CPAN::Frontend->myprint(qq{Untarred $file successfully\n});
+            } else {
+                if ($? == -1) {
+                    $CPAN::Frontend->mydie(sprintf qq{Couldn\'t untar %s: '%s'\n},
+                                           $file, $!);
+                } elsif ($? & 127) {
+                    $CPAN::Frontend->mydie(sprintf qq{Couldn\'t untar %s: child died with signal %d, %s coredump\n},
+                                           $file, ($? & 127),  ($? & 128) ? 'with' : 'without');
+                } else {
+                    $CPAN::Frontend->mydie(sprintf qq{Couldn\'t untar %s: child exited with value %d\n},
+                                           $file, $? >> 8);
+                }
+            }
+            return 1;
+        } else {
+            return 1;
+        }
+    } elsif ($prefer==2) { # 2 => modules
+        unless ($CPAN::META->has_usable("Archive::Tar")) {
+            $CPAN::Frontend->mydie("Archive::Tar not installed, please install it to continue");
+        }
+        # Make sure AT does not use uid/gid/permissions in the archive
+        # This leaves it to the user's umask instead
+        local $Archive::Tar::CHMOD = 1;
+        local $Archive::Tar::SAME_PERMISSIONS = 0;
+        # Make sure AT leaves current user as owner
+        local $Archive::Tar::CHOWN = 0;
+        my $tar = Archive::Tar->new($file,1);
+        my $af; # archive file
+        my @af;
+        if ($BUGHUNTING) {
+            # RCS 1.337 had this code, it turned out unacceptable slow but
+            # it revealed a bug in Archive::Tar. Code is only here to hunt
+            # the bug again. It should never be enabled in published code.
+            # GDGraph3d-0.53 was an interesting case according to Larry
+            # Virden.
+            warn(">>>Bughunting code enabled<<< " x 20);
+            for $af ($tar->list_files) {
+                if ($af =~ m!^(/|\.\./)!) {
+                    $CPAN::Frontend->mydie("ALERT: Archive contains ".
+                                           "illegal member [$af]");
+                }
+                $CPAN::Frontend->myprint("$af\n");
+                $tar->extract($af); # slow but effective for finding the bug
+                return if $CPAN::Signal;
+            }
+        } else {
+            for $af ($tar->list_files) {
+                if ($af =~ m!^(/|\.\./)!) {
+                    $CPAN::Frontend->mydie("ALERT: Archive contains ".
+                                           "illegal member [$af]");
+                }
+                if ($tar_verb eq "v" || $tar_verb eq "vv") {
+                    $CPAN::Frontend->myprint("$af\n");
+                }
+                push @af, $af;
+                return if $CPAN::Signal;
+            }
+            $tar->extract(@af) or
+                $CPAN::Frontend->mydie("Could not untar with Archive::Tar.");
+        }
+
+        Mac::BuildTools::convert_files([$tar->list_files], 1)
+            if ($^O eq 'MacOS');
+
+        return 1;
+    }
+}
+
+sub unzip {
+    my($self) = @_;
+    my $file = $self->{FILE};
+    if ($CPAN::META->has_inst("Archive::Zip")) {
+        # blueprint of the code from Archive::Zip::Tree::extractTree();
+        my $zip = Archive::Zip->new();
+        my $status;
+        $status = $zip->read($file);
+        $CPAN::Frontend->mydie("Read of file[$file] failed\n")
+            if $status != Archive::Zip::AZ_OK();
+        $CPAN::META->debug("Successfully read file[$file]") if $CPAN::DEBUG;
+        my @members = $zip->members();
+        for my $member ( @members ) {
+            my $af = $member->fileName();
+            if ($af =~ m!^(/|\.\./)!) {
+                $CPAN::Frontend->mydie("ALERT: Archive contains ".
+                                       "illegal member [$af]");
+            }
+            $status = $member->extractToFileNamed( $af );
+            $CPAN::META->debug("af[$af]status[$status]") if $CPAN::DEBUG;
+            $CPAN::Frontend->mydie("Extracting of file[$af] from zipfile[$file] failed\n") if
+                $status != Archive::Zip::AZ_OK();
+            return if $CPAN::Signal;
+        }
+        return 1;
+    } elsif ( my $unzip = $CPAN::Config->{unzip}  ) {
+        my @system = ($unzip, $file);
+        return system(@system) == 0;
+    }
+    else {
+            $CPAN::Frontend->mydie(<<"END");
+
+Can't unzip '$file':
+
+You have not configured an 'unzip' program and do not have Archive::Zip
+installed.  Please either install Archive::Zip or else configure 'unzip'
+by running the command 'o conf init unzip' from the CPAN shell prompt.
+
+END
+    }
+}
+
+1;
+
+__END__
+
+=head1 NAME
+
+CPAN::Tarzip - internal handling of tar archives for CPAN.pm
+
+=head1 LICENSE
+
+This program is free software; you can redistribute it and/or
+modify it under the same terms as Perl itself.
+
+=cut
+                                                                                                                                                                                                                                                                usr/share/perl/5.36.0/CPAN/URL.pm                                                                   0000644 0000000 0000000 00000001114 14530460112 014364  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        # -*- Mode: cperl; coding: utf-8; cperl-indent-level: 4 -*-
+# vim: ts=4 sts=4 sw=4:
+package CPAN::URL;
+use overload '""' => "as_string", fallback => 1;
+# accessors: TEXT(the url string), FROM(DEF=>defaultlist,USER=>urllist),
+# planned are things like age or quality
+
+use vars qw(
+            $VERSION
+);
+$VERSION = "5.5";
+
+sub new {
+    my($class,%args) = @_;
+    bless {
+           %args
+          }, $class;
+}
+sub as_string {
+    my($self) = @_;
+    $self->text;
+}
+sub text {
+    my($self,$set) = @_;
+    if (defined $set) {
+        $self->{TEXT} = $set;
+    }
+    $self->{TEXT};
+}
+
+1;
+                                                                                                                                                                                                                                                                                                                                                                                                                                                    usr/share/perl/5.36.0/CPAN/Version.pm                                                               0000644 0000000 0000000 00000010456 14530460112 015360  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        package CPAN::Version;
+
+use strict;
+use vars qw($VERSION);
+$VERSION = "5.5003";
+
+# CPAN::Version::vcmp courtesy Jost Krieger
+sub vcmp {
+    my($self,$l,$r) = @_;
+    local($^W) = 0;
+    CPAN->debug("l[$l] r[$r]") if $CPAN::DEBUG;
+
+    # treat undef as zero
+    $l = 0 if $l eq 'undef';
+    $r = 0 if $r eq 'undef';
+
+    return 0 if $l eq $r; # short circuit for quicker success
+
+    for ($l,$r) {
+        s/_//g;
+    }
+    CPAN->debug("l[$l] r[$r]") if $CPAN::DEBUG;
+    for ($l,$r) {
+        next unless tr/.// > 1 || /^v/;
+        s/^v?/v/;
+        1 while s/\.0+(\d)/.$1/; # remove leading zeroes per group
+    }
+    CPAN->debug("l[$l] r[$r]") if $CPAN::DEBUG;
+    if ($l=~/^v/ <=> $r=~/^v/) {
+        for ($l,$r) {
+            next if /^v/;
+            $_ = $self->float2vv($_);
+        }
+    }
+    CPAN->debug("l[$l] r[$r]") if $CPAN::DEBUG;
+    my $lvstring = "v0";
+    my $rvstring = "v0";
+    if ($] >= 5.006
+     && $l =~ /^v/
+     && $r =~ /^v/) {
+        $lvstring = $self->vstring($l);
+        $rvstring = $self->vstring($r);
+        CPAN->debug(sprintf "lv[%vd] rv[%vd]", $lvstring, $rvstring) if $CPAN::DEBUG;
+    }
+
+    return (
+            ($l ne "undef") <=> ($r ne "undef")
+            ||
+            $lvstring cmp $rvstring
+            ||
+            $l <=> $r
+            ||
+            $l cmp $r
+    );
+}
+
+sub vgt {
+    my($self,$l,$r) = @_;
+    $self->vcmp($l,$r) > 0;
+}
+
+sub vlt {
+    my($self,$l,$r) = @_;
+    $self->vcmp($l,$r) < 0;
+}
+
+sub vge {
+    my($self,$l,$r) = @_;
+    $self->vcmp($l,$r) >= 0;
+}
+
+sub vle {
+    my($self,$l,$r) = @_;
+    $self->vcmp($l,$r) <= 0;
+}
+
+sub vstring {
+    my($self,$n) = @_;
+    $n =~ s/^v// or die "CPAN::Version::vstring() called with invalid arg [$n]";
+    pack "U*", split /\./, $n;
+}
+
+# vv => visible vstring
+sub float2vv {
+    my($self,$n) = @_;
+    my($rev) = int($n);
+    $rev ||= 0;
+    my($mantissa) = $n =~ /\.(\d{1,12})/; # limit to 12 digits to limit
+                                          # architecture influence
+    $mantissa ||= 0;
+    $mantissa .= "0" while length($mantissa)%3;
+    my $ret = "v" . $rev;
+    while ($mantissa) {
+        $mantissa =~ s/(\d{1,3})// or
+            die "Panic: length>0 but not a digit? mantissa[$mantissa]";
+        $ret .= ".".int($1);
+    }
+    # warn "n[$n]ret[$ret]";
+    $ret =~ s/(\.0)+/.0/; # v1.0.0 => v1.0
+    $ret;
+}
+
+sub readable {
+    my($self,$n) = @_;
+    $n =~ /^([\w\-\+\.]+)/;
+
+    return $1 if defined $1 && length($1)>0;
+    # if the first user reaches version v43, he will be treated as "+".
+    # We'll have to decide about a new rule here then, depending on what
+    # will be the prevailing versioning behavior then.
+
+    if ($] < 5.006) { # or whenever v-strings were introduced
+        # we get them wrong anyway, whatever we do, because 5.005 will
+        # have already interpreted 0.2.4 to be "0.24". So even if he
+        # indexer sends us something like "v0.2.4" we compare wrongly.
+
+        # And if they say v1.2, then the old perl takes it as "v12"
+
+        if (defined $CPAN::Frontend) {
+            $CPAN::Frontend->mywarn("Suspicious version string seen [$n]\n");
+        } else {
+            warn("Suspicious version string seen [$n]\n");
+        }
+        return $n;
+    }
+    my $better = sprintf "v%vd", $n;
+    CPAN->debug("n[$n] better[$better]") if $CPAN::DEBUG;
+    return $better;
+}
+
+1;
+
+__END__
+
+=head1 NAME
+
+CPAN::Version - utility functions to compare CPAN versions
+
+=head1 SYNOPSIS
+
+  use CPAN::Version;
+
+  CPAN::Version->vgt("1.1","1.1.1");    # 1 bc. 1.1 > 1.001001
+
+  CPAN::Version->vlt("1.1","1.1");      # 0 bc. 1.1 not < 1.1
+
+  CPAN::Version->vcmp("1.1","1.1.1");   # 1 bc. first is larger
+
+  CPAN::Version->vcmp("1.1.1","1.1");   # -1 bc. first is smaller
+
+  CPAN::Version->readable(v1.2.3);      # "v1.2.3"
+
+  CPAN::Version->vstring("v1.2.3");     # v1.2.3
+
+  CPAN::Version->float2vv(1.002003);    # "v1.2.3"
+
+=head1 DESCRIPTION
+
+This module mediates between some version that perl sees in a package
+and the version that is published by the CPAN indexer.
+
+It's only written as a helper module for both CPAN.pm and CPANPLUS.pm.
+
+As it stands it predates version.pm but has the same goal: make
+version strings visible and comparable.
+
+=head1 LICENSE
+
+This program is free software; you can redistribute it and/or
+modify it under the same terms as Perl itself.
+
+=cut
+
+# Local Variables:
+# mode: cperl
+# cperl-indent-level: 4
+# End:
+                                                                                                                                                                                                                  usr/share/perl/5.36.0/CPAN.pm                                                                       0000644 0000000 0000000 00000441003 14530460112 013727  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        # -*- Mode: cperl; coding: utf-8; cperl-indent-level: 4 -*-
+# vim: ts=4 sts=4 sw=4:
+use strict;
+package CPAN;
+$CPAN::VERSION = '2.33';
+$CPAN::VERSION =~ s/_//;
+
+# we need to run chdir all over and we would get at wrong libraries
+# there
+use File::Spec ();
+BEGIN {
+    if (File::Spec->can("rel2abs")) {
+        for my $inc (@INC) {
+            $inc = File::Spec->rel2abs($inc) unless ref $inc;
+        }
+    }
+    $SIG{WINCH} = 'IGNORE' if exists $SIG{WINCH};
+}
+use CPAN::Author;
+use CPAN::HandleConfig;
+use CPAN::Version;
+use CPAN::Bundle;
+use CPAN::CacheMgr;
+use CPAN::Complete;
+use CPAN::Debug;
+use CPAN::Distribution;
+use CPAN::Distrostatus;
+use CPAN::FTP;
+use CPAN::Index 1.93; # https://rt.cpan.org/Ticket/Display.html?id=43349
+use CPAN::InfoObj;
+use CPAN::Module;
+use CPAN::Prompt;
+use CPAN::URL;
+use CPAN::Queue;
+use CPAN::Tarzip;
+use CPAN::DeferredCode;
+use CPAN::Shell;
+use CPAN::LWP::UserAgent;
+use CPAN::Exception::RecursiveDependency;
+use CPAN::Exception::yaml_not_installed;
+use CPAN::Exception::yaml_process_error;
+
+use Carp ();
+use Config ();
+use Cwd qw(chdir);
+use DirHandle ();
+use Exporter ();
+use ExtUtils::MakeMaker qw(prompt); # for some unknown reason,
+                                    # 5.005_04 does not work without
+                                    # this
+use File::Basename ();
+use File::Copy ();
+use File::Find;
+use File::Path ();
+use FileHandle ();
+use Fcntl qw(:flock);
+use Safe ();
+use Sys::Hostname qw(hostname);
+use Text::ParseWords ();
+use Text::Wrap ();
+
+# protect against "called too early"
+sub find_perl ();
+sub anycwd ();
+sub _uniq;
+
+no lib ".";
+
+require Mac::BuildTools if $^O eq 'MacOS';
+if ($ENV{PERL5_CPAN_IS_RUNNING} && $$ != $ENV{PERL5_CPAN_IS_RUNNING}) {
+    $ENV{PERL5_CPAN_IS_RUNNING_IN_RECURSION} ||= $ENV{PERL5_CPAN_IS_RUNNING};
+    my @rec = _uniq split(/,/, $ENV{PERL5_CPAN_IS_RUNNING_IN_RECURSION}), $$;
+    $ENV{PERL5_CPAN_IS_RUNNING_IN_RECURSION} = join ",", @rec;
+    # warn "# Note: Recursive call of CPAN.pm detected\n";
+    my $w = sprintf "# Note: CPAN.pm is running in process %d now", pop @rec;
+    my %sleep = (
+                 5 => 30,
+                 6 => 60,
+                 7 => 120,
+                );
+    my $sleep = @rec > 7 ? 300 : ($sleep{scalar @rec}||0);
+    my $verbose = @rec >= 4;
+    while (@rec) {
+        $w .= sprintf " which has been called by process %d", pop @rec;
+    }
+    if ($sleep) {
+        $w .= ".\n\n# Sleeping $sleep seconds to protect other processes\n";
+    }
+    if ($verbose) {
+        warn $w;
+    }
+    local $| = 1;
+    my $have_been_sleeping = 0;
+    while ($sleep > 0) {
+        printf "\r#%5d", --$sleep;
+        sleep 1;
+	++$have_been_sleeping;
+    }
+    print "\n" if $have_been_sleeping;
+}
+$ENV{PERL5_CPAN_IS_RUNNING}=$$;
+$ENV{PERL5_CPANPLUS_IS_RUNNING}=$$; # https://rt.cpan.org/Ticket/Display.html?id=23735
+
+END { $CPAN::End++; &cleanup; }
+
+$CPAN::Signal ||= 0;
+$CPAN::Frontend ||= "CPAN::Shell";
+unless (@CPAN::Defaultsites) {
+    @CPAN::Defaultsites = map {
+        CPAN::URL->new(TEXT => $_, FROM => "DEF")
+    }
+        "http://www.perl.org/CPAN/",
+        "ftp://ftp.perl.org/pub/CPAN/";
+}
+# $CPAN::iCwd (i for initial)
+$CPAN::iCwd ||= CPAN::anycwd();
+$CPAN::Perl ||= CPAN::find_perl();
+$CPAN::Defaultdocs ||= "http://search.cpan.org/perldoc?";
+$CPAN::Defaultrecent ||= "http://search.cpan.org/uploads.rdf";
+$CPAN::Defaultrecent ||= "http://cpan.uwinnipeg.ca/htdocs/cpan.xml";
+
+# our globals are getting a mess
+use vars qw(
+            $AUTOLOAD
+            $Be_Silent
+            $CONFIG_DIRTY
+            $Defaultdocs
+            $Echo_readline
+            $Frontend
+            $GOTOSHELL
+            $HAS_USABLE
+            $Have_warned
+            $MAX_RECURSION
+            $META
+            $RUN_DEGRADED
+            $Signal
+            $SQLite
+            $Suppress_readline
+            $VERSION
+            $autoload_recursion
+            $term
+            @Defaultsites
+            @EXPORT
+           );
+
+$MAX_RECURSION = 32;
+
+@CPAN::ISA = qw(CPAN::Debug Exporter);
+
+# note that these functions live in CPAN::Shell and get executed via
+# AUTOLOAD when called directly
+@EXPORT = qw(
+             autobundle
+             bundle
+             clean
+             cvs_import
+             expand
+             force
+             fforce
+             get
+             install
+             install_tested
+             is_tested
+             make
+             mkmyconfig
+             notest
+             perldoc
+             readme
+             recent
+             recompile
+             report
+             shell
+             smoke
+             test
+             upgrade
+            );
+
+sub soft_chdir_with_alternatives ($);
+
+{
+    $autoload_recursion ||= 0;
+
+    #-> sub CPAN::AUTOLOAD ;
+    sub AUTOLOAD { ## no critic
+        $autoload_recursion++;
+        my($l) = $AUTOLOAD;
+        $l =~ s/.*:://;
+        if ($CPAN::Signal) {
+            warn "Refusing to autoload '$l' while signal pending";
+            $autoload_recursion--;
+            return;
+        }
+        if ($autoload_recursion > 1) {
+            my $fullcommand = join " ", map { "'$_'" } $l, @_;
+            warn "Refusing to autoload $fullcommand in recursion\n";
+            $autoload_recursion--;
+            return;
+        }
+        my(%export);
+        @export{@EXPORT} = '';
+        CPAN::HandleConfig->load unless $CPAN::Config_loaded++;
+        if (exists $export{$l}) {
+            CPAN::Shell->$l(@_);
+        } else {
+            die(qq{Unknown CPAN command "$AUTOLOAD". }.
+                qq{Type ? for help.\n});
+        }
+        $autoload_recursion--;
+    }
+}
+
+{
+    my $x = *SAVEOUT; # avoid warning
+    open($x,">&STDOUT") or die "dup failed";
+    my $redir = 0;
+    sub _redirect(@) {
+        #die if $redir;
+        local $_;
+        push(@_,undef);
+        while(defined($_=shift)) {
+            if (s/^\s*>//){
+                my ($m) = s/^>// ? ">" : "";
+                s/\s+//;
+                $_=shift unless length;
+                die "no dest" unless defined;
+                open(STDOUT,">$m$_") or die "open:$_:$!\n";
+                $redir=1;
+            } elsif ( s/^\s*\|\s*// ) {
+                my $pipe="| $_";
+                while(defined($_[0])){
+                    $pipe .= ' ' . shift;
+                }
+                open(STDOUT,$pipe) or die "open:$pipe:$!\n";
+                $redir=1;
+            } else {
+                push(@_,$_);
+            }
+        }
+        return @_;
+    }
+    sub _unredirect {
+        return unless $redir;
+        $redir = 0;
+        ## redirect: unredirect and propagate errors.  explicit close to wait for pipe.
+        close(STDOUT);
+        open(STDOUT,">&SAVEOUT");
+        die "$@" if "$@";
+        ## redirect: done
+    }
+}
+
+sub _uniq {
+    my(@list) = @_;
+    my %seen;
+    return grep { !$seen{$_}++ } @list;
+}
+
+#-> sub CPAN::shell ;
+sub shell {
+    my($self) = @_;
+    $Suppress_readline = ! -t STDIN unless defined $Suppress_readline;
+    CPAN::HandleConfig->load unless $CPAN::Config_loaded++;
+
+    my $oprompt = shift || CPAN::Prompt->new;
+    my $prompt = $oprompt;
+    my $commandline = shift || "";
+    $CPAN::CurrentCommandId ||= 1;
+
+    local($^W) = 1;
+    unless ($Suppress_readline) {
+        require Term::ReadLine;
+        if (! $term
+            or
+            $term->ReadLine eq "Term::ReadLine::Stub"
+           ) {
+            $term = Term::ReadLine->new('CPAN Monitor');
+        }
+        if ($term->ReadLine eq "Term::ReadLine::Gnu") {
+            my $attribs = $term->Attribs;
+            $attribs->{attempted_completion_function} = sub {
+                &CPAN::Complete::gnu_cpl;
+            }
+        } else {
+            $readline::rl_completion_function =
+                $readline::rl_completion_function = 'CPAN::Complete::cpl';
+        }
+        if (my $histfile = $CPAN::Config->{'histfile'}) {{
+            unless ($term->can("AddHistory")) {
+                $CPAN::Frontend->mywarn("Terminal does not support AddHistory.\n");
+                unless ($CPAN::META->has_inst('Term::ReadLine::Perl')) {
+                    $CPAN::Frontend->mywarn("\nTo fix that, maybe try>  install Term::ReadLine::Perl\n\n");
+                }
+                last;
+            }
+            $META->readhist($term,$histfile);
+        }}
+        for ($CPAN::Config->{term_ornaments}) { # alias
+            local $Term::ReadLine::termcap_nowarn = 1;
+            $term->ornaments($_) if defined;
+        }
+        # $term->OUT is autoflushed anyway
+        my $odef = select STDERR;
+        $| = 1;
+        select STDOUT;
+        $| = 1;
+        select $odef;
+    }
+
+    $META->checklock();
+    my @cwd = grep { defined $_ and length $_ }
+        CPAN::anycwd(),
+              File::Spec->can("tmpdir") ? File::Spec->tmpdir() : (),
+                    File::Spec->rootdir();
+    my $try_detect_readline;
+    $try_detect_readline = $term->ReadLine eq "Term::ReadLine::Stub" if $term;
+    unless ($CPAN::Config->{inhibit_startup_message}) {
+        my $rl_avail = $Suppress_readline ? "suppressed" :
+            ($term->ReadLine ne "Term::ReadLine::Stub") ? "enabled" :
+                "available (maybe install Bundle::CPAN or Bundle::CPANxxl?)";
+        $CPAN::Frontend->myprint(
+                                 sprintf qq{
+cpan shell -- CPAN exploration and modules installation (v%s)
+Enter 'h' for help.
+
+},
+                                 $CPAN::VERSION,
+                                )
+    }
+    my($continuation) = "";
+    my $last_term_ornaments;
+  SHELLCOMMAND: while () {
+        if ($Suppress_readline) {
+            if ($Echo_readline) {
+                $|=1;
+            }
+            print $prompt;
+            last SHELLCOMMAND unless defined ($_ = <> );
+            if ($Echo_readline) {
+                # backdoor: I could not find a way to record sessions
+                print $_;
+            }
+            chomp;
+        } else {
+            last SHELLCOMMAND unless
+                defined ($_ = $term->readline($prompt, $commandline));
+        }
+        $_ = "$continuation$_" if $continuation;
+        s/^\s+//;
+        next SHELLCOMMAND if /^$/;
+        s/^\s*\?\s*/help /;
+        if (/^(?:q(?:uit)?|bye|exit)\s*$/i) {
+            last SHELLCOMMAND;
+        } elsif (s/\\$//s) {
+            chomp;
+            $continuation = $_;
+            $prompt = "    > ";
+        } elsif (/^\!/) {
+            s/^\!//;
+            my($eval) = $_;
+            package
+                CPAN::Eval; # hide from the indexer
+            use strict;
+            use vars qw($import_done);
+            CPAN->import(':DEFAULT') unless $import_done++;
+            CPAN->debug("eval[$eval]") if $CPAN::DEBUG;
+            eval($eval);
+            warn $@ if $@;
+            $continuation = "";
+            $prompt = $oprompt;
+        } elsif (/./) {
+            my(@line);
+            eval { @line = Text::ParseWords::shellwords($_) };
+            warn($@), next SHELLCOMMAND if $@;
+            warn("Text::Parsewords could not parse the line [$_]"),
+                next SHELLCOMMAND unless @line;
+            $CPAN::META->debug("line[".join("|",@line)."]") if $CPAN::DEBUG;
+            my $command = shift @line;
+            eval {
+                local (*STDOUT)=*STDOUT;
+                @line = _redirect(@line);
+                CPAN::Shell->$command(@line)
+              };
+            my $command_error = $@;
+            _unredirect;
+            my $reported_error;
+            if ($command_error) {
+                my $err = $command_error;
+                if (ref $err and $err->isa('CPAN::Exception::blocked_urllist')) {
+                    $CPAN::Frontend->mywarn("Client not fully configured, please proceed with configuring.$err");
+                    $reported_error = ref $err;
+                } else {
+                    # I'd prefer never to arrive here and make all errors exception objects
+                    if ($err =~ /\S/) {
+                        require Carp;
+                        require Dumpvalue;
+                        my $dv = Dumpvalue->new(tick => '"');
+                        Carp::cluck(sprintf "Catching error: %s", $dv->stringify($err));
+                    }
+                }
+            }
+            if ($command =~ /^(
+                             # classic commands
+                             make
+                             |test
+                             |install
+                             |clean
+
+                             # pragmas for classic commands
+                             |ff?orce
+                             |notest
+
+                             # compounds
+                             |report
+                             |smoke
+                             |upgrade
+                            )$/x) {
+                # only commands that tell us something about failed distros
+                # eval necessary for people without an urllist
+                eval {CPAN::Shell->failed($CPAN::CurrentCommandId,1);};
+                if (my $err = $@) {
+                    unless (ref $err and $reported_error eq ref $err) {
+                        die $@;
+                    }
+                }
+            }
+            soft_chdir_with_alternatives(\@cwd);
+            $CPAN::Frontend->myprint("\n");
+            $continuation = "";
+            $CPAN::CurrentCommandId++;
+            $prompt = $oprompt;
+        }
+    } continue {
+        $commandline = ""; # I do want to be able to pass a default to
+                           # shell, but on the second command I see no
+                           # use in that
+        $Signal=0;
+        CPAN::Queue->nullify_queue;
+        if ($try_detect_readline) {
+            if ($CPAN::META->has_inst("Term::ReadLine::Gnu")
+                ||
+                $CPAN::META->has_inst("Term::ReadLine::Perl")
+            ) {
+                delete $INC{"Term/ReadLine.pm"};
+                my $redef = 0;
+                local($SIG{__WARN__}) = CPAN::Shell::paintdots_onreload(\$redef);
+                require Term::ReadLine;
+                $CPAN::Frontend->myprint("\n$redef subroutines in ".
+                                         "Term::ReadLine redefined\n");
+                $GOTOSHELL = 1;
+            }
+        }
+        if ($term and $term->can("ornaments")) {
+            for ($CPAN::Config->{term_ornaments}) { # alias
+                if (defined $_) {
+                    if (not defined $last_term_ornaments
+                        or $_ != $last_term_ornaments
+                    ) {
+                        local $Term::ReadLine::termcap_nowarn = 1;
+                        $term->ornaments($_);
+                        $last_term_ornaments = $_;
+                    }
+                } else {
+                    undef $last_term_ornaments;
+                }
+            }
+        }
+        for my $class (qw(Module Distribution)) {
+            # again unsafe meta access?
+            for my $dm (sort keys %{$CPAN::META->{readwrite}{"CPAN::$class"}}) {
+                next unless $CPAN::META->{readwrite}{"CPAN::$class"}{$dm}{incommandcolor};
+                CPAN->debug("BUG: $class '$dm' was in command state, resetting");
+                delete $CPAN::META->{readwrite}{"CPAN::$class"}{$dm}{incommandcolor};
+            }
+        }
+        if ($GOTOSHELL) {
+            $GOTOSHELL = 0; # not too often
+            $META->savehist if $CPAN::term && $CPAN::term->can("GetHistory");
+            @_ = ($oprompt,"");
+            goto &shell;
+        }
+    }

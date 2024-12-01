@@ -1,0 +1,1000 @@
+httplib = util.httplib
+urlerr = util.urlerr
+urlreq = util.urlreq
+
+
+def encodevalueinheaders(value, header, limit):
+    """Encode a string value into multiple HTTP headers.
+
+    ``value`` will be encoded into 1 or more HTTP headers with the names
+    ``header-<N>`` where ``<N>`` is an integer starting at 1. Each header
+    name + value will be at most ``limit`` bytes long.
+
+    Returns an iterable of 2-tuples consisting of header names and
+    values as native strings.
+    """
+    # HTTP Headers are ASCII. Python 3 requires them to be unicodes,
+    # not bytes. This function always takes bytes in as arguments.
+    fmt = pycompat.strurl(header) + r'-%s'
+    # Note: it is *NOT* a bug that the last bit here is a bytestring
+    # and not a unicode: we're just getting the encoded length anyway,
+    # and using an r-string to make it portable between Python 2 and 3
+    # doesn't work because then the \r is a literal backslash-r
+    # instead of a carriage return.
+    valuelen = limit - len(fmt % '000') - len(b': \r\n')
+    result = []
+
+    n = 0
+    for i in range(0, len(value), valuelen):
+        n += 1
+        result.append((fmt % str(n), pycompat.strurl(value[i : i + valuelen])))
+
+    return result
+
+
+class _multifile:
+    def __init__(self, *fileobjs):
+        for f in fileobjs:
+            if not util.safehasattr(f, b'length'):
+                raise ValueError(
+                    b'_multifile only supports file objects that '
+                    b'have a length but this one does not:',
+                    type(f),
+                    f,
+                )
+        self._fileobjs = fileobjs
+        self._index = 0
+
+    @property
+    def length(self):
+        return sum(f.length for f in self._fileobjs)
+
+    def read(self, amt=None):
+        if amt <= 0:
+            return b''.join(f.read() for f in self._fileobjs)
+        parts = []
+        while amt and self._index < len(self._fileobjs):
+            parts.append(self._fileobjs[self._index].read(amt))
+            got = len(parts[-1])
+            if got < amt:
+                self._index += 1
+            amt -= got
+        return b''.join(parts)
+
+    def seek(self, offset, whence=os.SEEK_SET):
+        if whence != os.SEEK_SET:
+            raise NotImplementedError(
+                b'_multifile does not support anything other'
+                b' than os.SEEK_SET for whence on seek()'
+            )
+        if offset != 0:
+            raise NotImplementedError(
+                b'_multifile only supports seeking to start, but that '
+                b'could be fixed if you need it'
+            )
+        for f in self._fileobjs:
+            f.seek(0)
+        self._index = 0
+
+
+def makev1commandrequest(
+    ui, requestbuilder, caps, capablefn, repobaseurl, cmd, args
+):
+    """Make an HTTP request to run a command for a version 1 client.
+
+    ``caps`` is a set of known server capabilities. The value may be
+    None if capabilities are not yet known.
+
+    ``capablefn`` is a function to evaluate a capability.
+
+    ``cmd``, ``args``, and ``data`` define the command, its arguments, and
+    raw data to pass to it.
+    """
+    if cmd == b'pushkey':
+        args[b'data'] = b''
+    data = args.pop(b'data', None)
+    headers = args.pop(b'headers', {})
+
+    ui.debug(b"sending %s command\n" % cmd)
+    q = [(b'cmd', cmd)]
+    headersize = 0
+    # Important: don't use self.capable() here or else you end up
+    # with infinite recursion when trying to look up capabilities
+    # for the first time.
+    postargsok = caps is not None and b'httppostargs' in caps
+
+    # Send arguments via POST.
+    if postargsok and args:
+        strargs = urlreq.urlencode(sorted(args.items()))
+        if not data:
+            data = strargs
+        else:
+            if isinstance(data, bytes):
+                i = io.BytesIO(data)
+                i.length = len(data)
+                data = i
+            argsio = io.BytesIO(strargs)
+            argsio.length = len(strargs)
+            data = _multifile(argsio, data)
+        headers['X-HgArgs-Post'] = len(strargs)
+    elif args:
+        # Calling self.capable() can infinite loop if we are calling
+        # "capabilities". But that command should never accept wire
+        # protocol arguments. So this should never happen.
+        assert cmd != b'capabilities'
+        httpheader = capablefn(b'httpheader')
+        if httpheader:
+            headersize = int(httpheader.split(b',', 1)[0])
+
+        # Send arguments via HTTP headers.
+        if headersize > 0:
+            # The headers can typically carry more data than the URL.
+            encoded_args = urlreq.urlencode(sorted(args.items()))
+            for header, value in encodevalueinheaders(
+                encoded_args, b'X-HgArg', headersize
+            ):
+                headers[header] = value
+        # Send arguments via query string (Mercurial <1.9).
+        else:
+            q += sorted(args.items())
+
+    qs = b'?%s' % urlreq.urlencode(q)
+    cu = b"%s%s" % (repobaseurl, qs)
+    size = 0
+    if util.safehasattr(data, b'length'):
+        size = data.length
+    elif data is not None:
+        size = len(data)
+    if data is not None and 'Content-Type' not in headers:
+        headers['Content-Type'] = 'application/mercurial-0.1'
+
+    # Tell the server we accept application/mercurial-0.2 and multiple
+    # compression formats if the server is capable of emitting those
+    # payloads.
+    # Note: Keep this set empty by default, as client advertisement of
+    # protocol parameters should only occur after the handshake.
+    protoparams = set()
+
+    mediatypes = set()
+    if caps is not None:
+        mt = capablefn(b'httpmediatype')
+        if mt:
+            protoparams.add(b'0.1')
+            mediatypes = set(mt.split(b','))
+
+        protoparams.add(b'partial-pull')
+
+    if b'0.2tx' in mediatypes:
+        protoparams.add(b'0.2')
+
+    if b'0.2tx' in mediatypes and capablefn(b'compression'):
+        # We /could/ compare supported compression formats and prune
+        # non-mutually supported or error if nothing is mutually supported.
+        # For now, send the full list to the server and have it error.
+        comps = [
+            e.wireprotosupport().name
+            for e in util.compengines.supportedwireengines(util.CLIENTROLE)
+        ]
+        protoparams.add(b'comp=%s' % b','.join(comps))
+
+    if protoparams:
+        protoheaders = encodevalueinheaders(
+            b' '.join(sorted(protoparams)), b'X-HgProto', headersize or 1024
+        )
+        for header, value in protoheaders:
+            headers[header] = value
+
+    varyheaders = []
+    for header in headers:
+        if header.lower().startswith('x-hg'):
+            varyheaders.append(header)
+
+    if varyheaders:
+        headers['Vary'] = ','.join(sorted(varyheaders))
+
+    req = requestbuilder(pycompat.strurl(cu), data, headers)
+
+    if data is not None:
+        ui.debug(b"sending %d bytes\n" % size)
+        req.add_unredirected_header('Content-Length', '%d' % size)
+
+    return req, cu, qs
+
+
+def sendrequest(ui, opener, req):
+    """Send a prepared HTTP request.
+
+    Returns the response object.
+    """
+    dbg = ui.debug
+    if ui.debugflag and ui.configbool(b'devel', b'debug.peer-request'):
+        line = b'devel-peer-request: %s\n'
+        dbg(
+            line
+            % b'%s %s'
+            % (
+                pycompat.bytesurl(req.get_method()),
+                pycompat.bytesurl(req.get_full_url()),
+            )
+        )
+        hgargssize = None
+
+        for header, value in sorted(req.header_items()):
+            header = pycompat.bytesurl(header)
+            value = pycompat.bytesurl(value)
+            if header.startswith(b'X-hgarg-'):
+                if hgargssize is None:
+                    hgargssize = 0
+                hgargssize += len(value)
+            else:
+                dbg(line % b'  %s %s' % (header, value))
+
+        if hgargssize is not None:
+            dbg(
+                line
+                % b'  %d bytes of commands arguments in headers'
+                % hgargssize
+            )
+        data = req.data
+        if data is not None:
+            length = getattr(data, 'length', None)
+            if length is None:
+                length = len(data)
+            dbg(line % b'  %d bytes of data' % length)
+
+        start = util.timer()
+
+    res = None
+    try:
+        res = opener.open(req)
+    except urlerr.httperror as inst:
+        if inst.code == 401:
+            raise error.Abort(_(b'authorization failed'))
+        raise
+    except httplib.HTTPException as inst:
+        ui.debug(
+            b'http error requesting %s\n'
+            % urlutil.hidepassword(req.get_full_url())
+        )
+        ui.traceback()
+        raise IOError(None, inst)
+    finally:
+        if ui.debugflag and ui.configbool(b'devel', b'debug.peer-request'):
+            code = res.code if res else -1
+            dbg(
+                line
+                % b'  finished in %.4f seconds (%d)'
+                % (util.timer() - start, code)
+            )
+
+    # Insert error handlers for common I/O failures.
+    urlmod.wrapresponse(res)
+
+    return res
+
+
+class RedirectedRepoError(error.RepoError):
+    def __init__(self, msg, respurl):
+        super(RedirectedRepoError, self).__init__(msg)
+        self.respurl = respurl
+
+
+def parsev1commandresponse(ui, baseurl, requrl, qs, resp, compressible):
+    # record the url we got redirected to
+    redirected = False
+    respurl = pycompat.bytesurl(resp.geturl())
+    if respurl.endswith(qs):
+        respurl = respurl[: -len(qs)]
+        qsdropped = False
+    else:
+        qsdropped = True
+
+    if baseurl.rstrip(b'/') != respurl.rstrip(b'/'):
+        redirected = True
+        if not ui.quiet:
+            ui.warn(_(b'real URL is %s\n') % respurl)
+
+    try:
+        proto = pycompat.bytesurl(resp.getheader('content-type', ''))
+    except AttributeError:
+        proto = pycompat.bytesurl(resp.headers.get('content-type', ''))
+
+    safeurl = urlutil.hidepassword(baseurl)
+    if proto.startswith(b'application/hg-error'):
+        raise error.OutOfBandError(resp.read())
+
+    # Pre 1.0 versions of Mercurial used text/plain and
+    # application/hg-changegroup. We don't support such old servers.
+    if not proto.startswith(b'application/mercurial-'):
+        ui.debug(b"requested URL: '%s'\n" % urlutil.hidepassword(requrl))
+        msg = _(
+            b"'%s' does not appear to be an hg repository:\n"
+            b"---%%<--- (%s)\n%s\n---%%<---\n"
+        ) % (safeurl, proto or b'no content-type', resp.read(1024))
+
+        # Some servers may strip the query string from the redirect. We
+        # raise a special error type so callers can react to this specially.
+        if redirected and qsdropped:
+            raise RedirectedRepoError(msg, respurl)
+        else:
+            raise error.RepoError(msg)
+
+    try:
+        subtype = proto.split(b'-', 1)[1]
+
+        version_info = tuple([int(n) for n in subtype.split(b'.')])
+    except ValueError:
+        raise error.RepoError(
+            _(b"'%s' sent a broken Content-Type header (%s)") % (safeurl, proto)
+        )
+
+    # TODO consider switching to a decompression reader that uses
+    # generators.
+    if version_info == (0, 1):
+        if compressible:
+            resp = util.compengines[b'zlib'].decompressorreader(resp)
+
+    elif version_info == (0, 2):
+        # application/mercurial-0.2 always identifies the compression
+        # engine in the payload header.
+        elen = struct.unpack(b'B', util.readexactly(resp, 1))[0]
+        ename = util.readexactly(resp, elen)
+        engine = util.compengines.forwiretype(ename)
+
+        resp = engine.decompressorreader(resp)
+    else:
+        raise error.RepoError(
+            _(b"'%s' uses newer protocol %s") % (safeurl, subtype)
+        )
+
+    return respurl, proto, resp
+
+
+class httppeer(wireprotov1peer.wirepeer):
+    def __init__(self, ui, path, url, opener, requestbuilder, caps):
+        self.ui = ui
+        self._path = path
+        self._url = url
+        self._caps = caps
+        self.limitedarguments = caps is not None and b'httppostargs' not in caps
+        self._urlopener = opener
+        self._requestbuilder = requestbuilder
+
+    def __del__(self):
+        for h in self._urlopener.handlers:
+            h.close()
+            getattr(h, "close_all", lambda: None)()
+
+    # Begin of ipeerconnection interface.
+
+    def url(self):
+        return self._path
+
+    def local(self):
+        return None
+
+    def peer(self):
+        return self
+
+    def canpush(self):
+        return True
+
+    def close(self):
+        try:
+            reqs, sent, recv = (
+                self._urlopener.requestscount,
+                self._urlopener.sentbytescount,
+                self._urlopener.receivedbytescount,
+            )
+        except AttributeError:
+            return
+        self.ui.note(
+            _(
+                b'(sent %d HTTP requests and %d bytes; '
+                b'received %d bytes in responses)\n'
+            )
+            % (reqs, sent, recv)
+        )
+
+    # End of ipeerconnection interface.
+
+    # Begin of ipeercommands interface.
+
+    def capabilities(self):
+        return self._caps
+
+    # End of ipeercommands interface.
+
+    def _callstream(self, cmd, _compressible=False, **args):
+        args = pycompat.byteskwargs(args)
+
+        req, cu, qs = makev1commandrequest(
+            self.ui,
+            self._requestbuilder,
+            self._caps,
+            self.capable,
+            self._url,
+            cmd,
+            args,
+        )
+
+        resp = sendrequest(self.ui, self._urlopener, req)
+
+        self._url, ct, resp = parsev1commandresponse(
+            self.ui, self._url, cu, qs, resp, _compressible
+        )
+
+        return resp
+
+    def _call(self, cmd, **args):
+        fp = self._callstream(cmd, **args)
+        try:
+            return fp.read()
+        finally:
+            # if using keepalive, allow connection to be reused
+            fp.close()
+
+    def _callpush(self, cmd, cg, **args):
+        # have to stream bundle to a temp file because we do not have
+        # http 1.1 chunked transfer.
+
+        types = self.capable(b'unbundle')
+        try:
+            types = types.split(b',')
+        except AttributeError:
+            # servers older than d1b16a746db6 will send 'unbundle' as a
+            # boolean capability. They only support headerless/uncompressed
+            # bundles.
+            types = [b""]
+        for x in types:
+            if x in bundle2.bundletypes:
+                type = x
+                break
+
+        tempname = bundle2.writebundle(self.ui, cg, None, type)
+        fp = httpconnection.httpsendfile(self.ui, tempname, b"rb")
+        headers = {'Content-Type': 'application/mercurial-0.1'}
+
+        try:
+            r = self._call(cmd, data=fp, headers=headers, **args)
+            vals = r.split(b'\n', 1)
+            if len(vals) < 2:
+                raise error.ResponseError(_(b"unexpected response:"), r)
+            return vals
+        except urlerr.httperror:
+            # Catch and re-raise these so we don't try and treat them
+            # like generic socket errors. They lack any values in
+            # .args on Python 3 which breaks our socket.error block.
+            raise
+        except socket.error as err:
+            if err.args[0] in (errno.ECONNRESET, errno.EPIPE):
+                raise error.Abort(_(b'push failed: %s') % err.args[1])
+            raise error.Abort(err.args[1])
+        finally:
+            fp.close()
+            os.unlink(tempname)
+
+    def _calltwowaystream(self, cmd, fp, **args):
+        filename = None
+        try:
+            # dump bundle to disk
+            fd, filename = pycompat.mkstemp(prefix=b"hg-bundle-", suffix=b".hg")
+            with os.fdopen(fd, "wb") as fh:
+                d = fp.read(4096)
+                while d:
+                    fh.write(d)
+                    d = fp.read(4096)
+            # start http push
+            with httpconnection.httpsendfile(self.ui, filename, b"rb") as fp_:
+                headers = {'Content-Type': 'application/mercurial-0.1'}
+                return self._callstream(cmd, data=fp_, headers=headers, **args)
+        finally:
+            if filename is not None:
+                os.unlink(filename)
+
+    def _callcompressable(self, cmd, **args):
+        return self._callstream(cmd, _compressible=True, **args)
+
+    def _abort(self, exception):
+        raise exception
+
+
+class queuedcommandfuture(futures.Future):
+    """Wraps result() on command futures to trigger submission on call."""
+
+    def result(self, timeout=None):
+        if self.done():
+            return futures.Future.result(self, timeout)
+
+        self._peerexecutor.sendcommands()
+
+        # sendcommands() will restore the original __class__ and self.result
+        # will resolve to Future.result.
+        return self.result(timeout)
+
+
+def performhandshake(ui, url, opener, requestbuilder):
+    # The handshake is a request to the capabilities command.
+
+    caps = None
+
+    def capable(x):
+        raise error.ProgrammingError(b'should not be called')
+
+    args = {}
+
+    req, requrl, qs = makev1commandrequest(
+        ui, requestbuilder, caps, capable, url, b'capabilities', args
+    )
+    resp = sendrequest(ui, opener, req)
+
+    # The server may redirect us to the repo root, stripping the
+    # ?cmd=capabilities query string from the URL. The server would likely
+    # return HTML in this case and ``parsev1commandresponse()`` would raise.
+    # We catch this special case and re-issue the capabilities request against
+    # the new URL.
+    #
+    # We should ideally not do this, as a redirect that drops the query
+    # string from the URL is arguably a server bug. (Garbage in, garbage out).
+    # However,  Mercurial clients for several years appeared to handle this
+    # issue without behavior degradation. And according to issue 5860, it may
+    # be a longstanding bug in some server implementations. So we allow a
+    # redirect that drops the query string to "just work."
+    try:
+        respurl, ct, resp = parsev1commandresponse(
+            ui, url, requrl, qs, resp, compressible=False
+        )
+    except RedirectedRepoError as e:
+        req, requrl, qs = makev1commandrequest(
+            ui, requestbuilder, caps, capable, e.respurl, b'capabilities', args
+        )
+        resp = sendrequest(ui, opener, req)
+        respurl, ct, resp = parsev1commandresponse(
+            ui, url, requrl, qs, resp, compressible=False
+        )
+
+    try:
+        rawdata = resp.read()
+    finally:
+        resp.close()
+
+    if not ct.startswith(b'application/mercurial-'):
+        raise error.ProgrammingError(b'unexpected content-type: %s' % ct)
+
+    info = {b'v1capabilities': set(rawdata.split())}
+
+    return respurl, info
+
+
+def makepeer(ui, path, opener=None, requestbuilder=urlreq.request):
+    """Construct an appropriate HTTP peer instance.
+
+    ``opener`` is an ``url.opener`` that should be used to establish
+    connections, perform HTTP requests.
+
+    ``requestbuilder`` is the type used for constructing HTTP requests.
+    It exists as an argument so extensions can override the default.
+    """
+    u = urlutil.url(path)
+    if u.query or u.fragment:
+        raise error.Abort(
+            _(b'unsupported URL component: "%s"') % (u.query or u.fragment)
+        )
+
+    # urllib cannot handle URLs with embedded user or passwd.
+    url, authinfo = u.authinfo()
+    ui.debug(b'using %s\n' % url)
+
+    opener = opener or urlmod.opener(ui, authinfo)
+
+    respurl, info = performhandshake(ui, url, opener, requestbuilder)
+
+    return httppeer(
+        ui, path, respurl, opener, requestbuilder, info[b'v1capabilities']
+    )
+
+
+def instance(ui, path, create, intents=None, createopts=None):
+    if create:
+        raise error.Abort(_(b'cannot create new http repository'))
+    try:
+        if path.startswith(b'https:') and not urlmod.has_https:
+            raise error.Abort(
+                _(b'Python support for SSL and HTTPS is not installed')
+            )
+
+        inst = makepeer(ui, path)
+
+        return inst
+    except error.RepoError as httpexception:
+        try:
+            r = statichttprepo.instance(ui, b"static-" + path, create)
+            ui.note(_(b'(falling back to static-http)\n'))
+            return r
+        except error.RepoError:
+            raise httpexception  # use the original http RepoError instead
+                                 usr/lib/python3/dist-packages/mercurial/i18n.py                                                     0000644 0000000 0000000 00000007760 14355257011 020077  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        # i18n.py - internationalization support for mercurial
+#
+# Copyright 2005, 2006 Olivia Mackall <olivia@selenic.com>
+#
+# This software may be used and distributed according to the terms of the
+# GNU General Public License version 2 or any later version.
+
+
+import gettext as gettextmod
+import locale
+import os
+import sys
+
+from .pycompat import getattr
+from .utils import resourceutil
+from . import (
+    encoding,
+    pycompat,
+)
+
+if pycompat.TYPE_CHECKING:
+    from typing import (
+        Callable,
+        List,
+    )
+
+
+# modelled after templater.templatepath:
+if getattr(sys, 'frozen', None) is not None:
+    module = pycompat.sysexecutable
+else:
+    module = pycompat.fsencode(__file__)
+
+_languages = None
+if (
+    pycompat.iswindows
+    and b'LANGUAGE' not in encoding.environ
+    and b'LC_ALL' not in encoding.environ
+    and b'LC_MESSAGES' not in encoding.environ
+    and b'LANG' not in encoding.environ
+):
+    # Try to detect UI language by "User Interface Language Management" API
+    # if no locale variables are set. Note that locale.getdefaultlocale()
+    # uses GetLocaleInfo(), which may be different from UI language.
+    # (See http://msdn.microsoft.com/en-us/library/dd374098(v=VS.85).aspx )
+    try:
+        import ctypes
+
+        # pytype: disable=module-attr
+        langid = ctypes.windll.kernel32.GetUserDefaultUILanguage()
+        # pytype: enable=module-attr
+
+        _languages = [locale.windows_locale[langid]]
+    except (ImportError, AttributeError, KeyError):
+        # ctypes not found or unknown langid
+        pass
+
+
+datapath = pycompat.fsdecode(resourceutil.datapath)
+localedir = os.path.join(datapath, 'locale')
+t = gettextmod.translation('hg', localedir, _languages, fallback=True)
+try:
+    _ugettext = t.ugettext  # pytype: disable=attribute-error
+except AttributeError:
+    _ugettext = t.gettext
+
+
+_msgcache = {}  # encoding: {message: translation}
+
+
+def gettext(message):
+    # type: (bytes) -> bytes
+    """Translate message.
+
+    The message is looked up in the catalog to get a Unicode string,
+    which is encoded in the local encoding before being returned.
+
+    Important: message is restricted to characters in the encoding
+    given by sys.getdefaultencoding() which is most likely 'ascii'.
+    """
+    # If message is None, t.ugettext will return u'None' as the
+    # translation whereas our callers expect us to return None.
+    if message is None or not _ugettext:
+        return message
+
+    cache = _msgcache.setdefault(encoding.encoding, {})
+    if message not in cache:
+        if type(message) is str:
+            # goofy unicode docstrings in test
+            paragraphs = message.split(u'\n\n')  # type: List[str]
+        else:
+            # should be ascii, but we have unicode docstrings in test, which
+            # are converted to utf-8 bytes on Python 3.
+            paragraphs = [p.decode("utf-8") for p in message.split(b'\n\n')]
+        # Be careful not to translate the empty string -- it holds the
+        # meta data of the .po file.
+        u = u'\n\n'.join([p and _ugettext(p) or u'' for p in paragraphs])
+        try:
+            # encoding.tolocal cannot be used since it will first try to
+            # decode the Unicode string. Calling u.decode(enc) really
+            # means u.encode(sys.getdefaultencoding()).decode(enc). Since
+            # the Python encoding defaults to 'ascii', this fails if the
+            # translated string use non-ASCII characters.
+            encodingstr = pycompat.sysstr(encoding.encoding)
+            cache[message] = u.encode(encodingstr, "replace")
+        except LookupError:
+            # An unknown encoding results in a LookupError.
+            cache[message] = message
+    return cache[message]
+
+
+def _plain():
+    if (
+        b'HGPLAIN' not in encoding.environ
+        and b'HGPLAINEXCEPT' not in encoding.environ
+    ):
+        return False
+    exceptions = encoding.environ.get(b'HGPLAINEXCEPT', b'').strip().split(b',')
+    return b'i18n' not in exceptions
+
+
+if _plain():
+    _ = lambda message: message  # type: Callable[[bytes], bytes]
+else:
+    _ = gettext
+                usr/lib/python3/dist-packages/mercurial/interfaces/                                                 0000755 0000000 0000000 00000000000 14714551121 021055  5                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        usr/lib/python3/dist-packages/mercurial/interfaces/__init__.py                                      0000644 0000000 0000000 00000000000 14355257011 023156  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        usr/lib/python3/dist-packages/mercurial/interfaces/__pycache__/                                     0000755 0000000 0000000 00000000000 14714551122 023266  5                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        usr/lib/python3/dist-packages/mercurial/interfaces/__pycache__/__init__.cpython-311.pyc             0000644 0000000 0000000 00000000254 14714551122 027530  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        §
+    	^µc    ã                   ó   — d S )N© r   ó    ú?/usr/lib/python3/dist-packages/mercurial/interfaces/__init__.pyú<module>r      s   ğğ ğ r                                                                                                                                                                                                                                                                                                                                                       usr/lib/python3/dist-packages/mercurial/interfaces/__pycache__/dirstate.cpython-311.pyc             0000644 0000000 0000000 00000023061 14714551122 027611  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        §
+    	^µcş  ã                   ó@   — d dl Z ddlmZ  G d„ dej        ¦  «        ZdS )é    Né   )Úutilc                   óh  — e Zd Zd„ Z ej        d¦  «        Zd„ Zd„ Z ej        d¦  «        Z	 ej        d¦  «        Z
+ej        d„ ¦   «         Zd„ Zd	„ Zd
+„ Zd„ Zd„ Zd*d„Zd„ Zd„ Zd„ ZeZd„ Zd„ Zd„ Zd„ Zd*d„Zd„ Zd„ Zd„ Zd„ Z d„ Z!d+d„Z"d„ Z#d*d„Z$d „ Z%d!„ Z&d"„ Z'd,d$„Z(d%„ Z)d&„ Z*d'„ Z+d(„ Z,d)„ Z-dS )-Ú	idirstatec                 ó   — dS )zÈCreate a new dirstate object.
+
+        opener is an open()-like callable that can be used to open the
+        dirstate file; root is the root of the directory tracked by
+        the dirstate.
+        N© )ÚopenerÚuiÚrootÚvalidateÚsparsematchfnÚnodeconstantsÚuse_dirstate_v2s          ú?/usr/lib/python3/dist-packages/mercurial/interfaces/dirstate.pyÚ__init__zidirstate.__init__   ó   € € € ó    zMatcher for ignored files.c                  ó   — dS )z5Return a list of files containing patterns to ignore.Nr   r   r   r   Ú_ignorefileszidirstate._ignorefiles   r   r   c                 ó   — dS )zBGiven a file `f`, return the ignore file and line that ignores it.Nr   )Úfs    r   Ú_ignorefileandlinezidirstate._ignorefileandline   r   r   zCallable for checking symlinks.z Callable for checking exec bits.c                  ó   — dS )zÍContext manager for handling dirstate parents.
+
+        If an exception occurs in the scope of the context manager,
+        the incoherent dirstate won't be written when wlock is
+        released.
+        Nr   r   r   r   Úparentchangezidirstate.parentchange$   r   r   c                  ó   — dS )zsReturns true if the dirstate is in the middle of a set of changes
+        that modify the dirstate parent.
+        Nr   r   r   r   Úpendingparentchangezidirstate.pendingparentchange-   r   r   c                 ó   — d S ©Nr   )Úds    r   Úhasdirzidirstate.hasdir2   ó   € Øˆr   c                 ó   — d S r   r   )Úbuildfallbacks    r   Úflagfunczidirstate.flagfunc5   r!   r   c                  ó   — dS )a  Return the path from which a canonical path is calculated.
+
+        This path should be used to resolve file patterns or to convert
+        canonical paths back to file paths for display. It shouldn't be
+        used to get real file paths. Use vfs functions instead.
+        Nr   r   r   r   Úgetcwdzidirstate.getcwd8   r   r   c                 ó   — dS )z-return a DirstateItem for the associated pathNr   )Úpaths    r   Ú	get_entryzidirstate.get_entry@   r   r   Nc                 ó   — d S r   r   )r   Úcwds     r   Úpathtozidirstate.pathtoC   r!   r   c                 ó   — dS )z3Check if bytestring `key` is known to the dirstate.Nr   )Úkeys    r   Ú__contains__zidirstate.__contains__F   r   r   c                  ó   — dS )z:Iterate the dirstate's contained filenames as bytestrings.Nr   r   r   r   Ú__iter__zidirstate.__iter__I   r   r   c                  ó   — dS )zpIterate the dirstate's entries as (filename, DirstateItem.
+
+        As usual, filename is a bytestring.
+        Nr   r   r   r   Úitemszidirstate.itemsL   r   r   c                  ó   — d S r   r   r   r   r   Úparentszidirstate.parentsT   r!   r   c                  ó   — d S r   r   r   r   r   Úp1zidirstate.p1W   r!   r   c                  ó   — d S r   r   r   r   r   Úp2zidirstate.p2Z   r!   r   c                  ó   — d S r   r   r   r   r   Úbranchzidirstate.branch]   r!   r   c                 ó   — dS )zóSet dirstate parents to p1 and p2.
+
+        When moving from two parents to one, 'm' merged entries a
+        adjusted to normal and previous copy records discarded and
+        returned by the call.
+
+        See localrepo.setparents()
+        Nr   )r7   r9   s     r   Ú
+setparentszidirstate.setparents`   r   r   c                 ó   — d S r   r   )r;   s    r   Ú	setbranchzidirstate.setbranchj   r!   r   c                  ó   — dS )a  Causes the next access to reread the dirstate.
+
+        This is different from localrepo.invalidatedirstate() because it always
+        rereads the dirstate. Use localrepo.invalidatedirstate() if you want to
+        check whether the dirstate has changed before rereading it.Nr   r   r   r   Ú
+invalidatezidirstate.invalidatem   r   r   c                 ó   — dS )z=Mark dest as a copy of source. Unmark dest if source is None.Nr   )ÚsourceÚdests     r   Úcopyzidirstate.copyt   r   r   c                 ó   — d S r   r   )Úfiles    r   Úcopiedzidirstate.copiedw   r!   r   c                  ó   — d S r   r   r   r   r   Úcopieszidirstate.copiesz   r!   r   Fc                 ó   — dS )aL  
+        normalize the case of a pathname when on a casefolding filesystem
+
+        isknown specifies whether the filename came from walking the
+        disk, to avoid extra filesystem access.
+
+        If ignoremissing is True, missing path are returned
+        unchanged. Otherwise, we try harder to normalize possibly
+        existing path components.
+
+        The normalized case is determined based on the following precedence:
+
+        - version of name already stored in the dirstate
+        - version of name stored on disk
+        - version provided via command arguments
+        Nr   )r(   ÚisknownÚignoremissings      r   Ú	normalizezidirstate.normalize}   r   r   c                  ó   — d S r   r   r   r   r   Úclearzidirstate.clear   r!   r   c                 ó   — d S r   r   )ÚparentÚallfilesÚchangedfiless      r   Úrebuildzidirstate.rebuild’   r!   r   c                  ó   — dS )zĞReturn identity of dirstate it to detect changing in storage
+
+        If identity of previous dirstate is equal to this, writing
+        changes based on the former dirstate out can keep consistency.
+        Nr   r   r   r   Úidentityzidirstate.identity•   r   r   c                 ó   — d S r   r   )Útrs    r   Úwritezidirstate.writeœ   r!   r   c                 ó   — dS )a%  add a callback to be called when the wd parents are changed
+
+        Callback will be called with the following arguments:
+            dirstate, (oldp1, oldp2), (newp1, newp2)
+
+        Category is a unique identifier to allow overwriting an old callback
+        with a newer callback.
+        Nr   )ÚcategoryÚcallbacks     r   Úaddparentchangecallbackz!idirstate.addparentchangecallbackŸ   r   r   Tc                 ó   — dS )a3  
+        Walk recursively through the directory tree, finding all files
+        matched by match.
+
+        If full is False, maybe skip some known-clean files.
+
+        Return a dict mapping filename to stat-like object (either
+        mercurial.osutil.stat instance or return value of os.stat()).
+
+        Nr   )ÚmatchÚsubreposÚunknownÚignoredÚfulls        r   Úwalkzidirstate.walk©   r   r   c                 ó   — dS )a|  Determine the status of the working copy relative to the
+        dirstate and return a pair of (unsure, status), where status is of type
+        scmutil.status and:
+
+          unsure:
+            files that might have been modified since the dirstate was
+            written, but need to be read to be sure (size is the same
+            but mtime differs)
+          status.modified:
+            files that have definitely been modified since the dirstate
+            was written (different size or mode)
+          status.clean:
+            files that have definitely not been modified since the
+            dirstate was written
+        Nr   )r`   ra   rc   Úcleanrb   s        r   Ústatuszidirstate.statusµ   r   r   c                 ó   — dS )zT
+        return files in the dirstate (in whatever state) filtered by match
+        Nr   )r`   s    r   Úmatcheszidirstate.matchesÆ   r   r   c                 ó   — dS )z&Save current dirstate into backup fileNr   ©rY   Ú
+backupnames     r   Ú
+savebackupzidirstate.savebackupË   r   r   c                 ó   — dS )zRestore dirstate by backup fileNr   rl   s     r   Úrestorebackupzidirstate.restorebackupÎ   r   r   c                 ó   — dS )zClear backup fileNr   rl   s     r   Úclearbackupzidirstate.clearbackupÑ   r   r   r   )FF)T).Ú__name__Ú
+__module__Ú__qualname__r   ÚinterfaceutilÚ	AttributeÚ_ignorer   r   Ú
+_checklinkÚ
+_checkexecÚ
+contextlibÚcontextmanagerr   r   r    r$   r&   r)   r,   r/   r1   r3   Ú	iteritemsr5   r7   r9   r;   r=   r?   rA   rE   rH   rJ   rN   rP   rU   rW   rZ   r^   re   rh   rj   rn   rp   rr   r   r   r   r   r      s  € € € € € ğğ ğ ğ$ &ˆmÔ%Ğ&FÑGÔG€GğDğ Dğ DğQğ Qğ Qğ )Ô(Ğ)NÑOÔO€JØ(Ô(Ğ)OÑPÔP€JàÔğğ ñ Ôğğğ ğ ğ
+ğ ğ ğğ ğ ğğ ğ ğ<ğ <ğ <ğğ ğ ğ ğBğ Bğ BğIğ Iğ Iğğ ğ ğ €Iğğ ğ ğğ ğ ğğ ğ ğğ ğ ğğ ğ ğ ğğ ğ ğGğ Gğ GğLğ Lğ Lğğ ğ ğğ ğ ğğ ğ ğ ğ$ğ ğ ğğ ğ ğ ğğ ğ ğğ ğ ğğ ğ ğ
+ğ 
+ğ 
+ğ 
+ğğ ğ ğ"ğ ğ ğ
+5ğ 5ğ 5ğ.ğ .ğ .ğ ğ  ğ  ğ  ğ  r   r   )r{   Ú r   rv   Ú	Interfacer   r   r   r   ú<module>r€      sd   ğØ Ğ Ğ Ğ à #Ğ #Ğ #Ğ #Ğ #Ğ #ğL ğ L ğ L ğ L ğ L Ô'ñ L ô L ğ L ğ L ğ L r                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  usr/lib/python3/dist-packages/mercurial/interfaces/__pycache__/repository.cpython-311.pyc           0000644 0000000 0000000 00000261634 14714551122 030223  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        §
+    	^µc¬ ã                   óü  — d dl mZ d dlmZ ddlmZ dZdZdZdZ	d	Z
+d
+ZdZdZdZdZeez  ez  ez  ZdZdZdZdZdZdZdZdZdZdZdZdZdZehZeeeeeeeehZe                      ¦   «         Z!e! "                    e¦  «          G d„ dej#        ¦  «        Z$ G d„ dej#        ¦  «        Z% G d „ d!ej#        ¦  «        Z& G d"„ d#ej#        ¦  «        Z' G d$„ d%ej#        ¦  «        Z( G d&„ d'ej#        ¦  «        Z) G d(„ d)e$e%e)¦  «        Z* G d*„ d+e$e%e)¦  «        Z+ ej,        e*¦  «         G d,„ d-¦  «        ¦   «         Z- G d.„ d/ej#        ¦  «        Z. G d0„ d1ej#        ¦  «        Z/ G d2„ d3ej#        ¦  «        Z0 G d4„ d5ej#        ¦  «        Z1 G d6„ d7ej#        ¦  «        Z2 G d8„ d9ej#        ¦  «        Z3 G d:„ d;e1e2e3¦  «        Z4 G d<„ d=ej#        ¦  «        Z5 G d>„ d?ej#        ¦  «        Z6 G d@„ dAej#        ¦  «        Z7 G dB„ dCe7¦  «        Z8 G dD„ dEe7¦  «        Z9 G dF„ dGej#        ¦  «        Z: G dH„ dIej#        ¦  «        Z; G dJ„ dKej#        ¦  «        Z< G dL„ dMej#        ¦  «        Z= G dN„ dOe=e<¦  «        Z> G dP„ dQej#        ¦  «        Z?dRS )Sé   )Ú_)Úerroré   )Úutils   revlogfilestorages   sharedstores   lfss   streamclones	   side-datas   shallowfilestoragei €  i @  i    i   s   defaults   previouss   fulltexts   p1s   branchmap-alls   branchmap-serveds   changelog-caches   full-manifests   file-node-tagss   manifestlog-caches   rev-branch-caches   tags-defaults   tags-servedc                   óP   — e Zd ZdZ ej        d¦  «        Zd„ Zd„ Zd„ Z	d„ Z
+d„ ZdS )	Úipeerconnectiona*  Represents a "connection" to a repository.
+
+    This is the base interface for representing a connection to a repository.
+    It holds basic properties and methods applicable to all peer types.
+
+    This is not a complete interface definition and should not be used
+    outside of this module.
+    zui.ui instancec                  ó   — dS )aŠ  Returns a URL string representing this peer.
+
+        Currently, implementations expose the raw URL used to construct the
+        instance. It may contain credentials as part of the URL. The
+        expectations of the value aren't well-defined and this could lead to
+        data leakage.
+
+        TODO audit/clean consumers and more clearly define the contents of this
+        value.
+        N© r
+   ó    úA/usr/lib/python3/dist-packages/mercurial/interfaces/repository.pyÚurlzipeerconnection.urlk   ó   € € € r   c                  ó   — dS )z¾Returns a local repository instance.
+
+        If the peer represents a local repository, returns an object that
+        can be used to interface with it. Otherwise returns ``None``.
+        Nr
+   r
+   r   r   Úlocalzipeerconnection.localw   r   r   c                  ó   — dS )zlReturns an object conforming to this interface.
+
+        Most implementations will ``return self``.
+        Nr
+   r
+   r   r   Úpeerzipeerconnection.peer~   r   r   c                  ó   — dS )z;Returns a boolean indicating if this peer can be pushed to.Nr
+   r
+   r   r   Úcanpushzipeerconnection.canpush„   r   r   c                  ó   — dS )zªClose the connection to this peer.
+
+        This is called when the peer will no longer be used. Resources
+        associated with the peer should be cleaned up.
+        Nr
+   r
+   r   r   Úclosezipeerconnection.close‡   r   r   N)Ú__name__Ú
+__module__Ú__qualname__Ú__doc__ÚinterfaceutilÚ	AttributeÚuir   r   r   r   r   r
+   r   r   r   r   _   s   € € € € € ğğ ğ 
+!ˆÔ	 Ğ!5Ñ	6Ô	6€Bğ
+ğ 
+ğ 
+ğğ ğ ğğ ğ ğJğ Jğ Jğğ ğ ğ ğ r   r   c                   ó   — e Zd ZdZd„ Zd„ ZdS )Úipeercapabilitiesz+Peer sub-interface related to capabilities.c                 ó   — dS )a5  Determine support for a named capability.
+
+        Returns ``False`` if capability not supported.
+
+        Returns ``True`` if boolean capability is supported. Returns a string
+        if capability support is non-boolean.
+
+        Capability strings may or may not map to wire protocol capabilities.
+        Nr
+   )Únames    r   Úcapablezipeercapabilities.capable’   r   r   c                 ó   — dS )zsRequire a capability to be present.
+
+        Raises a ``CapabilityError`` if the capability isn't present.
+        Nr
+   )r!   Úpurposes     r   Ú
+requirecapzipeercapabilities.requirecap   r   r   N)r   r   r   r   r"   r%   r
+   r   r   r   r      s8   € € € € € Ø5Ğ5ğ	ğ 	ğ 	ğğ ğ ğ ğ r   r   c                   ó\   — e Zd ZdZd„ Zd„ Zd„ Zdd„Zd„ Zd„ Z	d	„ Z
+d
+„ Zd„ Zd„ Zd„ Zd„ ZdS )ÚipeercommandszĞClient-side interface for communicating over the wire protocol.
+
+    This interface is used as a gateway to the Mercurial wire protocol.
+    methods commonly call wire protocol commands of the same name.
+    c                  ó   — dS )z“Obtain heads in named branches.
+
+        Returns a dict mapping branch name to an iterable of nodes that are
+        heads on that branch.
+        Nr
+   r
+   r   r   Ú	branchmapzipeercommands.branchmap«   r   r   c                  ó   — dS )zXObtain capabilities of the peer.
+
+        Returns a set of string capabilities.
+        Nr
+   r
+   r   r   Úcapabilitieszipeercommands.capabilities²   r   r   c                  ó   — dS )zjObtains the clone bundles manifest for the repo.
+
+        Returns the manifest as unparsed bytes.
+        Nr
+   r
+   r   r   Úclonebundleszipeercommands.clonebundles¸   r   r   Nc                 ó   — dS )z?Used to facilitate debugging of arguments passed over the wire.Nr
+   ©ÚoneÚtwoÚthreeÚfourÚfives        r   Údebugwireargszipeercommands.debugwireargs¾   r   r   c                 ó   — dS )zÖObtain remote repository data as a bundle.
+
+        This command is how the bulk of repository data is transferred from
+        the peer to the local repository
+
+        Returns a generator of bundle data.
+        Nr
+   )ÚsourceÚkwargss     r   Ú	getbundlezipeercommands.getbundleÁ   r   r   c                  ó   — dS )zfDetermine all known head revisions in the peer.
+
+        Returns an iterable of binary nodes.
+        Nr
+   r
+   r   r   Úheadszipeercommands.headsÊ   r   r   c                 ó   — dS )zñDetermine whether multiple nodes are known.
+
+        Accepts an iterable of nodes whose presence to check for.
+
+        Returns an iterable of booleans indicating of the corresponding node
+        at that index is known to the peer.
+        Nr
+   ©Únodess    r   Úknownzipeercommands.knownĞ   r   r   c                 ó   — dS )z[Obtain all keys in a pushkey namespace.
+
+        Returns an iterable of key names.
+        Nr
+   ©Ú	namespaces    r   Úlistkeyszipeercommands.listkeysÙ   r   r   c                 ó   — dS )zqResolve a value to a known revision.
+
+        Returns a binary node of the resolved revision on success.
+        Nr
+   ©Úkeys    r   Úlookupzipeercommands.lookupß   r   r   c                 ó   — dS )a  Set a value using the ``pushkey`` protocol.
+
+        Arguments correspond to the pushkey namespace and key to operate on and
+        the old and new values for that key.
+
+        Returns a string with the peer result. The value inside varies by the
+        namespace.
+        Nr
+   ©rB   rF   ÚoldÚnews       r   Úpushkeyzipeercommands.pushkeyå   r   r   c                  ó   — dS )zfObtain streaming clone data.
+
+        Successful result should be a generator of data chunks.
+        Nr
+   r
+   r   r   Ú
+stream_outzipeercommands.stream_outï   r   r   c                 ó   — dS )z²Transfer repository data to the peer.
+
+        This is how the bulk of data during a push is transferred.
+
+        Returns the integer number of heads added to the peer.
+        Nr
+   )Úbundler;   r   s      r   Úunbundlezipeercommands.unbundleõ   r   r   ©NNN)r   r   r   r   r)   r+   r-   r5   r9   r;   r?   rC   rG   rL   rN   rQ   r
+   r   r   r'   r'   ¤   sÛ   € € € € € ğğ ğğ ğ ğğ ğ ğğ ğ ğNğ Nğ Nğ Nğğ ğ ğğ ğ ğğ ğ ğğ ğ ğğ ğ ğğ ğ ğğ ğ ğğ ğ ğ ğ r   r'   c                   ó*   — e Zd ZdZd„ Zd„ Zd„ Zd„ ZdS )Úipeerlegacycommandsa	  Interface for implementing support for legacy wire protocol commands.
+
+    Wire protocol commands transition to legacy status when they are no longer
+    used by modern clients. To facilitate identifying which commands are
+    legacy, the interfaces are split.
+    c                 ó   — dS )z¿Obtain nodes between pairs of nodes.
+
+        ``pairs`` is an iterable of node pairs.
+
+        Returns an iterable of iterables of nodes corresponding to each
+        requested pair.
+        Nr
+   ©Úpairss    r   Úbetweenzipeerlegacycommands.between  r   r   c                 ó   — dS )a  Obtain ancestor changesets of specific nodes back to a branch point.
+
+        For each requested node, the peer finds the first ancestor node that is
+        a DAG root or is a merge.
+
+        Returns an iterable of iterables with the resolved values for each node.
+        Nr
+   r=   s    r   Úbrancheszipeerlegacycommands.branches  r   r   c                 ó   — dS )zBObtain a changegroup with data for descendants of specified nodes.Nr
+   )r>   r7   s     r   Úchangegroupzipeerlegacycommands.changegroup  r   r   c                 ó   — d S ©Nr
+   )Úbasesr;   r7   s      r   Úchangegroupsubsetz%ipeerlegacycommands.changegroupsubset  ó   € Øˆr   N)r   r   r   r   rX   rZ   r\   r`   r
+   r   r   rT   rT   ş   s]   € € € € € ğğ ğğ ğ ğğ ğ ğQğ Qğ Qğğ ğ ğ ğ r   rT   c                   ó$   — e Zd ZdZd„ Zd„ Zd„ ZdS )ÚipeercommandexecutoraD  Represents a mechanism to execute remote commands.
+
+    This is the primary interface for requesting that wire protocol commands
+    be executed. Instances of this interface are active in a context manager
+    and have a well-defined lifetime. When the context manager exits, all
+    outstanding requests are waited on.

@@ -1,0 +1,1000 @@
+
+use strict;
+use warnings;
+
+use File::Basename qw(basename);
+use File::Temp;
+use File::StripNondeterminism;
+use Archive::Zip qw/:CONSTANTS :ERROR_CODES/;
+use Sub::Override;
+
+=head1 DEPRECATION PLANS
+
+Given that so many libraries and utilities generate ZIP archives themselves
+(rather than delegating to one or two central libraries) it is infeasible to
+get this upstreamed everywhere. There are also countless formats that generate
+ZIP files under different names (notably Jar archives and its many variants).
+
+=cut
+
+# A magic number from Archive::Zip for the earliest timestamp that
+# can be represented by a Zip file.  From the Archive::Zip source:
+# "Note, this isn't exactly UTC 1980, it's 1980 + 12 hours and 1
+# minute so that nothing timezoney can muck us up."
+use constant SAFE_EPOCH => 315576060;
+
+# Extract and return the first $nbytes of $member (an Archive::Zip::Member)
+sub peek_member($$) {
+	my ($member, $nbytes) = @_;
+	my $original_size = $member->compressedSize();
+	my $old_compression_method
+	  = $member->desiredCompressionMethod(COMPRESSION_STORED);
+	$member->rewindData() == AZ_OK or die "failed to rewind ZIP member";
+	my ($buffer, $status) = $member->readChunk($nbytes);
+	die "failed to read ZIP member"
+	  if $status != AZ_OK && $status != AZ_STREAM_END;
+	$member->endRead();
+	$member->desiredCompressionMethod($old_compression_method);
+	$member->{'compressedSize'} = $original_size
+	  ; # Work around https://github.com/redhotpenguin/perl-Archive-Zip/issues/11
+	return $$buffer;
+}
+
+# Normalize the contents of $member (an Archive::Zip::Member) with $normalizer
+sub normalize_member($$) {
+	my ($member, $normalizer) = @_;
+
+	# Extract the member to a temporary file.
+	my $tempdir = File::Temp->newdir();
+	my $filename = "$tempdir/" . basename($member->fileName());
+	my $original_size = $member->compressedSize();
+	$member->extractToFileNamed($filename);
+	chmod(0600, $filename);
+	$member->{'compressedSize'} = $original_size
+	  ; # Work around https://github.com/redhotpenguin/perl-Archive-Zip/issues/11
+
+	$normalizer = File::StripNondeterminism::get_normalizer_for_file($filename) unless defined $normalizer;
+	if (not defined $normalizer) {
+		warn "strip-nondeterminism: unknown file type of " . $member->fileName();
+		return;
+	}
+
+	# Normalize the temporary file.
+	if ($normalizer->($filename)) {
+		# Normalizer modified the temporary file.
+		# Replace the member's contents with the temporary file's contents.
+		open(my $fh, '<', $filename) or die "Unable to open $filename: $!";
+		$member->contents(
+			do { local $/; <$fh> }
+		);
+	}
+
+	unlink($filename);
+
+	return 1;
+}
+
+sub unixtime_to_winnt($) {
+	my $unixtime = shift || 0;
+
+	# WinNT epoch is 01-Jan-1601 00:00:00 UTC
+	# diff to unix time: `date -u -d "01-Jan-1601 00:00:00 UTC" +%s`
+	my $secondsdiff = 11644473600;
+
+	return $unixtime + $secondsdiff;
+}
+
+sub normalize_extra_fields($$) {
+	# See http://sources.debian.net/src/zip/3.0-6/proginfo/extrafld.txt for extra field documentation
+	# WARNING: some fields have a different format depending on the header type
+	my ($canonical_time, $field) = @_;
+
+	my $result = "";
+	my $pos = 0;
+	my ($id, $len);
+
+	# field format: 2 bytes id, 2 bytes data len, n bytes data
+	while (($id, $len) = unpack("vv", substr($field, $pos))) {
+		if ($id == 0x5455) {
+			# extended timestamp found.
+			# first byte of data contains flags.
+			$result .= substr($field, $pos, 5);
+			# len determines how many timestamps this field contains
+			# this works for both the central header and local header version
+			for (my $i = 1; $i < $len; $i += 4) {
+				$result .= pack("V", $canonical_time);
+			}
+		} elsif ($id == 0x000a) {
+			# first 4 bytes are reserved
+			$result .= substr($field, $pos, 2+2+4);
+			my ($tag, $tagsize) = (0, 0);
+			for (my $i = 2+2+4; $i < $len; $i += $tagsize) {
+				($tag, $tagsize) = unpack("vv", substr($field, $pos + $i));
+				$result .= substr($field, $pos + $i, 2+2);
+				if ($tag == 0x0001 && $tagsize == 24) {
+					# timestamp in 1/10th microseconds
+					my $timestamp = unixtime_to_winnt($File::StripNondeterminism::canonical_time) * 10**7;
+					# mtime
+					$result .= pack("VV", $timestamp % (2**32), $timestamp / (2**32));
+					# atime
+					$result .= pack("VV", $timestamp % (2**32), $timestamp / (2**32));
+					# ctime
+					$result .= pack("VV", $timestamp % (2**32), $timestamp / (2**32));
+				} else {
+					$result .= substr($field, $pos + $i, $tagsize)
+				}
+			}
+		} elsif ($id == 0x7875) { # Info-ZIP New Unix Extra Field
+			$result .= substr($field, $pos, 4);
+			#  Version       1 byte      version of this extra field, currently 1
+			#  UIDSize       1 byte      Size of UID field
+			#  UID           Variable    UID for this entry
+			#  GIDSize       1 byte      Size of GID field
+			#  GID           Variable    GID for this entry
+			# (Same format for both central header and local header)
+			if (ord(substr($field, $pos + 4, 1)) == 1) {
+				my $uid_len = ord(substr($field, $pos + 5, 1));
+				my $gid_len = ord(substr($field, $pos + 6 + $uid_len, 1));
+				$result
+				  .= pack("CCx${uid_len}Cx${gid_len}", 1, $uid_len, $gid_len);
+			} else {
+				$result .= substr($field, $pos + 4, $len);
+			}
+		} else {
+			# Catch invalid field lengths by calculating whether we would
+			# read beyond the end of the file.
+			if (!defined($len)) {
+				warn "strip-nondeterminism: unknown extra field length";
+				return;
+			}
+			if ($pos + $len >= length($field)) {
+				warn "strip-nondeterminism: invalid extra field length ($len)";
+				return;
+			}
+			# use the current extra field unmodified.
+			$result .= substr($field, $pos, $len+4);
+		}
+		$pos += $len + 4;
+	}
+
+	return $result;
+}
+
+sub try(&$) {
+	my ($sub, $errors) = @_;
+	@$errors = ();
+	my $old_error_handler
+	  = Archive::Zip::setErrorHandler(sub { push @$errors, @_ });
+	my $res = $sub->();
+	Archive::Zip::setErrorHandler($old_error_handler);
+	return $res;
+}
+
+sub normalize {
+	my ($zip_filename, %options) = @_;
+	my $filename_cmp = $options{filename_cmp} || sub { $a cmp $b };
+	my $zip = Archive::Zip->new();
+	my @errors;
+	if (try(sub { $zip->read($zip_filename) }, \@errors) != AZ_OK) {
+		if (grep { /zip64 not supported/ } @errors) {
+			# Ignore zip64 files, which aren't supported by Archive::Zip.
+			# Ignoring unsupported files, instead of erroring out, is
+			# consistent with the rest of strip-nondeterminism's behavior,
+			# but warn about it in case someone is confused why a .zip
+			# file is left with nondeterminism in it.  (Hopefully this won't
+			# happen much since zip64 files are very rare.)
+			warn "strip-nondeterminism: $zip_filename: ignoring zip64 file\n";
+			return 0;
+		} else {
+			die "Reading ZIP archive failed: " . join("\n", @errors);
+		}
+	}
+	if (exists($options{archive_filter})
+		and not($options{archive_filter}->($zip))) {
+		return 0;
+	}
+	my $canonical_time = $File::StripNondeterminism::canonical_time;
+	$canonical_time = SAFE_EPOCH
+	  if not defined $canonical_time or $canonical_time < SAFE_EPOCH;
+	my @filenames = sort $filename_cmp $zip->memberNames();
+	if (exists($options{filename_filter})) {
+		@filenames = $options{filename_filter}->(@filenames);
+		# Remove any members deleted by the custom filter
+		my %seen = map { $_ => 1 } @filenames;
+		for my $filename ($zip->memberNames()) {
+			next if $seen{$filename};
+			print STDERR "Removing $filename from $zip_filename\n";
+			$zip->removeMember($filename);
+		}
+	}
+	for my $filename (@filenames) {
+		my $member = $zip->removeMember($filename);
+		if ($member->isEncrypted()) {
+			warn "strip-nondeterminism: $zip_filename: ignoring encrypted zip file\n";
+			return 0;
+		}
+		$zip->addMember($member);
+		# member_normalizer returns the timestamp to use.
+		my $timestamp = exists $options{member_normalizer}
+		  ? $options{member_normalizer}->($member, $canonical_time)
+		  : $canonical_time;
+		$member->setLastModFileDateTimeFromUnix($timestamp);
+		if ($member->fileAttributeFormat() == FA_UNIX) {
+			$member->unixFileAttributes(
+				($member->unixFileAttributes() & oct(100))
+				? oct(755)
+				: oct(644));
+		}
+	}
+	my $old_perms = (stat($zip_filename))[2] & oct(7777);
+
+	# Archive::Zip::Member does not handle the localExtraField field (used for
+	# uid/gids) correctly or consistently.
+	#
+	# It does not populate localExtraField in the class upon initial reading of
+	# the file whilst it does for cdExtraField. One can workaround this
+	# manually with calls to _seekToLocalHeader and _readLocalFileHeader but
+	# upon writing to a file back to the disk Archive::Zip will ignore any
+	# stored value of localExtraField (!) and reload it again from the existing
+	# file handle in/around rewindData.
+	#
+	# We therefore override the accessor methods of the Member class to
+	# ensure that normalised values are used in this final save.
+	#
+	# <https://salsa.debian.org/reproducible-builds/strip-nondeterminism/issues/4>
+	my @overrides = map {
+		my $full_name = "Archive::Zip::Member::$_";
+		my $orig_sub = \&$full_name;
+		Sub::Override->new(
+			$full_name => sub {
+				my $result = $orig_sub->(@_);
+				return defined($result) ?
+					normalize_extra_fields($canonical_time, $result) : $result;
+			}
+		);
+	} qw(cdExtraField localExtraField);
+
+	return 0 unless $zip->overwrite() == AZ_OK;
+	$_->restore for @overrides;
+	chmod($old_perms, $zip_filename);
+	return 1;
+}
+
+1;
+                                                                                                                                                           usr/share/perl5/File/StripNondeterminism.pm                                                         0000644 0000000 0000000 00000012663 14361054711 017452  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        #
+# Copyright 2014 Andrew Ayer
+# Copyright 2015-2020 Chris Lamb <lamby@debian.org>
+#
+# This file is part of strip-nondeterminism.
+#
+# strip-nondeterminism is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# strip-nondeterminism is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with strip-nondeterminism.  If not, see <http://www.gnu.org/licenses/>.
+#
+package File::StripNondeterminism;
+
+use strict;
+use warnings;
+
+use POSIX qw(tzset);
+
+our($VERSION, $canonical_time, $clamp_time, $verbose);
+
+$VERSION = '1.13.1'; # <https://semver.org/>
+
+sub init() {
+	$ENV{'TZ'} = 'UTC';
+	tzset();
+}
+
+sub _get_file_type($) {
+	my $file=shift;
+	open(FILE, '-|') # handle all filenames safely
+	  || exec('file', _internal_optional_file_args(), '--', $file)
+	  || die "can't exec file: $!";
+	my $type=<FILE>;
+	close FILE;
+	return $type;
+}
+
+sub get_normalizer_for_file($) {
+	$_ = shift;
+
+	return undef if -d $_; # Skip directories
+
+	# ar
+	if (m/\.a$/ && _get_file_type($_) =~ m/ar archive/) {
+		return _handler('ar');
+	}
+	# cpio
+	if (m/\.cpio$/ && _get_file_type($_) =~ m/cpio archive/) {
+		return _handler('cpio');
+	}
+	# gettext
+	if (m/\.g?mo$/ && _get_file_type($_) =~ m/GNU message catalog/) {
+		return _handler('gettext');
+	}
+	# gzip
+	if (m/\.(gz|dz)$/ && _get_file_type($_) =~ m/gzip compressed data/) {
+		return _handler('gzip');
+	}
+	# jar
+	if (m/\.(jar|war|hpi|apk|sym)$/
+		&& _get_file_type($_) =~ m/(Java|Zip) archive data/) {
+		return _handler('jar');
+	}
+	# jmod
+	if (m/\.jmod$/) {
+		# Loading the handler forces the load of the jmod package as well
+		my $handler = _handler('jmod');
+
+		# Only recent versions of file(1) can detect Jmod file so we
+		# perform a manual test.
+		return $handler
+		  if File::StripNondeterminism::handlers::jmod::is_jmod_file($_);
+	}
+	# javadoc
+	if (m/\.html$/) {
+		# Loading the handler forces the load of the javadoc package as well
+		my $handler = _handler('javadoc');
+		return $handler
+		  if File::StripNondeterminism::handlers::javadoc::is_javadoc_file($_);
+	}
+	# bFLT
+	if (m/\.bflt$/) {
+		# Loading the handler forces the load of the bflt package as well
+		my $handler = _handler('bflt');
+		return $handler
+		  if File::StripNondeterminism::handlers::bflt::is_bflt_file($_);
+	}
+	# uImage
+	if (m/\.uimage$/i) {
+		# Loading the handler forces the load of the uimage package as well
+		my $handler = _handler('uimage');
+		return $handler
+		  if File::StripNondeterminism::handlers::uimage::is_uimage_file($_);
+	}
+	# PNG
+	if (m/\.png$/ && _get_file_type($_) =~ m/PNG image data/) {
+		return _handler('png');
+	}
+	# zip
+	if (m/\.(zip|pk3|epub|whl|xpi|htb|zhfst|par|codadef)$/
+		&& _get_file_type($_) =~ m/Zip archive data|EPUB document/) {
+		return _handler('zip');
+	}
+
+	# pyzip - check last due to call to file(1)
+	if (_get_file_type($_) =~ m/python3 script executable \((Zip archive|binary data)\)/) {
+		my $handler = _handler('pyzip');
+		return $handler
+		  if File::StripNondeterminism::handlers::pyzip::is_pyzip_file($_);
+	}
+
+	return undef;
+}
+
+our %HANDLER_CACHE;
+our %KNOWN_HANDLERS = (
+	ar	=> 0,
+	bflt	=> 1,
+	cpio	=> 1,
+	gettext	=> 1,
+	gzip	=> 1,
+	jar	=> 1,
+	javadoc	=> 1,
+	jmod	=> 1,
+	uimage	=> 1,
+	png	=> 1,
+	pyzip	=> 1,
+	javaproperties => 1,
+	zip	=> 1,
+);
+
+sub all_normalizers () {
+	return sort keys %KNOWN_HANDLERS;
+}
+
+sub enabled_normalizers () {
+	my @normalizers;
+	foreach my $x (all_normalizers()) {
+		push @normalizers, $x if $KNOWN_HANDLERS{$x};
+	}
+	return @normalizers;
+}
+
+sub enable_normalizer ($) {
+	my ($name) = @_;
+	die("Unknown normalizer: ${name}")
+	  if not exists($KNOWN_HANDLERS{$name});
+	$KNOWN_HANDLERS{$name} = 1;
+}
+
+sub disable_normalizer ($) {
+	my ($name) = @_;
+	die("Unknown normalizer: ${name}")
+	  if not exists($KNOWN_HANDLERS{$name});
+	$KNOWN_HANDLERS{$name} = 0;
+}
+
+sub _handler {
+	# Returns the normalize routine for this handler or 0 (not undef)
+	# if the handler is not enabled.
+	my ($handler_name) = @_;
+	return $HANDLER_CACHE{$handler_name}
+	  if exists($HANDLER_CACHE{$handler_name});
+	die("Unknown handler: ${handler_name}\n")
+	  if not exists($KNOWN_HANDLERS{$handler_name});
+	return 0 if !$KNOWN_HANDLERS{$handler_name};
+	my $pkg = "File::StripNondeterminism::handlers::${handler_name}";
+	my $mod = "File/StripNondeterminism/handlers/${handler_name}.pm";
+	my $sub_name = "${pkg}::normalize";
+	require $mod;
+	no strict 'refs';
+
+	if (not defined &{$sub_name}) {
+		die("Internal error: No handler for $handler_name!?\n");
+	}
+	my $handler = \&{$sub_name};
+	return $HANDLER_CACHE{$handler_name} = $handler;
+}
+
+sub get_normalizer_by_name($) {
+	return _handler(shift);
+}
+
+# From Debian::Debhelper::Dh_Lib
+my $_disable_file_seccomp;
+
+sub _internal_optional_file_args {
+	if (not defined($_disable_file_seccomp)) {
+		my $consider_disabling_seccomp = 0;
+		if ($ENV{'FAKEROOTKEY'} or ($ENV{'LD_PRELOAD'}//'') =~ m/fakeroot/) {
+			$consider_disabling_seccomp = 1;
+		}
+		if ($consider_disabling_seccomp) {
+			my $has_no_sandbox = (qx/file --help/ // '') =~ m/--no-sandbox/;
+			$consider_disabling_seccomp = 0 if not $has_no_sandbox;
+		}
+		$_disable_file_seccomp = $consider_disabling_seccomp;
+	}
+	return ('--no-sandbox') if $_disable_file_seccomp;
+	return;
+}
+
+1;
+                                                                             usr/share/perl5/Mail/                                                                               0000755 0000000 0000000 00000000000 14723045615 013077  5                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        usr/share/perl5/Mail/.wh..wh..opq                                                                   0000755 0000000 0000000 00000000000 00000000000 015010  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        usr/share/perl5/Mail/Sendmail.pm                                                                    0000644 0000000 0000000 00000101223 14344207746 015174  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        package Mail::Sendmail;
+
+# Mail::Sendmail by Milivoj Ivkovic <mi\x40alma.ch>
+# see embedded POD documentation after __END__
+# or http://alma.ch/perl/mail.html
+
+=head1 NAME
+
+Mail::Sendmail - Simple platform independent mailer
+
+=cut
+
+require 5.006;
+
+our $VERSION = "0.80";
+
+use strict;
+use warnings;
+
+use parent 'Exporter';
+
+# *************** Configuration you may want to change *******************
+# You probably want to set your SMTP server here (unless you specify it in
+# every script), and leave the rest as is. See pod documentation for details
+
+our %mailcfg = (
+    # List of SMTP servers:
+    'smtp'    => [ qw( localhost ) ],
+    #'smtp'    => [ qw( mail.mydomain.com ) ], # example
+
+    'from'    => '', # default sender e-mail, used when no From header in mail
+
+    'mime'    => 1, # use MIME encoding by default
+
+    'retries' => 1, # number of retries on smtp connect failure
+    'delay'   => 1, # delay in seconds between retries
+
+    'tz'      => '', # only to override automatic detection
+    'port'    => 25, # change it if you always use a non-standard port
+    'debug'   => 0 # prints stuff to STDERR
+);
+
+# *******************************************************************
+
+our $address_rx;
+our $debug;
+our $log;
+our $error;
+our $retry_delay;
+our $connect_retries;
+our $auth_support;
+
+use Socket;
+use Time::Local; # for automatic time zone detection
+use Sys::Hostname; # for use of hostname in HELO
+use Sys::Hostname::Long; # for use of hostname in HELO
+
+#use Digest::HMAC_MD5 qw(hmac_md5 hmac_md5_hex);
+
+$auth_support = 'DIGEST-MD5 CRAM-MD5 PLAIN LOGIN';
+
+# use MIME::QuotedPrint if available and configured in %mailcfg
+eval("use MIME::QuotedPrint");
+$mailcfg{'mime'} &&= (!$@);
+
+our @EXPORT     = qw(&sendmail);
+our @EXPORT_OK  = qw(
+                     %mailcfg
+                     time_to_date
+                     $address_rx
+                     $debug
+                     $log
+                     $error
+                    );
+
+# regex for e-mail addresses where full=$1, user=$2, domain=$3
+# see pod documentation about this regex
+
+my $word_rx = '[\x21\x23-\x27\x2A-\x2B\x2D\x2F\w\x3D\x3F]+';
+my $user_rx = $word_rx         # valid chars
+             .'(?:\.' . $word_rx . ')*' # possibly more words preceded by a dot
+             ;
+my $dom_rx = '\w[-\w]*(?:\.\w[-\w]*)*'; # less valid chars in domain names
+my $ip_rx = '\[\d{1,3}(?:\.\d{1,3}){3}\]';
+
+$address_rx = '((' . $user_rx . ')\@(' . $dom_rx . '|' . $ip_rx . '))';
+; # v. 0.61
+
+sub _require_md5 {
+    eval { require Digest::MD5; Digest::MD5->import(qw(md5 md5_hex)); };
+    $error .= $@ if $@;
+    return ($@ ? undef : 1);
+}
+
+sub _require_base64 {
+    eval {
+        require MIME::Base64; MIME::Base64->import(qw(encode_base64 decode_base64));
+    };
+    $error .= $@ if $@;
+    return ($@ ? undef : 1);
+}
+
+sub _hmac_md5 {
+    my ($pass, $ckey) = @_;
+    my $size = 64;
+    $pass = md5($pass) if length($pass) > $size;
+    my $ipad = $pass ^ (chr(0x36) x $size);
+    my $opad = $pass ^ (chr(0x5c) x $size);
+    return md5_hex($opad, md5($ipad, $ckey));
+}
+
+sub _digest_md5 {
+    my ($user, $pass, $challenge, $realm) = @_;
+
+    my %ckey = map { /^([^=]+)="?(.+?)"?$/ } split(/,/, $challenge);
+    $realm ||= $ckey{realm}; #($user =~ s/\@(.+)$//o) ? $1 : $server;
+    my $nonce  = $ckey{nonce};
+    my $cnonce = &make_cnonce;
+    my $uri = join('/', 'smtp', hostname()||'localhost', $ckey{realm});
+    my $qop = 'auth';
+    my $nc  = '00000001';
+    my($hv, $a1, $a2);
+    $hv = md5("$user:$realm:$pass");
+    $a1 = md5_hex("$hv:$nonce:$cnonce");
+    $a2 = md5_hex("AUTHENTICATE:$uri");
+    $hv = md5_hex("$a1:$nonce:$nc:$cnonce:$qop:$a2");
+    return qq(username="$user",realm="$ckey{realm}",nonce="$nonce",nc=$nc,cnonce="$cnonce",digest-uri="$uri",response=$hv,qop=$qop);
+}
+
+sub make_cnonce {
+    my $s = '' ;
+    for(1..16) { $s .= chr(rand 256) }
+    $s = encode_base64($s, "");
+    $s =~ s/\W/X/go;
+    return substr($s, 0, 16);
+}
+
+sub time_to_date {
+    # convert a time() value to a date-time string according to RFC 822
+
+    my $time = $_[0] || time(); # default to now if no argument
+
+    my @months = qw(Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec);
+    my @wdays  = qw(Sun Mon Tue Wed Thu Fri Sat);
+
+    my ($sec,$min,$hour,$mday,$mon,$year,$wday,$yday,$isdst)
+        = localtime($time);
+
+    my $TZ = $mailcfg{'tz'};
+    if ( $TZ eq "" ) {
+        # offset in hours
+        my $offset  = sprintf "%.1f", (timegm(localtime) - time) / 3600;
+        my $minutes = sprintf "%02d", abs( $offset - int($offset) ) * 60;
+        $TZ  = sprintf("%+03d", int($offset)) . $minutes;
+    }
+    return join(" ",
+                    ($wdays[$wday] . ','),
+                     $mday,
+                     $months[$mon],
+                     $year+1900,
+                     sprintf("%02d:%02d:%02d", $hour, $min, $sec),
+                     $TZ
+               );
+} # end sub time_to_date
+
+sub sendmail {
+
+    $error = '';
+    $log = "Mail::Sendmail v. $VERSION - "    . scalar(localtime()) . "\n";
+
+    my $CRLF = "\015\012";
+    local $/ = $CRLF;
+    local $\ = ''; # to protect us from outside settings
+    local $_;
+
+    my (%mail, $k,
+        $smtp, $server, $port, $connected, $localhost,
+        $fromaddr, $recip, @recipients, $to, $header,
+        %esmtp, @wanted_methods,
+       );
+    use vars qw($server_reply);
+    # -------- a few internal subs ----------
+    sub fail {
+        # things to do before returning a sendmail failure
+        $error .= join(" ", @_) . "\n";
+        if ($server_reply) {
+            $error .= "Server said: $server_reply\n";
+            print STDERR "Server said: $server_reply\n" if $^W;
+        }
+        close S;
+        return 0;
+    }
+
+    sub socket_write {
+        my $i;
+        for $i (0..$#_) {
+            # accept references, so we don't copy potentially big data
+            my $data = ref($_[$i]) ? $_[$i] : \$_[$i];
+            if ($mailcfg{'debug'} > 5) {
+                if (length($$data) < 500) {
+                    print ">", $$data;
+                }
+                else {
+                    print "> [...", length($$data), " bytes sent ...]\n";
+                }
+            }
+            print(S $$data) || return 0;
+        }
+        1;
+    }
+
+    sub socket_read {
+        $server_reply = "";
+        do {
+            $_ = <S>;
+            $server_reply .= $_;
+            #chomp $_;
+            print "<$_" if $mailcfg{'debug'} > 5;
+            if (/^[45]/ or !$_) {
+                chomp $server_reply;
+                return; # return false
+            }
+        } while (/^[\d]+-/);
+        chomp $server_reply;
+        return $server_reply;
+    }
+    # -------- end of internal subs ----------
+
+    # all config keys to lowercase, to prevent typo errors
+    foreach $k (keys %mailcfg) {
+        if ($k =~ /[A-Z]/) {
+            $mailcfg{lc($k)} = $mailcfg{$k};
+        }
+    }
+
+    # redo mail hash, arranging keys case etc...
+    while (@_) {
+        $k = shift @_;
+        if (!$k and $^W) {
+            warn "Received false mail hash key: \'$k\'. Did you forget to put it in quotes?\n";
+        }
+
+        # arrange keys case
+        $k = ucfirst lc($k);
+
+        $k =~ s/\s*:\s*$//o; # kill colon (and possible spaces) at end, we add it later.
+        # uppercase also after "-", so people don't complain that headers case is different
+        # than in Outlook.
+        $k =~ s/-(.)/"-" . uc($1)/ge;
+        $mail{$k} = shift @_;
+        if ($k !~ /^(Message|Body|Text)$/i) {
+            # normalize possible line endings in headers
+            $mail{$k} =~ s/\015\012?/\012/go;
+            $mail{$k} =~ s/\012/$CRLF/go;
+        }
+    }
+
+    $smtp = $mail{'Smtp'} || $mail{'Server'};
+    unshift @{$mailcfg{'smtp'}}, $smtp if ($smtp and $mailcfg{'smtp'}->[0] ne $smtp);
+
+    # delete non-header keys, so we don't send them later as mail headers
+    # I like this syntax, but it doesn't seem to work with AS port 5.003_07:
+    # delete @mail{'Smtp', 'Server'};
+    # so instead:
+    delete $mail{'Smtp'}; delete $mail{'Server'};
+
+    $mailcfg{'port'} = $mail{'Port'} || $mailcfg{'port'} || 25;
+    delete $mail{'Port'};
+
+    my $auth = $mail{'Auth'};
+    delete $mail{'Auth'};
+
+    my @parts;
+    push(@parts, $mail{'Message'}) if defined($mail{'Message'});
+    push(@parts, $mail{'Body'})    if defined($mail{'Body'});
+    push(@parts, $mail{'Text'})    if defined($mail{'Text'});
+    $mail{'Message'} = join("", @parts);
+
+    # delete @mail{'Body', 'Text'};
+    delete $mail{'Body'};
+    delete $mail{'Text'};
+
+    # Extract 'From:' e-mail address to use as envelope sender
+
+    $fromaddr = $mail{'Sender'} || $mail{'From'} || $mailcfg{'from'};
+    #delete $mail{'Sender'};
+    unless ($fromaddr =~ /$address_rx/) {
+        return fail("Bad or missing From address: \'$fromaddr\'");
+    }
+    $fromaddr = $1;
+
+    # add Date header if needed
+    $mail{Date} ||= time_to_date() ;
+    $log .= "Date: $mail{Date}\n";
+
+    # cleanup message, and encode if needed
+    $mail{'Message'} =~ s/\r\n/\n/go;     # normalize line endings, step 1 of 2 (next step after MIME encoding)
+
+    $mail{'Mime-Version'} ||= '1.0';
+    $mail{'Content-Type'} ||= 'text/plain; charset="iso-8859-1"';
+
+    unless ( $mail{'Content-Transfer-Encoding'}
+          || $mail{'Content-Type'} =~ /multipart/io )
+    {
+        if ($mailcfg{'mime'}) {
+            $mail{'Content-Transfer-Encoding'} = 'quoted-printable';
+            $mail{'Message'} = encode_qp($mail{'Message'});
+        }
+        else {
+            $mail{'Content-Transfer-Encoding'} = '8bit';
+            if ($mail{'Message'} =~ /[\x80-\xFF]/o) {
+                $error .= "MIME::QuotedPrint not present!\nSending 8bit characters, hoping it will come across OK.\n";
+                warn "MIME::QuotedPrint not present!\n",
+                     "Sending 8bit characters without encoding, hoping it will come across OK.\n"
+                     if $^W;
+            }
+        }
+    }
+
+    $mail{'Message'} =~ s/^\./\.\./gom;     # handle . as first character
+    $mail{'Message'} =~ s/\n/$CRLF/go; # normalize line endings, step 2.
+
+    # Get recipients
+    {    # don't warn for undefined values below
+        my @recipients;
+        push(@recipients, $mail{To})  if defined($mail{To});
+        push(@recipients, $mail{Cc})  if defined($mail{Cc});
+        push(@recipients, $mail{Bcc}) if defined($mail{Bcc});
+        $recip = join(", ", @recipients);
+    }
+
+    delete $mail{'Bcc'};
+
+    @recipients = ();
+    while ($recip =~ /$address_rx/go) {
+        push @recipients, $1;
+    }
+    unless (@recipients) {
+        return fail("No recipient!")
+    }
+
+    # get local hostname for polite HELO
+    $localhost = hostname_long() || hostname() || 'localhost';
+
+    foreach $server ( @{$mailcfg{'smtp'}} ) {
+        # open socket needs to be inside this foreach loop on Linux,
+        # otherwise all servers fail if 1st one fails !??! why?
+        unless ( socket S, AF_INET, SOCK_STREAM, scalar(getprotobyname 'tcp') ) {
+            return fail("socket failed ($!)")
+        }
+
+        print "- trying $server\n" if $mailcfg{'debug'} > 1;
+
+        $server =~ s/\s+//go; # remove spaces just in case of a typo
+        # extract port if server name like "mail.domain.com:2525"
+        $port = ($server =~ s/:(\d+)$//o) ? $1 : $mailcfg{'port'};
+        $smtp = $server; # save $server for use outside foreach loop
+
+        my $smtpaddr = inet_aton $server;
+        unless ($smtpaddr) {
+            $error .= "$server not found\n";
+            next; # next server
+        }
+
+        my $retried = 0; # reset retries for each server
+        while ( ( not $connected = connect S, pack_sockaddr_in($port, $smtpaddr) )
+            and ( $retried < $mailcfg{'retries'} )
+              ) {
+            $retried++;
+            $error .= "connect to $server failed ($!)\n";
+            print "- connect to $server failed ($!)\n" if $mailcfg{'debug'} > 1;
+            print "retrying in $mailcfg{'delay'} seconds...\n" if $mailcfg{'debug'} > 1;
+            sleep $mailcfg{'delay'};
+        }
+
+        if ( $connected ) {
+            print "- connected to $server\n" if $mailcfg{'debug'} > 3;
+            last;
+        }
+        else {
+            $error .= "connect to $server failed\n";
+            print "- connect to $server failed, next server...\n" if $mailcfg{'debug'} > 1;
+            next; # next server
+        }
+    }
+
+    unless ( $connected ) {
+        return fail("connect to $smtp failed ($!) no (more) retries!")
+    };
+
+    {
+        local $^W = 0; # don't warn on undefined variables
+        # Add info to log variable
+        $log .= "Server: $smtp Port: $port\n"
+              . "From: $fromaddr\n"
+              . "Subject: $mail{Subject}\n"
+              ;
+    }
+
+    my($oldfh) = select(S); $| = 1; select($oldfh);
+
+    socket_read()
+        || return fail("Connection error from $smtp on port $port ($_)");
+    socket_write("EHLO $localhost$CRLF")
+        || return fail("send EHLO error (lost connection?)");
+    my $ehlo = socket_read();
+    if ($ehlo) {
+        # parse EHLO response
+        map {
+            s/^\d+[- ]//;
+            my ($k, $v) = split /\s+/, $_, 2;
+            $esmtp{$k} = $v || 1 if $k;
+        } split(/\n/, $ehlo);
+    }
+    else {
+        # try plain HELO instead
+        socket_write("HELO $localhost$CRLF")
+            || return fail("send HELO error (lost connection?)");
+    }
+
+    if ($auth) {
+        warn "AUTH requested\n" if ($mailcfg{debug} > 4);
+        # reduce wanted methods to those supported
+        my @methods = grep {$esmtp{'AUTH'}=~/(^|\s)$_(\s|$)/i}
+                        grep {$auth_support =~ /(^|\s)$_(\s|$)/i}
+                            grep /\S/, split(/\s+/, $auth->{method});
+
+        if (@methods) {
+            # try to authenticate
+
+            if (exists $auth->{pass}) {
+                $auth->{password} = $auth->{pass};
+            }
+
+            my $method = uc $methods[0];
+            _require_base64() || fail("Could not use MIME::Base64 module required for authentication");
+            if ($method eq "LOGIN") {
+                print STDERR "Trying AUTH LOGIN\n" if ($mailcfg{debug} > 9);
+                socket_write("AUTH LOGIN$CRLF")
+                    || return fail("send AUTH LOGIN failed (lost connection?)");
+                socket_read()
+                    || return fail("AUTH LOGIN failed: $server_reply");
+                socket_write(encode_base64($auth->{user},$CRLF))
+                    || return fail("send LOGIN username failed (lost connection?)");
+                socket_read()
+                    || return fail("LOGIN username failed: $server_reply");
+                socket_write(encode_base64($auth->{password},$CRLF))
+                    || return fail("send LOGIN password failed (lost connection?)");
+                socket_read()
+                    || return fail("LOGIN password failed: $server_reply");
+            }
+            elsif ($method eq "PLAIN") {
+                warn "Trying AUTH PLAIN\n" if ($mailcfg{debug} > 9);
+                socket_write(
+                    "AUTH PLAIN "
+                    . encode_base64(join("\0", $auth->{user}, $auth->{user}, $auth->{password}), $CRLF)
+                ) || return fail("send AUTH PLAIN failed (lost connection?)");
+                socket_read()
+                    || return fail("AUTH PLAIN failed: $server_reply");
+            }
+            elsif ($method eq "CRAM-MD5") {
+                _require_md5() || fail("Could not use Digest::MD5 module required for authentication");
+                warn "Trying AUTH CRAM-MD5\n" if ($mailcfg{debug} > 9);
+                socket_write("AUTH CRAM-MD5$CRLF")
+                    || return fail("send CRAM-MD5 failed (lost connection?)");
+                my $challenge = socket_read()
+                    || return fail("AUTH CRAM-MD5 failed: $server_reply");
+                $challenge =~ s/^\d+\s+//;
+                my $response = _hmac_md5($auth->{password}, decode_base64($challenge));
+                socket_write(encode_base64("$auth->{user} $response", $CRLF))
+                    || return fail("AUTH CRAM-MD5 failed: $server_reply");
+                socket_read()
+                    || return fail("AUTH CRAM-MD5 failed: $server_reply");
+            }
+            elsif ($method eq "DIGEST-MD5") {
+                _require_md5() || fail("Could not use Digest::MD5 module required for authentication");
+                warn "Trying AUTH DIGEST-MD5\n" if ($mailcfg{debug} > 9);
+                socket_write("AUTH DIGEST-MD5$CRLF")
+                    || return fail("send CRAM-MD5 failed (lost connection?)");
+                my $challenge = socket_read()
+                    || return fail("AUTH DIGEST-MD5 failed: $server_reply");
+                $challenge =~ s/^\d+\s+//; $challenge =~ s/[\r\n]+$//;
+                warn "\nCHALLENGE=", decode_base64($challenge), "\n" if ($mailcfg{debug} > 10);
+                my $response = _digest_md5($auth->{user}, $auth->{password}, decode_base64($challenge), $auth->{realm});
+                warn "\nRESPONSE=$response\n" if ($mailcfg{debug} > 10);
+                socket_write(encode_base64($response, ""), $CRLF)
+                    || return fail("AUTH DIGEST-MD5 failed: $server_reply");
+                my $status = socket_read()
+                    || return fail("AUTH DIGEST-MD5 failed: $server_reply");
+                if ($status =~ /^3/) {
+                    socket_write($CRLF)
+                        || return fail("AUTH DIGEST-MD5 failed: $server_reply");
+                    socket_read()
+                        || return fail("AUTH DIGEST-MD5 failed: $server_reply");
+                }
+            }
+            else {
+                return fail("$method not supported (and wrongly advertised as supported by this silly module)\n");
+            }
+            $log .= "AUTH $method succeeded as user $auth->{user}\n";
+        }
+        else {
+            $esmtp{'AUTH'} =~ s/(^\s+|\s+$)//g; # cleanup for printig it below
+            if ($auth->{required}) {
+                return fail("Required AUTH method '$auth->{method}' not supported. "
+                            ."(Server supports '$esmtp{'AUTH'}'. Module supports: '$auth_support')");
+            }
+            else {
+                warn "No common authentication method! Requested: '$auth->{method}'. Server supports '$esmtp{'AUTH'}'. Module supports: '$auth_support'. Skipping authentication\n";
+            }
+        }
+    }
+    socket_write("MAIL FROM:<$fromaddr>$CRLF")
+        || return fail("send MAIL FROM: error");
+    socket_read()
+        || return fail("MAIL FROM: error ($_)");
+
+    my $to_ok = 0;
+    foreach $to (@recipients) {
+        socket_write("RCPT TO:<$to>$CRLF")
+            || return fail("send RCPT TO: error");
+        if (socket_read()) {
+            $log .= "To: $to\n";
+            $to_ok++;
+        } else {
+            $log .= "FAILED To: $to ($server_reply)";

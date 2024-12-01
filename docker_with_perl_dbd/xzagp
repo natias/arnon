@@ -1,0 +1,1000 @@
+        if self.dispatch[event](self, frame,t):
+            t = timer()
+            self.t = t[0] + t[1]
+        else:
+            r = timer()
+            self.t = r[0] + r[1] - t # put back unrecorded delta
+
+    # Dispatch routine for best timer program (return = scalar, fastest if
+    # an integer but float works too -- and time.process_time() relies on that).
+
+    def trace_dispatch_i(self, frame, event, arg):
+        timer = self.timer
+        t = timer() - self.t - self.bias
+
+        if event == "c_call":
+            self.c_func_name = arg.__name__
+
+        if self.dispatch[event](self, frame, t):
+            self.t = timer()
+        else:
+            self.t = timer() - t  # put back unrecorded delta
+
+    # Dispatch routine for macintosh (timer returns time in ticks of
+    # 1/60th second)
+
+    def trace_dispatch_mac(self, frame, event, arg):
+        timer = self.timer
+        t = timer()/60.0 - self.t - self.bias
+
+        if event == "c_call":
+            self.c_func_name = arg.__name__
+
+        if self.dispatch[event](self, frame, t):
+            self.t = timer()/60.0
+        else:
+            self.t = timer()/60.0 - t  # put back unrecorded delta
+
+    # SLOW generic dispatch routine for timer returning lists of numbers
+
+    def trace_dispatch_l(self, frame, event, arg):
+        get_time = self.get_time
+        t = get_time() - self.t - self.bias
+
+        if event == "c_call":
+            self.c_func_name = arg.__name__
+
+        if self.dispatch[event](self, frame, t):
+            self.t = get_time()
+        else:
+            self.t = get_time() - t # put back unrecorded delta
+
+    # In the event handlers, the first 3 elements of self.cur are unpacked
+    # into vrbls w/ 3-letter names.  The last two characters are meant to be
+    # mnemonic:
+    #     _pt  self.cur[0] "parent time"   time to be charged to parent frame
+    #     _it  self.cur[1] "internal time" time spent directly in the function
+    #     _et  self.cur[2] "external time" time spent in subfunctions
+
+    def trace_dispatch_exception(self, frame, t):
+        rpt, rit, ret, rfn, rframe, rcur = self.cur
+        if (rframe is not frame) and rcur:
+            return self.trace_dispatch_return(rframe, t)
+        self.cur = rpt, rit+t, ret, rfn, rframe, rcur
+        return 1
+
+
+    def trace_dispatch_call(self, frame, t):
+        if self.cur and frame.f_back is not self.cur[-2]:
+            rpt, rit, ret, rfn, rframe, rcur = self.cur
+            if not isinstance(rframe, Profile.fake_frame):
+                assert rframe.f_back is frame.f_back, ("Bad call", rfn,
+                                                       rframe, rframe.f_back,
+                                                       frame, frame.f_back)
+                self.trace_dispatch_return(rframe, 0)
+                assert (self.cur is None or \
+                        frame.f_back is self.cur[-2]), ("Bad call",
+                                                        self.cur[-3])
+        fcode = frame.f_code
+        fn = (fcode.co_filename, fcode.co_firstlineno, fcode.co_name)
+        self.cur = (t, 0, 0, fn, frame, self.cur)
+        timings = self.timings
+        if fn in timings:
+            cc, ns, tt, ct, callers = timings[fn]
+            timings[fn] = cc, ns + 1, tt, ct, callers
+        else:
+            timings[fn] = 0, 0, 0, 0, {}
+        return 1
+
+    def trace_dispatch_c_call (self, frame, t):
+        fn = ("", 0, self.c_func_name)
+        self.cur = (t, 0, 0, fn, frame, self.cur)
+        timings = self.timings
+        if fn in timings:
+            cc, ns, tt, ct, callers = timings[fn]
+            timings[fn] = cc, ns+1, tt, ct, callers
+        else:
+            timings[fn] = 0, 0, 0, 0, {}
+        return 1
+
+    def trace_dispatch_return(self, frame, t):
+        if frame is not self.cur[-2]:
+            assert frame is self.cur[-2].f_back, ("Bad return", self.cur[-3])
+            self.trace_dispatch_return(self.cur[-2], 0)
+
+        # Prefix "r" means part of the Returning or exiting frame.
+        # Prefix "p" means part of the Previous or Parent or older frame.
+
+        rpt, rit, ret, rfn, frame, rcur = self.cur
+        rit = rit + t
+        frame_total = rit + ret
+
+        ppt, pit, pet, pfn, pframe, pcur = rcur
+        self.cur = ppt, pit + rpt, pet + frame_total, pfn, pframe, pcur
+
+        timings = self.timings
+        cc, ns, tt, ct, callers = timings[rfn]
+        if not ns:
+            # This is the only occurrence of the function on the stack.
+            # Else this is a (directly or indirectly) recursive call, and
+            # its cumulative time will get updated when the topmost call to
+            # it returns.
+            ct = ct + frame_total
+            cc = cc + 1
+
+        if pfn in callers:
+            callers[pfn] = callers[pfn] + 1  # hack: gather more
+            # stats such as the amount of time added to ct courtesy
+            # of this specific call, and the contribution to cc
+            # courtesy of this call.
+        else:
+            callers[pfn] = 1
+
+        timings[rfn] = cc, ns - 1, tt + rit, ct, callers
+
+        return 1
+
+
+    dispatch = {
+        "call": trace_dispatch_call,
+        "exception": trace_dispatch_exception,
+        "return": trace_dispatch_return,
+        "c_call": trace_dispatch_c_call,
+        "c_exception": trace_dispatch_return,  # the C function returned
+        "c_return": trace_dispatch_return,
+        }
+
+
+    # The next few functions play with self.cmd. By carefully preloading
+    # our parallel stack, we can force the profiled result to include
+    # an arbitrary string as the name of the calling function.
+    # We use self.cmd as that string, and the resulting stats look
+    # very nice :-).
+
+    def set_cmd(self, cmd):
+        if self.cur[-1]: return   # already set
+        self.cmd = cmd
+        self.simulate_call(cmd)
+
+    class fake_code:
+        def __init__(self, filename, line, name):
+            self.co_filename = filename
+            self.co_line = line
+            self.co_name = name
+            self.co_firstlineno = 0
+
+        def __repr__(self):
+            return repr((self.co_filename, self.co_line, self.co_name))
+
+    class fake_frame:
+        def __init__(self, code, prior):
+            self.f_code = code
+            self.f_back = prior
+
+    def simulate_call(self, name):
+        code = self.fake_code('profile', 0, name)
+        if self.cur:
+            pframe = self.cur[-2]
+        else:
+            pframe = None
+        frame = self.fake_frame(code, pframe)
+        self.dispatch['call'](self, frame, 0)
+
+    # collect stats from pending stack, including getting final
+    # timings for self.cmd frame.
+
+    def simulate_cmd_complete(self):
+        get_time = self.get_time
+        t = get_time() - self.t
+        while self.cur[-1]:
+            # We *can* cause assertion errors here if
+            # dispatch_trace_return checks for a frame match!
+            self.dispatch['return'](self, self.cur[-2], t)
+            t = 0
+        self.t = get_time() - t
+
+
+    def print_stats(self, sort=-1):
+        import pstats
+        pstats.Stats(self).strip_dirs().sort_stats(sort). \
+                  print_stats()
+
+    def dump_stats(self, file):
+        with open(file, 'wb') as f:
+            self.create_stats()
+            marshal.dump(self.stats, f)
+
+    def create_stats(self):
+        self.simulate_cmd_complete()
+        self.snapshot_stats()
+
+    def snapshot_stats(self):
+        self.stats = {}
+        for func, (cc, ns, tt, ct, callers) in self.timings.items():
+            callers = callers.copy()
+            nc = 0
+            for callcnt in callers.values():
+                nc += callcnt
+            self.stats[func] = cc, nc, tt, ct, callers
+
+
+    # The following two methods can be called by clients to use
+    # a profiler to profile a statement, given as a string.
+
+    def run(self, cmd):
+        import __main__
+        dict = __main__.__dict__
+        return self.runctx(cmd, dict, dict)
+
+    def runctx(self, cmd, globals, locals):
+        self.set_cmd(cmd)
+        sys.setprofile(self.dispatcher)
+        try:
+            exec(cmd, globals, locals)
+        finally:
+            sys.setprofile(None)
+        return self
+
+    # This method is more useful to profile a single function call.
+    def runcall(self, func, /, *args, **kw):
+        self.set_cmd(repr(func))
+        sys.setprofile(self.dispatcher)
+        try:
+            return func(*args, **kw)
+        finally:
+            sys.setprofile(None)
+
+
+    #******************************************************************
+    # The following calculates the overhead for using a profiler.  The
+    # problem is that it takes a fair amount of time for the profiler
+    # to stop the stopwatch (from the time it receives an event).
+    # Similarly, there is a delay from the time that the profiler
+    # re-starts the stopwatch before the user's code really gets to
+    # continue.  The following code tries to measure the difference on
+    # a per-event basis.
+    #
+    # Note that this difference is only significant if there are a lot of
+    # events, and relatively little user code per event.  For example,
+    # code with small functions will typically benefit from having the
+    # profiler calibrated for the current platform.  This *could* be
+    # done on the fly during init() time, but it is not worth the
+    # effort.  Also note that if too large a value specified, then
+    # execution time on some functions will actually appear as a
+    # negative number.  It is *normal* for some functions (with very
+    # low call counts) to have such negative stats, even if the
+    # calibration figure is "correct."
+    #
+    # One alternative to profile-time calibration adjustments (i.e.,
+    # adding in the magic little delta during each event) is to track
+    # more carefully the number of events (and cumulatively, the number
+    # of events during sub functions) that are seen.  If this were
+    # done, then the arithmetic could be done after the fact (i.e., at
+    # display time).  Currently, we track only call/return events.
+    # These values can be deduced by examining the callees and callers
+    # vectors for each functions.  Hence we *can* almost correct the
+    # internal time figure at print time (note that we currently don't
+    # track exception event processing counts).  Unfortunately, there
+    # is currently no similar information for cumulative sub-function
+    # time.  It would not be hard to "get all this info" at profiler
+    # time.  Specifically, we would have to extend the tuples to keep
+    # counts of this in each frame, and then extend the defs of timing
+    # tuples to include the significant two figures. I'm a bit fearful
+    # that this additional feature will slow the heavily optimized
+    # event/time ratio (i.e., the profiler would run slower, fur a very
+    # low "value added" feature.)
+    #**************************************************************
+
+    def calibrate(self, m, verbose=0):
+        if self.__class__ is not Profile:
+            raise TypeError("Subclasses must override .calibrate().")
+
+        saved_bias = self.bias
+        self.bias = 0
+        try:
+            return self._calibrate_inner(m, verbose)
+        finally:
+            self.bias = saved_bias
+
+    def _calibrate_inner(self, m, verbose):
+        get_time = self.get_time
+
+        # Set up a test case to be run with and without profiling.  Include
+        # lots of calls, because we're trying to quantify stopwatch overhead.
+        # Do not raise any exceptions, though, because we want to know
+        # exactly how many profile events are generated (one call event, +
+        # one return event, per Python-level call).
+
+        def f1(n):
+            for i in range(n):
+                x = 1
+
+        def f(m, f1=f1):
+            for i in range(m):
+                f1(100)
+
+        f(m)    # warm up the cache
+
+        # elapsed_noprofile <- time f(m) takes without profiling.
+        t0 = get_time()
+        f(m)
+        t1 = get_time()
+        elapsed_noprofile = t1 - t0
+        if verbose:
+            print("elapsed time without profiling =", elapsed_noprofile)
+
+        # elapsed_profile <- time f(m) takes with profiling.  The difference
+        # is profiling overhead, only some of which the profiler subtracts
+        # out on its own.
+        p = Profile()
+        t0 = get_time()
+        p.runctx('f(m)', globals(), locals())
+        t1 = get_time()
+        elapsed_profile = t1 - t0
+        if verbose:
+            print("elapsed time with profiling =", elapsed_profile)
+
+        # reported_time <- "CPU seconds" the profiler charged to f and f1.
+        total_calls = 0.0
+        reported_time = 0.0
+        for (filename, line, funcname), (cc, ns, tt, ct, callers) in \
+                p.timings.items():
+            if funcname in ("f", "f1"):
+                total_calls += cc
+                reported_time += tt
+
+        if verbose:
+            print("'CPU seconds' profiler reported =", reported_time)
+            print("total # calls =", total_calls)
+        if total_calls != m + 1:
+            raise ValueError("internal error: total calls = %d" % total_calls)
+
+        # reported_time - elapsed_noprofile = overhead the profiler wasn't
+        # able to measure.  Divide by twice the number of calls (since there
+        # are two profiler events per call in this test) to get the hidden
+        # overhead per event.
+        mean = (reported_time - elapsed_noprofile) / 2.0 / total_calls
+        if verbose:
+            print("mean stopwatch overhead per profile event =", mean)
+        return mean
+
+#****************************************************************************
+
+def main():
+    import os
+    from optparse import OptionParser
+
+    usage = "profile.py [-o output_file_path] [-s sort] [-m module | scriptfile] [arg] ..."
+    parser = OptionParser(usage=usage)
+    parser.allow_interspersed_args = False
+    parser.add_option('-o', '--outfile', dest="outfile",
+        help="Save stats to <outfile>", default=None)
+    parser.add_option('-m', dest="module", action="store_true",
+        help="Profile a library module.", default=False)
+    parser.add_option('-s', '--sort', dest="sort",
+        help="Sort order when printing to stdout, based on pstats.Stats class",
+        default=-1)
+
+    if not sys.argv[1:]:
+        parser.print_usage()
+        sys.exit(2)
+
+    (options, args) = parser.parse_args()
+    sys.argv[:] = args
+
+    # The script that we're profiling may chdir, so capture the absolute path
+    # to the output file at startup.
+    if options.outfile is not None:
+        options.outfile = os.path.abspath(options.outfile)
+
+    if len(args) > 0:
+        if options.module:
+            import runpy
+            code = "run_module(modname, run_name='__main__')"
+            globs = {
+                'run_module': runpy.run_module,
+                'modname': args[0]
+            }
+        else:
+            progname = args[0]
+            sys.path.insert(0, os.path.dirname(progname))
+            with open(progname, 'rb') as fp:
+                code = compile(fp.read(), progname, 'exec')
+            globs = {
+                '__file__': progname,
+                '__name__': '__main__',
+                '__package__': None,
+                '__cached__': None,
+            }
+        try:
+            runctx(code, globs, None, options.outfile, options.sort)
+        except BrokenPipeError as exc:
+            # Prevent "Exception ignored" during interpreter shutdown.
+            sys.stdout = None
+            sys.exit(exc.errno)
+    else:
+        parser.print_usage()
+    return parser
+
+# When invoked as main program, invoke the profiler on a script
+if __name__ == '__main__':
+    main()
+                                                                                                                                                                         usr/lib/python3.11/pstats.py                                                                        0000644 0000000 0000000 00000071254 14671176116 014362  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        """Class for printing reports on profiled python code."""
+
+# Written by James Roskind
+# Based on prior profile module by Sjoerd Mullender...
+#   which was hacked somewhat by: Guido van Rossum
+
+# Copyright Disney Enterprises, Inc.  All Rights Reserved.
+# Licensed to PSF under a Contributor Agreement
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND,
+# either express or implied.  See the License for the specific language
+# governing permissions and limitations under the License.
+
+
+import sys
+import os
+import time
+import marshal
+import re
+
+from enum import StrEnum, _simple_enum
+from functools import cmp_to_key
+from dataclasses import dataclass
+from typing import Dict
+
+__all__ = ["Stats", "SortKey", "FunctionProfile", "StatsProfile"]
+
+@_simple_enum(StrEnum)
+class SortKey:
+    CALLS = 'calls', 'ncalls'
+    CUMULATIVE = 'cumulative', 'cumtime'
+    FILENAME = 'filename', 'module'
+    LINE = 'line'
+    NAME = 'name'
+    NFL = 'nfl'
+    PCALLS = 'pcalls'
+    STDNAME = 'stdname'
+    TIME = 'time', 'tottime'
+
+    def __new__(cls, *values):
+        value = values[0]
+        obj = str.__new__(cls, value)
+        obj._value_ = value
+        for other_value in values[1:]:
+            cls._value2member_map_[other_value] = obj
+        obj._all_values = values
+        return obj
+
+
+@dataclass(unsafe_hash=True)
+class FunctionProfile:
+    ncalls: str
+    tottime: float
+    percall_tottime: float
+    cumtime: float
+    percall_cumtime: float
+    file_name: str
+    line_number: int
+
+@dataclass(unsafe_hash=True)
+class StatsProfile:
+    '''Class for keeping track of an item in inventory.'''
+    total_tt: float
+    func_profiles: Dict[str, FunctionProfile]
+
+class Stats:
+    """This class is used for creating reports from data generated by the
+    Profile class.  It is a "friend" of that class, and imports data either
+    by direct access to members of Profile class, or by reading in a dictionary
+    that was emitted (via marshal) from the Profile class.
+
+    The big change from the previous Profiler (in terms of raw functionality)
+    is that an "add()" method has been provided to combine Stats from
+    several distinct profile runs.  Both the constructor and the add()
+    method now take arbitrarily many file names as arguments.
+
+    All the print methods now take an argument that indicates how many lines
+    to print.  If the arg is a floating point number between 0 and 1.0, then
+    it is taken as a decimal percentage of the available lines to be printed
+    (e.g., .1 means print 10% of all available lines).  If it is an integer,
+    it is taken to mean the number of lines of data that you wish to have
+    printed.
+
+    The sort_stats() method now processes some additional options (i.e., in
+    addition to the old -1, 0, 1, or 2 that are respectively interpreted as
+    'stdname', 'calls', 'time', and 'cumulative').  It takes either an
+    arbitrary number of quoted strings or SortKey enum to select the sort
+    order.
+
+    For example sort_stats('time', 'name') or sort_stats(SortKey.TIME,
+    SortKey.NAME) sorts on the major key of 'internal function time', and on
+    the minor key of 'the name of the function'.  Look at the two tables in
+    sort_stats() and get_sort_arg_defs(self) for more examples.
+
+    All methods return self, so you can string together commands like:
+        Stats('foo', 'goo').strip_dirs().sort_stats('calls').\
+                            print_stats(5).print_callers(5)
+    """
+
+    def __init__(self, *args, stream=None):
+        self.stream = stream or sys.stdout
+        if not len(args):
+            arg = None
+        else:
+            arg = args[0]
+            args = args[1:]
+        self.init(arg)
+        self.add(*args)
+
+    def init(self, arg):
+        self.all_callees = None  # calc only if needed
+        self.files = []
+        self.fcn_list = None
+        self.total_tt = 0
+        self.total_calls = 0
+        self.prim_calls = 0
+        self.max_name_len = 0
+        self.top_level = set()
+        self.stats = {}
+        self.sort_arg_dict = {}
+        self.load_stats(arg)
+        try:
+            self.get_top_level_stats()
+        except Exception:
+            print("Invalid timing data %s" %
+                  (self.files[-1] if self.files else ''), file=self.stream)
+            raise
+
+    def load_stats(self, arg):
+        if arg is None:
+            self.stats = {}
+            return
+        elif isinstance(arg, str):
+            with open(arg, 'rb') as f:
+                self.stats = marshal.load(f)
+            try:
+                file_stats = os.stat(arg)
+                arg = time.ctime(file_stats.st_mtime) + "    " + arg
+            except:  # in case this is not unix
+                pass
+            self.files = [arg]
+        elif hasattr(arg, 'create_stats'):
+            arg.create_stats()
+            self.stats = arg.stats
+            arg.stats = {}
+        if not self.stats:
+            raise TypeError("Cannot create or construct a %r object from %r"
+                            % (self.__class__, arg))
+        return
+
+    def get_top_level_stats(self):
+        for func, (cc, nc, tt, ct, callers) in self.stats.items():
+            self.total_calls += nc
+            self.prim_calls  += cc
+            self.total_tt    += tt
+            if ("jprofile", 0, "profiler") in callers:
+                self.top_level.add(func)
+            if len(func_std_string(func)) > self.max_name_len:
+                self.max_name_len = len(func_std_string(func))
+
+    def add(self, *arg_list):
+        if not arg_list:
+            return self
+        for item in reversed(arg_list):
+            if type(self) != type(item):
+                item = Stats(item)
+            self.files += item.files
+            self.total_calls += item.total_calls
+            self.prim_calls += item.prim_calls
+            self.total_tt += item.total_tt
+            for func in item.top_level:
+                self.top_level.add(func)
+
+            if self.max_name_len < item.max_name_len:
+                self.max_name_len = item.max_name_len
+
+            self.fcn_list = None
+
+            for func, stat in item.stats.items():
+                if func in self.stats:
+                    old_func_stat = self.stats[func]
+                else:
+                    old_func_stat = (0, 0, 0, 0, {},)
+                self.stats[func] = add_func_stats(old_func_stat, stat)
+        return self
+
+    def dump_stats(self, filename):
+        """Write the profile data to a file we know how to load back."""
+        with open(filename, 'wb') as f:
+            marshal.dump(self.stats, f)
+
+    # list the tuple indices and directions for sorting,
+    # along with some printable description
+    sort_arg_dict_default = {
+              "calls"     : (((1,-1),              ), "call count"),
+              "ncalls"    : (((1,-1),              ), "call count"),
+              "cumtime"   : (((3,-1),              ), "cumulative time"),
+              "cumulative": (((3,-1),              ), "cumulative time"),
+              "filename"  : (((4, 1),              ), "file name"),
+              "line"      : (((5, 1),              ), "line number"),
+              "module"    : (((4, 1),              ), "file name"),
+              "name"      : (((6, 1),              ), "function name"),
+              "nfl"       : (((6, 1),(4, 1),(5, 1),), "name/file/line"),
+              "pcalls"    : (((0,-1),              ), "primitive call count"),
+              "stdname"   : (((7, 1),              ), "standard name"),
+              "time"      : (((2,-1),              ), "internal time"),
+              "tottime"   : (((2,-1),              ), "internal time"),
+              }
+
+    def get_sort_arg_defs(self):
+        """Expand all abbreviations that are unique."""
+        if not self.sort_arg_dict:
+            self.sort_arg_dict = dict = {}
+            bad_list = {}
+            for word, tup in self.sort_arg_dict_default.items():
+                fragment = word
+                while fragment:
+                    if not fragment:
+                        break
+                    if fragment in dict:
+                        bad_list[fragment] = 0
+                        break
+                    dict[fragment] = tup
+                    fragment = fragment[:-1]
+            for word in bad_list:
+                del dict[word]
+        return self.sort_arg_dict
+
+    def sort_stats(self, *field):
+        if not field:
+            self.fcn_list = 0
+            return self
+        if len(field) == 1 and isinstance(field[0], int):
+            # Be compatible with old profiler
+            field = [ {-1: "stdname",
+                       0:  "calls",
+                       1:  "time",
+                       2:  "cumulative"}[field[0]] ]
+        elif len(field) >= 2:
+            for arg in field[1:]:
+                if type(arg) != type(field[0]):
+                    raise TypeError("Can't have mixed argument type")
+
+        sort_arg_defs = self.get_sort_arg_defs()
+
+        sort_tuple = ()
+        self.sort_type = ""
+        connector = ""
+        for word in field:
+            if isinstance(word, SortKey):
+                word = word.value
+            sort_tuple = sort_tuple + sort_arg_defs[word][0]
+            self.sort_type += connector + sort_arg_defs[word][1]
+            connector = ", "
+
+        stats_list = []
+        for func, (cc, nc, tt, ct, callers) in self.stats.items():
+            stats_list.append((cc, nc, tt, ct) + func +
+                              (func_std_string(func), func))
+
+        stats_list.sort(key=cmp_to_key(TupleComp(sort_tuple).compare))
+
+        self.fcn_list = fcn_list = []
+        for tuple in stats_list:
+            fcn_list.append(tuple[-1])
+        return self
+
+    def reverse_order(self):
+        if self.fcn_list:
+            self.fcn_list.reverse()
+        return self
+
+    def strip_dirs(self):
+        oldstats = self.stats
+        self.stats = newstats = {}
+        max_name_len = 0
+        for func, (cc, nc, tt, ct, callers) in oldstats.items():
+            newfunc = func_strip_path(func)
+            if len(func_std_string(newfunc)) > max_name_len:
+                max_name_len = len(func_std_string(newfunc))
+            newcallers = {}
+            for func2, caller in callers.items():
+                newcallers[func_strip_path(func2)] = caller
+
+            if newfunc in newstats:
+                newstats[newfunc] = add_func_stats(
+                                        newstats[newfunc],
+                                        (cc, nc, tt, ct, newcallers))
+            else:
+                newstats[newfunc] = (cc, nc, tt, ct, newcallers)
+        old_top = self.top_level
+        self.top_level = new_top = set()
+        for func in old_top:
+            new_top.add(func_strip_path(func))
+
+        self.max_name_len = max_name_len
+
+        self.fcn_list = None
+        self.all_callees = None
+        return self
+
+    def calc_callees(self):
+        if self.all_callees:
+            return
+        self.all_callees = all_callees = {}
+        for func, (cc, nc, tt, ct, callers) in self.stats.items():
+            if not func in all_callees:
+                all_callees[func] = {}
+            for func2, caller in callers.items():
+                if not func2 in all_callees:
+                    all_callees[func2] = {}
+                all_callees[func2][func]  = caller
+        return
+
+    #******************************************************************
+    # The following functions support actual printing of reports
+    #******************************************************************
+
+    # Optional "amount" is either a line count, or a percentage of lines.
+
+    def eval_print_amount(self, sel, list, msg):
+        new_list = list
+        if isinstance(sel, str):
+            try:
+                rex = re.compile(sel)
+            except re.error:
+                msg += "   <Invalid regular expression %r>\n" % sel
+                return new_list, msg
+            new_list = []
+            for func in list:
+                if rex.search(func_std_string(func)):
+                    new_list.append(func)
+        else:
+            count = len(list)
+            if isinstance(sel, float) and 0.0 <= sel < 1.0:
+                count = int(count * sel + .5)
+                new_list = list[:count]
+            elif isinstance(sel, int) and 0 <= sel < count:
+                count = sel
+                new_list = list[:count]
+        if len(list) != len(new_list):
+            msg += "   List reduced from %r to %r due to restriction <%r>\n" % (
+                len(list), len(new_list), sel)
+
+        return new_list, msg
+
+    def get_stats_profile(self):
+        """This method returns an instance of StatsProfile, which contains a mapping
+        of function names to instances of FunctionProfile. Each FunctionProfile
+        instance holds information related to the function's profile such as how
+        long the function took to run, how many times it was called, etc...
+        """
+        func_list = self.fcn_list[:] if self.fcn_list else list(self.stats.keys())
+        if not func_list:
+            return StatsProfile(0, {})
+
+        total_tt = float(f8(self.total_tt))
+        func_profiles = {}
+        stats_profile = StatsProfile(total_tt, func_profiles)
+
+        for func in func_list:
+            cc, nc, tt, ct, callers = self.stats[func]
+            file_name, line_number, func_name = func
+            ncalls = str(nc) if nc == cc else (str(nc) + '/' + str(cc))
+            tottime = float(f8(tt))
+            percall_tottime = -1 if nc == 0 else float(f8(tt/nc))
+            cumtime = float(f8(ct))
+            percall_cumtime = -1 if cc == 0 else float(f8(ct/cc))
+            func_profile = FunctionProfile(
+                ncalls,
+                tottime, # time spent in this function alone
+                percall_tottime,
+                cumtime, # time spent in the function plus all functions that this function called,
+                percall_cumtime,
+                file_name,
+                line_number
+            )
+            func_profiles[func_name] = func_profile
+
+        return stats_profile
+
+    def get_print_list(self, sel_list):
+        width = self.max_name_len
+        if self.fcn_list:
+            stat_list = self.fcn_list[:]
+            msg = "   Ordered by: " + self.sort_type + '\n'
+        else:
+            stat_list = list(self.stats.keys())
+            msg = "   Random listing order was used\n"
+
+        for selection in sel_list:
+            stat_list, msg = self.eval_print_amount(selection, stat_list, msg)
+
+        count = len(stat_list)
+
+        if not stat_list:
+            return 0, stat_list
+        print(msg, file=self.stream)
+        if count < len(self.stats):
+            width = 0
+            for func in stat_list:
+                if  len(func_std_string(func)) > width:
+                    width = len(func_std_string(func))
+        return width+2, stat_list
+
+    def print_stats(self, *amount):
+        for filename in self.files:
+            print(filename, file=self.stream)
+        if self.files:
+            print(file=self.stream)
+        indent = ' ' * 8
+        for func in self.top_level:
+            print(indent, func_get_function_name(func), file=self.stream)
+
+        print(indent, self.total_calls, "function calls", end=' ', file=self.stream)
+        if self.total_calls != self.prim_calls:
+            print("(%d primitive calls)" % self.prim_calls, end=' ', file=self.stream)
+        print("in %.3f seconds" % self.total_tt, file=self.stream)
+        print(file=self.stream)
+        width, list = self.get_print_list(amount)
+        if list:
+            self.print_title()
+            for func in list:
+                self.print_line(func)
+            print(file=self.stream)
+            print(file=self.stream)
+        return self
+
+    def print_callees(self, *amount):
+        width, list = self.get_print_list(amount)
+        if list:
+            self.calc_callees()
+
+            self.print_call_heading(width, "called...")
+            for func in list:
+                if func in self.all_callees:
+                    self.print_call_line(width, func, self.all_callees[func])
+                else:
+                    self.print_call_line(width, func, {})
+            print(file=self.stream)
+            print(file=self.stream)
+        return self
+
+    def print_callers(self, *amount):
+        width, list = self.get_print_list(amount)
+        if list:
+            self.print_call_heading(width, "was called by...")
+            for func in list:
+                cc, nc, tt, ct, callers = self.stats[func]
+                self.print_call_line(width, func, callers, "<-")
+            print(file=self.stream)
+            print(file=self.stream)
+        return self
+
+    def print_call_heading(self, name_size, column_title):
+        print("Function ".ljust(name_size) + column_title, file=self.stream)
+        # print sub-header only if we have new-style callers
+        subheader = False
+        for cc, nc, tt, ct, callers in self.stats.values():
+            if callers:
+                value = next(iter(callers.values()))
+                subheader = isinstance(value, tuple)
+                break
+        if subheader:
+            print(" "*name_size + "    ncalls  tottime  cumtime", file=self.stream)
+
+    def print_call_line(self, name_size, source, call_dict, arrow="->"):
+        print(func_std_string(source).ljust(name_size) + arrow, end=' ', file=self.stream)
+        if not call_dict:
+            print(file=self.stream)
+            return
+        clist = sorted(call_dict.keys())
+        indent = ""
+        for func in clist:
+            name = func_std_string(func)
+            value = call_dict[func]
+            if isinstance(value, tuple):
+                nc, cc, tt, ct = value
+                if nc != cc:
+                    substats = '%d/%d' % (nc, cc)
+                else:
+                    substats = '%d' % (nc,)
+                substats = '%s %s %s  %s' % (substats.rjust(7+2*len(indent)),
+                                             f8(tt), f8(ct), name)
+                left_width = name_size + 1
+            else:
+                substats = '%s(%r) %s' % (name, value, f8(self.stats[func][3]))
+                left_width = name_size + 3
+            print(indent*left_width + substats, file=self.stream)
+            indent = " "
+
+    def print_title(self):
+        print('   ncalls  tottime  percall  cumtime  percall', end=' ', file=self.stream)
+        print('filename:lineno(function)', file=self.stream)
+
+    def print_line(self, func):  # hack: should print percentages
+        cc, nc, tt, ct, callers = self.stats[func]
+        c = str(nc)
+        if nc != cc:
+            c = c + '/' + str(cc)
+        print(c.rjust(9), end=' ', file=self.stream)
+        print(f8(tt), end=' ', file=self.stream)
+        if nc == 0:
+            print(' '*8, end=' ', file=self.stream)
+        else:
+            print(f8(tt/nc), end=' ', file=self.stream)
+        print(f8(ct), end=' ', file=self.stream)
+        if cc == 0:
+            print(' '*8, end=' ', file=self.stream)
+        else:
+            print(f8(ct/cc), end=' ', file=self.stream)
+        print(func_std_string(func), file=self.stream)
+
+class TupleComp:
+    """This class provides a generic function for comparing any two tuples.
+    Each instance records a list of tuple-indices (from most significant
+    to least significant), and sort direction (ascending or descending) for
+    each tuple-index.  The compare functions can then be used as the function
+    argument to the system sort() function when a list of tuples need to be
+    sorted in the instances order."""
+
+    def __init__(self, comp_select_list):
+        self.comp_select_list = comp_select_list
+
+    def compare (self, left, right):
+        for index, direction in self.comp_select_list:
+            l = left[index]
+            r = right[index]
+            if l < r:
+                return -direction
+            if l > r:
+                return direction
+        return 0
+
+
+#**************************************************************************
+# func_name is a triple (file:string, line:int, name:string)
+
+def func_strip_path(func_name):
+    filename, line, name = func_name
+    return os.path.basename(filename), line, name
+
+def func_get_function_name(func):
+    return func[2]
+
+def func_std_string(func_name): # match what old profile produced
+    if func_name[:2] == ('~', 0):
+        # special case for built-in functions
+        name = func_name[2]
+        if name.startswith('<') and name.endswith('>'):
+            return '{%s}' % name[1:-1]
+        else:
+            return name
+    else:
+        return "%s:%d(%s)" % func_name
+
+#**************************************************************************
+# The following functions combine statistics for pairs functions.
+# The bulk of the processing involves correctly handling "call" lists,
+# such as callers and callees.
+#**************************************************************************
+
+def add_func_stats(target, source):
+    """Add together all the stats for two profile entries."""
+    cc, nc, tt, ct, callers = source
+    t_cc, t_nc, t_tt, t_ct, t_callers = target
+    return (cc+t_cc, nc+t_nc, tt+t_tt, ct+t_ct,
+              add_callers(t_callers, callers))
+
+def add_callers(target, source):
+    """Combine two caller lists in a single list."""

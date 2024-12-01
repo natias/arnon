@@ -1,0 +1,1000 @@
+            repl = re.sub(br'\\\\([0-9]+)', br'\\\1', repl)
+            try:
+                src = re.sub(pattern, repl, src, 1)
+            except re.error as e:
+                raise error.Abort(
+                    _(b"bad subrepository pattern in %s: %s")
+                    % (
+                        p.source(b'subpaths', pattern),
+                        stringutil.forcebytestr(e),
+                    )
+                )
+        return src
+
+    state = {}
+    for path, src in p.items(b''):  # type: bytes
+        kind = b'hg'
+        if src.startswith(b'['):
+            if b']' not in src:
+                raise error.Abort(_(b'missing ] in subrepository source'))
+            kind, src = src.split(b']', 1)
+            kind = kind[1:]
+            src = src.lstrip()  # strip any extra whitespace after ']'
+
+        if not urlutil.url(src).isabs():
+            parent = _abssource(repo, abort=False)
+            if parent:
+                parent = urlutil.url(parent)
+                parent.path = posixpath.join(parent.path or b'', src)
+                parent.path = posixpath.normpath(parent.path)
+                joined = bytes(parent)
+                # Remap the full joined path and use it if it changes,
+                # else remap the original source.
+                remapped = remap(joined)
+                if remapped == joined:
+                    src = remap(src)
+                else:
+                    src = remapped
+
+        src = remap(src)
+        state[util.pconvert(path)] = (src.strip(), rev.get(path, b''), kind)
+
+    return state
+
+
+def writestate(repo, state):
+    # type: (localrepo.localrepository, Substate) -> None
+    """rewrite .hgsubstate in (outer) repo with these subrepo states"""
+    lines = [
+        b'%s %s\n' % (state[s][1], s)
+        for s in sorted(state)
+        if state[s][1] != nullstate[1]
+    ]
+    repo.wwrite(b'.hgsubstate', b''.join(lines), b'')
+
+
+def submerge(repo, wctx, mctx, actx, overwrite, labels=None):
+    # type: (localrepo.localrepository, context.workingctx, context.changectx, context.changectx, bool, Optional[Any]) -> Substate
+    # TODO: type the `labels` arg
+    """delegated from merge.applyupdates: merging of .hgsubstate file
+    in working context, merging context and ancestor context"""
+    if mctx == actx:  # backwards?
+        actx = wctx.p1()
+    s1 = wctx.substate
+    s2 = mctx.substate
+    sa = actx.substate
+    sm = {}
+
+    repo.ui.debug(b"subrepo merge %s %s %s\n" % (wctx, mctx, actx))
+
+    def debug(s, msg, r=b""):
+        if r:
+            r = b"%s:%s:%s" % r
+        repo.ui.debug(b"  subrepo %s: %s %s\n" % (s, msg, r))
+
+    promptssrc = filemerge.partextras(labels)
+    for s, l in sorted(s1.items()):
+        a = sa.get(s, nullstate)
+        ld = l  # local state with possible dirty flag for compares
+        if wctx.sub(s).dirty():
+            ld = (l[0], l[1] + b"+")
+        if wctx == actx:  # overwrite
+            a = ld
+
+        prompts = promptssrc.copy()
+        prompts[b's'] = s
+        if s in s2:
+            r = s2[s]
+            if ld == r or r == a:  # no change or local is newer
+                sm[s] = l
+                continue
+            elif ld == a:  # other side changed
+                debug(s, b"other changed, get", r)
+                wctx.sub(s).get(r, overwrite)
+                sm[s] = r
+            elif ld[0] != r[0]:  # sources differ
+                prompts[b'lo'] = l[0]
+                prompts[b'ro'] = r[0]
+                if repo.ui.promptchoice(
+                    _(
+                        b' subrepository sources for %(s)s differ\n'
+                        b'you can use (l)ocal%(l)s source (%(lo)s)'
+                        b' or (r)emote%(o)s source (%(ro)s).\n'
+                        b'what do you want to do?'
+                        b'$$ &Local $$ &Remote'
+                    )
+                    % prompts,
+                    0,
+                ):
+                    debug(s, b"prompt changed, get", r)
+                    wctx.sub(s).get(r, overwrite)
+                    sm[s] = r
+            elif ld[1] == a[1]:  # local side is unchanged
+                debug(s, b"other side changed, get", r)
+                wctx.sub(s).get(r, overwrite)
+                sm[s] = r
+            else:
+                debug(s, b"both sides changed")
+                srepo = wctx.sub(s)
+                prompts[b'sl'] = srepo.shortid(l[1])
+                prompts[b'sr'] = srepo.shortid(r[1])
+                option = repo.ui.promptchoice(
+                    _(
+                        b' subrepository %(s)s diverged (local revision: %(sl)s, '
+                        b'remote revision: %(sr)s)\n'
+                        b'you can (m)erge, keep (l)ocal%(l)s or keep '
+                        b'(r)emote%(o)s.\n'
+                        b'what do you want to do?'
+                        b'$$ &Merge $$ &Local $$ &Remote'
+                    )
+                    % prompts,
+                    0,
+                )
+                if option == 0:
+                    wctx.sub(s).merge(r)
+                    sm[s] = l
+                    debug(s, b"merge with", r)
+                elif option == 1:
+                    sm[s] = l
+                    debug(s, b"keep local subrepo revision", l)
+                else:
+                    wctx.sub(s).get(r, overwrite)
+                    sm[s] = r
+                    debug(s, b"get remote subrepo revision", r)
+        elif ld == a:  # remote removed, local unchanged
+            debug(s, b"remote removed, remove")
+            wctx.sub(s).remove()
+        elif a == nullstate:  # not present in remote or ancestor
+            debug(s, b"local added, keep")
+            sm[s] = l
+            continue
+        else:
+            if repo.ui.promptchoice(
+                _(
+                    b' local%(l)s changed subrepository %(s)s'
+                    b' which remote%(o)s removed\n'
+                    b'use (c)hanged version or (d)elete?'
+                    b'$$ &Changed $$ &Delete'
+                )
+                % prompts,
+                0,
+            ):
+                debug(s, b"prompt remove")
+                wctx.sub(s).remove()
+
+    for s, r in sorted(s2.items()):
+        if s in s1:
+            continue
+        elif s not in sa:
+            debug(s, b"remote added, get", r)
+            mctx.sub(s).get(r)
+            sm[s] = r
+        elif r != sa[s]:
+            prompts = promptssrc.copy()
+            prompts[b's'] = s
+            if (
+                repo.ui.promptchoice(
+                    _(
+                        b' remote%(o)s changed subrepository %(s)s'
+                        b' which local%(l)s removed\n'
+                        b'use (c)hanged version or (d)elete?'
+                        b'$$ &Changed $$ &Delete'
+                    )
+                    % prompts,
+                    0,
+                )
+                == 0
+            ):
+                debug(s, b"prompt recreate", r)
+                mctx.sub(s).get(r)
+                sm[s] = r
+
+    # record merged .hgsubstate
+    writestate(repo, sm)
+    return sm
+
+
+def precommit(ui, wctx, status, match, force=False):
+    # type: (uimod.ui, context.workingcommitctx, scmutil.status, matchmod.basematcher, bool) -> Tuple[List[bytes], Set[bytes], Substate]
+    """Calculate .hgsubstate changes that should be applied before committing
+
+    Returns (subs, commitsubs, newstate) where
+    - subs: changed subrepos (including dirty ones)
+    - commitsubs: dirty subrepos which the caller needs to commit recursively
+    - newstate: new state dict which the caller must write to .hgsubstate
+
+    This also updates the given status argument.
+    """
+    subs = []
+    commitsubs = set()
+    newstate = wctx.substate.copy()
+
+    # only manage subrepos and .hgsubstate if .hgsub is present
+    if b'.hgsub' in wctx:
+        # we'll decide whether to track this ourselves, thanks
+        for c in status.modified, status.added, status.removed:
+            if b'.hgsubstate' in c:
+                c.remove(b'.hgsubstate')
+
+        # compare current state to last committed state
+        # build new substate based on last committed state
+        oldstate = wctx.p1().substate
+        for s in sorted(newstate.keys()):
+            if not match(s):
+                # ignore working copy, use old state if present
+                if s in oldstate:
+                    newstate[s] = oldstate[s]
+                    continue
+                if not force:
+                    raise error.Abort(
+                        _(b"commit with new subrepo %s excluded") % s
+                    )
+            dirtyreason = wctx.sub(s).dirtyreason(True)
+            if dirtyreason:
+                if not ui.configbool(b'ui', b'commitsubrepos'):
+                    raise error.Abort(
+                        dirtyreason,
+                        hint=_(b"use --subrepos for recursive commit"),
+                    )
+                subs.append(s)
+                commitsubs.add(s)
+            else:
+                bs = wctx.sub(s).basestate()
+                newstate[s] = (newstate[s][0], bs, newstate[s][2])
+                if oldstate.get(s, (None, None, None))[1] != bs:
+                    subs.append(s)
+
+        # check for removed subrepos
+        for p in wctx.parents():
+            r = [s for s in p.substate if s not in newstate]
+            subs += [s for s in r if match(s)]
+        if subs:
+            if not match(b'.hgsub') and b'.hgsub' in (
+                wctx.modified() + wctx.added()
+            ):
+                raise error.Abort(_(b"can't commit subrepos without .hgsub"))
+            status.modified.insert(0, b'.hgsubstate')
+
+    elif b'.hgsub' in status.removed:
+        # clean up .hgsubstate when .hgsub is removed
+        if b'.hgsubstate' in wctx and b'.hgsubstate' not in (
+            status.modified + status.added + status.removed
+        ):
+            status.removed.insert(0, b'.hgsubstate')
+
+    return subs, commitsubs, newstate
+
+
+def repo_rel_or_abs_source(repo):
+    """return the source of this repo
+
+    Either absolute or relative the outermost repo"""
+    parent = repo
+    chunks = []
+    while util.safehasattr(parent, b'_subparent'):
+        source = urlutil.url(parent._subsource)
+        chunks.append(bytes(source))
+        if source.isabs():
+            break
+        parent = parent._subparent
+
+    chunks.reverse()
+    path = posixpath.join(*chunks)
+    return posixpath.normpath(path)
+
+
+def reporelpath(repo):
+    # type: (localrepo.localrepository) -> bytes
+    """return path to this (sub)repo as seen from outermost repo"""
+    parent = repo
+    while util.safehasattr(parent, b'_subparent'):
+        parent = parent._subparent
+    return repo.root[len(pathutil.normasprefix(parent.root)) :]
+
+
+def subrelpath(sub):
+    # type: (subrepo.abstractsubrepo) -> bytes
+    """return path to this subrepo as seen from outermost repo"""
+    return sub._relpath
+
+
+def _abssource(repo, push=False, abort=True):
+    # type: (localrepo.localrepository, bool, bool) -> Optional[bytes]
+    """return pull/push path of repo - either based on parent repo .hgsub info
+    or on the top repo config. Abort or return None if no source found."""
+    if util.safehasattr(repo, b'_subparent'):
+        source = urlutil.url(repo._subsource)
+        if source.isabs():
+            return bytes(source)
+        source.path = posixpath.normpath(source.path)
+        parent = _abssource(repo._subparent, push, abort=False)
+        if parent:
+            parent = urlutil.url(util.pconvert(parent))
+            parent.path = posixpath.join(parent.path or b'', source.path)
+            parent.path = posixpath.normpath(parent.path)
+            return bytes(parent)
+    else:  # recursion reached top repo
+        path = None
+        if util.safehasattr(repo, b'_subtoppath'):
+            path = repo._subtoppath
+        elif push and repo.ui.config(b'paths', b'default-push'):
+            path = repo.ui.config(b'paths', b'default-push')
+        elif repo.ui.config(b'paths', b'default'):
+            path = repo.ui.config(b'paths', b'default')
+        elif repo.shared():
+            # chop off the .hg component to get the default path form.  This has
+            # already run through vfsmod.vfs(..., realpath=True), so it doesn't
+            # have problems with 'C:'
+            return os.path.dirname(repo.sharedpath)
+        if path:
+            # issue5770: 'C:\' and 'C:' are not equivalent paths.  The former is
+            # as expected: an absolute path to the root of the C: drive.  The
+            # latter is a relative path, and works like so:
+            #
+            #   C:\>cd C:\some\path
+            #   C:\>D:
+            #   D:\>python -c "import os; print os.path.abspath('C:')"
+            #   C:\some\path
+            #
+            #   D:\>python -c "import os; print os.path.abspath('C:relative')"
+            #   C:\some\path\relative
+            if urlutil.hasdriveletter(path):
+                if len(path) == 2 or path[2:3] not in br'\/':
+                    path = util.abspath(path)
+            return path
+
+    if abort:
+        raise error.Abort(_(b"default path for subrepository not found"))
+
+
+def newcommitphase(ui, ctx):
+    # type: (uimod.ui, context.changectx) -> int
+    commitphase = phases.newcommitphase(ui)
+    substate = getattr(ctx, "substate", None)
+    if not substate:
+        return commitphase
+    check = ui.config(b'phases', b'checksubrepos')
+    if check not in (b'ignore', b'follow', b'abort'):
+        raise error.Abort(
+            _(b'invalid phases.checksubrepos configuration: %s') % check
+        )
+    if check == b'ignore':
+        return commitphase
+    maxphase = phases.public
+    maxsub = None
+    for s in sorted(substate):
+        sub = ctx.sub(s)
+        subphase = sub.phase(substate[s][1])
+        if maxphase < subphase:
+            maxphase = subphase
+            maxsub = s
+    if commitphase < maxphase:
+        if check == b'abort':
+            raise error.Abort(
+                _(
+                    b"can't commit in %s phase"
+                    b" conflicting %s from subrepository %s"
+                )
+                % (
+                    phases.phasenames[commitphase],
+                    phases.phasenames[maxphase],
+                    maxsub,
+                )
+            )
+        ui.warn(
+            _(
+                b"warning: changes are committed in"
+                b" %s phase from subrepository %s\n"
+            )
+            % (phases.phasenames[maxphase], maxsub)
+        )
+        return maxphase
+    return commitphase
+                                                                                                                                                                                                                                                               usr/lib/python3/dist-packages/mercurial/tagmerge.py                                                 0000644 0000000 0000000 00000026376 14355257011 021117  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        # tagmerge.py - merge .hgtags files
+#
+# Copyright 2014 Angel Ezquerra <angel.ezquerra@gmail.com>
+#
+# This software may be used and distributed according to the terms of the
+# GNU General Public License version 2 or any later version.
+
+# This module implements an automatic merge algorithm for mercurial's tag files
+#
+# The tagmerge algorithm implemented in this module is able to resolve most
+# merge conflicts that currently would trigger a .hgtags merge conflict. The
+# only case that it does not (and cannot) handle is that in which two tags point
+# to different revisions on each merge parent _and_ their corresponding tag
+# histories have the same rank (i.e. the same length). In all other cases the
+# merge algorithm will choose the revision belonging to the parent with the
+# highest ranked tag history. The merged tag history is the combination of both
+# tag histories (special care is taken to try to combine common tag histories
+# where possible).
+#
+# In addition to actually merging the tags from two parents, taking into
+# account the base, the algorithm also tries to minimize the difference
+# between the merged tag file and the first parent's tag file (i.e. it tries to
+# make the merged tag order as as similar as possible to the first parent's tag
+# file order).
+#
+# The algorithm works as follows:
+# 1. read the tags from p1, p2 and the base
+#     - when reading the p1 tags, also get the line numbers associated to each
+#       tag node (these will be used to sort the merged tags in a way that
+#       minimizes the diff to p1). Ignore the file numbers when reading p2 and
+#       the base
+# 2. recover the "lost tags" (i.e. those that are found in the base but not on
+#    p1 or p2) and add them back to p1 and/or p2
+#     - at this point the only tags that are on p1 but not on p2 are those new
+#       tags that were introduced in p1. Same thing for the tags that are on p2
+#       but not on p2
+# 3. take all tags that are only on p1 or only on p2 (but not on the base)
+#     - Note that these are the tags that were introduced between base and p1
+#       and between base and p2, possibly on separate clones
+# 4. for each tag found both on p1 and p2 perform the following merge algorithm:
+#     - the tags conflict if their tag "histories" have the same "rank" (i.e.
+#       length) AND the last (current) tag is NOT the same
+#     - for non conflicting tags:
+#         - choose which are the high and the low ranking nodes
+#             - the high ranking list of nodes is the one that is longer.
+#               In case of draw favor p1
+#             - the merged node list is made of 3 parts:
+#                 - first the nodes that are common to the beginning of both
+#                   the low and the high ranking nodes
+#                 - second the non common low ranking nodes
+#                 - finally the non common high ranking nodes (with the last
+#                   one being the merged tag node)
+#             - note that this is equivalent to putting the whole low ranking
+#               node list first, followed by the non common high ranking nodes
+#     - note that during the merge we keep the "node line numbers", which will
+#       be used when writing the merged tags to the tag file
+# 5. write the merged tags taking into account to their positions in the first
+#    parent (i.e. try to keep the relative ordering of the nodes that come
+#    from p1). This minimizes the diff between the merged and the p1 tag files
+#    This is done by using the following algorithm
+#     - group the nodes for a given tag that must be written next to each other
+#         - A: nodes that come from consecutive lines on p1
+#         - B: nodes that come from p2 (i.e. whose associated line number is
+#              None) and are next to one of the a nodes in A
+#         - each group is associated with a line number coming from p1
+#     - generate a "tag block" for each of the groups
+#         - a tag block is a set of consecutive "node tag" lines belonging to
+#           the same tag and which will be written next to each other on the
+#           merged tags file
+#     - sort the "tag blocks" according to their associated number line
+#         - put blocks whose nodes come all from p2 first
+#     - write the tag blocks in the sorted order
+
+
+from .i18n import _
+from . import (
+    tags as tagsmod,
+    util,
+)
+
+
+def readtagsformerge(ui, repo, lines, fn=b'', keeplinenums=False):
+    """read the .hgtags file into a structure that is suitable for merging
+
+    Depending on the keeplinenums flag, clear the line numbers associated
+    with each tag. This is done because only the line numbers of the first
+    parent are useful for merging.
+    """
+    filetags = tagsmod._readtaghist(
+        ui, repo, lines, fn=fn, recode=None, calcnodelines=True
+    )[1]
+    for tagname, taginfo in filetags.items():
+        if not keeplinenums:
+            for el in taginfo:
+                el[1] = None
+    return filetags
+
+
+def grouptagnodesbyline(tagnodes):
+    """
+    Group nearby nodes (i.e. those that must be written next to each other)
+
+    The input is a list of [node, position] pairs, corresponding to a given tag
+    The position is the line number where the node was found on the first parent
+    .hgtags file, or None for those nodes that came from the base or the second
+    parent .hgtags files.
+
+    This function groups those [node, position] pairs, returning a list of
+    groups of nodes that must be written next to each other because their
+    positions are consecutive or have no position preference (because their
+    position is None).
+
+    The result is a list of [position, [consecutive node list]]
+    """
+    firstlinenum = None
+    for hexnode, linenum in tagnodes:
+        firstlinenum = linenum
+        if firstlinenum is not None:
+            break
+    if firstlinenum is None:
+        return [[None, [el[0] for el in tagnodes]]]
+    tagnodes[0][1] = firstlinenum
+    groupednodes = [[firstlinenum, []]]
+    prevlinenum = firstlinenum
+    for hexnode, linenum in tagnodes:
+        if linenum is not None and linenum - prevlinenum > 1:
+            groupednodes.append([linenum, []])
+        groupednodes[-1][1].append(hexnode)
+        if linenum is not None:
+            prevlinenum = linenum
+    return groupednodes
+
+
+def writemergedtags(fcd, mergedtags):
+    """
+    write the merged tags while trying to minimize the diff to the first parent
+
+    This function uses the ordering info stored on the merged tags dict to
+    generate an .hgtags file which is correct (in the sense that its contents
+    correspond to the result of the tag merge) while also being as close as
+    possible to the first parent's .hgtags file.
+    """
+    # group the node-tag pairs that must be written next to each other
+    for tname, taglist in list(mergedtags.items()):
+        mergedtags[tname] = grouptagnodesbyline(taglist)
+
+    # convert the grouped merged tags dict into a format that resembles the
+    # final .hgtags file (i.e. a list of blocks of 'node tag' pairs)
+    def taglist2string(tlist, tname):
+        return b'\n'.join([b'%s %s' % (hexnode, tname) for hexnode in tlist])
+
+    finaltags = []
+    for tname, tags in mergedtags.items():
+        for block in tags:
+            block[1] = taglist2string(block[1], tname)
+        finaltags += tags
+
+    # the tag groups are linked to a "position" that can be used to sort them
+    # before writing them
+    # the position is calculated to ensure that the diff of the merged .hgtags
+    # file to the first parent's .hgtags file is as small as possible
+    finaltags.sort(key=lambda x: -1 if x[0] is None else x[0])
+
+    # finally we can join the sorted groups to get the final contents of the
+    # merged .hgtags file, and then write it to disk
+    mergedtagstring = b'\n'.join([tags for rank, tags in finaltags if tags])
+    fcd.write(mergedtagstring + b'\n', fcd.flags())
+
+
+def singletagmerge(p1nodes, p2nodes):
+    """
+    merge the nodes corresponding to a single tag
+
+    Note that the inputs are lists of node-linenum pairs (i.e. not just lists
+    of nodes)
+    """
+    if not p2nodes:
+        return p1nodes
+    if not p1nodes:
+        return p2nodes
+
+    # there is no conflict unless both tags point to different revisions
+    # and have a non identical tag history
+    p1currentnode = p1nodes[-1][0]
+    p2currentnode = p2nodes[-1][0]
+    if p1currentnode != p2currentnode and len(p1nodes) == len(p2nodes):
+        # cannot merge two tags with same rank pointing to different nodes
+        return None
+
+    # which are the highest ranking (hr) / lowest ranking (lr) nodes?
+    if len(p1nodes) >= len(p2nodes):
+        hrnodes, lrnodes = p1nodes, p2nodes
+    else:
+        hrnodes, lrnodes = p2nodes, p1nodes
+
+    # the lowest ranking nodes will be written first, followed by the highest
+    # ranking nodes
+    # to avoid unwanted tag rank explosion we try to see if there are some
+    # common nodes that can be written only once
+    commonidx = len(lrnodes)
+    for n in range(len(lrnodes)):
+        if hrnodes[n][0] != lrnodes[n][0]:
+            commonidx = n
+            break
+        lrnodes[n][1] = p1nodes[n][1]
+
+    # the merged node list has 3 parts:
+    # - common nodes
+    # - non common lowest ranking nodes
+    # - non common highest ranking nodes
+    # note that the common nodes plus the non common lowest ranking nodes is the
+    # whole list of lr nodes
+    return lrnodes + hrnodes[commonidx:]
+
+
+def merge(repo, fcd, fco, fca):
+    """
+    Merge the tags of two revisions, taking into account the base tags
+    Try to minimize the diff between the merged tags and the first parent tags
+    """
+    ui = repo.ui
+    # read the p1, p2 and base tags
+    # only keep the line numbers for the p1 tags
+    p1tags = readtagsformerge(
+        ui, repo, fcd.data().splitlines(), fn=b"p1 tags", keeplinenums=True
+    )
+    p2tags = readtagsformerge(
+        ui, repo, fco.data().splitlines(), fn=b"p2 tags", keeplinenums=False
+    )
+    basetags = readtagsformerge(
+        ui, repo, fca.data().splitlines(), fn=b"base tags", keeplinenums=False
+    )
+
+    # recover the list of "lost tags" (i.e. those that were found on the base
+    # revision but not on one of the revisions being merged)
+    basetagset = set(basetags)
+    for n, pntags in enumerate((p1tags, p2tags)):
+        pntagset = set(pntags)
+        pnlosttagset = basetagset - pntagset
+        for t in pnlosttagset:
+            pntags[t] = basetags[t]
+            if pntags[t][-1][0] != repo.nodeconstants.nullhex:
+                pntags[t].append([repo.nodeconstants.nullhex, None])
+
+    conflictedtags = []  # for reporting purposes
+    mergedtags = util.sortdict(p1tags)
+    # sortdict does not implement iteritems()
+    for tname, p2nodes in p2tags.items():
+        if tname not in mergedtags:
+            mergedtags[tname] = p2nodes
+            continue
+        p1nodes = mergedtags[tname]
+        mergednodes = singletagmerge(p1nodes, p2nodes)
+        if mergednodes is None:
+            conflictedtags.append(tname)
+            continue
+        mergedtags[tname] = mergednodes
+
+    if conflictedtags:
+        numconflicts = len(conflictedtags)
+        ui.warn(
+            _(
+                b'automatic .hgtags merge failed\n'
+                b'the following %d tags are in conflict: %s\n'
+            )
+            % (numconflicts, b', '.join(sorted(conflictedtags)))
+        )
+        return True, 1
+
+    writemergedtags(fcd, mergedtags)
+    ui.note(_(b'.hgtags merged successfully\n'))
+    return False, 0
+                                                                                                                                                                                                                                                                  usr/lib/python3/dist-packages/mercurial/tags.py                                                     0000644 0000000 0000000 00000073041 14355257011 020251  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        # tags.py - read tag info from local repository
+#
+# Copyright 2009 Olivia Mackall <olivia@selenic.com>
+# Copyright 2009 Greg Ward <greg@gerg.ca>
+#
+# This software may be used and distributed according to the terms of the
+# GNU General Public License version 2 or any later version.
+
+# Currently this module only deals with reading and caching tags.
+# Eventually, it could take care of updating (adding/removing/moving)
+# tags too.
+
+
+import binascii
+import io
+
+from .node import (
+    bin,
+    hex,
+    nullrev,
+    short,
+)
+from .i18n import _
+from . import (
+    encoding,
+    error,
+    match as matchmod,
+    scmutil,
+    util,
+)
+from .utils import stringutil
+
+# Tags computation can be expensive and caches exist to make it fast in
+# the common case.
+#
+# The "hgtagsfnodes1" cache file caches the .hgtags filenode values for
+# each revision in the repository. The file is effectively an array of
+# fixed length records. Read the docs for "hgtagsfnodescache" for technical
+# details.
+#
+# The .hgtags filenode cache grows in proportion to the length of the
+# changelog. The file is truncated when the # changelog is stripped.
+#
+# The purpose of the filenode cache is to avoid the most expensive part
+# of finding global tags, which is looking up the .hgtags filenode in the
+# manifest for each head. This can take dozens or over 100ms for
+# repositories with very large manifests. Multiplied by dozens or even
+# hundreds of heads and there is a significant performance concern.
+#
+# There also exist a separate cache file for each repository filter.
+# These "tags-*" files store information about the history of tags.
+#
+# The tags cache files consists of a cache validation line followed by
+# a history of tags.
+#
+# The cache validation line has the format:
+#
+#   <tiprev> <tipnode> [<filteredhash>]
+#
+# <tiprev> is an integer revision and <tipnode> is a 40 character hex
+# node for that changeset. These redundantly identify the repository
+# tip from the time the cache was written. In addition, <filteredhash>,
+# if present, is a 40 character hex hash of the contents of the filtered
+# revisions for this filter. If the set of filtered revs changes, the
+# hash will change and invalidate the cache.
+#
+# The history part of the tags cache consists of lines of the form:
+#
+#   <node> <tag>
+#
+# (This format is identical to that of .hgtags files.)
+#
+# <tag> is the tag name and <node> is the 40 character hex changeset
+# the tag is associated with.
+#
+# Tags are written sorted by tag name.
+#
+# Tags associated with multiple changesets have an entry for each changeset.
+# The most recent changeset (in terms of revlog ordering for the head
+# setting it) for each tag is last.
+
+
+def fnoderevs(ui, repo, revs):
+    """return the list of '.hgtags' fnodes used in a set revisions
+
+    This is returned as list of unique fnodes. We use a list instead of a set
+    because order matters when it comes to tags."""
+    unfi = repo.unfiltered()
+    tonode = unfi.changelog.node
+    nodes = [tonode(r) for r in revs]
+    fnodes = _getfnodes(ui, repo, nodes)
+    fnodes = _filterfnodes(fnodes, nodes)
+    return fnodes
+
+
+def _nulltonone(repo, value):
+    """convert nullid to None
+
+    For tag value, nullid means "deleted". This small utility function helps
+    translating that to None."""
+    if value == repo.nullid:
+        return None
+    return value
+
+
+def difftags(ui, repo, oldfnodes, newfnodes):
+    """list differences between tags expressed in two set of file-nodes
+
+    The list contains entries in the form: (tagname, oldvalue, new value).
+    None is used to expressed missing value:
+        ('foo', None, 'abcd') is a new tag,
+        ('bar', 'ef01', None) is a deletion,
+        ('baz', 'abcd', 'ef01') is a tag movement.
+    """
+    if oldfnodes == newfnodes:
+        return []
+    oldtags = _tagsfromfnodes(ui, repo, oldfnodes)
+    newtags = _tagsfromfnodes(ui, repo, newfnodes)
+
+    # list of (tag, old, new): None means missing
+    entries = []
+    for tag, (new, __) in newtags.items():
+        new = _nulltonone(repo, new)
+        old, __ = oldtags.pop(tag, (None, None))
+        old = _nulltonone(repo, old)
+        if old != new:
+            entries.append((tag, old, new))
+    # handle deleted tags
+    for tag, (old, __) in oldtags.items():
+        old = _nulltonone(repo, old)
+        if old is not None:
+            entries.append((tag, old, None))
+    entries.sort()
+    return entries
+
+
+def writediff(fp, difflist):
+    """write tags diff information to a file.
+
+    Data are stored with a line based format:
+
+        <action> <hex-node> <tag-name>\n
+
+    Action are defined as follow:
+       -R tag is removed,
+       +A tag is added,
+       -M tag is moved (old value),
+       +M tag is moved (new value),
+
+    Example:
+
+         +A 875517b4806a848f942811a315a5bce30804ae85 t5
+
+    See documentation of difftags output for details about the input.
+    """
+    add = b'+A %s %s\n'
+    remove = b'-R %s %s\n'
+    updateold = b'-M %s %s\n'
+    updatenew = b'+M %s %s\n'
+    for tag, old, new in difflist:
+        # translate to hex
+        if old is not None:
+            old = hex(old)
+        if new is not None:
+            new = hex(new)
+        # write to file
+        if old is None:
+            fp.write(add % (new, tag))
+        elif new is None:
+            fp.write(remove % (old, tag))
+        else:
+            fp.write(updateold % (old, tag))
+            fp.write(updatenew % (new, tag))
+
+
+def findglobaltags(ui, repo):
+    """Find global tags in a repo: return a tagsmap
+
+    tagsmap: tag name to (node, hist) 2-tuples.
+
+    The tags cache is read and updated as a side-effect of calling.
+    """
+    (heads, tagfnode, valid, cachetags, shouldwrite) = _readtagcache(ui, repo)
+    if cachetags is not None:
+        assert not shouldwrite
+        # XXX is this really 100% correct?  are there oddball special
+        # cases where a global tag should outrank a local tag but won't,
+        # because cachetags does not contain rank info?
+        alltags = {}
+        _updatetags(cachetags, alltags)
+        return alltags
+
+    for head in reversed(heads):  # oldest to newest
+        assert repo.changelog.index.has_node(
+            head
+        ), b"tag cache returned bogus head %s" % short(head)
+    fnodes = _filterfnodes(tagfnode, reversed(heads))
+    alltags = _tagsfromfnodes(ui, repo, fnodes)
+
+    # and update the cache (if necessary)
+    if shouldwrite:
+        _writetagcache(ui, repo, valid, alltags)
+    return alltags
+
+
+def _filterfnodes(tagfnode, nodes):
+    """return a list of unique fnodes
+
+    The order of this list matches the order of "nodes". Preserving this order
+    is important as reading tags in different order provides different
+    results."""
+    seen = set()  # set of fnode
+    fnodes = []
+    for no in nodes:  # oldest to newest
+        fnode = tagfnode.get(no)
+        if fnode and fnode not in seen:
+            seen.add(fnode)
+            fnodes.append(fnode)
+    return fnodes
+
+
+def _tagsfromfnodes(ui, repo, fnodes):
+    """return a tagsmap from a list of file-node
+
+    tagsmap: tag name to (node, hist) 2-tuples.
+
+    The order of the list matters."""
+    alltags = {}
+    fctx = None
+    for fnode in fnodes:
+        if fctx is None:
+            fctx = repo.filectx(b'.hgtags', fileid=fnode)
+        else:
+            fctx = fctx.filectx(fnode)
+        filetags = _readtags(ui, repo, fctx.data().splitlines(), fctx)
+        _updatetags(filetags, alltags)
+    return alltags
+
+
+def readlocaltags(ui, repo, alltags, tagtypes):
+    '''Read local tags in repo. Update alltags and tagtypes.'''
+    try:
+        data = repo.vfs.read(b"localtags")
+    except FileNotFoundError:
+        return
+
+    # localtags is in the local encoding; re-encode to UTF-8 on
+    # input for consistency with the rest of this module.
+    filetags = _readtags(
+        ui, repo, data.splitlines(), b"localtags", recode=encoding.fromlocal
+    )
+
+    # remove tags pointing to invalid nodes
+    cl = repo.changelog
+    for t in list(filetags):
+        try:
+            cl.rev(filetags[t][0])
+        except (LookupError, ValueError):
+            del filetags[t]
+
+    _updatetags(filetags, alltags, b'local', tagtypes)
+
+
+def _readtaghist(ui, repo, lines, fn, recode=None, calcnodelines=False):
+    """Read tag definitions from a file (or any source of lines).
+
+    This function returns two sortdicts with similar information:
+
+    - the first dict, bintaghist, contains the tag information as expected by
+      the _readtags function, i.e. a mapping from tag name to (node, hist):
+        - node is the node id from the last line read for that name,
+        - hist is the list of node ids previously associated with it (in file
+          order). All node ids are binary, not hex.
+
+    - the second dict, hextaglines, is a mapping from tag name to a list of
+      [hexnode, line number] pairs, ordered from the oldest to the newest node.
+
+    When calcnodelines is False the hextaglines dict is not calculated (an
+    empty dict is returned). This is done to improve this function's
+    performance in cases where the line numbers are not needed.
+    """
+
+    bintaghist = util.sortdict()
+    hextaglines = util.sortdict()
+    count = 0
+
+    def dbg(msg):
+        ui.debug(b"%s, line %d: %s\n" % (fn, count, msg))
+
+    for nline, line in enumerate(lines):
+        count += 1
+        if not line:
+            continue
+        try:
+            (nodehex, name) = line.split(b" ", 1)
+        except ValueError:
+            dbg(b"cannot parse entry")
+            continue
+        name = name.strip()
+        if recode:
+            name = recode(name)
+        try:
+            nodebin = bin(nodehex)
+        except binascii.Error:
+            dbg(b"node '%s' is not well formed" % nodehex)
+            continue
+
+        # update filetags
+        if calcnodelines:
+            # map tag name to a list of line numbers
+            if name not in hextaglines:
+                hextaglines[name] = []
+            hextaglines[name].append([nodehex, nline])
+            continue
+        # map tag name to (node, hist)
+        if name not in bintaghist:
+            bintaghist[name] = []
+        bintaghist[name].append(nodebin)
+    return bintaghist, hextaglines
+
+
+def _readtags(ui, repo, lines, fn, recode=None, calcnodelines=False):
+    """Read tag definitions from a file (or any source of lines).
+
+    Returns a mapping from tag name to (node, hist).
+
+    "node" is the node id from the last line read for that name. "hist"
+    is the list of node ids previously associated with it (in file order).
+    All node ids are binary, not hex.
+    """
+    filetags, nodelines = _readtaghist(
+        ui, repo, lines, fn, recode=recode, calcnodelines=calcnodelines
+    )
+    # util.sortdict().__setitem__ is much slower at replacing then inserting
+    # new entries. The difference can matter if there are thousands of tags.
+    # Create a new sortdict to avoid the performance penalty.

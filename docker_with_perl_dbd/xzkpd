@@ -1,0 +1,1000 @@
+    };
+    check( $tmpl, \%hash ) or return;
+    my $curl;
+    unless ( $curl = can_run('curl') ) {
+        $METHOD_FAIL->{'curl'} = 1;
+        return;
+    }
+
+    ### these long opts are self explanatory - I like that -jmb
+    my $cmd = [ $curl, '-q' ];
+
+    push(@$cmd, '-4') if $^O eq 'netbsd' && $FORCEIPV4; # only seen this on NetBSD so far
+
+    push(@$cmd, '--connect-timeout', $TIMEOUT) if $TIMEOUT;
+
+    push(@$cmd, '--silent') unless $DEBUG;
+
+    ### curl does the right thing with passive, regardless ###
+    if ($self->scheme eq 'ftp') {
+        push(@$cmd, '--user', "anonymous:$FROM_EMAIL");
+    }
+
+    ### curl doesn't follow 302 (temporarily moved) etc automatically
+    ### so we add --location to enable that.
+    push @$cmd, '--fail', '--location', '--output', $to, $self->uri;
+
+    ### with IPC::Cmd > 0.41, this is fixed in teh library,
+    ### and there's no need for special casing any more.
+    ### DO NOT quote things for IPC::Run, it breaks stuff.
+    # $IPC::Cmd::USE_IPC_RUN
+    #    ? ($to, $self->uri)
+    #    : (QUOTE. $to .QUOTE, QUOTE. $self->uri .QUOTE);
+
+
+    my $captured;
+    unless(run( command => $cmd,
+                buffer  => \$captured,
+                verbose => $DEBUG )
+    ) {
+
+        return $self->_error(loc("Command failed: %1", $captured || ''));
+    }
+
+    return $to;
+
+}
+
+### /usr/bin/fetch fetch! ###
+sub _fetch_fetch {
+    my $self = shift;
+    my %hash = @_;
+
+    my ($to);
+    my $tmpl = {
+        to  => { required => 1, store => \$to }
+    };
+    check( $tmpl, \%hash ) or return;
+
+    ### see if we have a fetch binary ###
+    my $fetch;
+    unless( HAS_FETCH and $fetch = can_run('fetch') ) {
+        $METHOD_FAIL->{'fetch'} = 1;
+        return;
+    }
+
+    ### no verboseness, thanks ###
+    my $cmd = [ $fetch, '-q' ];
+
+    ### if a timeout is set, add it ###
+    push(@$cmd, '-T', $TIMEOUT) if $TIMEOUT;
+
+    ### run passive if specified ###
+    #push @$cmd, '-p' if $FTP_PASSIVE;
+    local $ENV{'FTP_PASSIVE_MODE'} = 1 if $FTP_PASSIVE;
+
+    ### set the output document, add the uri ###
+    push @$cmd, '-o', $to, $self->uri;
+
+    ### with IPC::Cmd > 0.41, this is fixed in teh library,
+    ### and there's no need for special casing any more.
+    ### DO NOT quote things for IPC::Run, it breaks stuff.
+    # $IPC::Cmd::USE_IPC_RUN
+    #    ? ($to, $self->uri)
+    #    : (QUOTE. $to .QUOTE, QUOTE. $self->uri .QUOTE);
+
+    ### shell out ###
+    my $captured;
+    unless(run( command => $cmd,
+                buffer  => \$captured,
+                verbose => $DEBUG
+    )) {
+        ### wget creates the output document always, even if the fetch
+        ### fails.. so unlink it in that case
+        1 while unlink $to;
+
+        return $self->_error(loc( "Command failed: %1", $captured || '' ));
+    }
+
+    return $to;
+}
+
+### use File::Copy for fetching file:// urls ###
+###
+### See section 3.10 of RFC 1738 (https://datatracker.ietf.org/doc/html/rfc1738#section-3.10)
+### Also see wikipedia on file:// (http://en.wikipedia.org/wiki/File://)
+###
+
+sub _file_fetch {
+    my $self = shift;
+    my %hash = @_;
+
+    my ($to);
+    my $tmpl = {
+        to  => { required => 1, store => \$to }
+    };
+    check( $tmpl, \%hash ) or return;
+
+
+
+    ### prefix a / on unix systems with a file uri, since it would
+    ### look somewhat like this:
+    ###     file:///home/kane/file
+    ### whereas windows file uris for 'c:\some\dir\file' might look like:
+    ###     file:///C:/some/dir/file
+    ###     file:///C|/some/dir/file
+    ### or for a network share '\\host\share\some\dir\file':
+    ###     file:////host/share/some/dir/file
+    ###
+    ### VMS file uri's for 'DISK$USER:[MY.NOTES]NOTE123456.TXT' might look like:
+    ###     file://vms.host.edu/disk$user/my/notes/note12345.txt
+    ###
+
+    my $path    = $self->path;
+    my $vol     = $self->vol;
+    my $share   = $self->share;
+
+    my $remote;
+    if (!$share and $self->host) {
+        return $self->_error(loc(
+            "Currently %1 cannot handle hosts in %2 urls",
+            'File::Fetch', 'file://'
+        ));
+    }
+
+    if( $vol ) {
+        $path   = File::Spec->catdir( split /\//, $path );
+        $remote = File::Spec->catpath( $vol, $path, $self->file);
+
+    } elsif( $share ) {
+        ### win32 specific, and a share name, so we wont bother with File::Spec
+        $path   =~ s|/+|\\|g;
+        $remote = "\\\\".$self->host."\\$share\\$path";
+
+    } else {
+        ### File::Spec on VMS can not currently handle UNIX syntax.
+        my $file_class = ON_VMS
+            ? 'File::Spec::Unix'
+            : 'File::Spec';
+
+        $remote  = $file_class->catfile( $path, $self->file );
+    }
+
+    ### File::Copy is littered with 'die' statements :( ###
+    my $rv = eval { File::Copy::copy( $remote, $to ) };
+
+    ### something went wrong ###
+    if( !$rv or $@ ) {
+        return $self->_error(loc("Could not copy '%1' to '%2': %3 %4",
+                             $remote, $to, $!, $@));
+    }
+
+    return $to;
+}
+
+### use /usr/bin/rsync to fetch files
+sub _rsync_fetch {
+    my $self = shift;
+    my %hash = @_;
+
+    my ($to);
+    my $tmpl = {
+        to  => { required => 1, store => \$to }
+    };
+    check( $tmpl, \%hash ) or return;
+    my $rsync;
+    unless ( $rsync = can_run('rsync') ) {
+        $METHOD_FAIL->{'rsync'} = 1;
+        return;
+    }
+
+    my $cmd = [ $rsync ];
+
+    ### XXX: rsync has no I/O timeouts at all, by default
+    push(@$cmd, '--timeout=' . $TIMEOUT) if $TIMEOUT;
+
+    push(@$cmd, '--quiet') unless $DEBUG;
+
+    ### DO NOT quote things for IPC::Run, it breaks stuff.
+    push @$cmd, $self->uri, $to;
+
+    ### with IPC::Cmd > 0.41, this is fixed in teh library,
+    ### and there's no need for special casing any more.
+    ### DO NOT quote things for IPC::Run, it breaks stuff.
+    # $IPC::Cmd::USE_IPC_RUN
+    #    ? ($to, $self->uri)
+    #    : (QUOTE. $to .QUOTE, QUOTE. $self->uri .QUOTE);
+
+    my $captured;
+    unless(run( command => $cmd,
+                buffer  => \$captured,
+                verbose => $DEBUG )
+    ) {
+
+        return $self->_error(loc("Command %1 failed: %2",
+            "@$cmd" || '', $captured || ''));
+    }
+
+    return $to;
+
+}
+
+### use git to fetch files
+sub _git_fetch {
+    my $self = shift;
+    my %hash = @_;
+
+    my ($to);
+    my $tmpl = {
+        to  => { required => 1, store => \$to }
+    };
+    check( $tmpl, \%hash ) or return;
+    my $git;
+    unless ( $git = can_run('git') ) {
+        $METHOD_FAIL->{'git'} = 1;
+        return;
+    }
+
+    my $cmd = [ $git, 'clone' ];
+
+    #push(@$cmd, '--timeout=' . $TIMEOUT) if $TIMEOUT;
+
+    push(@$cmd, '--quiet') unless $DEBUG;
+
+    ### DO NOT quote things for IPC::Run, it breaks stuff.
+    push @$cmd, $self->uri, $to;
+
+    ### with IPC::Cmd > 0.41, this is fixed in teh library,
+    ### and there's no need for special casing any more.
+    ### DO NOT quote things for IPC::Run, it breaks stuff.
+    # $IPC::Cmd::USE_IPC_RUN
+    #    ? ($to, $self->uri)
+    #    : (QUOTE. $to .QUOTE, QUOTE. $self->uri .QUOTE);
+
+    my $captured;
+    unless(run( command => $cmd,
+                buffer  => \$captured,
+                verbose => $DEBUG )
+    ) {
+
+        return $self->_error(loc("Command %1 failed: %2",
+            "@$cmd" || '', $captured || ''));
+    }
+
+    return $to;
+
+}
+
+#################################
+#
+# Error code
+#
+#################################
+
+=pod
+
+=head2 $ff->error([BOOL])
+
+Returns the last encountered error as string.
+Pass it a true value to get the C<Carp::longmess()> output instead.
+
+=cut
+
+### error handling the way Archive::Extract does it
+sub _error {
+    my $self    = shift;
+    my $error   = shift;
+
+    $self->_error_msg( $error );
+    $self->_error_msg_long( Carp::longmess($error) );
+
+    if( $WARN ) {
+        carp $DEBUG ? $self->_error_msg_long : $self->_error_msg;
+    }
+
+    return;
+}
+
+sub error {
+    my $self = shift;
+    return shift() ? $self->_error_msg_long : $self->_error_msg;
+}
+
+
+1;
+
+=pod
+
+=head1 HOW IT WORKS
+
+File::Fetch is able to fetch a variety of uris, by using several
+external programs and modules.
+
+Below is a mapping of what utilities will be used in what order
+for what schemes, if available:
+
+    file    => LWP, lftp, file
+    http    => LWP, HTTP::Tiny, wget, curl, lftp, fetch, HTTP::Lite, lynx, iosock
+    ftp     => LWP, Net::FTP, wget, curl, lftp, fetch, ncftp, ftp
+    rsync   => rsync
+    git     => git
+
+If you'd like to disable the use of one or more of these utilities
+and/or modules, see the C<$BLACKLIST> variable further down.
+
+If a utility or module isn't available, it will be marked in a cache
+(see the C<$METHOD_FAIL> variable further down), so it will not be
+tried again. The C<fetch> method will only fail when all options are
+exhausted, and it was not able to retrieve the file.
+
+The C<fetch> utility is available on FreeBSD. NetBSD and Dragonfly BSD
+may also have it from C<pkgsrc>. We only check for C<fetch> on those
+three platforms.
+
+C<iosock> is a very limited L<IO::Socket::INET> based mechanism for
+retrieving C<http> schemed urls. It doesn't follow redirects for instance.
+
+C<git> only supports C<git://> style urls.
+
+A special note about fetching files from an ftp uri:
+
+By default, all ftp connections are done in passive mode. To change
+that, see the C<$FTP_PASSIVE> variable further down.
+
+Furthermore, ftp uris only support anonymous connections, so no
+named user/password pair can be passed along.
+
+C</bin/ftp> is blacklisted by default; see the C<$BLACKLIST> variable
+further down.
+
+=head1 GLOBAL VARIABLES
+
+The behaviour of File::Fetch can be altered by changing the following
+global variables:
+
+=head2 $File::Fetch::FROM_EMAIL
+
+This is the email address that will be sent as your anonymous ftp
+password.
+
+Default is C<File-Fetch@example.com>.
+
+=head2 $File::Fetch::USER_AGENT
+
+This is the useragent as C<LWP> will report it.
+
+Default is C<File::Fetch/$VERSION>.
+
+=head2 $File::Fetch::FTP_PASSIVE
+
+This variable controls whether the environment variable C<FTP_PASSIVE>
+and any passive switches to commandline tools will be set to true.
+
+Default value is 1.
+
+Note: When $FTP_PASSIVE is true, C<ncftp> will not be used to fetch
+files, since passive mode can only be set interactively for this binary
+
+=head2 $File::Fetch::TIMEOUT
+
+When set, controls the network timeout (counted in seconds).
+
+Default value is 0.
+
+=head2 $File::Fetch::WARN
+
+This variable controls whether errors encountered internally by
+C<File::Fetch> should be C<carp>'d or not.
+
+Set to false to silence warnings. Inspect the output of the C<error()>
+method manually to see what went wrong.
+
+Defaults to C<true>.
+
+=head2 $File::Fetch::DEBUG
+
+This enables debugging output when calling commandline utilities to
+fetch files.
+This also enables C<Carp::longmess> errors, instead of the regular
+C<carp> errors.
+
+Good for tracking down why things don't work with your particular
+setup.
+
+Default is 0.
+
+=head2 $File::Fetch::BLACKLIST
+
+This is an array ref holding blacklisted modules/utilities for fetching
+files with.
+
+To disallow the use of, for example, C<LWP> and C<Net::FTP>, you could
+set $File::Fetch::BLACKLIST to:
+
+    $File::Fetch::BLACKLIST = [qw|lwp netftp|]
+
+The default blacklist is [qw|ftp|], as C</bin/ftp> is rather unreliable.
+
+See the note on C<MAPPING> below.
+
+=head2 $File::Fetch::METHOD_FAIL
+
+This is a hashref registering what modules/utilities were known to fail
+for fetching files (mostly because they weren't installed).
+
+You can reset this cache by assigning an empty hashref to it, or
+individually remove keys.
+
+See the note on C<MAPPING> below.
+
+=head1 MAPPING
+
+
+Here's a quick mapping for the utilities/modules, and their names for
+the $BLACKLIST, $METHOD_FAIL and other internal functions.
+
+    LWP         => lwp
+    HTTP::Lite  => httplite
+    HTTP::Tiny  => httptiny
+    Net::FTP    => netftp
+    wget        => wget
+    lynx        => lynx
+    ncftp       => ncftp
+    ftp         => ftp
+    curl        => curl
+    rsync       => rsync
+    lftp        => lftp
+    fetch       => fetch
+    IO::Socket  => iosock
+
+=head1 FREQUENTLY ASKED QUESTIONS
+
+=head2 So how do I use a proxy with File::Fetch?
+
+C<File::Fetch> currently only supports proxies with LWP::UserAgent.
+You will need to set your environment variables accordingly. For
+example, to use an ftp proxy:
+
+    $ENV{ftp_proxy} = 'foo.com';
+
+Refer to the LWP::UserAgent manpage for more details.
+
+=head2 I used 'lynx' to fetch a file, but its contents is all wrong!
+
+C<lynx> can only fetch remote files by dumping its contents to C<STDOUT>,
+which we in turn capture. If that content is a 'custom' error file
+(like, say, a C<404 handler>), you will get that contents instead.
+
+Sadly, C<lynx> doesn't support any options to return a different exit
+code on non-C<200 OK> status, giving us no way to tell the difference
+between a 'successful' fetch and a custom error page.
+
+Therefor, we recommend to only use C<lynx> as a last resort. This is
+why it is at the back of our list of methods to try as well.
+
+=head2 Files I'm trying to fetch have reserved characters or non-ASCII characters in them. What do I do?
+
+C<File::Fetch> is relatively smart about things. When trying to write
+a file to disk, it removes the C<query parameters> (see the
+C<output_file> method for details) from the file name before creating
+it. In most cases this suffices.
+
+If you have any other characters you need to escape, please install
+the C<URI::Escape> module from CPAN, and pre-encode your URI before
+passing it to C<File::Fetch>. You can read about the details of URIs
+and URI encoding here:
+
+L<https://datatracker.ietf.org/doc/html/rfc2396>
+
+=head1 TODO
+
+=over 4
+
+=item Implement $PREFER_BIN
+
+To indicate to rather use commandline tools than modules
+
+=back
+
+=head1 BUG REPORTS
+
+Please report bugs or other issues to E<lt>bug-file-fetch@rt.cpan.org<gt>.
+
+=head1 AUTHOR
+
+This module by Jos Boumans E<lt>kane@cpan.orgE<gt>.
+
+=head1 COPYRIGHT
+
+This library is free software; you may redistribute and/or modify it
+under the same terms as Perl itself.
+
+
+=cut
+
+# Local variables:
+# c-indentation-style: bsd
+# c-basic-offset: 4
+# indent-tabs-mode: nil
+# End:
+# vim: expandtab shiftwidth=4:
+
+
+
+
+                                                                                                                                                                                                                                                                                                                          usr/local/lib/perl5/5.40.0/File/Find.pm                                                             0000444 0000000 0000000 00000111111 14714567415 015575  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        package File::Find;
+
+use 5.006;
+use strict;
+use warnings;
+use warnings::register;
+
+use Exporter 'import';
+require Cwd;
+require File::Basename;
+require File::Spec;
+
+our $VERSION = '1.44';
+our @EXPORT = qw(find finddepth);
+
+my $Is_VMS = $^O eq 'VMS';
+my $Is_Win32 = $^O eq 'MSWin32';
+
+
+# Should ideally be my() not our() but local() currently
+# refuses to operate on lexicals
+
+our %SLnkSeen;
+our ($wanted_callback, $avoid_nlink, $bydepth, $no_chdir, $follow,
+    $follow_skip, $full_check, $untaint, $untaint_skip, $untaint_pat,
+    $pre_process, $post_process, $dangling_symlinks);
+
+sub contract_name {
+    my ($cdir,$fn) = @_;
+
+    return substr($cdir,0,rindex($cdir,'/')) if $fn eq $File::Find::current_dir;
+
+    $cdir = substr($cdir,0,rindex($cdir,'/')+1);
+
+    $fn =~ s|^\./||;
+
+    my $abs_name= $cdir . $fn;
+
+    if (substr($fn,0,3) eq '../') {
+       1 while $abs_name =~ s!/[^/]*/\.\./+!/!;
+    }
+
+    return $abs_name;
+}
+
+sub _is_absolute {
+    return $_[0] =~ m|^(?:[A-Za-z]:)?/| if $Is_Win32;
+    return substr($_[0], 0, 1) eq '/';
+}
+
+sub _is_root {
+    return $_[0] =~ m|^(?:[A-Za-z]:)?/\z| if $Is_Win32;
+    return $_[0] eq '/';
+}
+
+sub PathCombine($$) {
+    my ($Base,$Name) = @_;
+    my $AbsName;
+
+    if (_is_absolute($Name)) {
+        $AbsName= $Name;
+    }
+    else {
+        $AbsName= contract_name($Base,$Name);
+    }
+
+    # (simple) check for recursion
+    my $newlen= length($AbsName);
+    if ($newlen <= length($Base)) {
+        if (($newlen == length($Base) || substr($Base,$newlen,1) eq '/')
+            && $AbsName eq substr($Base,0,$newlen))
+        {
+            return undef;
+        }
+    }
+    return $AbsName;
+}
+
+sub Follow_SymLink($) {
+    my ($AbsName) = @_;
+
+    my ($NewName,$DEV, $INO);
+    ($DEV, $INO)= lstat $AbsName;
+
+    while (-l _) {
+        if ($SLnkSeen{$DEV, $INO}++) {
+            if ($follow_skip < 2) {
+                die "$AbsName is encountered a second time";
+            }
+            else {
+                return undef;
+            }
+        }
+        my $Link = readlink($AbsName);
+        # canonicalize directory separators
+        $Link =~ s|\\|/|g if $Is_Win32;
+        $NewName= PathCombine($AbsName, $Link);
+        unless(defined $NewName) {
+            if ($follow_skip < 2) {
+                die "$AbsName is a recursive symbolic link";
+            }
+            else {
+                return undef;
+            }
+        }
+        else {
+            $AbsName= $NewName;
+        }
+        ($DEV, $INO) = lstat($AbsName);
+        return undef unless defined $DEV;  #  dangling symbolic link
+    }
+
+    if ($full_check && defined $DEV && $SLnkSeen{$DEV, $INO}++) {
+        if ( ($follow_skip < 1) || ((-d _) && ($follow_skip < 2)) ) {
+            die "$AbsName encountered a second time";
+        }
+        else {
+            return undef;
+        }
+    }
+
+    return $AbsName;
+}
+
+our($dir, $name, $fullname, $prune);
+sub _find_dir_symlnk($$$);
+sub _find_dir($$$);
+
+# check whether or not a scalar variable is tainted
+# (code straight from the Camel, 3rd ed., page 561)
+sub is_tainted_pp {
+    my $arg = shift;
+    my $nada = substr($arg, 0, 0); # zero-length
+    local $@;
+    eval { eval "# $nada" };
+    return length($@) != 0;
+}
+
+
+sub _find_opt {
+    my $wanted = shift;
+    return unless @_;
+    die "invalid top directory" unless defined $_[0];
+
+    # This function must local()ize everything because callbacks may
+    # call find() or finddepth()
+
+    local %SLnkSeen;
+    local ($wanted_callback, $avoid_nlink, $bydepth, $no_chdir, $follow,
+        $follow_skip, $full_check, $untaint, $untaint_skip, $untaint_pat,
+        $pre_process, $post_process, $dangling_symlinks);
+    local($dir, $name, $fullname, $prune);
+    local *_ = \my $a;
+
+    my $cwd            = $wanted->{bydepth} ? Cwd::fastcwd() : Cwd::getcwd();
+    if ($Is_VMS) {
+        # VMS returns this by default in VMS format which just doesn't
+        # work for the rest of this module.
+        $cwd = VMS::Filespec::unixpath($cwd);
+
+        # Apparently this is not expected to have a trailing space.
+        # To attempt to make VMS/UNIX conversions mostly reversible,
+        # a trailing slash is needed.  The run-time functions ignore the
+        # resulting double slash, but it causes the perl tests to fail.
+        $cwd =~ s#/\z##;
+
+        # This comes up in upper case now, but should be lower.
+        # In the future this could be exact case, no need to change.
+    }
+    my $cwd_untainted  = $cwd;
+    my $check_t_cwd    = 1;
+    $wanted_callback   = $wanted->{wanted};
+    $bydepth           = $wanted->{bydepth};
+    $pre_process       = $wanted->{preprocess};
+    $post_process      = $wanted->{postprocess};
+    $no_chdir          = $wanted->{no_chdir};
+    $full_check        = $wanted->{follow};
+    $follow            = $full_check || $wanted->{follow_fast};
+    $follow_skip       = $wanted->{follow_skip};
+    $untaint           = $wanted->{untaint};
+    $untaint_pat       = $wanted->{untaint_pattern};
+    $untaint_skip      = $wanted->{untaint_skip};
+    $dangling_symlinks = $wanted->{dangling_symlinks};
+
+    # for compatibility reasons (find.pl, find2perl)
+    local our ($topdir, $topdev, $topino, $topmode, $topnlink);
+
+    # a symbolic link to a directory doesn't increase the link count
+    $avoid_nlink      = $follow || $File::Find::dont_use_nlink;
+
+    my ($abs_dir, $Is_Dir);
+
+    Proc_Top_Item:
+    foreach my $TOP (@_) {
+        my $top_item = $TOP;
+        $top_item = VMS::Filespec::unixify($top_item) if $Is_VMS;
+
+        ($topdev,$topino,$topmode,$topnlink) = $follow ? stat $top_item : lstat $top_item;
+
+        # canonicalize directory separators
+        $top_item =~ s|[/\\]|/|g if $Is_Win32;
+
+        # no trailing / unless path is root
+        $top_item =~ s|/\z|| unless _is_root($top_item);
+
+        $Is_Dir= 0;
+
+        if ($follow) {
+
+            if (_is_absolute($top_item)) {
+                $abs_dir = $top_item;
+            }
+            elsif ($top_item eq $File::Find::current_dir) {
+                $abs_dir = $cwd;
+            }
+            else {  # care about any  ../
+                $top_item =~ s/\.dir\z//i if $Is_VMS;
+                $abs_dir = contract_name("$cwd/",$top_item);
+            }
+            $abs_dir= Follow_SymLink($abs_dir);
+            unless (defined $abs_dir) {
+                if ($dangling_symlinks) {
+                    if (ref $dangling_symlinks eq 'CODE') {
+                        $dangling_symlinks->($top_item, $cwd);
+                    } else {
+                        warnings::warnif "$top_item is a dangling symbolic link\n";
+                    }
+                }
+                next Proc_Top_Item;
+            }
+
+            if (-d _) {
+                $top_item =~ s/\.dir\z//i if $Is_VMS;
+                _find_dir_symlnk($wanted, $abs_dir, $top_item);
+                $Is_Dir= 1;
+            }
+        }
+        else { # no follow
+            $topdir = $top_item;
+            unless (defined $topnlink) {
+                warnings::warnif "Can't stat $top_item: $!\n";
+                next Proc_Top_Item;
+            }
+            if (-d _) {
+                $top_item =~ s/\.dir\z//i if $Is_VMS;
+                _find_dir($wanted, $top_item, $topnlink);
+                $Is_Dir= 1;
+            }
+            else {
+                $abs_dir= $top_item;
+            }
+        }
+
+        unless ($Is_Dir) {
+            unless (($_,$dir) = File::Basename::fileparse($abs_dir)) {
+                ($dir,$_) = ('./', $top_item);
+            }
+
+            $abs_dir = $dir;
+            if (( $untaint ) && (is_tainted($dir) )) {
+                ( $abs_dir ) = $dir =~ m|$untaint_pat|;
+                unless (defined $abs_dir) {
+                    if ($untaint_skip == 0) {
+                        die "directory $dir is still tainted";
+                    }
+                    else {
+                        next Proc_Top_Item;
+                    }
+                }
+            }
+
+            unless ($no_chdir || chdir $abs_dir) {
+                warnings::warnif "Couldn't chdir $abs_dir: $!\n";
+                next Proc_Top_Item;
+            }
+
+            $name = $abs_dir . $_; # $File::Find::name
+            $_ = $name if $no_chdir;
+
+            { $wanted_callback->() }; # protect against wild "next"
+
+        }
+
+        unless ( $no_chdir ) {
+            if ( ($check_t_cwd) && (($untaint) && (is_tainted($cwd) )) ) {
+                ( $cwd_untainted ) = $cwd =~ m|$untaint_pat|;
+                unless (defined $cwd_untainted) {
+                    die "insecure cwd in find(depth)";
+                }
+                $check_t_cwd = 0;
+            }
+            unless (chdir $cwd_untainted) {
+                die "Can't cd to $cwd: $!\n";
+            }
+        }
+    }
+}
+
+# API:
+#  $wanted
+#  $p_dir :  "parent directory"
+#  $nlink :  what came back from the stat
+# preconditions:
+#  chdir (if not no_chdir) to dir
+
+sub _find_dir($$$) {
+    my ($wanted, $p_dir, $nlink) = @_;
+    my ($CdLvl,$Level) = (0,0);
+    my @Stack;
+    my @filenames;
+    my ($subcount,$sub_nlink);
+    my $SE= [];
+    my $dir_name= $p_dir;
+    my $dir_pref;
+    my $dir_rel = $File::Find::current_dir;
+    my $tainted = 0;
+    my $no_nlink;
+
+    if ($Is_VMS) {
+        # VMS is returning trailing .dir on directories
+        # and trailing . on files and symbolic links
+        # in UNIX syntax.
+        #
+
+        $p_dir =~ s/\.(dir)?$//i unless $p_dir eq '.';
+
+        $dir_pref = ($p_dir =~ m/[\]>]+$/ ? $p_dir : "$p_dir/" );
+    }
+    else {
+        $dir_pref = _is_root($p_dir) ? $p_dir : "$p_dir/";
+    }
+
+    local ($dir, $name, $prune);
+
+    unless ( $no_chdir || ($p_dir eq $File::Find::current_dir)) {
+        my $udir = $p_dir;
+        if (( $untaint ) && (is_tainted($p_dir) )) {
+            ( $udir ) = $p_dir =~ m|$untaint_pat|;
+            unless (defined $udir) {
+                if ($untaint_skip == 0) {
+                    die "directory $p_dir is still tainted";
+                }
+                else {
+                    return;
+                }
+            }
+        }
+        unless (chdir ($Is_VMS && $udir !~ /[\/\[<]+/ ? "./$udir" : $udir)) {
+            warnings::warnif "Can't cd to $udir: $!\n";
+            return;
+        }
+    }
+
+    # push the starting directory
+    push @Stack,[$CdLvl,$p_dir,$dir_rel,-1]  if  $bydepth;
+
+    while (defined $SE) {
+        unless ($bydepth) {
+            $dir= $p_dir; # $File::Find::dir
+            $name= $dir_name; # $File::Find::name
+            $_= ($no_chdir ? $dir_name : $dir_rel ); # $_
+            # prune may happen here
+            $prune= 0;
+            { $wanted_callback->() };   # protect against wild "next"
+            next if $prune;
+        }
+
+        # change to that directory
+        unless ($no_chdir || ($dir_rel eq $File::Find::current_dir)) {
+            my $udir= $dir_rel;
+            if ( ($untaint) && (($tainted) || ($tainted = is_tainted($dir_rel) )) ) {
+                ( $udir ) = $dir_rel =~ m|$untaint_pat|;
+                unless (defined $udir) {
+                    if ($untaint_skip == 0) {
+                        die "directory (" . ($p_dir ne '/' ? $p_dir : '') . "/) $dir_rel is still tainted";
+                    } else { # $untaint_skip == 1
+                        next;
+                    }
+                }
+            }
+            unless (chdir ($Is_VMS && $udir !~ /[\/\[<]+/ ? "./$udir" : $udir)) {
+                warnings::warnif "Can't cd to (" .
+                    ($p_dir ne '/' ? $p_dir : '') . "/) $udir: $!\n";
+                next;
+            }
+            $CdLvl++;
+        }
+
+        $dir= $dir_name; # $File::Find::dir
+
+        # Get the list of files in the current directory.
+        my $dh;
+        unless (opendir $dh, ($no_chdir ? $dir_name : $File::Find::current_dir)) {
+            warnings::warnif "Can't opendir($dir_name): $!\n";
+            next;
+        }
+        @filenames = readdir $dh;
+        closedir($dh);
+        @filenames = $pre_process->(@filenames) if $pre_process;
+        push @Stack,[$CdLvl,$dir_name,"",-2]   if $post_process;
+
+        # default: use whatever was specified
+        # (if $nlink >= 2, and $avoid_nlink == 0, this will switch back)
+        $no_nlink = $avoid_nlink;
+        # if dir has wrong nlink count, force switch to slower stat method
+        $no_nlink = 1 if ($nlink < 2);
+
+        if ($nlink == 2 && !$no_nlink) {
+            # This dir has no subdirectories.
+            for my $FN (@filenames) {
+                if ($Is_VMS) {
+                    # Big hammer here - Compensate for VMS trailing . and .dir
+                    # No win situation until this is changed, but this
+                    # will handle the majority of the cases with breaking the fewest
+
+                    $FN =~ s/\.dir\z//i;
+                    $FN =~ s#\.$## if ($FN ne '.');
+                }
+                next if $FN =~ $File::Find::skip_pattern;
+
+                $name = $dir_pref . $FN; # $File::Find::name
+                $_ = ($no_chdir ? $name : $FN); # $_
+                { $wanted_callback->() }; # protect against wild "next"
+            }
+
+        }
+        else {
+            # This dir has subdirectories.
+            $subcount = $nlink - 2;
+
+            # HACK: insert directories at this position, so as to preserve
+            # the user pre-processed ordering of files (thus ensuring
+            # directory traversal is in user sorted order, not at random).
+            my $stack_top = @Stack;
+
+            for my $FN (@filenames) {
+                next if $FN =~ $File::Find::skip_pattern;
+                if ($subcount > 0 || $no_nlink) {
+                    # Seen all the subdirs?
+                    # check for directoriness.
+                    # stat is faster for a file in the current directory
+                    $sub_nlink = (lstat ($no_chdir ? $dir_pref . $FN : $FN))[3];
+
+                    if (-d _) {
+                        --$subcount;
+                        $FN =~ s/\.dir\z//i if $Is_VMS;
+                        # HACK: replace push to preserve dir traversal order
+                        #push @Stack,[$CdLvl,$dir_name,$FN,$sub_nlink];
+                        splice @Stack, $stack_top, 0,
+                                 [$CdLvl,$dir_name,$FN,$sub_nlink];
+                    }
+                    else {
+                        $name = $dir_pref . $FN; # $File::Find::name
+                        $_= ($no_chdir ? $name : $FN); # $_
+                        { $wanted_callback->() }; # protect against wild "next"
+                    }
+                }
+                else {
+                    $name = $dir_pref . $FN; # $File::Find::name
+                    $_= ($no_chdir ? $name : $FN); # $_
+                    { $wanted_callback->() }; # protect against wild "next"
+                }
+            }
+        }
+    }
+    continue {
+        while ( defined ($SE = pop @Stack) ) {
+            ($Level, $p_dir, $dir_rel, $nlink) = @$SE;
+            if ($CdLvl > $Level && !$no_chdir) {
+                my $tmp;
+                if ($Is_VMS) {
+                    $tmp = '[' . ('-' x ($CdLvl-$Level)) . ']';
+                }
+                else {
+                    $tmp = join('/',('..') x ($CdLvl-$Level));
+                }

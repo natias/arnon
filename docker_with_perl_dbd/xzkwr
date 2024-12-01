@@ -1,0 +1,1000 @@
+
+    if ($] ge "5.007003" and @_) {
+        my ($enc) = @_;
+        my $handles = $self->{+HANDLES};
+
+        # https://rt.perl.org/Public/Bug/Display.html?id=31923
+        # If utf8 is requested we use ':utf8' instead of ':encoding(utf8)' in
+        # order to avoid the thread segfault.
+        if ($enc =~ m/^utf-?8$/i) {
+            binmode($_, ":utf8") for @$handles;
+        }
+        else {
+            binmode($_, ":encoding($enc)") for @$handles;
+        }
+        $self->{+_ENCODING} = $enc;
+    }
+
+    return $self->{+_ENCODING};
+}
+
+if ($^C) {
+    no warnings 'redefine';
+    *write = sub {};
+}
+sub write {
+    my ($self, $e, $num, $f) = @_;
+
+    # The most common case, a pass event with no amnesty and a normal name.
+    return if $self->print_optimal_pass($e, $num);
+
+    $f ||= $e->facet_data;
+
+    $self->encoding($f->{control}->{encoding}) if $f->{control}->{encoding};
+
+    my @tap = $self->event_tap($f, $num) or return;
+
+    $self->{+MADE_ASSERTION} = 1 if $f->{assert};
+
+    my $nesting = $f->{trace}->{nested} || 0;
+    my $handles = $self->{+HANDLES};
+    my $indent = '    ' x $nesting;
+
+    # Local is expensive! Only do it if we really need to.
+    local($\, $,) = (undef, '') if $\ || $,;
+    for my $set (@tap) {
+        no warnings 'uninitialized';
+        my ($hid, $msg) = @$set;
+        next unless $msg;
+        my $io = $handles->[$hid] or next;
+
+        print $io "\n"
+            if $ENV{HARNESS_ACTIVE}
+            && $hid == OUT_ERR
+            && $self->{+_LAST_FH} != $io
+            && $msg =~ m/^#\s*Failed( \(TODO\))? test /;
+
+        $msg =~ s/^/$indent/mg if $nesting;
+        print $io $msg;
+        $self->{+_LAST_FH} = $io;
+    }
+}
+
+sub print_optimal_pass {
+    my ($self, $e, $num) = @_;
+
+    my $type = ref($e);
+
+    # Only optimal if this is a Pass or a passing Ok
+    return unless $type eq 'Test2::Event::Pass' || ($type eq 'Test2::Event::Ok' && $e->{pass});
+
+    # Amnesty requires further processing (todo is a form of amnesty)
+    return if ($e->{amnesty} && @{$e->{amnesty}}) || defined($e->{todo});
+
+    # A name with a newline or hash symbol needs extra processing
+    return if defined($e->{name}) && (-1 != index($e->{name}, "\n") || -1 != index($e->{name}, '#'));
+
+    my $ok = 'ok';
+    $ok .= " $num" if $num && !$self->{+NO_NUMBERS};
+    $ok .= defined($e->{name}) ? " - $e->{name}\n" : "\n";
+
+    if (my $nesting = $e->{trace}->{nested}) {
+        my $indent = '    ' x $nesting;
+        $ok = "$indent$ok";
+    }
+
+    my $io = $self->{+HANDLES}->[OUT_STD];
+
+    local($\, $,) = (undef, '') if $\ || $,;
+    print $io $ok;
+    $self->{+_LAST_FH} = $io;
+
+    return 1;
+}
+
+sub event_tap {
+    my ($self, $f, $num) = @_;
+
+    my @tap;
+
+    # If this IS the first event the plan should come first
+    # (plan must be before or after assertions, not in the middle)
+    push @tap => $self->plan_tap($f) if $f->{plan} && !$self->{+MADE_ASSERTION};
+
+    # The assertion is most important, if present.
+    if ($f->{assert}) {
+        push @tap => $self->assert_tap($f, $num);
+        push @tap => $self->debug_tap($f, $num) unless $f->{assert}->{no_debug} || $f->{assert}->{pass};
+    }
+
+    # Almost as important as an assertion
+    push @tap => $self->error_tap($f) if $f->{errors};
+
+    # Now lets see the diagnostics messages
+    push @tap => $self->info_tap($f) if $f->{info};
+
+    # If this IS NOT the first event the plan should come last
+    # (plan must be before or after assertions, not in the middle)
+    push @tap => $self->plan_tap($f) if $self->{+MADE_ASSERTION} && $f->{plan};
+
+    # Bail out
+    push @tap => $self->halt_tap($f) if $f->{control}->{halt};
+
+    return @tap if @tap;
+    return @tap if $f->{control}->{halt};
+    return @tap if grep { $f->{$_} } qw/assert plan info errors/;
+
+    # Use the summary as a fallback if nothing else is usable.
+    return $self->summary_tap($f, $num);
+}
+
+sub error_tap {
+    my $self = shift;
+    my ($f) = @_;
+
+    my $IO = ($f->{amnesty} && @{$f->{amnesty}}) ? OUT_STD : OUT_ERR;
+
+    return map {
+        my $details = $_->{details};
+
+        my $msg;
+        if (ref($details)) {
+            require Data::Dumper;
+            my $dumper = Data::Dumper->new([$details])->Indent(2)->Terse(1)->Pad('# ')->Useqq(1)->Sortkeys(1);
+            chomp($msg = $dumper->Dump);
+        }
+        else {
+            chomp($msg = $details);
+            $msg =~ s/^/# /;
+            $msg =~ s/\n/\n# /g;
+        }
+
+        [$IO, "$msg\n"];
+    } @{$f->{errors}};
+}
+
+sub plan_tap {
+    my $self = shift;
+    my ($f) = @_;
+    my $plan = $f->{plan} or return;
+
+    return if $plan->{none};
+
+    if ($plan->{skip}) {
+        my $reason = $plan->{details} or return [OUT_STD, "1..0 # SKIP\n"];
+        chomp($reason);
+        return [OUT_STD, '1..0 # SKIP ' . $reason . "\n"];
+    }
+
+    return [OUT_STD, "1.." . $plan->{count} . "\n"];
+}
+
+sub no_subtest_space { 0 }
+sub assert_tap {
+    my $self = shift;
+    my ($f, $num) = @_;
+
+    my $assert = $f->{assert} or return;
+    my $pass = $assert->{pass};
+    my $name = $assert->{details};
+
+    my $ok = $pass ? 'ok' : 'not ok';
+    $ok .= " $num" if $num && !$self->{+NO_NUMBERS};
+
+    # The regex form is ~250ms, the index form is ~50ms
+    my @extra;
+    defined($name) && (
+        (index($name, "\n") != -1 && (($name, @extra) = split(/\n\r?/, $name, -1))),
+        ((index($name, "#" ) != -1  || substr($name, -1) eq '\\') && (($name =~ s|\\|\\\\|g), ($name =~ s|#|\\#|g)))
+    );
+
+    my $extra_space = @extra ? ' ' x (length($ok) + 2) : '';
+    my $extra_indent = '';
+
+    my ($directives, $reason, $is_skip);
+    if ($f->{amnesty}) {
+        my %directives;
+
+        for my $am (@{$f->{amnesty}}) {
+            next if $am->{inherited};
+            my $tag = $am->{tag} or next;
+            $is_skip = 1 if $tag eq 'skip';
+
+            $directives{$tag} ||= $am->{details};
+        }
+
+        my %seen;
+
+        # Sort so that TODO comes before skip even on systems where lc sorts
+        # before uc, as other code depends on that ordering.
+        my @order = grep { !$seen{$_}++ } sort { lc $b cmp lc $a } keys %directives;
+
+        $directives = ' # ' . join ' & ' => @order;
+
+        for my $tag ('skip', @order) {
+            next unless defined($directives{$tag}) && length($directives{$tag});
+            $reason = $directives{$tag};
+            last;
+        }
+    }
+
+    $ok .= " - $name" if defined $name && !($is_skip && !$name);
+
+    my @subtap;
+    if ($f->{parent} && $f->{parent}->{buffered}) {
+        $ok .= ' {';
+
+        # In a verbose harness we indent the extra since they will appear
+        # inside the subtest braces. This helps readability. In a non-verbose
+        # harness we do not do this because it is less readable.
+        if ($ENV{HARNESS_IS_VERBOSE} || !$ENV{HARNESS_ACTIVE}) {
+            $extra_indent = "    ";
+            $extra_space = ' ';
+        }
+
+        # Render the sub-events, we use our own counter for these.
+        my $count = 0;
+        @subtap = map {
+            my $f2 = $_;
+
+            # Bump the count for any event that should bump it.
+            $count++ if $f2->{assert};
+
+            # This indents all output lines generated for the sub-events.
+            # index 0 is the filehandle, index 1 is the message we want to indent.
+            map { $_->[1] =~ s/^(.*\S.*)$/    $1/mg; $_ } $self->event_tap($f2, $count);
+        } @{$f->{parent}->{children}};
+
+        push @subtap => [OUT_STD, "}\n"];
+    }
+
+    if ($directives) {
+        $directives = ' # TODO & SKIP' if $directives eq ' # TODO & skip';
+        $ok .= $directives;
+        $ok .= " $reason" if defined($reason);
+    }
+
+    $extra_space = ' ' if $self->no_subtest_space;
+
+    my @out = ([OUT_STD, "$ok\n"]);
+    push @out => map {[OUT_STD, "${extra_indent}#${extra_space}$_\n"]} @extra if @extra;
+    push @out => @subtap;
+
+    return @out;
+}
+
+sub debug_tap {
+    my ($self, $f, $num) = @_;
+
+    # Figure out the debug info, this is typically the file name and line
+    # number, but can also be a custom message. If no trace object is provided
+    # then we have nothing useful to display.
+    my $name  = $f->{assert}->{details};
+    my $trace = $f->{trace};
+
+    my $debug = "[No trace info available]";
+    if ($trace->{details}) {
+        $debug = $trace->{details};
+    }
+    elsif ($trace->{frame}) {
+        my ($pkg, $file, $line) = @{$trace->{frame}};
+        $debug = "at $file line $line." if $file && $line;
+    }
+
+    my $amnesty = $f->{amnesty} && @{$f->{amnesty}}
+        ? ' (with amnesty)'
+        : '';
+
+    # Create the initial diagnostics. If the test has a name we put the debug
+    # info on a second line, this behavior is inherited from Test::Builder.
+    my $msg = defined($name)
+        ? qq[# Failed test${amnesty} '$name'\n# $debug\n]
+        : qq[# Failed test${amnesty} $debug\n];
+
+    my $IO = $f->{amnesty} && @{$f->{amnesty}} ? OUT_STD : OUT_ERR;
+
+    return [$IO, $msg];
+}
+
+sub halt_tap {
+    my ($self, $f) = @_;
+
+    return if $f->{trace}->{nested} && !$f->{trace}->{buffered};
+    my $details = $f->{control}->{details};
+
+    return [OUT_STD, "Bail out!\n"] unless defined($details) && length($details);
+    return [OUT_STD, "Bail out!  $details\n"];
+}
+
+sub info_tap {
+    my ($self, $f) = @_;
+
+    return map {
+        my $details = $_->{details};
+        my $table   = $_->{table};
+
+        my $IO = $_->{debug} && !($f->{amnesty} && @{$f->{amnesty}}) ? OUT_ERR : OUT_STD;
+
+        my $msg;
+        if ($table && $self->supports_tables) {
+            $msg = join "\n" => map { "# $_" } Term::Table->new(
+                header      => $table->{header},
+                rows        => $table->{rows},
+                collapse    => $table->{collapse},
+                no_collapse => $table->{no_collapse},
+                sanitize    => 1,
+                mark_tail   => 1,
+                max_width   => $self->calc_table_size($f),
+            )->render();
+        }
+        elsif (ref($details)) {
+            require Data::Dumper;
+            my $dumper = Data::Dumper->new([$details])->Indent(2)->Terse(1)->Pad('# ')->Useqq(1)->Sortkeys(1);
+            chomp($msg = $dumper->Dump);
+        }
+        else {
+            chomp($msg = $details);
+            $msg =~ s/^/# /;
+            $msg =~ s/\n/\n# /g;
+        }
+
+        [$IO, "$msg\n"];
+    } @{$f->{info}};
+}
+
+sub summary_tap {
+    my ($self, $f, $num) = @_;
+
+    return if $f->{about}->{no_display};
+
+    my $summary = $f->{about}->{details} or return;
+    chomp($summary);
+    $summary =~ s/^/# /smg;
+
+    return [OUT_STD, "$summary\n"];
+}
+
+sub calc_table_size {
+    my $self = shift;
+    my ($f) = @_;
+
+    my $term = Term::Table::Util::term_size();
+    my $nesting = 2 + (($f->{trace}->{nested} || 0) * 4); # 4 spaces per level, also '# ' prefix
+    my $total = $term - $nesting;
+
+    # Sane minimum width, any smaller and we are asking for pain
+    return 50 if $total < 50;
+
+    return $total;
+}
+
+1;
+
+__END__
+
+=pod
+
+=encoding UTF-8
+
+=head1 NAME
+
+Test2::Formatter::TAP - Standard TAP formatter
+
+=head1 DESCRIPTION
+
+This is what takes events and turns them into TAP.
+
+=head1 SYNOPSIS
+
+    use Test2::Formatter::TAP;
+    my $tap = Test2::Formatter::TAP->new();
+
+    # Switch to utf8
+    $tap->encoding('utf8');
+
+    $tap->write($event, $number); # Output an event
+
+=head1 METHODS
+
+=over 4
+
+=item $bool = $tap->no_numbers
+
+=item $tap->set_no_numbers($bool)
+
+Use to turn numbers on and off.
+
+=item $arrayref = $tap->handles
+
+=item $tap->set_handles(\@handles);
+
+Can be used to get/set the filehandles. Indexes are identified by the
+C<OUT_STD> and C<OUT_ERR> constants.
+
+=item $encoding = $tap->encoding
+
+=item $tap->encoding($encoding)
+
+Get or set the encoding. By default no encoding is set, the original settings
+of STDOUT and STDERR are used.
+
+This directly modifies the stored filehandles, it does not create new ones.
+
+=item $tap->write($e, $num)
+
+Write an event to the console.
+
+=back
+
+=head1 SOURCE
+
+The source code repository for Test2 can be found at
+L<https://github.com/Test-More/test-more/>.
+
+=head1 MAINTAINERS
+
+=over 4
+
+=item Chad Granum E<lt>exodist@cpan.orgE<gt>
+
+=back
+
+=head1 AUTHORS
+
+=over 4
+
+=item Chad Granum E<lt>exodist@cpan.orgE<gt>
+
+=item Kent Fredric E<lt>kentnl@cpan.orgE<gt>
+
+=back
+
+=head1 COPYRIGHT
+
+Copyright 2020 Chad Granum E<lt>exodist@cpan.orgE<gt>.
+
+This program is free software; you can redistribute it and/or
+modify it under the same terms as Perl itself.
+
+See L<https://dev.perl.org/licenses/>
+
+=cut
+                                                                                          usr/local/lib/perl5/5.40.0/Test2/Formatter.pm                                                       0000444 0000000 0000000 00000007563 14714567415 017021  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        package Test2::Formatter;
+use strict;
+use warnings;
+
+our $VERSION = '1.302199';
+
+
+my %ADDED;
+sub import {
+    my $class = shift;
+    return if $class eq __PACKAGE__;
+    return if $ADDED{$class}++;
+    require Test2::API;
+    Test2::API::test2_formatter_add($class);
+}
+
+sub new_root {
+    my $class = shift;
+    return $class->new(@_);
+}
+
+sub supports_tables { 0 }
+
+sub hide_buffered { 1 }
+
+sub terminate { }
+
+sub finalize { }
+
+1;
+
+__END__
+
+=pod
+
+=encoding UTF-8
+
+=head1 NAME
+
+Test2::Formatter - Namespace for formatters.
+
+=head1 DESCRIPTION
+
+This is the namespace for formatters. This is an empty package.
+
+=head1 CREATING FORMATTERS
+
+A formatter is any package or object with a C<write($event, $num)> method.
+
+    package Test2::Formatter::Foo;
+    use strict;
+    use warnings;
+
+    sub write {
+        my $self_or_class = shift;
+        my ($event, $assert_num) = @_;
+        ...
+    }
+
+    sub hide_buffered { 1 }
+
+    sub terminate { }
+
+    sub finalize { }
+
+    sub supports_tables { return $BOOL }
+
+    sub new_root {
+        my $class = shift;
+        ...
+        $class->new(@_);
+    }
+
+    1;
+
+The C<write> method is a method, so it either gets a class or instance. The two
+arguments are the C<$event> object it should record, and the C<$assert_num>
+which is the number of the current assertion (ok), or the last assertion if
+this event is not itself an assertion. The assertion number may be any integer 0
+or greater, and may be undefined in some cases.
+
+The C<hide_buffered()> method must return a boolean. This is used to tell
+buffered subtests whether or not to send it events as they are being buffered.
+See L<Test2::API/"run_subtest(...)"> for more information.
+
+The C<terminate> and C<finalize> methods are optional methods called that you
+can implement if the format you're generating needs to handle these cases, for
+example if you are generating XML and need close open tags.
+
+The C<terminate> method is called when an event's C<terminate> method returns
+true, for example when a L<Test2::Event::Plan> has a C<'skip_all'> plan, or
+when a L<Test2::Event::Bail> event is sent. The C<terminate> method is passed
+a single argument, the L<Test2::Event> object which triggered the terminate.
+
+The C<finalize> method is always the last thing called on the formatter, I<<
+except when C<terminate> is called for a Bail event >>. It is passed the
+following arguments:
+
+The C<supports_tables> method should be true if the formatter supports directly
+rendering table data from the C<info> facets. This is a newer feature and many
+older formatters may not support it. When not supported the formatter falls
+back to rendering C<detail> instead of the C<table> data.
+
+The C<new_root> method is used when constructing a root formatter. The default
+is to just delegate to the regular C<new()> method, most formatters can ignore
+this.
+
+=over 4
+
+=item * The number of tests that were planned
+
+=item * The number of tests actually seen
+
+=item * The number of tests which failed
+
+=item * A boolean indicating whether or not the test suite passed
+
+=item * A boolean indicating whether or not this call is for a subtest
+
+=back
+
+The C<new_root> method is called when C<Test2::API::Stack> Initializes the root
+hub for the first time. Most formatters will simply have this call C<<
+$class->new >>, which is the default behavior. Some formatters however may want
+to take extra action during construction of the root formatter, this is where
+they can do that.
+
+=head1 SOURCE
+
+The source code repository for Test2 can be found at
+L<https://github.com/Test-More/test-more/>.
+
+=head1 MAINTAINERS
+
+=over 4
+
+=item Chad Granum E<lt>exodist@cpan.orgE<gt>
+
+=back
+
+=head1 AUTHORS
+
+=over 4
+
+=item Chad Granum E<lt>exodist@cpan.orgE<gt>
+
+=back
+
+=head1 COPYRIGHT
+
+Copyright 2020 Chad Granum E<lt>exodist@cpan.orgE<gt>.
+
+This program is free software; you can redistribute it and/or
+modify it under the same terms as Perl itself.
+
+See L<https://dev.perl.org/licenses/>
+
+=cut
+                                                                                                                                             usr/local/lib/perl5/5.40.0/Test2/Hub/                                                               0000755 0000000 0000000 00000000000 14714567415 015225  5                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        usr/local/lib/perl5/5.40.0/Test2/Hub/Interceptor/                                                   0000755 0000000 0000000 00000000000 14714567415 017523  5                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        usr/local/lib/perl5/5.40.0/Test2/Hub/Interceptor/Terminator.pm                                      0000444 0000000 0000000 00000001342 14714567415 022203  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        package Test2::Hub::Interceptor::Terminator;
+use strict;
+use warnings;
+
+our $VERSION = '1.302199';
+
+
+1;
+
+__END__
+
+=pod
+
+=encoding UTF-8
+
+=head1 NAME
+
+Test2::Hub::Interceptor::Terminator - Exception class used by
+Test2::Hub::Interceptor
+
+=head1 SOURCE
+
+The source code repository for Test2 can be found at
+L<https://github.com/Test-More/test-more/>.
+
+=head1 MAINTAINERS
+
+=over 4
+
+=item Chad Granum E<lt>exodist@cpan.orgE<gt>
+
+=back
+
+=head1 AUTHORS
+
+=over 4
+
+=item Chad Granum E<lt>exodist@cpan.orgE<gt>
+
+=back
+
+=head1 COPYRIGHT
+
+Copyright 2020 Chad Granum E<lt>exodist@cpan.orgE<gt>.
+
+This program is free software; you can redistribute it and/or
+modify it under the same terms as Perl itself.
+
+See L<https://dev.perl.org/licenses/>
+
+=cut
+                                                                                                                                                                                                                                                                                              usr/local/lib/perl5/5.40.0/Test2/Hub/Interceptor.pm                                                 0000444 0000000 0000000 00000005250 14714567415 020061  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        package Test2::Hub::Interceptor;
+use strict;
+use warnings;
+
+our $VERSION = '1.302199';
+
+
+use Test2::Hub::Interceptor::Terminator();
+
+BEGIN { require Test2::Hub; our @ISA = qw(Test2::Hub) }
+use Test2::Util::HashBase;
+
+sub init {
+    my $self = shift;
+    $self->SUPER::init();
+    $self->{+NESTED} = 0;
+}
+
+sub inherit {
+    my $self = shift;
+    my ($from, %params) = @_;
+
+    $self->{+NESTED} = 0;
+
+    if ($from->{+IPC} && !$self->{+IPC} && !exists($params{ipc})) {
+        my $ipc = $from->{+IPC};
+        $self->{+IPC} = $ipc;
+        $ipc->add_hub($self->{+HID});
+    }
+
+    if (my $ls = $from->{+_LISTENERS}) {
+        push @{$self->{+_LISTENERS}} => grep { $_->{intercept_inherit} } @$ls;
+    }
+
+    if (my $pfs = $from->{+_PRE_FILTERS}) {
+        push @{$self->{+_PRE_FILTERS}} => grep { $_->{intercept_inherit} } @$pfs;
+    }
+
+    if (my $fs = $from->{+_FILTERS}) {
+        push @{$self->{+_FILTERS}} => grep { $_->{intercept_inherit} } @$fs;
+    }
+}
+
+sub clean_inherited {
+    my $self = shift;
+    my %params = @_;
+
+    my @sets = (
+        $self->{+_LISTENERS},
+        $self->{+_PRE_FILTERS},
+        $self->{+_FILTERS},
+    );
+
+    for my $set (@sets) {
+        next unless $set;
+
+        for my $i (@$set) {
+            my $cbs = $i->{intercept_inherit} or next;
+            next unless ref($cbs) eq 'HASH';
+            my $cb = $cbs->{clean} or next;
+            $cb->(%params);
+        }
+    }
+}
+
+sub restore_inherited {
+    my $self = shift;
+    my %params = @_;
+
+    my @sets = (
+        $self->{+_FILTERS},
+        $self->{+_PRE_FILTERS},
+        $self->{+_LISTENERS},
+    );
+
+    for my $set (@sets) {
+        next unless $set;
+
+        for my $i (@$set) {
+            my $cbs = $i->{intercept_inherit} or next;
+            next unless ref($cbs) eq 'HASH';
+            my $cb = $cbs->{restore} or next;
+            $cb->(%params);
+        }
+    }
+}
+
+sub terminate {
+    my $self = shift;
+    my ($code) = @_;
+
+    eval {
+        no warnings 'exiting';
+        last T2_SUBTEST_WRAPPER;
+    };
+    my $err = $@;
+
+    # Fallback
+    die bless(\$err, 'Test2::Hub::Interceptor::Terminator');
+}
+
+1;
+
+__END__
+
+=pod
+
+=encoding UTF-8
+
+=head1 NAME
+
+Test2::Hub::Interceptor - Hub used by interceptor to grab results.
+
+=head1 SOURCE
+
+The source code repository for Test2 can be found at
+L<https://github.com/Test-More/test-more/>.
+
+=head1 MAINTAINERS
+
+=over 4
+
+=item Chad Granum E<lt>exodist@cpan.orgE<gt>
+
+=back
+
+=head1 AUTHORS
+
+=over 4
+
+=item Chad Granum E<lt>exodist@cpan.orgE<gt>
+
+=back
+
+=head1 COPYRIGHT
+
+Copyright 2020 Chad Granum E<lt>exodist@cpan.orgE<gt>.
+
+This program is free software; you can redistribute it and/or
+modify it under the same terms as Perl itself.
+
+See L<https://dev.perl.org/licenses/>
+
+=cut
+                                                                                                                                                                                                                                                                                                                                                        usr/local/lib/perl5/5.40.0/Test2/Hub/Subtest.pm                                                     0000444 0000000 0000000 00000005122 14714567415 017212  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        package Test2::Hub::Subtest;
+use strict;
+use warnings;
+
+our $VERSION = '1.302199';
+
+BEGIN { require Test2::Hub; our @ISA = qw(Test2::Hub) }
+use Test2::Util::HashBase qw/nested exit_code manual_skip_all/;
+use Test2::Util qw/get_tid/;
+
+sub is_subtest { 1 }
+
+sub inherit {
+    my $self = shift;
+    my ($from) = @_;
+
+    $self->SUPER::inherit($from);
+
+    $self->{+NESTED} = $from->nested + 1;
+}
+
+{
+    # Legacy
+    no warnings 'once';
+    *ID = \&Test2::Hub::HID;
+    *id = \&Test2::Hub::hid;
+    *set_id = \&Test2::Hub::set_hid;
+}
+
+sub send {
+    my $self = shift;
+    my ($e) = @_;
+
+    my $out = $self->SUPER::send($e);
+
+    return $out if $self->{+MANUAL_SKIP_ALL};
+
+    my $f = $e->facet_data;
+
+    my $plan = $f->{plan} or return $out;
+    return $out unless $plan->{skip};
+
+    my $trace = $f->{trace} or die "Missing Trace!";
+    return $out unless $trace->{pid} != $self->pid
+                    || $trace->{tid} != $self->tid;
+
+    no warnings 'exiting';
+    last T2_SUBTEST_WRAPPER;
+}
+
+sub terminate {
+    my $self = shift;
+    my ($code, $e, $f) = @_;
+    $self->set_exit_code($code);
+
+    return if $self->{+MANUAL_SKIP_ALL};
+
+    $f ||= $e->facet_data;
+
+    if(my $plan = $f->{plan}) {
+        my $trace = $f->{trace} or die "Missing Trace!";
+        return if $plan->{skip}
+               && ($trace->{pid} != $$ || $trace->{tid} != get_tid);
+    }
+
+    no warnings 'exiting';
+    last T2_SUBTEST_WRAPPER;
+}
+
+1;
+
+__END__
+
+=pod
+
+=encoding UTF-8
+
+=head1 NAME
+
+Test2::Hub::Subtest - Hub used by subtests
+
+=head1 DESCRIPTION
+
+Subtests make use of this hub to route events.
+
+=head1 TOGGLES
+
+=over 4
+
+=item $bool = $hub->manual_skip_all
+
+=item $hub->set_manual_skip_all($bool)
+
+The default is false.
+
+Normally a skip-all plan event will cause a subtest to stop executing. This is
+accomplished via C<last LABEL> to a label inside the subtest code. Most of the
+time this is perfectly fine. There are times however where this flow control
+causes bad things to happen.
+
+This toggle lets you turn off the abort logic for the hub. When this is toggled
+to true B<you> are responsible for ensuring no additional events are generated.
+
+=back
+
+=head1 SOURCE
+
+The source code repository for Test2 can be found at
+L<https://github.com/Test-More/test-more/>.
+
+=head1 MAINTAINERS
+
+=over 4
+
+=item Chad Granum E<lt>exodist@cpan.orgE<gt>
+
+=back
+
+=head1 AUTHORS
+
+=over 4
+
+=item Chad Granum E<lt>exodist@cpan.orgE<gt>
+
+=back
+
+=head1 COPYRIGHT
+
+Copyright 2020 Chad Granum E<lt>exodist@cpan.orgE<gt>.
+
+This program is free software; you can redistribute it and/or
+modify it under the same terms as Perl itself.
+
+See L<https://dev.perl.org/licenses/>
+
+=cut
+                                                                                                                                                                                                                                                                                                                                                                                                                                              usr/local/lib/perl5/5.40.0/Test2/Hub.pm                                                             0000444 0000000 0000000 00000054500 14714567415 015565  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        package Test2::Hub;
+use strict;
+use warnings;
+
+our $VERSION = '1.302199';
+
+
+use Carp qw/carp croak confess/;
+use Test2::Util qw/get_tid gen_uid/;
+
+use Scalar::Util qw/weaken/;
+use List::Util qw/first/;
+
+use Test2::Util::ExternalMeta qw/meta get_meta set_meta delete_meta/;
+use Test2::Util::HashBase qw{
+    pid tid hid ipc
+    nested buffered
+    no_ending
+    _filters
+    _pre_filters
+    _listeners
+    _follow_ups
+    _formatter
+    _context_acquire
+    _context_init
+    _context_release
+
+    uuid
+    active
+    count
+    failed
+    ended
+    bailed_out
+    _passing
+    _plan
+    skip_reason
+};
+
+my $UUID_VIA;
+
+sub init {
+    my $self = shift;
+
+    $self->{+PID} = $$;
+    $self->{+TID} = get_tid();
+    $self->{+HID} = gen_uid();
+
+    $UUID_VIA ||= Test2::API::_add_uuid_via_ref();
+    $self->{+UUID} = ${$UUID_VIA}->('hub') if $$UUID_VIA;
+

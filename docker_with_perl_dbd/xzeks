@@ -1,0 +1,1000 @@
+            if (SvROK(pathsv) && SvTYPE(SvRV(pathsv))==SVt_PVCV) {
+                /* call sub, use returned list of values as path */
+                /* returning a ref to undef vetos this profile data */
+                dSP;
+                I32 ax;
+                SV *code_sv = SvRV(pathsv);
+                I32 items;
+                I32 item_idx;
+                EXTEND(SP, 4);
+                PUSHMARK(SP);
+                PUSHs(h);   /* push inner handle, then others params */
+                PUSHs( sv_2mortal(newSVpv(method_pv,0)));
+                PUTBACK;
+                SAVE_DEFSV; /* local($_) = $statement */
+                DEFSV_set(statement_sv);
+                items = call_sv(code_sv, G_LIST);
+                SPAGAIN;
+                SP -= items ;
+                ax = (SP - PL_stack_base) + 1 ;
+                for (item_idx=0; item_idx < items; ++item_idx) {
+                    SV *item_sv = ST(item_idx);
+                    if (SvROK(item_sv)) {
+                        if (!SvOK(SvRV(item_sv)))
+                            items = -2; /* flag that we're rejecting this profile data */
+                        else /* other refs reserved */
+                            warn("Ignored ref returned by code ref in Profile Path");
+                        break;
+                    }
+                    dest_node = _profile_next_node(dest_node, (SvOK(item_sv) ? SvPV_nolen(item_sv) : "undef"));
+                }
+                PUTBACK;
+                if (items == -2) /* this profile data was vetoed */
+                    return &PL_sv_undef;
+            }
+            else if (SvROK(pathsv)) {
+                /* only meant for refs to scalars currently */
+                const char *p = SvPV_nolen(SvRV(pathsv));
+                dest_node = _profile_next_node(dest_node, p);
+            }
+            else if (SvOK(pathsv)) {
+                STRLEN len;
+                const char *p = SvPV(pathsv,len);
+                if (p[0] == '!') { /* special cases */
+                    if (p[1] == 'S' && strEQ(p, "!Statement")) {
+                        dest_node = _profile_next_node(dest_node, statement_pv);
+                    }
+                    else if (p[1] == 'M' && strEQ(p, "!MethodName")) {
+                        dest_node = _profile_next_node(dest_node, method_pv);
+                    }
+                    else if (p[1] == 'M' && strEQ(p, "!MethodClass")) {
+                        if (SvTYPE(method) == SVt_PVCV) {
+                            p = SvPV_nolen((SV*)CvGV(method));
+                        }
+                        else if (isGV(method)) {
+                            /* just using SvPV_nolen(method) sometimes causes an error: */
+                            /* "Can't coerce GLOB to string" so we use gv_efullname()   */
+                            SV *tmpsv = sv_2mortal(newSVpv("",0));
+                            gv_efullname4(tmpsv, (GV*)method, "", TRUE);
+                            p = SvPV_nolen(tmpsv);
+                            if (*p == '*') ++p; /* skip past leading '*' glob sigil */
+                        }
+                        else {
+                            p = method_pv;
+                        }
+                        dest_node = _profile_next_node(dest_node, p);
+                    }
+                    else if (p[1] == 'F' && strEQ(p, "!File")) {
+                        dest_node = _profile_next_node(dest_node, log_where(0, 0, "", "", 0, 0, 0));
+                    }
+                    else if (p[1] == 'F' && strEQ(p, "!File2")) {
+                        dest_node = _profile_next_node(dest_node, log_where(0, 0, "", "", 0, 1, 0));
+                    }
+                    else if (p[1] == 'C' && strEQ(p, "!Caller")) {
+                        dest_node = _profile_next_node(dest_node, log_where(0, 0, "", "", 1, 0, 0));
+                    }
+                    else if (p[1] == 'C' && strEQ(p, "!Caller2")) {
+                        dest_node = _profile_next_node(dest_node, log_where(0, 0, "", "", 1, 1, 0));
+                    }
+                    else if (p[1] == 'T' && (strEQ(p, "!Time") || strnEQ(p, "!Time~", 6))) {
+                        char timebuf[20];
+                        int factor = 1;
+                        if (p[5] == '~') {
+                            factor = atoi(&p[6]);
+                            if (factor == 0) /* sanity check to avoid div by zero error */
+                                factor = 3600;
+                        }
+                        sprintf(timebuf, "%ld", ((long)(dbi_time()/factor))*factor);
+                        dest_node = _profile_next_node(dest_node, timebuf);
+                    }
+                    else {
+                        warn("Unknown ! element in DBI::Profile Path: %s", p);
+                        dest_node = _profile_next_node(dest_node, p);
+                    }
+                }
+                else if (p[0] == '{' && p[len-1] == '}') { /* treat as name of dbh attribute to use */
+                    SV **attr_svp;
+                    if (!dbh_inner_hv) {        /* cache dbh handles the first time we need them */
+                        imp_dbh_t *imp_dbh = (DBIc_TYPE(imp_xxh) <= DBIt_DB) ? (imp_dbh_t*)imp_xxh : (imp_dbh_t*)DBIc_PARENT_COM(imp_xxh);
+                        dbh_outer_hv = DBIc_MY_H(imp_dbh);
+                        if (SvTYPE(dbh_outer_hv) != SVt_PVHV)
+                            return &PL_sv_undef;        /* presumably global destruction - bail */
+                        dbh_inner_hv = (HV*)SvRV(dbih_inner(aTHX_ (SV*)dbh_outer_hv, "profile"));
+                        if (SvTYPE(dbh_inner_hv) != SVt_PVHV)
+                            return &PL_sv_undef;        /* presumably global destruction - bail */
+                    }
+                    /* fetch from inner first, then outer if key doesn't exist */
+                    /* (yes, this is an evil premature optimization) */
+                    p += 1; len -= 2; /* ignore the braces */
+                    if ((attr_svp = hv_fetch(dbh_inner_hv, p, len, 0)) == NULL) {
+                        /* try outer (tied) hash - for things like AutoCommit   */
+                        /* (will always return something even for unknowns)     */
+                        if ((attr_svp = hv_fetch(dbh_outer_hv, p, len, 0))) {
+                            if (SvGMAGICAL(*attr_svp))
+                                mg_get(*attr_svp); /* FETCH */
+                        }
+                    }
+                    if (!attr_svp)
+                        p -= 1; /* unignore the braces */
+                    else if (!SvOK(*attr_svp))
+                        p = "";
+                    else if (!SvTRUE(*attr_svp) && SvPOK(*attr_svp) && SvNIOK(*attr_svp))
+                        p = "0"; /* catch &sv_no style special case */
+                    else
+                        p = SvPV_nolen(*attr_svp);
+                    dest_node = _profile_next_node(dest_node, p);
+                }
+                else {
+                    dest_node = _profile_next_node(dest_node, p);
+                }
+            }
+            /* else undef, so ignore */
+        }
+    }
+    else { /* a bad Path value is treated as a Path of just Statement */
+        dest_node = _profile_next_node(dest_node, statement_pv);
+    }
+
+
+    if (!SvOK(dest_node)) {
+        av = newAV();
+        sv_setsv(dest_node, newRV_noinc((SV*)av));
+        av_store(av, DBIprof_COUNT,             newSViv(1));
+        av_store(av, DBIprof_TOTAL_TIME,        newSVnv(ti));
+        av_store(av, DBIprof_FIRST_TIME,        newSVnv(ti));
+        av_store(av, DBIprof_MIN_TIME,          newSVnv(ti));
+        av_store(av, DBIprof_MAX_TIME,          newSVnv(ti));
+        av_store(av, DBIprof_FIRST_CALLED,      newSVnv(t1));
+        av_store(av, DBIprof_LAST_CALLED,       newSVnv(t1));
+    }
+    else {
+        tmp = dest_node;
+        if (SvROK(tmp))
+            tmp = SvRV(tmp);
+        if (SvTYPE(tmp) != SVt_PVAV)
+            croak("Invalid Profile data leaf element: %s (type %ld)",
+                    neatsvpv(tmp,0), (long)SvTYPE(tmp));
+        av = (AV*)tmp;
+        sv_inc( *av_fetch(av, DBIprof_COUNT, 1));
+        tmp = *av_fetch(av, DBIprof_TOTAL_TIME, 1);
+        sv_setnv(tmp, SvNV(tmp) + ti);
+        tmp = *av_fetch(av, DBIprof_MIN_TIME, 1);
+        if (ti < SvNV(tmp)) sv_setnv(tmp, ti);
+        tmp = *av_fetch(av, DBIprof_MAX_TIME, 1);
+        if (ti > SvNV(tmp)) sv_setnv(tmp, ti);
+        sv_setnv( *av_fetch(av, DBIprof_LAST_CALLED, 1), t1);
+    }
+    return dest_node; /* use with caution - copy first, ie sv_mortalcopy() */
+}
+
+
+static void
+dbi_profile_merge_nodes(SV *dest, SV *increment)
+{
+    dTHX;
+    AV *d_av, *i_av;
+    SV *tmp;
+    SV *tmp2;
+    NV i_nv;
+    int i_is_earlier;
+
+    if (!SvROK(dest) || SvTYPE(SvRV(dest)) != SVt_PVAV)
+        croak("dbi_profile_merge_nodes(%s, ...) requires array ref", neatsvpv(dest,0));
+    d_av = (AV*)SvRV(dest);
+
+    if (av_len(d_av) < DBIprof_max_index) {
+        int idx;
+        av_extend(d_av, DBIprof_max_index);
+        for(idx=0; idx<=DBIprof_max_index; ++idx) {
+            tmp = *av_fetch(d_av, idx, 1);
+            if (!SvOK(tmp) && idx != DBIprof_MIN_TIME && idx != DBIprof_FIRST_CALLED)
+                sv_setnv(tmp, 0.0); /* leave 'min' values as undef */
+        }
+    }
+
+    if (!SvOK(increment))
+        return;
+
+    if (SvROK(increment) && SvTYPE(SvRV(increment)) == SVt_PVHV) {
+        HV *hv = (HV*)SvRV(increment);
+        char *key;
+        I32 keylen = 0;
+        hv_iterinit(hv);
+        while ( (tmp = hv_iternextsv(hv, &key, &keylen)) != NULL ) {
+            dbi_profile_merge_nodes(dest, tmp);
+        };
+        return;
+    }
+
+    if (!SvROK(increment) || SvTYPE(SvRV(increment)) != SVt_PVAV)
+        croak("dbi_profile_merge_nodes: increment %s not an array or hash ref", neatsvpv(increment,0));
+    i_av = (AV*)SvRV(increment);
+
+    tmp  = *av_fetch(d_av, DBIprof_COUNT, 1);
+    tmp2 = *av_fetch(i_av, DBIprof_COUNT, 1);
+    if (SvIOK(tmp) && SvIOK(tmp2))
+        sv_setiv( tmp, SvIV(tmp) + SvIV(tmp2) );
+    else
+        sv_setnv( tmp, SvNV(tmp) + SvNV(tmp2) );
+
+    tmp = *av_fetch(d_av, DBIprof_TOTAL_TIME, 1);
+    sv_setnv( tmp, SvNV(tmp) + SvNV( *av_fetch(i_av, DBIprof_TOTAL_TIME, 1)) );
+
+    i_nv = SvNV(*av_fetch(i_av, DBIprof_MIN_TIME, 1));
+    tmp  =      *av_fetch(d_av, DBIprof_MIN_TIME, 1);
+    if (!SvOK(tmp) || i_nv < SvNV(tmp)) sv_setnv(tmp, i_nv);
+
+    i_nv = SvNV(*av_fetch(i_av, DBIprof_MAX_TIME, 1));
+    tmp  =      *av_fetch(d_av, DBIprof_MAX_TIME, 1);
+    if (i_nv > SvNV(tmp)) sv_setnv(tmp, i_nv);
+
+    i_nv = SvNV(*av_fetch(i_av, DBIprof_FIRST_CALLED, 1));
+    tmp  =      *av_fetch(d_av, DBIprof_FIRST_CALLED, 1);
+    i_is_earlier = (!SvOK(tmp) || i_nv < SvNV(tmp));
+    if (i_is_earlier)
+        sv_setnv(tmp, i_nv);
+
+    i_nv = SvNV(*av_fetch(i_av, DBIprof_FIRST_TIME, 1));
+    tmp  =      *av_fetch(d_av, DBIprof_FIRST_TIME, 1);
+    if (i_is_earlier || !SvOK(tmp)) {
+        /* If the increment has an earlier DBIprof_FIRST_CALLED
+        then we set the DBIprof_FIRST_TIME from the increment */
+        sv_setnv(tmp, i_nv);
+    }
+
+    i_nv = SvNV(*av_fetch(i_av, DBIprof_LAST_CALLED, 1));
+    tmp  =      *av_fetch(d_av, DBIprof_LAST_CALLED, 1);
+    if (i_nv > SvNV(tmp)) sv_setnv(tmp, i_nv);
+}
+
+
+/* ----------------------------------------------------------------- */
+/* ---   The DBI dispatcher. The heart of the perl DBI.          --- */
+
+XS(XS_DBI_dispatch);            /* prototype to pass -Wmissing-prototypes */
+XS(XS_DBI_dispatch)
+{
+    dXSARGS;
+    dORIGMARK;
+    dMY_CXT;
+
+    SV *h   = ST(0);            /* the DBI handle we are working with   */
+    SV *st1 = ST(1);            /* used in debugging */
+    SV *st2 = ST(2);            /* used in debugging */
+    SV *orig_h = h;
+    SV *err_sv;
+    SV **tmp_svp;
+    SV **hook_svp = 0;
+    MAGIC *mg;
+    I32 gimme = GIMME_V;
+    I32 trace_flags = DBIS->debug;      /* local copy may change during dispatch */
+    I32 trace_level = (trace_flags & DBIc_TRACE_LEVEL_MASK);
+    int is_DESTROY;
+    meth_types meth_type;
+    int is_unrelated_to_Statement = 0;
+    U32 keep_error = FALSE;
+    UV  ErrCount = UV_MAX;
+    int i, outitems;
+    int call_depth;
+    int is_nested_call;
+    NV profile_t1 = 0.0;
+    int is_orig_method_name = 1;
+
+    const char  *meth_name = GvNAME(CvGV(cv));
+    dbi_ima_t *ima = (dbi_ima_t*)CvXSUBANY(cv).any_ptr;
+    U32   ima_flags;
+    imp_xxh_t   *imp_xxh   = NULL;
+    SV          *imp_msv   = Nullsv;
+    SV          *qsv       = Nullsv; /* quick result from a shortcut method   */
+
+
+#ifdef BROKEN_DUP_ANY_PTR
+    if (ima->my_perl != my_perl) {
+        /* we couldn't dup the ima struct at clone time, so do it now */
+        dbi_ima_t *nima;
+        Newx(nima, 1, dbi_ima_t);
+        *nima = *ima; /* structure copy */
+        CvXSUBANY(cv).any_ptr = nima;
+        nima->stash = NULL;
+        nima->gv    = NULL;
+        nima->my_perl = my_perl;
+        ima = nima;
+    }
+#endif
+
+    ima_flags  = ima->flags;
+    meth_type = ima->meth_type;
+    if (trace_level >= 9) {
+        PerlIO *logfp = DBILOGFP;
+        PerlIO_printf(logfp,"%c   >> %-11s DISPATCH (%s rc%ld/%ld @%ld g%x ima%lx pid#%ld)",
+            (PL_dirty?'!':' '), meth_name, neatsvpv(h,0),
+            (long)SvREFCNT(h), (SvROK(h) ? (long)SvREFCNT(SvRV(h)) : (long)-1),
+            (long)items, (int)gimme, (long)ima_flags, (long)PerlProc_getpid());
+        PerlIO_puts(logfp, log_where(0, 0, " at ","\n", 1, (trace_level >= 3), (trace_level >= 4)));
+        PerlIO_flush(logfp);
+    }
+
+    if ( ( (is_DESTROY=(meth_type == methtype_DESTROY))) ) {
+        /* note that croak()'s won't propagate, only append to $@ */
+        keep_error = TRUE;
+    }
+
+    /* If h is a tied hash ref, switch to the inner ref 'behind' the tie.
+       This means *all* DBI methods work with the inner (non-tied) ref.
+       This makes it much easier for methods to access the real hash
+       data (without having to go through FETCH and STORE methods) and
+       for tie and non-tie methods to call each other.
+    */
+    if (SvROK(h)
+        && SvRMAGICAL(SvRV(h))
+        && (
+               ((mg=SvMAGIC(SvRV(h)))->mg_type == 'P')
+            || ((mg=mg_find(SvRV(h),'P')) != NULL)
+           )
+    ) {
+        if (mg->mg_obj==NULL || !SvOK(mg->mg_obj) || SvRV(mg->mg_obj)==NULL) {  /* maybe global destruction */
+            if (trace_level >= 3)
+                PerlIO_printf(DBILOGFP,
+                    "%c   <> %s for %s ignored (inner handle gone)\n",
+                    (PL_dirty?'!':' '), meth_name, neatsvpv(h,0));
+            XSRETURN(0);
+        }
+        /* Distinguish DESTROY of tie (outer) from DESTROY of inner ref */
+        /* This may one day be used to manually destroy extra internal  */
+        /* refs if the application ceases to use the handle.            */
+        if (is_DESTROY) {
+            imp_xxh = DBIh_COM(mg->mg_obj);
+#ifdef DBI_USE_THREADS
+            if (imp_xxh && DBIc_THR_USER(imp_xxh) != my_perl) {
+                goto is_DESTROY_wrong_thread;
+            }
+#endif
+            if (imp_xxh && DBIc_TYPE(imp_xxh) <= DBIt_DB)
+                clear_cached_kids(aTHX_ mg->mg_obj, imp_xxh, meth_name, trace_level);
+            /* XXX might be better to move this down to after call_depth has been
+             * incremented and then also SvREFCNT_dec(mg->mg_obj) to force an immediate
+             * DESTROY of the inner handle if there are no other refs to it.
+             * That way the inner DESTROY is properly flagged as a nested call,
+             * and the outer DESTROY gets profiled more accurately, and callbacks work.
+             */
+            if (trace_level >= 3) {
+                PerlIO_printf(DBILOGFP,
+                    "%c   <> DESTROY(%s) ignored for outer handle (inner %s has ref cnt %ld)\n",
+                    (PL_dirty?'!':' '), neatsvpv(h,0), neatsvpv(mg->mg_obj,0),
+                    (long)SvREFCNT(SvRV(mg->mg_obj))
+                );
+            }
+            /* for now we ignore it since it'll be followed soon by     */
+            /* a destroy of the inner hash and that'll do the real work */
+
+            /* However, we must at least modify DBIc_MY_H() as that is  */
+            /* pointing (without a refcnt inc) to the scalar that is    */
+            /* being destroyed, so it'll contain random values later.   */
+            if (imp_xxh)
+                DBIc_MY_H(imp_xxh) = (HV*)SvRV(mg->mg_obj); /* inner (untied) HV */
+
+            XSRETURN(0);
+        }
+        h = mg->mg_obj; /* switch h to inner ref                        */
+        ST(0) = h;      /* switch handle on stack to inner ref          */
+    }
+
+    imp_xxh = dbih_getcom2(aTHX_ h, 0); /* get common Internal Handle Attributes        */
+    if (!imp_xxh) {
+        if (meth_type == methtype_can) {  /* ref($h)->can("foo")        */
+            const char *can_meth = SvPV_nolen(st1);
+            SV *rv = &PL_sv_undef;
+            GV *gv = gv_fetchmethod_autoload(gv_stashsv(orig_h,FALSE), can_meth, FALSE);
+            if (gv && isGV(gv))
+                rv = sv_2mortal(newRV_inc((SV*)GvCV(gv)));
+            if (trace_level >= 1) {
+                PerlIO_printf(DBILOGFP,"    <- %s(%s) = %p\n", meth_name, can_meth, neatsvpv(rv,0));
+            }
+            ST(0) = rv;
+            XSRETURN(1);
+        }
+        if (trace_level)
+            PerlIO_printf(DBILOGFP, "%c   <> %s for %s ignored (no imp_data)\n",
+                (PL_dirty?'!':' '), meth_name, neatsvpv(h,0));
+        if (!is_DESTROY)
+            warn("Can't call %s method on handle %s%s", meth_name, neatsvpv(h,0),
+                SvROK(h) ? " after take_imp_data()" : " (not a reference)");
+        XSRETURN(0);
+    }
+
+    if (DBIc_has(imp_xxh,DBIcf_Profile)) {
+        profile_t1 = dbi_time(); /* just get start time here */
+    }
+
+#ifdef DBI_USE_THREADS
+{
+    PerlInterpreter * h_perl;
+    is_DESTROY_wrong_thread:
+    h_perl = DBIc_THR_USER(imp_xxh) ;
+    if (h_perl != my_perl) {
+        /* XXX could call a 'handle clone' method here?, for dbh's at least */
+        if (is_DESTROY) {
+            if (trace_level >= 3) {
+                PerlIO_printf(DBILOGFP,"    DESTROY ignored because DBI %sh handle (%s) is owned by thread %p not current thread %p\n",
+                      dbih_htype_name(DBIc_TYPE(imp_xxh)), HvNAME(DBIc_IMP_STASH(imp_xxh)),
+                      (void*)DBIc_THR_USER(imp_xxh), (void*)my_perl) ;
+                PerlIO_flush(DBILOGFP);
+            }
+            XSRETURN(0); /* don't DESTROY handle, if it is not our's !*/
+        }
+        croak("%s %s failed: handle %d is owned by thread %lx not current thread %lx (%s)",
+            HvNAME(DBIc_IMP_STASH(imp_xxh)), meth_name, DBIc_TYPE(imp_xxh),
+            (unsigned long)h_perl, (unsigned long)my_perl,
+            "handles can't be shared between threads and your driver may need a CLONE method added");
+    }
+}
+#endif
+
+    if ((i = DBIc_DEBUGIV(imp_xxh))) { /* merge handle into global */
+        I32 h_trace_level = (i & DBIc_TRACE_LEVEL_MASK);
+        if ( h_trace_level > trace_level )
+            trace_level = h_trace_level;
+        trace_flags = (trace_flags & ~DBIc_TRACE_LEVEL_MASK)
+                    | (          i & ~DBIc_TRACE_LEVEL_MASK)
+                    | trace_level;
+    }
+
+    /* Check method call against Internal Method Attributes */
+    if (ima_flags) {
+
+        if (ima_flags & (IMA_STUB|IMA_FUNC_REDIRECT|IMA_KEEP_ERR|IMA_KEEP_ERR_SUB|IMA_CLEAR_STMT)) {
+
+            if (ima_flags & IMA_STUB) {
+                if (meth_type == methtype_can) {
+                    const char *can_meth = SvPV_nolen(st1);
+                    SV *dbi_msv = Nullsv;
+                    /* find handle implementors method (GV or CV) */
+                    if ( (imp_msv = (SV*)gv_fetchmethod_autoload(DBIc_IMP_STASH(imp_xxh), can_meth, FALSE)) ) {
+                        /* return DBI's CV, not the implementors CV (else we'd bypass dispatch) */
+                        /* and anyway, we may have hit a private method not part of the DBI     */
+                        GV *gv = gv_fetchmethod_autoload(SvSTASH(SvRV(orig_h)), can_meth, FALSE);
+                        if (gv && isGV(gv))
+                            dbi_msv = (SV*)GvCV(gv);
+                    }
+                    if (trace_level >= 1) {
+                        PerlIO *logfp = DBILOGFP;
+                        PerlIO_printf(logfp,"    <- %s(%s) = %p (%s %p)\n", meth_name, can_meth, (void*)dbi_msv,
+                                (imp_msv && isGV(imp_msv)) ? HvNAME(GvSTASH(imp_msv)) : "?", (void*)imp_msv);
+                    }
+                    ST(0) = (dbi_msv) ? sv_2mortal(newRV_inc(dbi_msv)) : &PL_sv_undef;
+                    XSRETURN(1);
+                }
+                XSRETURN(0);
+            }
+            if (ima_flags & IMA_FUNC_REDIRECT) {
+                /* XXX this doesn't redispatch, nor consider the IMA of the new method */
+                SV *meth_name_sv = POPs;
+                PUTBACK;
+                --items;
+                if (!SvPOK(meth_name_sv) || SvNIOK(meth_name_sv))
+                    croak("%s->%s() invalid redirect method name %s",
+                            neatsvpv(h,0), meth_name, neatsvpv(meth_name_sv,0));
+                meth_name = SvPV_nolen(meth_name_sv);
+                meth_type = get_meth_type(meth_name);
+                is_orig_method_name = 0;
+            }
+            if (ima_flags & IMA_KEEP_ERR)
+                keep_error = TRUE;
+            if ((ima_flags & IMA_KEEP_ERR_SUB)
+                && !PL_dirty
+                && DBIc_PARENT_COM(imp_xxh) && DBIc_CALL_DEPTH(DBIc_PARENT_COM(imp_xxh)) > 0)
+                keep_error = TRUE;
+            if (ima_flags & IMA_CLEAR_STMT) {
+                /* don't use SvOK_off: dbh's Statement may be ref to sth's */
+                (void)hv_store((HV*)SvRV(h), "Statement", 9, &PL_sv_undef, 0);
+            }
+            if (ima_flags & IMA_CLEAR_CACHED_KIDS)
+                clear_cached_kids(aTHX_ h, imp_xxh, meth_name, trace_flags);
+
+        }
+
+        if (ima_flags & IMA_HAS_USAGE) {
+            const char *err = NULL;
+            char msg[200];
+
+            if (ima->minargs && (items < ima->minargs
+                                || (ima->maxargs>0 && items > ima->maxargs))) {
+                sprintf(msg,
+                    "DBI %s: invalid number of arguments: got handle + %ld, expected handle + between %d and %d\n",
+                    meth_name, (long)items-1, (int)ima->minargs-1, (int)ima->maxargs-1);
+                err = msg;
+            }
+            /* arg type checking could be added here later */
+            if (err) {
+                croak("%sUsage: %s->%s(%s)", err, "$h", meth_name,
+                    (ima->usage_msg) ? ima->usage_msg : "...?");
+            }
+        }
+    }
+
+    is_unrelated_to_Statement = ( (DBIc_TYPE(imp_xxh) == DBIt_ST) ? 0
+                                : (DBIc_TYPE(imp_xxh) == DBIt_DR) ? 1
+                                : (ima_flags & IMA_UNRELATED_TO_STMT) );
+
+    if (PL_tainting && items > 1              /* method call has args   */
+        && DBIc_is(imp_xxh, DBIcf_TaintIn)    /* taint checks requested */
+        && !(ima_flags & IMA_NO_TAINT_IN)
+    ) {
+        for(i=1; i < items; ++i) {
+            if (SvTAINTED(ST(i))) {
+                char buf[100];
+                sprintf(buf,"parameter %d of %s->%s method call",
+                        i, SvPV_nolen(h), meth_name);
+                PL_tainted = 1; /* needed for TAINT_PROPER to work      */
+                TAINT_PROPER(buf);      /* die's */
+            }
+        }
+    }
+
+    /* record this inner handle for use by DBI::var::FETCH      */
+    if (is_DESTROY) {
+
+        /* force destruction of any outstanding children */
+        if ((tmp_svp = hv_fetch((HV*)SvRV(h), "ChildHandles", 12, FALSE)) && SvROK(*tmp_svp)) {
+            AV *av = (AV*)SvRV(*tmp_svp);
+            I32 kidslots;
+            PerlIO *logfp = DBILOGFP;
+
+            for (kidslots = AvFILL(av); kidslots >= 0; --kidslots) {
+                SV **hp = av_fetch(av, kidslots, FALSE);
+                if (!hp || !SvROK(*hp) || SvTYPE(SvRV(*hp))!=SVt_PVHV)
+                    break;
+
+                if (trace_level >= 1) {
+                    PerlIO_printf(logfp, "on DESTROY handle %s still has child %s (refcnt %ld, obj %d, dirty=%d)\n",
+                        neatsvpv(h,0), neatsvpv(*hp, 0), (long)SvREFCNT(*hp), !!sv_isobject(*hp), PL_dirty);
+                    if (trace_level >= 9)
+                        sv_dump(SvRV(*hp));
+                }
+                if (sv_isobject(*hp)) { /* call DESTROY on the handle */
+                    PUSHMARK(SP);
+                    XPUSHs(*hp);
+                    PUTBACK;
+                    call_method("DESTROY", G_VOID|G_EVAL|G_KEEPERR);
+                    MSPAGAIN;
+                }
+                else {
+                    imp_xxh_t *imp_xxh = dbih_getcom2(aTHX_ *hp, 0);
+                    if (imp_xxh && DBIc_COMSET(imp_xxh)) {
+                        dbih_clearcom(imp_xxh);
+                        sv_setsv(*hp, &PL_sv_undef);
+                    }
+                }
+            }
+        }
+
+        if (DBIc_TYPE(imp_xxh) <= DBIt_DB ) {   /* is dbh or drh */
+            imp_xxh_t *parent_imp;
+
+            if (SvOK(DBIc_ERR(imp_xxh)) && (parent_imp = DBIc_PARENT_COM(imp_xxh))
+                && !PL_dirty /* XXX - remove? */
+            ) {
+                /* copy err/errstr/state values to $DBI::err etc still work */
+                sv_setsv(DBIc_ERR(parent_imp),    DBIc_ERR(imp_xxh));
+                sv_setsv(DBIc_ERRSTR(parent_imp), DBIc_ERRSTR(imp_xxh));
+                sv_setsv(DBIc_STATE(parent_imp),  DBIc_STATE(imp_xxh));
+            }
+        }
+
+        if (DBIc_AIADESTROY(imp_xxh)) { /* wants ineffective destroy after fork */
+            if ((U32)PerlProc_getpid() != _imp2com(imp_xxh, std.pid))
+                DBIc_set(imp_xxh, DBIcf_IADESTROY, 1);
+        }
+        if (DBIc_IADESTROY(imp_xxh)) {  /* wants ineffective destroy    */
+            DBIc_ACTIVE_off(imp_xxh);
+        }
+        call_depth = 0;
+        is_nested_call = 0;
+    }
+    else {
+        DBI_SET_LAST_HANDLE(h);
+        SAVEINT(DBIc_CALL_DEPTH(imp_xxh));
+        call_depth = ++DBIc_CALL_DEPTH(imp_xxh);
+
+        if (ima_flags & IMA_COPY_UP_STMT) { /* execute() */
+            copy_statement_to_parent(aTHX_ h, imp_xxh);
+        }
+        is_nested_call =
+            (call_depth > 1
+                || (!PL_dirty /* not in global destruction [CPAN #75614] */
+                    && DBIc_PARENT_COM(imp_xxh)
+                    && DBIc_CALL_DEPTH(DBIc_PARENT_COM(imp_xxh))) >= 1);
+
+    }
+
+
+    /* --- dispatch --- */
+
+    if (!keep_error && meth_type != methtype_set_err) {
+        SV *err_sv;
+        if (trace_level && SvOK(err_sv=DBIc_ERR(imp_xxh))) {
+            PerlIO *logfp = DBILOGFP;
+            PerlIO_printf(logfp, "    !! The %s '%s' was CLEARED by call to %s method\n",
+                SvTRUE(err_sv) ? "ERROR" : strlen(SvPV_nolen(err_sv)) ? "warn" : "info",
+                neatsvpv(DBIc_ERR(imp_xxh),0), meth_name);
+        }
+        DBIh_CLEAR_ERROR(imp_xxh);
+    }
+    else {      /* we check for change in ErrCount/err_hash during call */
+        ErrCount = DBIc_ErrCount(imp_xxh);
+        if (keep_error)
+            keep_error = err_hash(aTHX_ imp_xxh);
+    }
+
+    if (DBIc_has(imp_xxh,DBIcf_Callbacks)
+        && (tmp_svp = hv_fetch((HV*)SvRV(h), "Callbacks", 9, 0))
+        && (   (hook_svp = hv_fetch((HV*)SvRV(*tmp_svp), meth_name, strlen(meth_name), 0))
+              /* the "*" fallback callback only applies to non-nested calls
+               * and also doesn't apply to the 'set_err' or DESTROY methods.
+               * Nor during global destruction.
+               * Other restrictions may be added over time.
+               * It's an undocumented hack.
+               */
+          || (!is_nested_call && !PL_dirty && meth_type != methtype_set_err &&
+               meth_type != methtype_DESTROY &&
+               (hook_svp = hv_fetch((HV*)SvRV(*tmp_svp), "*", 1, 0))
+             )
+        )
+        && SvROK(*hook_svp)
+    ) {
+        SV *orig_defsv;
+        SV *temp_defsv;
+        SV *code = SvRV(*hook_svp);
+        I32 skip_dispatch = 0;
+        if (trace_level)
+            PerlIO_printf(DBILOGFP, "%c   {{ %s callback %s being invoked with %ld args\n",
+                (PL_dirty?'!':' '), meth_name, neatsvpv(*hook_svp,0), (long)items);
+
+        /* we don't use ENTER,SAVETMPS & FREETMPS,LEAVE because we may need mortal
+         * results to live long enough to be returned to our caller
+         */
+        /* we want to localize $_ for the callback but can't just do that alone
+         * because we're not using SAVETMPS & FREETMPS, so we have to get sneaky.
+         * We still localize, so we're safe from the callback die-ing,
+         * but after the callback we manually restore the original $_.
+         */
+        orig_defsv = DEFSV; /* remember the current $_ */
+        SAVE_DEFSV;         /* local($_) = $method_name */
+        temp_defsv = sv_2mortal(newSVpv(meth_name,0));
+# ifdef SvTEMP_off
+        SvTEMP_off(temp_defsv);
+# endif
+        DEFSV_set(temp_defsv);
+
+        EXTEND(SP, items+1);
+        PUSHMARK(SP);
+        PUSHs(orig_h);                  /* push outer handle, then others params */
+        for (i=1; i < items; ++i) {     /* start at 1 to skip handle */
+            PUSHs( ST(i) );
+        }
+        PUTBACK;
+        outitems = call_sv(code, G_LIST); /* call the callback code */
+        MSPAGAIN;
+
+        /* The callback code can undef $_ to indicate to skip dispatch */
+        skip_dispatch = !SvOK(DEFSV);
+        /* put $_ back now */
+        DEFSV_set(orig_defsv);
+
+        if (trace_level)
+            PerlIO_printf(DBILOGFP, "%c   }} %s callback %s returned%s\n",
+                (PL_dirty?'!':' '), meth_name, neatsvpv(*hook_svp,0),
+                skip_dispatch ? ", actual method will not be called" : ""
+            );
+        if (skip_dispatch) {    /* XXX experimental */
+            int ix = outitems;
+            /* copy the new items down to the destination list */
+            while (ix-- > 0) {
+                if(0)warn("\tcopy down %d: %s overwriting %s\n", ix, SvPV_nolen(TOPs), SvPV_nolen(ST(ix)) );
+                ST(ix) = POPs;
+            }
+            imp_msv = *hook_svp; /* for trace and profile */
+            goto post_dispatch;
+        }
+        else {
+            if (outitems != 0)
+                die("Callback for %s returned %d values but must not return any (temporary restriction in current version)",
+                        meth_name, (int)outitems);
+            /* POP's and PUTBACK? to clear stack */
+        }
+    }
+
+    /* set Executed after Callbacks so it's not set if callback elects to skip the method */
+    if (ima_flags & IMA_EXECUTE) {
+        imp_xxh_t *parent = DBIc_PARENT_COM(imp_xxh);
+        DBIc_on(imp_xxh, DBIcf_Executed);
+        if (parent)
+            DBIc_on(parent, DBIcf_Executed);
+    }
+
+    /* The "quick_FETCH" logic...                                       */
+    /* Shortcut for fetching attributes to bypass method call overheads */
+    if (meth_type == methtype_FETCH && !DBIc_COMPAT(imp_xxh)) {
+        STRLEN kl;
+        const char *key = SvPV(st1, kl);
+        SV **attr_svp;
+        if (*key != '_' && (attr_svp=hv_fetch((HV*)SvRV(h), key, kl, 0))) {
+            qsv = *attr_svp;
+            /* disable FETCH from cache for special attributes */
+            if (SvROK(qsv) && SvTYPE(SvRV(qsv))==SVt_PVHV && *key=='D' &&
+                (  (kl==6 && DBIc_TYPE(imp_xxh)==DBIt_DB && strEQ(key,"Driver"))
+                || (kl==8 && DBIc_TYPE(imp_xxh)==DBIt_ST && strEQ(key,"Database")) )
+            ) {
+                qsv = Nullsv;
+            }
+            /* disable profiling of FETCH of Profile data */
+            if (*key == 'P' && strEQ(key, "Profile"))
+                profile_t1 = 0.0;
+        }
+        if (qsv) { /* skip real method call if we already have a 'quick' value */
+            ST(0) = sv_mortalcopy(qsv);
+            outitems = 1;
+            goto post_dispatch;
+        }
+    }
+
+    {
+        CV *meth_cv;
+#ifdef DBI_save_hv_fetch_ent
+        HE save_mh;
+        if (meth_type == methtype_FETCH)
+            save_mh = PL_hv_fetch_ent_mh; /* XXX nested tied FETCH bug17575 workaround */
+#endif
+
+        if (trace_flags) {
+            SAVEI32(DBIS->debug);       /* fall back to orig value later */
+            DBIS->debug = trace_flags;  /* make new value global (for now) */
+            if (ima) {
+                /* enabling trace via flags takes precedence over disabling due to min level */
+                if ((trace_flags & DBIc_TRACE_FLAGS_MASK) & (ima->method_trace & DBIc_TRACE_FLAGS_MASK))
+                    trace_level = (trace_level < 2) ? 2 : trace_level; /* min */
+                else
+                if (trace_level < (DBIc_TRACE_LEVEL_MASK & ima->method_trace))
+                    trace_level = 0;        /* silence dispatch log for this method */
+            }
+        }
+
+        if (is_orig_method_name
+            && ima->stash == DBIc_IMP_STASH(imp_xxh)
+            && ima->generation == PL_sub_generation +
+                                        MY_cache_gen(DBIc_IMP_STASH(imp_xxh))
+        )
+            imp_msv = (SV*)ima->gv;
+        else {
+            imp_msv = (SV*)gv_fetchmethod_autoload(DBIc_IMP_STASH(imp_xxh),
+                                            meth_name, FALSE);
+            if (is_orig_method_name) {
+                /* clear stale entry, if any */
+                SvREFCNT_dec(ima->stash);
+                SvREFCNT_dec(ima->gv);
+                if (!imp_msv) {
+                    ima->stash = NULL;
+                    ima->gv    = NULL;
+                }
+                else {
+                    ima->stash = (HV*)SvREFCNT_inc(DBIc_IMP_STASH(imp_xxh));
+                    ima->gv    = (GV*)SvREFCNT_inc(imp_msv);
+                    ima->generation = PL_sub_generation +
+                                        MY_cache_gen(DBIc_IMP_STASH(imp_xxh));
+                }
+            }
+        }
+
+        /* if method was a 'func' then try falling back to real 'func' method */
+        if (!imp_msv && (ima_flags & IMA_FUNC_REDIRECT)) {
+            imp_msv = (SV*)gv_fetchmethod_autoload(DBIc_IMP_STASH(imp_xxh), "func", FALSE);
+            if (imp_msv) {
+                /* driver does have func method so undo the earlier 'func' stack changes */
+                PUSHs(sv_2mortal(newSVpv(meth_name,0)));
+                PUTBACK;
+                ++items;
+                meth_name = "func";
+                meth_type = methtype_ordinary;
+            }
+        }
+
+        if (trace_level >= (is_nested_call ? 4 : 2)) {
+            PerlIO *logfp = DBILOGFP;
+            /* Full pkg method name (or just meth_name for ANON CODE)   */
+            const char *imp_meth_name = (imp_msv && isGV(imp_msv)) ? GvNAME(imp_msv) : meth_name;
+            HV *imp_stash = DBIc_IMP_STASH(imp_xxh);
+            PerlIO_printf(logfp, "%c   -> %s ",
+                    call_depth>1 ? '0'+call_depth-1 : (PL_dirty?'!':' '), imp_meth_name);
+            if (imp_meth_name[0] == 'A' && strEQ(imp_meth_name,"AUTOLOAD"))
+                    PerlIO_printf(logfp, "\"%s\" ", meth_name);
+            if (imp_msv && isGV(imp_msv) && GvSTASH(imp_msv) != imp_stash)
+                PerlIO_printf(logfp, "in %s ", HvNAME(GvSTASH(imp_msv)));
+            PerlIO_printf(logfp, "for %s (%s", HvNAME(imp_stash),
+                        SvPV_nolen(orig_h));
+            if (h != orig_h)    /* show inner handle to aid tracing */
+                 PerlIO_printf(logfp, "~0x%lx", (long)SvRV(h));
+            else PerlIO_printf(logfp, "~INNER");
+            for(i=1; i<items; ++i) {
+                PerlIO_printf(logfp," %s",
+                    (ima && i==ima->hidearg) ? "****" : neatsvpv(ST(i),0));
+            }
+#ifdef DBI_USE_THREADS
+            PerlIO_printf(logfp, ") thr#%p\n", (void*)DBIc_THR_USER(imp_xxh));
+#else
+            PerlIO_printf(logfp, ")\n");
+#endif
+            PerlIO_flush(logfp);
+        }
+
+        if (!imp_msv || ! ((meth_cv = GvCV(imp_msv))) ) {
+            if (PL_dirty || is_DESTROY) {
+                outitems = 0;
+                goto post_dispatch;
+            }
+            if (ima_flags & IMA_NOT_FOUND_OKAY) {
+                outitems = 0;
+                goto post_dispatch;
+            }
+            croak("Can't locate DBI object method \"%s\" via package \"%s\"",
+                meth_name, HvNAME(DBIc_IMP_STASH(imp_xxh)));
+        }
+
+        PUSHMARK(mark);  /* mark arguments again so we can pass them on */
+
+        /* Note: the handle on the stack is still an object blessed into a
+         * DBI::* class and not the DBD::*::* class whose method is being
+         * invoked. This is correct and should be largely transparent.
+         */
+
+        /* SHORT-CUT ALERT! */
+        if (use_xsbypass && CvISXSUB(meth_cv) && CvXSUB(meth_cv)) {
+
+            /* If we are calling an XSUB we jump directly to its C code and
+             * bypass perl_call_sv(), pp_entersub() etc. This is fast.
+             * This code is based on a small section of pp_entersub().
+             */
+            (void)(*CvXSUB(meth_cv))(aTHXo_ meth_cv); /* Call the C code directly */
+
+            if (gimme == G_SCALAR) {    /* Enforce sanity in scalar context */
+                if (ax != PL_stack_sp - PL_stack_base ) { /* outitems != 1 */
+                    ST(0) =
+                        (ax > PL_stack_sp - PL_stack_base)
+                            ? &PL_sv_undef  /* outitems == 0 */
+                            : *PL_stack_sp; /* outitems > 1 */
+                    PL_stack_sp = PL_stack_base + ax;
+                }
+                outitems = 1;
+            }
+            else {
+                outitems = PL_stack_sp - (PL_stack_base + ax - 1);
+            }
+
+        }
+        else {
+            /* sv_dump(imp_msv); */
+            outitems = call_sv((SV*)meth_cv,
+                (is_DESTROY ? gimme | G_EVAL | G_KEEPERR : gimme) );
+        }
+
+        XSprePUSH; /* reset SP to base of stack frame */
+
+#ifdef DBI_save_hv_fetch_ent
+        if (meth_type == methtype_FETCH)
+            PL_hv_fetch_ent_mh = save_mh;       /* see start of block */
+#endif
+    }
+
+    post_dispatch:
+
+    if (is_DESTROY && DBI_IS_LAST_HANDLE(h)) { /* if destroying _this_ handle */
+        SV *lhp = DBIc_PARENT_H(imp_xxh);
+        if (lhp && SvROK(lhp)) {
+            DBI_SET_LAST_HANDLE(lhp);
+        }
+        else {
+            DBI_UNSET_LAST_HANDLE;
+        }
+    }
+
+    if (keep_error) {
+        /* if we didn't clear err before the call, check to see if a new error
+         * or warning has been recorded. If so, turn off keep_error so it gets acted on
+         */
+        if (DBIc_ErrCount(imp_xxh) > ErrCount || err_hash(aTHX_ imp_xxh) != keep_error) {
+            keep_error = 0;
+        }
+    }
+
+    err_sv = DBIc_ERR(imp_xxh);
+
+    if (trace_level >= (is_nested_call ? 3 : 1)) {
+        PerlIO *logfp = DBILOGFP;
+        const int is_fetch  = (meth_type == methtype_fetch_star && DBIc_TYPE(imp_xxh)==DBIt_ST);
+        const IV row_count = (is_fetch) ? DBIc_ROW_COUNT((imp_sth_t*)imp_xxh) : 0;
+        if (is_fetch && row_count>=2 && trace_level<=4 && SvOK(ST(0))) {
+            /* skip the 'middle' rows to reduce output */
+            goto skip_meth_return_trace;
+        }
+        if (SvOK(err_sv)) {
+            PerlIO_printf(logfp, "    %s %s %s %s (err#%ld)\n", (keep_error) ? "  " : "!!",
+                SvTRUE(err_sv) ? "ERROR:" : strlen(SvPV_nolen(err_sv)) ? "warn:" : "info:",
+                neatsvpv(err_sv,0), neatsvpv(DBIc_ERRSTR(imp_xxh),0), (long)DBIc_ErrCount(imp_xxh));
+        }
+        PerlIO_printf(logfp,"%c%c  <%c %s",
+                    (call_depth > 1)  ? '0'+call_depth-1 : (PL_dirty?'!':' '),
+                    (DBIc_is(imp_xxh, DBIcf_TaintIn|DBIcf_TaintOut)) ? 'T' : ' ',
+                    (qsv) ? '>' : '-',
+                    meth_name);
+        if (trace_level==1 && (items>=2||is_DESTROY)) { /* make level 1 more useful */
+            /* we only have the first two parameters available here */
+            if (is_DESTROY) /* show handle as first arg to DESTROY */
+                /* want to show outer handle so trace makes sense       */
+                /* but outer handle has been destroyed so we fake it    */
+                PerlIO_printf(logfp,"(%s=HASH(0x%p)", HvNAME(SvSTASH(SvRV(orig_h))), (void*)DBIc_MY_H(imp_xxh));
+            else
+                PerlIO_printf(logfp,"(%s", neatsvpv(st1,0));
+            if (items >= 3)
+                PerlIO_printf(logfp,", %s", neatsvpv(st2,0));
+            PerlIO_printf(logfp,"%s)", (items > 3) ? ", ..." : "");
+        }
+
+        if (gimme & G_LIST)
+             PerlIO_printf(logfp,"= (");
+        else PerlIO_printf(logfp,"=");
+        for(i=0; i < outitems; ++i) {
+            SV *s = ST(i);
+            if ( SvROK(s) && SvTYPE(SvRV(s))==SVt_PVAV) {
+                AV *av = (AV*)SvRV(s);
+                int avi;
+                int avi_last = SvIV(DBIS->neatsvpvlen) / 10;
+                if (avi_last < 39)
+                    avi_last = 39;
+                PerlIO_printf(logfp, " [");
+                for (avi=0; avi <= AvFILL(av); ++avi) {
+                    PerlIO_printf(logfp, " %s",  neatsvpv(AvARRAY(av)[avi],0));
+                    if (avi >= avi_last && AvFILL(av) - avi > 1) {
+                        PerlIO_printf(logfp, " ... %ld others skipped", AvFILL(av) - avi);
+                        break;
+                    }
+                }
+                PerlIO_printf(logfp, " ]");
+            }
+            else {
+                PerlIO_printf(logfp, " %s",  neatsvpv(s,0));
+                if ( SvROK(s) && SvTYPE(SvRV(s))==SVt_PVHV && !SvOBJECT(SvRV(s)) )
+                    PerlIO_printf(logfp, "%ldkeys", (long)HvKEYS(SvRV(s)));
+            }
+        }
+        if (gimme & G_LIST) {
+            PerlIO_printf(logfp," ) [%d items]", outitems);
+        }
+        if (is_fetch && row_count) {
+            PerlIO_printf(logfp," row%"IVdf, row_count);
+        }
+        if (qsv) /* flag as quick and peek at the first arg (still on the stack) */
+            PerlIO_printf(logfp," (%s from cache)", neatsvpv(st1,0));
+        else if (!imp_msv)
+            PerlIO_printf(logfp," (not implemented)");
+        /* XXX add flag to show pid here? */
+        /* add file and line number information */
+        PerlIO_puts(logfp, log_where(0, 0, " at ", "\n", 1, (trace_level >= 3), (trace_level >= 4)));
+    skip_meth_return_trace:
+        PerlIO_flush(logfp);
+    }
+
+    if (ima_flags & IMA_END_WORK) { /* commit() or rollback() */
+        /* XXX does not consider if the method call actually worked or not */
+        DBIc_off(imp_xxh, DBIcf_Executed);
+
+        if (DBIc_has(imp_xxh, DBIcf_BegunWork)) {
+            DBIc_off(imp_xxh, DBIcf_BegunWork);
+            if (!DBIc_has(imp_xxh, DBIcf_AutoCommit)) {
+                /* We only get here if the driver hasn't implemented their own code     */
+                /* for begin_work, or has but hasn't correctly turned AutoCommit        */
+                /* back on in their commit or rollback code. So we have to do it.       */
+                /* This is bad because it'll probably trigger a spurious commit()       */
+                /* and may mess up the error handling below for the commit/rollback     */
+                PUSHMARK(SP);
+                XPUSHs(h);
+                XPUSHs(sv_2mortal(newSVpv("AutoCommit",0)));
+                XPUSHs(&PL_sv_yes);

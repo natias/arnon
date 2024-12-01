@@ -1,0 +1,1000 @@
+# This software may be used and distributed according to the terms of the
+# GNU General Public License version 2 or any later version.
+
+
+import collections
+import contextlib
+import copy
+import os
+import re
+import shutil
+import zlib
+
+from .i18n import _
+from .node import (
+    hex,
+    sha1nodeconstants,
+    short,
+)
+from .pycompat import open
+from . import (
+    copies,
+    diffhelper,
+    diffutil,
+    encoding,
+    error,
+    mail,
+    mdiff,
+    pathutil,
+    pycompat,
+    scmutil,
+    similar,
+    util,
+    vfs as vfsmod,
+)
+from .utils import (
+    dateutil,
+    hashutil,
+    procutil,
+    stringutil,
+)
+
+stringio = util.stringio
+
+gitre = re.compile(br'diff --git a/(.*) b/(.*)')
+tabsplitter = re.compile(br'(\t+|[^\t]+)')
+wordsplitter = re.compile(
+    br'(\t+| +|[a-zA-Z0-9_\x80-\xff]+|[^ \ta-zA-Z0-9_\x80-\xff])'
+)
+
+PatchError = error.PatchError
+PatchParseError = error.PatchParseError
+PatchApplicationError = error.PatchApplicationError
+
+# public functions
+
+
+def split(stream):
+    '''return an iterator of individual patches from a stream'''
+
+    def isheader(line, inheader):
+        if inheader and line.startswith((b' ', b'\t')):
+            # continuation
+            return True
+        if line.startswith((b' ', b'-', b'+')):
+            # diff line - don't check for header pattern in there
+            return False
+        l = line.split(b': ', 1)
+        return len(l) == 2 and b' ' not in l[0]
+
+    def chunk(lines):
+        return stringio(b''.join(lines))
+
+    def hgsplit(stream, cur):
+        inheader = True
+
+        for line in stream:
+            if not line.strip():
+                inheader = False
+            if not inheader and line.startswith(b'# HG changeset patch'):
+                yield chunk(cur)
+                cur = []
+                inheader = True
+
+            cur.append(line)
+
+        if cur:
+            yield chunk(cur)
+
+    def mboxsplit(stream, cur):
+        for line in stream:
+            if line.startswith(b'From '):
+                for c in split(chunk(cur[1:])):
+                    yield c
+                cur = []
+
+            cur.append(line)
+
+        if cur:
+            for c in split(chunk(cur[1:])):
+                yield c
+
+    def mimesplit(stream, cur):
+        def msgfp(m):
+            fp = stringio()
+            # pytype: disable=wrong-arg-types
+            g = mail.Generator(fp, mangle_from_=False)
+            # pytype: enable=wrong-arg-types
+            g.flatten(m)
+            fp.seek(0)
+            return fp
+
+        for line in stream:
+            cur.append(line)
+        c = chunk(cur)
+
+        m = mail.parse(c)
+        if not m.is_multipart():
+            yield msgfp(m)
+        else:
+            ok_types = (b'text/plain', b'text/x-diff', b'text/x-patch')
+            for part in m.walk():
+                ct = part.get_content_type()
+                if ct not in ok_types:
+                    continue
+                yield msgfp(part)
+
+    def headersplit(stream, cur):
+        inheader = False
+
+        for line in stream:
+            if not inheader and isheader(line, inheader):
+                yield chunk(cur)
+                cur = []
+                inheader = True
+            if inheader and not isheader(line, inheader):
+                inheader = False
+
+            cur.append(line)
+
+        if cur:
+            yield chunk(cur)
+
+    def remainder(cur):
+        yield chunk(cur)
+
+    class fiter:
+        def __init__(self, fp):
+            self.fp = fp
+
+        def __iter__(self):
+            return self
+
+        def next(self):
+            l = self.fp.readline()
+            if not l:
+                raise StopIteration
+            return l
+
+        __next__ = next
+
+    inheader = False
+    cur = []
+
+    mimeheaders = [b'content-type']
+
+    if not util.safehasattr(stream, b'next'):
+        # http responses, for example, have readline but not next
+        stream = fiter(stream)
+
+    for line in stream:
+        cur.append(line)
+        if line.startswith(b'# HG changeset patch'):
+            return hgsplit(stream, cur)
+        elif line.startswith(b'From '):
+            return mboxsplit(stream, cur)
+        elif isheader(line, inheader):
+            inheader = True
+            if line.split(b':', 1)[0].lower() in mimeheaders:
+                # let email parser handle this
+                return mimesplit(stream, cur)
+        elif line.startswith(b'--- ') and inheader:
+            # No evil headers seen by diff start, split by hand
+            return headersplit(stream, cur)
+        # Not enough info, keep reading
+
+    # if we are here, we have a very plain patch
+    return remainder(cur)
+
+
+## Some facility for extensible patch parsing:
+# list of pairs ("header to match", "data key")
+patchheadermap = [
+    (b'Date', b'date'),
+    (b'Branch', b'branch'),
+    (b'Node ID', b'nodeid'),
+]
+
+
+@contextlib.contextmanager
+def extract(ui, fileobj):
+    """extract patch from data read from fileobj.
+
+    patch can be a normal patch or contained in an email message.
+
+    return a dictionary. Standard keys are:
+      - filename,
+      - message,
+      - user,
+      - date,
+      - branch,
+      - node,
+      - p1,
+      - p2.
+    Any item can be missing from the dictionary. If filename is missing,
+    fileobj did not contain a patch. Caller must unlink filename when done."""
+
+    fd, tmpname = pycompat.mkstemp(prefix=b'hg-patch-')
+    tmpfp = os.fdopen(fd, 'wb')
+    try:
+        yield _extract(ui, fileobj, tmpname, tmpfp)
+    finally:
+        tmpfp.close()
+        os.unlink(tmpname)
+
+
+def _extract(ui, fileobj, tmpname, tmpfp):
+
+    # attempt to detect the start of a patch
+    # (this heuristic is borrowed from quilt)
+    diffre = re.compile(
+        br'^(?:Index:[ \t]|diff[ \t]-|RCS file: |'
+        br'retrieving revision [0-9]+(\.[0-9]+)*$|'
+        br'---[ \t].*?^\+\+\+[ \t]|'
+        br'\*\*\*[ \t].*?^---[ \t])',
+        re.MULTILINE | re.DOTALL,
+    )
+
+    data = {}
+
+    msg = mail.parse(fileobj)
+
+    subject = msg['Subject'] and mail.headdecode(msg['Subject'])
+    data[b'user'] = msg['From'] and mail.headdecode(msg['From'])
+    if not subject and not data[b'user']:
+        # Not an email, restore parsed headers if any
+        subject = (
+            b'\n'.join(
+                b': '.join(map(encoding.strtolocal, h)) for h in msg.items()
+            )
+            + b'\n'
+        )
+
+    # should try to parse msg['Date']
+    parents = []
+
+    nodeid = msg['X-Mercurial-Node']
+    if nodeid:
+        data[b'nodeid'] = nodeid = mail.headdecode(nodeid)
+        ui.debug(b'Node ID: %s\n' % nodeid)
+
+    if subject:
+        if subject.startswith(b'[PATCH'):
+            pend = subject.find(b']')
+            if pend >= 0:
+                subject = subject[pend + 1 :].lstrip()
+        subject = re.sub(br'\n[ \t]+', b' ', subject)
+        ui.debug(b'Subject: %s\n' % subject)
+    if data[b'user']:
+        ui.debug(b'From: %s\n' % data[b'user'])
+    diffs_seen = 0
+    ok_types = (b'text/plain', b'text/x-diff', b'text/x-patch')
+    message = b''
+    for part in msg.walk():
+        content_type = pycompat.bytestr(part.get_content_type())
+        ui.debug(b'Content-Type: %s\n' % content_type)
+        if content_type not in ok_types:
+            continue
+        payload = part.get_payload(decode=True)
+        m = diffre.search(payload)
+        if m:
+            hgpatch = False
+            hgpatchheader = False
+            ignoretext = False
+
+            ui.debug(b'found patch at byte %d\n' % m.start(0))
+            diffs_seen += 1
+            cfp = stringio()
+            for line in payload[: m.start(0)].splitlines():
+                if line.startswith(b'# HG changeset patch') and not hgpatch:
+                    ui.debug(b'patch generated by hg export\n')
+                    hgpatch = True
+                    hgpatchheader = True
+                    # drop earlier commit message content
+                    cfp.seek(0)
+                    cfp.truncate()
+                    subject = None
+                elif hgpatchheader:
+                    if line.startswith(b'# User '):
+                        data[b'user'] = line[7:]
+                        ui.debug(b'From: %s\n' % data[b'user'])
+                    elif line.startswith(b"# Parent "):
+                        parents.append(line[9:].lstrip())
+                    elif line.startswith(b"# "):
+                        for header, key in patchheadermap:
+                            prefix = b'# %s ' % header
+                            if line.startswith(prefix):
+                                data[key] = line[len(prefix) :]
+                                ui.debug(b'%s: %s\n' % (header, data[key]))
+                    else:
+                        hgpatchheader = False
+                elif line == b'---':
+                    ignoretext = True
+                if not hgpatchheader and not ignoretext:
+                    cfp.write(line)
+                    cfp.write(b'\n')
+            message = cfp.getvalue()
+            if tmpfp:
+                tmpfp.write(payload)
+                if not payload.endswith(b'\n'):
+                    tmpfp.write(b'\n')
+        elif not diffs_seen and message and content_type == b'text/plain':
+            message += b'\n' + payload
+
+    if subject and not message.startswith(subject):
+        message = b'%s\n%s' % (subject, message)
+    data[b'message'] = message
+    tmpfp.close()
+    if parents:
+        data[b'p1'] = parents.pop(0)
+        if parents:
+            data[b'p2'] = parents.pop(0)
+
+    if diffs_seen:
+        data[b'filename'] = tmpname
+
+    return data
+
+
+class patchmeta:
+    """Patched file metadata
+
+    'op' is the performed operation within ADD, DELETE, RENAME, MODIFY
+    or COPY.  'path' is patched file path. 'oldpath' is set to the
+    origin file when 'op' is either COPY or RENAME, None otherwise. If
+    file mode is changed, 'mode' is a tuple (islink, isexec) where
+    'islink' is True if the file is a symlink and 'isexec' is True if
+    the file is executable. Otherwise, 'mode' is None.
+    """
+
+    def __init__(self, path):
+        self.path = path
+        self.oldpath = None
+        self.mode = None
+        self.op = b'MODIFY'
+        self.binary = False
+
+    def setmode(self, mode):
+        islink = mode & 0o20000
+        isexec = mode & 0o100
+        self.mode = (islink, isexec)
+
+    def copy(self):
+        other = patchmeta(self.path)
+        other.oldpath = self.oldpath
+        other.mode = self.mode
+        other.op = self.op
+        other.binary = self.binary
+        return other
+
+    def _ispatchinga(self, afile):
+        if afile == b'/dev/null':
+            return self.op == b'ADD'
+        return afile == b'a/' + (self.oldpath or self.path)
+
+    def _ispatchingb(self, bfile):
+        if bfile == b'/dev/null':
+            return self.op == b'DELETE'
+        return bfile == b'b/' + self.path
+
+    def ispatching(self, afile, bfile):
+        return self._ispatchinga(afile) and self._ispatchingb(bfile)
+
+    def __repr__(self):
+        return "<patchmeta %s %r>" % (self.op, self.path)
+
+
+def readgitpatch(lr):
+    """extract git-style metadata about patches from <patchname>"""
+
+    # Filter patch for git information
+    gp = None
+    gitpatches = []
+    for line in lr:
+        line = line.rstrip(b'\r\n')
+        if line.startswith(b'diff --git a/'):
+            m = gitre.match(line)
+            if m:
+                if gp:
+                    gitpatches.append(gp)
+                dst = m.group(2)
+                gp = patchmeta(dst)
+        elif gp:
+            if line.startswith(b'--- '):
+                gitpatches.append(gp)
+                gp = None
+                continue
+            if line.startswith(b'rename from '):
+                gp.op = b'RENAME'
+                gp.oldpath = line[12:]
+            elif line.startswith(b'rename to '):
+                gp.path = line[10:]
+            elif line.startswith(b'copy from '):
+                gp.op = b'COPY'
+                gp.oldpath = line[10:]
+            elif line.startswith(b'copy to '):
+                gp.path = line[8:]
+            elif line.startswith(b'deleted file'):
+                gp.op = b'DELETE'
+            elif line.startswith(b'new file mode '):
+                gp.op = b'ADD'
+                gp.setmode(int(line[-6:], 8))
+            elif line.startswith(b'new mode '):
+                gp.setmode(int(line[-6:], 8))
+            elif line.startswith(b'GIT binary patch'):
+                gp.binary = True
+    if gp:
+        gitpatches.append(gp)
+
+    return gitpatches
+
+
+class linereader:
+    # simple class to allow pushing lines back into the input stream
+    def __init__(self, fp):
+        self.fp = fp
+        self.buf = []
+
+    def push(self, line):
+        if line is not None:
+            self.buf.append(line)
+
+    def readline(self):
+        if self.buf:
+            l = self.buf[0]
+            del self.buf[0]
+            return l
+        return self.fp.readline()
+
+    def __iter__(self):
+        return iter(self.readline, b'')
+
+
+class abstractbackend:
+    def __init__(self, ui):
+        self.ui = ui
+
+    def getfile(self, fname):
+        """Return target file data and flags as a (data, (islink,
+        isexec)) tuple. Data is None if file is missing/deleted.
+        """
+        raise NotImplementedError
+
+    def setfile(self, fname, data, mode, copysource):
+        """Write data to target file fname and set its mode. mode is a
+        (islink, isexec) tuple. If data is None, the file content should
+        be left unchanged. If the file is modified after being copied,
+        copysource is set to the original file name.
+        """
+        raise NotImplementedError
+
+    def unlink(self, fname):
+        """Unlink target file."""
+        raise NotImplementedError
+
+    def writerej(self, fname, failed, total, lines):
+        """Write rejected lines for fname. total is the number of hunks
+        which failed to apply and total the total number of hunks for this
+        files.
+        """
+
+    def exists(self, fname):
+        raise NotImplementedError
+
+    def close(self):
+        raise NotImplementedError
+
+
+class fsbackend(abstractbackend):
+    def __init__(self, ui, basedir):
+        super(fsbackend, self).__init__(ui)
+        self.opener = vfsmod.vfs(basedir)
+
+    def getfile(self, fname):
+        if self.opener.islink(fname):
+            return (self.opener.readlink(fname), (True, False))
+
+        isexec = False
+        try:
+            isexec = self.opener.lstat(fname).st_mode & 0o100 != 0
+        except FileNotFoundError:
+            pass
+        try:
+            return (self.opener.read(fname), (False, isexec))
+        except FileNotFoundError:
+            return None, None
+
+    def setfile(self, fname, data, mode, copysource):
+        islink, isexec = mode
+        if data is None:
+            self.opener.setflags(fname, islink, isexec)
+            return
+        if islink:
+            self.opener.symlink(data, fname)
+        else:
+            self.opener.write(fname, data)
+            if isexec:
+                self.opener.setflags(fname, False, True)
+
+    def unlink(self, fname):
+        rmdir = self.ui.configbool(b'experimental', b'removeemptydirs')
+        self.opener.unlinkpath(fname, ignoremissing=True, rmdir=rmdir)
+
+    def writerej(self, fname, failed, total, lines):
+        fname = fname + b".rej"
+        self.ui.warn(
+            _(b"%d out of %d hunks FAILED -- saving rejects to file %s\n")
+            % (failed, total, fname)
+        )
+        fp = self.opener(fname, b'w')
+        fp.writelines(lines)
+        fp.close()
+
+    def exists(self, fname):
+        return self.opener.lexists(fname)
+
+
+class workingbackend(fsbackend):
+    def __init__(self, ui, repo, similarity):
+        super(workingbackend, self).__init__(ui, repo.root)
+        self.repo = repo
+        self.similarity = similarity
+        self.removed = set()
+        self.changed = set()
+        self.copied = []
+
+    def _checkknown(self, fname):
+        if not self.repo.dirstate.get_entry(fname).any_tracked and self.exists(
+            fname
+        ):
+            raise PatchApplicationError(
+                _(b'cannot patch %s: file is not tracked') % fname
+            )
+
+    def setfile(self, fname, data, mode, copysource):
+        self._checkknown(fname)
+        super(workingbackend, self).setfile(fname, data, mode, copysource)
+        if copysource is not None:
+            self.copied.append((copysource, fname))
+        self.changed.add(fname)
+
+    def unlink(self, fname):
+        self._checkknown(fname)
+        super(workingbackend, self).unlink(fname)
+        self.removed.add(fname)
+        self.changed.add(fname)
+
+    def close(self):
+        wctx = self.repo[None]
+        changed = set(self.changed)
+        for src, dst in self.copied:
+            scmutil.dirstatecopy(self.ui, self.repo, wctx, src, dst)
+        if self.removed:
+            wctx.forget(sorted(self.removed))
+            for f in self.removed:
+                if f not in self.repo.dirstate:
+                    # File was deleted and no longer belongs to the
+                    # dirstate, it was probably marked added then
+                    # deleted, and should not be considered by
+                    # marktouched().
+                    changed.discard(f)
+        if changed:
+            scmutil.marktouched(self.repo, changed, self.similarity)
+        return sorted(self.changed)
+
+
+class filestore:
+    def __init__(self, maxsize=None):
+        self.opener = None
+        self.files = {}
+        self.created = 0
+        self.maxsize = maxsize
+        if self.maxsize is None:
+            self.maxsize = 4 * (2 ** 20)
+        self.size = 0
+        self.data = {}
+
+    def setfile(self, fname, data, mode, copied=None):
+        if self.maxsize < 0 or (len(data) + self.size) <= self.maxsize:
+            self.data[fname] = (data, mode, copied)
+            self.size += len(data)
+        else:
+            if self.opener is None:
+                root = pycompat.mkdtemp(prefix=b'hg-patch-')
+                self.opener = vfsmod.vfs(root)
+            # Avoid filename issues with these simple names
+            fn = b'%d' % self.created
+            self.opener.write(fn, data)
+            self.created += 1
+            self.files[fname] = (fn, mode, copied)
+
+    def getfile(self, fname):
+        if fname in self.data:
+            return self.data[fname]
+        if not self.opener or fname not in self.files:
+            return None, None, None
+        fn, mode, copied = self.files[fname]
+        return self.opener.read(fn), mode, copied
+
+    def close(self):
+        if self.opener:
+            shutil.rmtree(self.opener.base)
+
+
+class repobackend(abstractbackend):
+    def __init__(self, ui, repo, ctx, store):
+        super(repobackend, self).__init__(ui)
+        self.repo = repo
+        self.ctx = ctx
+        self.store = store
+        self.changed = set()
+        self.removed = set()
+        self.copied = {}
+
+    def _checkknown(self, fname):
+        if fname not in self.ctx:
+            raise PatchApplicationError(
+                _(b'cannot patch %s: file is not tracked') % fname
+            )
+
+    def getfile(self, fname):
+        try:
+            fctx = self.ctx[fname]
+        except error.LookupError:
+            return None, None
+        flags = fctx.flags()
+        return fctx.data(), (b'l' in flags, b'x' in flags)
+
+    def setfile(self, fname, data, mode, copysource):
+        if copysource:
+            self._checkknown(copysource)
+        if data is None:
+            data = self.ctx[fname].data()
+        self.store.setfile(fname, data, mode, copysource)
+        self.changed.add(fname)
+        if copysource:
+            self.copied[fname] = copysource
+
+    def unlink(self, fname):
+        self._checkknown(fname)
+        self.removed.add(fname)
+
+    def exists(self, fname):
+        return fname in self.ctx
+
+    def close(self):
+        return self.changed | self.removed
+
+
+# @@ -start,len +start,len @@ or @@ -start +start @@ if len is 1
+unidesc = re.compile(br'@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@')
+contextdesc = re.compile(br'(?:---|\*\*\*) (\d+)(?:,(\d+))? (?:---|\*\*\*)')
+eolmodes = [b'strict', b'crlf', b'lf', b'auto']
+
+
+class patchfile:
+    def __init__(self, ui, gp, backend, store, eolmode=b'strict'):
+        self.fname = gp.path
+        self.eolmode = eolmode
+        self.eol = None
+        self.backend = backend
+        self.ui = ui
+        self.lines = []
+        self.exists = False
+        self.missing = True
+        self.mode = gp.mode
+        self.copysource = gp.oldpath
+        self.create = gp.op in (b'ADD', b'COPY', b'RENAME')
+        self.remove = gp.op == b'DELETE'
+        if self.copysource is None:
+            data, mode = backend.getfile(self.fname)
+        else:
+            data, mode = store.getfile(self.copysource)[:2]
+        if data is not None:
+            self.exists = self.copysource is None or backend.exists(self.fname)
+            self.missing = False
+            if data:
+                self.lines = mdiff.splitnewlines(data)
+            if self.mode is None:
+                self.mode = mode
+            if self.lines:
+                # Normalize line endings
+                if self.lines[0].endswith(b'\r\n'):
+                    self.eol = b'\r\n'
+                elif self.lines[0].endswith(b'\n'):
+                    self.eol = b'\n'
+                if eolmode != b'strict':
+                    nlines = []
+                    for l in self.lines:
+                        if l.endswith(b'\r\n'):
+                            l = l[:-2] + b'\n'
+                        nlines.append(l)
+                    self.lines = nlines
+        else:
+            if self.create:
+                self.missing = False
+            if self.mode is None:
+                self.mode = (False, False)
+        if self.missing:
+            self.ui.warn(_(b"unable to find '%s' for patching\n") % self.fname)
+            self.ui.warn(
+                _(
+                    b"(use '--prefix' to apply patch relative to the "
+                    b"current directory)\n"
+                )
+            )
+
+        self.hash = {}
+        self.dirty = 0
+        self.offset = 0
+        self.skew = 0
+        self.rej = []
+        self.fileprinted = False
+        self.printfile(False)
+        self.hunks = 0
+
+    def writelines(self, fname, lines, mode):
+        if self.eolmode == b'auto':
+            eol = self.eol
+        elif self.eolmode == b'crlf':
+            eol = b'\r\n'
+        else:
+            eol = b'\n'
+
+        if self.eolmode != b'strict' and eol and eol != b'\n':
+            rawlines = []
+            for l in lines:
+                if l and l.endswith(b'\n'):
+                    l = l[:-1] + eol
+                rawlines.append(l)
+            lines = rawlines
+
+        self.backend.setfile(fname, b''.join(lines), mode, self.copysource)
+
+    def printfile(self, warn):
+        if self.fileprinted:
+            return
+        if warn or self.ui.verbose:
+            self.fileprinted = True
+        s = _(b"patching file %s\n") % self.fname
+        if warn:
+            self.ui.warn(s)
+        else:
+            self.ui.note(s)
+
+    def findlines(self, l, linenum):
+        # looks through the hash and finds candidate lines.  The
+        # result is a list of line numbers sorted based on distance
+        # from linenum
+
+        cand = self.hash.get(l, [])
+        if len(cand) > 1:
+            # resort our list of potentials forward then back.
+            cand.sort(key=lambda x: abs(x - linenum))
+        return cand
+
+    def write_rej(self):
+        # our rejects are a little different from patch(1).  This always
+        # creates rejects in the same form as the original patch.  A file
+        # header is inserted so that you can run the reject through patch again
+        # without having to type the filename.
+        if not self.rej:
+            return
+        base = os.path.basename(self.fname)
+        lines = [b"--- %s\n+++ %s\n" % (base, base)]
+        for x in self.rej:
+            for l in x.hunk:
+                lines.append(l)
+                if l[-1:] != b'\n':
+                    lines.append(b'\n' + diffhelper.MISSING_NEWLINE_MARKER)
+        self.backend.writerej(self.fname, len(self.rej), self.hunks, lines)
+
+    def apply(self, h):
+        if not h.complete():
+            raise PatchParseError(
+                _(b"bad hunk #%d %s (%d %d %d %d)")
+                % (h.number, h.desc, len(h.a), h.lena, len(h.b), h.lenb)
+            )
+
+        self.hunks += 1
+
+        if self.missing:
+            self.rej.append(h)
+            return -1
+
+        if self.exists and self.create:
+            if self.copysource:
+                self.ui.warn(
+                    _(b"cannot create %s: destination already exists\n")
+                    % self.fname
+                )
+            else:
+                self.ui.warn(_(b"file %s already exists\n") % self.fname)
+            self.rej.append(h)
+            return -1
+
+        if isinstance(h, binhunk):
+            if self.remove:
+                self.backend.unlink(self.fname)
+            else:
+                l = h.new(self.lines)
+                self.lines[:] = l
+                self.offset += len(l)
+                self.dirty = True
+            return 0
+
+        horig = h
+        if (
+            self.eolmode in (b'crlf', b'lf')
+            or self.eolmode == b'auto'
+            and self.eol
+        ):
+            # If new eols are going to be normalized, then normalize
+            # hunk data before patching. Otherwise, preserve input
+            # line-endings.
+            h = h.getnormalized()
+
+        # fast case first, no offsets, no fuzz
+        old, oldstart, new, newstart = h.fuzzit(0, False)
+        oldstart += self.offset
+        orig_start = oldstart
+        # if there's skew we want to emit the "(offset %d lines)" even
+        # when the hunk cleanly applies at start + skew, so skip the
+        # fast case code
+        if self.skew == 0 and diffhelper.testhunk(old, self.lines, oldstart):
+            if self.remove:
+                self.backend.unlink(self.fname)
+            else:
+                self.lines[oldstart : oldstart + len(old)] = new
+                self.offset += len(new) - len(old)
+                self.dirty = True
+            return 0
+
+        # ok, we couldn't match the hunk. Lets look for offsets and fuzz it
+        self.hash = {}
+        for x, s in enumerate(self.lines):
+            self.hash.setdefault(s, []).append(x)
+
+        for fuzzlen in range(self.ui.configint(b"patch", b"fuzz") + 1):
+            for toponly in [True, False]:
+                old, oldstart, new, newstart = h.fuzzit(fuzzlen, toponly)
+                oldstart = oldstart + self.offset + self.skew
+                oldstart = min(oldstart, len(self.lines))
+                if old:
+                    cand = self.findlines(old[0][1:], oldstart)
+                else:
+                    # Only adding lines with no or fuzzed context, just
+                    # take the skew in account
+                    cand = [oldstart]
+
+                for l in cand:
+                    if not old or diffhelper.testhunk(old, self.lines, l):
+                        self.lines[l : l + len(old)] = new
+                        self.offset += len(new) - len(old)
+                        self.skew = l - orig_start
+                        self.dirty = True
+                        offset = l - orig_start - fuzzlen
+                        if fuzzlen:
+                            msg = _(
+                                b"Hunk #%d succeeded at %d "
+                                b"with fuzz %d "
+                                b"(offset %d lines).\n"
+                            )
+                            self.printfile(True)
+                            self.ui.warn(
+                                msg % (h.number, l + 1, fuzzlen, offset)
+                            )
+                        else:
+                            msg = _(
+                                b"Hunk #%d succeeded at %d "
+                                b"(offset %d lines).\n"
+                            )
+                            self.ui.note(msg % (h.number, l + 1, offset))
+                        return fuzzlen
+        self.printfile(True)
+        self.ui.warn(_(b"Hunk #%d FAILED at %d\n") % (h.number, orig_start))
+        self.rej.append(horig)
+        return -1
+
+    def close(self):
+        if self.dirty:
+            self.writelines(self.fname, self.lines, self.mode)
+        self.write_rej()
+        return len(self.rej)
+
+
+class header:
+    """patch header"""
+
+    diffgit_re = re.compile(b'diff --git a/(.*) b/(.*)$')
+    diff_re = re.compile(b'diff -r .* (.*)$')
+    allhunks_re = re.compile(b'(?:index|deleted file) ')
+    pretty_re = re.compile(b'(?:new file|deleted file) ')
+    special_re = re.compile(b'(?:index|deleted|copy|rename|new mode) ')
+    newfile_re = re.compile(b'(?:new file|copy to|rename to)')
+
+    def __init__(self, header):
+        self.header = header
+        self.hunks = []
+
+    def binary(self):
+        return any(h.startswith(b'index ') for h in self.header)
+
+    def pretty(self, fp):
+        for h in self.header:
+            if h.startswith(b'index '):
+                fp.write(_(b'this modifies a binary file (all or nothing)\n'))
+                break
+            if self.pretty_re.match(h):
+                fp.write(h)
+                if self.binary():
+                    fp.write(_(b'this is a binary file\n'))
+                break
+            if h.startswith(b'---'):
+                fp.write(
+                    _(b'%d hunks, %d lines changed\n')
+                    % (
+                        len(self.hunks),
+                        sum([max(h.added, h.removed) for h in self.hunks]),
+                    )
+                )
+                break
+            fp.write(h)
+
+    def write(self, fp):
+        fp.write(b''.join(self.header))
+
+    def allhunks(self):
+        return any(self.allhunks_re.match(h) for h in self.header)
+
+    def files(self):
+        match = self.diffgit_re.match(self.header[0])
+        if match:
+            fromfile, tofile = match.groups()
+            if fromfile == tofile:
+                return [fromfile]
+            return [fromfile, tofile]
+        else:
+            return self.diff_re.match(self.header[0]).groups()
+
+    def filename(self):
+        return self.files()[-1]
+
+    def __repr__(self):
+        return '<header %s>' % (
+            ' '.join(pycompat.rapply(pycompat.fsdecode, self.files()))
+        )
+
+    def isnewfile(self):
+        return any(self.newfile_re.match(h) for h in self.header)
+
+    def special(self):
+        # Special files are shown only at the header level and not at the hunk
+        # level for example a file that has been deleted is a special file.
+        # The user cannot change the content of the operation, in the case of
+        # the deleted file he has to take the deletion or not take it, he
+        # cannot take some of it.
+        # Newly added files are special if they are empty, they are not special
+        # if they have some content as we want to be able to change it
+        nocontent = len(self.header) == 2
+        emptynewfile = self.isnewfile() and nocontent
+        return emptynewfile or any(
+            self.special_re.match(h) for h in self.header
+        )
+
+
+class recordhunk:
+    """patch hunk
+
+    XXX shouldn't we merge this with the other hunk class?
+    """
+
+    def __init__(
+        self,
+        header,
+        fromline,
+        toline,
+        proc,
+        before,
+        hunk,
+        after,

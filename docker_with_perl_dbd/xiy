@@ -1,0 +1,1000 @@
+                finally:
+                    other.close()
+            _saveremotebookmarks(repo, remotescratchbookmarks, destpath)
+    if oldphasemove:
+        exchange._localphasemove = oldphasemove
+    return result
+
+
+def _deleteinfinitepushbookmarks(ui, repo, path, names):
+    """Prune remote names by removing the bookmarks we don't want anymore,
+    then writing the result back to disk
+    """
+    remotenamesext = extensions.find(b'remotenames')
+
+    # remotename format is:
+    # (node, nametype ("branches" or "bookmarks"), remote, name)
+    nametype_idx = 1
+    remote_idx = 2
+    name_idx = 3
+    remotenames = [
+        remotename
+        for remotename in remotenamesext.readremotenames(repo)
+        if remotename[remote_idx] == path
+    ]
+    remote_bm_names = [
+        remotename[name_idx]
+        for remotename in remotenames
+        if remotename[nametype_idx] == b"bookmarks"
+    ]
+
+    for name in names:
+        if name not in remote_bm_names:
+            raise error.Abort(
+                _(
+                    b"infinitepush bookmark '{}' does not exist "
+                    b"in path '{}'"
+                ).format(name, path)
+            )
+
+    bookmarks = {}
+    branches = collections.defaultdict(list)
+    for node, nametype, remote, name in remotenames:
+        if nametype == b"bookmarks" and name not in names:
+            bookmarks[name] = node
+        elif nametype == b"branches":
+            # saveremotenames wants binary nodes for branches
+            branches[name].append(bin(node))
+
+    remotenamesext.saveremotenames(repo, path, branches, bookmarks)
+
+
+def _phasemove(orig, pushop, nodes, phase=phases.public):
+    """prevent commits from being marked public
+
+    Since these are going to a scratch branch, they aren't really being
+    published."""
+
+    if phase != phases.public:
+        orig(pushop, nodes, phase)
+
+
+@exchange.b2partsgenerator(scratchbranchparttype)
+def partgen(pushop, bundler):
+    bookmark = pushop.ui.config(experimental, configbookmark)
+    scratchpush = pushop.ui.configbool(experimental, configscratchpush)
+    if b'changesets' in pushop.stepsdone or not scratchpush:
+        return
+
+    if scratchbranchparttype not in bundle2.bundle2caps(pushop.remote):
+        return
+
+    pushop.stepsdone.add(b'changesets')
+    if not pushop.outgoing.missing:
+        pushop.ui.status(_(b'no changes found\n'))
+        pushop.cgresult = 0
+        return
+
+    # This parameter tells the server that the following bundle is an
+    # infinitepush. This let's it switch the part processing to our infinitepush
+    # code path.
+    bundler.addparam(b"infinitepush", b"True")
+
+    scratchparts = bundleparts.getscratchbranchparts(
+        pushop.repo, pushop.remote, pushop.outgoing, pushop.ui, bookmark
+    )
+
+    for scratchpart in scratchparts:
+        bundler.addpart(scratchpart)
+
+    def handlereply(op):
+        # server either succeeds or aborts; no code to read
+        pushop.cgresult = 1
+
+    return handlereply
+
+
+bundle2.capabilities[bundleparts.scratchbranchparttype] = ()
+
+
+def _getrevs(bundle, oldnode, force, bookmark):
+    b'extracts and validates the revs to be imported'
+    revs = [bundle[r] for r in bundle.revs(b'sort(bundle())')]
+
+    # new bookmark
+    if oldnode is None:
+        return revs
+
+    # Fast forward update
+    if oldnode in bundle and list(bundle.set(b'bundle() & %s::', oldnode)):
+        return revs
+
+    return revs
+
+
+@contextlib.contextmanager
+def logservicecall(logger, service, **kwargs):
+    start = time.time()
+    logger(service, eventtype=b'start', **kwargs)
+    try:
+        yield
+        logger(
+            service,
+            eventtype=b'success',
+            elapsedms=(time.time() - start) * 1000,
+            **kwargs
+        )
+    except Exception as e:
+        logger(
+            service,
+            eventtype=b'failure',
+            elapsedms=(time.time() - start) * 1000,
+            errormsg=stringutil.forcebytestr(e),
+            **kwargs
+        )
+        raise
+
+
+def _getorcreateinfinitepushlogger(op):
+    logger = op.records[b'infinitepushlogger']
+    if not logger:
+        ui = op.repo.ui
+        try:
+            username = procutil.getuser()
+        except Exception:
+            username = b'unknown'
+        # Generate random request id to be able to find all logged entries
+        # for the same request. Since requestid is pseudo-generated it may
+        # not be unique, but we assume that (hostname, username, requestid)
+        # is unique.
+        random.seed()
+        requestid = random.randint(0, 2000000000)
+        hostname = socket.gethostname()
+        logger = functools.partial(
+            ui.log,
+            b'infinitepush',
+            user=username,
+            requestid=requestid,
+            hostname=hostname,
+            reponame=ui.config(b'infinitepush', b'reponame'),
+        )
+        op.records.add(b'infinitepushlogger', logger)
+    else:
+        logger = logger[0]
+    return logger
+
+
+def storetobundlestore(orig, repo, op, unbundler):
+    """stores the incoming bundle coming from push command to the bundlestore
+    instead of applying on the revlogs"""
+
+    repo.ui.status(_(b"storing changesets on the bundlestore\n"))
+    bundler = bundle2.bundle20(repo.ui)
+
+    # processing each part and storing it in bundler
+    with bundle2.partiterator(repo, op, unbundler) as parts:
+        for part in parts:
+            bundlepart = None
+            if part.type == b'replycaps':
+                # This configures the current operation to allow reply parts.
+                bundle2._processpart(op, part)
+            else:
+                bundlepart = bundle2.bundlepart(part.type, data=part.read())
+                for key, value in part.params.items():
+                    bundlepart.addparam(key, value)
+
+                # Certain parts require a response
+                if part.type in (b'pushkey', b'changegroup'):
+                    if op.reply is not None:
+                        rpart = op.reply.newpart(b'reply:%s' % part.type)
+                        rpart.addparam(
+                            b'in-reply-to', b'%d' % part.id, mandatory=False
+                        )
+                        rpart.addparam(b'return', b'1', mandatory=False)
+
+            op.records.add(
+                part.type,
+                {
+                    b'return': 1,
+                },
+            )
+            if bundlepart:
+                bundler.addpart(bundlepart)
+
+    # storing the bundle in the bundlestore
+    buf = util.chunkbuffer(bundler.getchunks())
+    fd, bundlefile = pycompat.mkstemp()
+    try:
+        try:
+            fp = os.fdopen(fd, 'wb')
+            fp.write(buf.read())
+        finally:
+            fp.close()
+        storebundle(op, {}, bundlefile)
+    finally:
+        try:
+            os.unlink(bundlefile)
+        except Exception:
+            # we would rather see the original exception
+            pass
+
+
+def processparts(orig, repo, op, unbundler):
+
+    # make sure we don't wrap processparts in case of `hg unbundle`
+    if op.source == b'unbundle':
+        return orig(repo, op, unbundler)
+
+    # this server routes each push to bundle store
+    if repo.ui.configbool(b'infinitepush', b'pushtobundlestore'):
+        return storetobundlestore(orig, repo, op, unbundler)
+
+    if unbundler.params.get(b'infinitepush') != b'True':
+        return orig(repo, op, unbundler)
+
+    handleallparts = repo.ui.configbool(b'infinitepush', b'storeallparts')
+
+    bundler = bundle2.bundle20(repo.ui)
+    cgparams = None
+    with bundle2.partiterator(repo, op, unbundler) as parts:
+        for part in parts:
+            bundlepart = None
+            if part.type == b'replycaps':
+                # This configures the current operation to allow reply parts.
+                bundle2._processpart(op, part)
+            elif part.type == bundleparts.scratchbranchparttype:
+                # Scratch branch parts need to be converted to normal
+                # changegroup parts, and the extra parameters stored for later
+                # when we upload to the store. Eventually those parameters will
+                # be put on the actual bundle instead of this part, then we can
+                # send a vanilla changegroup instead of the scratchbranch part.
+                cgversion = part.params.get(b'cgversion', b'01')
+                bundlepart = bundle2.bundlepart(
+                    b'changegroup', data=part.read()
+                )
+                bundlepart.addparam(b'version', cgversion)
+                cgparams = part.params
+
+                # If we're not dumping all parts into the new bundle, we need to
+                # alert the future pushkey and phase-heads handler to skip
+                # the part.
+                if not handleallparts:
+                    op.records.add(
+                        scratchbranchparttype + b'_skippushkey', True
+                    )
+                    op.records.add(
+                        scratchbranchparttype + b'_skipphaseheads', True
+                    )
+            else:
+                if handleallparts:
+                    # Ideally we would not process any parts, and instead just
+                    # forward them to the bundle for storage, but since this
+                    # differs from previous behavior, we need to put it behind a
+                    # config flag for incremental rollout.
+                    bundlepart = bundle2.bundlepart(part.type, data=part.read())
+                    for key, value in part.params.items():
+                        bundlepart.addparam(key, value)
+
+                    # Certain parts require a response
+                    if part.type == b'pushkey':
+                        if op.reply is not None:
+                            rpart = op.reply.newpart(b'reply:pushkey')
+                            rpart.addparam(
+                                b'in-reply-to', str(part.id), mandatory=False
+                            )
+                            rpart.addparam(b'return', b'1', mandatory=False)
+                else:
+                    bundle2._processpart(op, part)
+
+            if handleallparts:
+                op.records.add(
+                    part.type,
+                    {
+                        b'return': 1,
+                    },
+                )
+            if bundlepart:
+                bundler.addpart(bundlepart)
+
+    # If commits were sent, store them
+    if cgparams:
+        buf = util.chunkbuffer(bundler.getchunks())
+        fd, bundlefile = pycompat.mkstemp()
+        try:
+            try:
+                fp = os.fdopen(fd, 'wb')
+                fp.write(buf.read())
+            finally:
+                fp.close()
+            storebundle(op, cgparams, bundlefile)
+        finally:
+            try:
+                os.unlink(bundlefile)
+            except Exception:
+                # we would rather see the original exception
+                pass
+
+
+def storebundle(op, params, bundlefile):
+    log = _getorcreateinfinitepushlogger(op)
+    parthandlerstart = time.time()
+    log(scratchbranchparttype, eventtype=b'start')
+    index = op.repo.bundlestore.index
+    store = op.repo.bundlestore.store
+    op.records.add(scratchbranchparttype + b'_skippushkey', True)
+
+    bundle = None
+    try:  # guards bundle
+        bundlepath = b"bundle:%s+%s" % (op.repo.root, bundlefile)
+        bundle = hg.repository(op.repo.ui, bundlepath)
+
+        bookmark = params.get(b'bookmark')
+        bookprevnode = params.get(b'bookprevnode', b'')
+        force = params.get(b'force')
+
+        if bookmark:
+            oldnode = index.getnode(bookmark)
+        else:
+            oldnode = None
+        bundleheads = bundle.revs(b'heads(bundle())')
+        if bookmark and len(bundleheads) > 1:
+            raise error.Abort(
+                _(b'cannot push more than one head to a scratch branch')
+            )
+
+        revs = _getrevs(bundle, oldnode, force, bookmark)
+
+        # Notify the user of what is being pushed
+        plural = b's' if len(revs) > 1 else b''
+        op.repo.ui.warn(_(b"pushing %d commit%s:\n") % (len(revs), plural))
+        maxoutput = 10
+        for i in range(0, min(len(revs), maxoutput)):
+            firstline = bundle[revs[i]].description().split(b'\n')[0][:50]
+            op.repo.ui.warn(b"    %s  %s\n" % (revs[i], firstline))
+
+        if len(revs) > maxoutput + 1:
+            op.repo.ui.warn(b"    ...\n")
+            firstline = bundle[revs[-1]].description().split(b'\n')[0][:50]
+            op.repo.ui.warn(b"    %s  %s\n" % (revs[-1], firstline))
+
+        nodesctx = [bundle[rev] for rev in revs]
+        inindex = lambda rev: bool(index.getbundle(bundle[rev].hex()))
+        if bundleheads:
+            newheadscount = sum(not inindex(rev) for rev in bundleheads)
+        else:
+            newheadscount = 0
+        # If there's a bookmark specified, there should be only one head,
+        # so we choose the last node, which will be that head.
+        # If a bug or malicious client allows there to be a bookmark
+        # with multiple heads, we will place the bookmark on the last head.
+        bookmarknode = nodesctx[-1].hex() if nodesctx else None
+        key = None
+        if newheadscount:
+            with open(bundlefile, b'rb') as f:
+                bundledata = f.read()
+                with logservicecall(
+                    log, b'bundlestore', bundlesize=len(bundledata)
+                ):
+                    bundlesizelimit = 100 * 1024 * 1024  # 100 MB
+                    if len(bundledata) > bundlesizelimit:
+                        error_msg = (
+                            b'bundle is too big: %d bytes. '
+                            + b'max allowed size is 100 MB'
+                        )
+                        raise error.Abort(error_msg % (len(bundledata),))
+                    key = store.write(bundledata)
+
+        with logservicecall(log, b'index', newheadscount=newheadscount), index:
+            if key:
+                index.addbundle(key, nodesctx)
+            if bookmark:
+                index.addbookmark(bookmark, bookmarknode)
+                _maybeaddpushbackpart(
+                    op, bookmark, bookmarknode, bookprevnode, params
+                )
+        log(
+            scratchbranchparttype,
+            eventtype=b'success',
+            elapsedms=(time.time() - parthandlerstart) * 1000,
+        )
+
+    except Exception as e:
+        log(
+            scratchbranchparttype,
+            eventtype=b'failure',
+            elapsedms=(time.time() - parthandlerstart) * 1000,
+            errormsg=stringutil.forcebytestr(e),
+        )
+        raise
+    finally:
+        if bundle:
+            bundle.close()
+
+
+@bundle2.parthandler(
+    scratchbranchparttype,
+    (
+        b'bookmark',
+        b'bookprevnode',
+        b'force',
+        b'pushbackbookmarks',
+        b'cgversion',
+    ),
+)
+def bundle2scratchbranch(op, part):
+    '''unbundle a bundle2 part containing a changegroup to store'''
+
+    bundler = bundle2.bundle20(op.repo.ui)
+    cgversion = part.params.get(b'cgversion', b'01')
+    cgpart = bundle2.bundlepart(b'changegroup', data=part.read())
+    cgpart.addparam(b'version', cgversion)
+    bundler.addpart(cgpart)
+    buf = util.chunkbuffer(bundler.getchunks())
+
+    fd, bundlefile = pycompat.mkstemp()
+    try:
+        try:
+            fp = os.fdopen(fd, 'wb')
+            fp.write(buf.read())
+        finally:
+            fp.close()
+        storebundle(op, part.params, bundlefile)
+    finally:
+        try:
+            os.unlink(bundlefile)
+        except FileNotFoundError:
+            pass
+
+    return 1
+
+
+def _maybeaddpushbackpart(op, bookmark, newnode, oldnode, params):
+    if params.get(b'pushbackbookmarks'):
+        if op.reply and b'pushback' in op.reply.capabilities:
+            params = {
+                b'namespace': b'bookmarks',
+                b'key': bookmark,
+                b'new': newnode,
+                b'old': oldnode,
+            }
+            op.reply.newpart(b'pushkey', mandatoryparams=params.items())
+
+
+def bundle2pushkey(orig, op, part):
+    """Wrapper of bundle2.handlepushkey()
+
+    The only goal is to skip calling the original function if flag is set.
+    It's set if infinitepush push is happening.
+    """
+    if op.records[scratchbranchparttype + b'_skippushkey']:
+        if op.reply is not None:
+            rpart = op.reply.newpart(b'reply:pushkey')
+            rpart.addparam(b'in-reply-to', str(part.id), mandatory=False)
+            rpart.addparam(b'return', b'1', mandatory=False)
+        return 1
+
+    return orig(op, part)
+
+
+def bundle2handlephases(orig, op, part):
+    """Wrapper of bundle2.handlephases()
+
+    The only goal is to skip calling the original function if flag is set.
+    It's set if infinitepush push is happening.
+    """
+
+    if op.records[scratchbranchparttype + b'_skipphaseheads']:
+        return
+
+    return orig(op, part)
+
+
+def _asyncsavemetadata(root, nodes):
+    """starts a separate process that fills metadata for the nodes
+
+    This function creates a separate process and doesn't wait for it's
+    completion. This was done to avoid slowing down pushes
+    """
+
+    maxnodes = 50
+    if len(nodes) > maxnodes:
+        return
+    nodesargs = []
+    for node in nodes:
+        nodesargs.append(b'--node')
+        nodesargs.append(node)
+    with open(os.devnull, b'w+b') as devnull:
+        cmdline = [
+            util.hgexecutable(),
+            b'debugfillinfinitepushmetadata',
+            b'-R',
+            root,
+        ] + nodesargs
+        # Process will run in background. We don't care about the return code
+        subprocess.Popen(
+            pycompat.rapply(procutil.tonativestr, cmdline),
+            close_fds=True,
+            shell=False,
+            stdin=devnull,
+            stdout=devnull,
+            stderr=devnull,
+        )
+                                                                                     usr/lib/python3/dist-packages/hgext/infinitepush/__pycache__/                                       0000755 0000000 0000000 00000000000 14714551121 023003  5                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        usr/lib/python3/dist-packages/hgext/infinitepush/__pycache__/__init__.cpython-311.pyc               0000644 0000000 0000000 00000171475 14714551121 027263  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        §
+    	^µc«³  ã                   ó²  — d Z ddlZddlZddlZddlZddlZddlZddlZddlZddl	Z	ddl
+Z
+ddlmZmZ ddlmZ ddlmZmZ ddlmZmZmZ ddlmZmZmZmZmZmZmZmZm Z m!Z!m"Z"m#Z#m$Z$m%Z%m&Z&m'Z'm(Z(m)Z) dd	l*m+Z+m,Z, d
+Z-i Z. e%j/        e.¦  «        Z/ e/ddd¬¦  «          e/ddd¬¦  «          e/ddd¬¦  «          e/ddd¬¦  «          e/ddd¬¦  «          e/ddd¬¦  «          e/ddd¬¦  «          e/ddd¬¦  «          e/ddd¬¦  «          e/ddd¬¦  «          e/ddd¬¦  «         dZ0dZ1dZ2e+j3        Z3 e%j4        ¦   «         Z4 e%j5        ¦   «         Z5d„ a6 ej7        d¦  «        j8        Z9d„ Z:d„ Z;d „ Z<d!„ Z= G d"„ d#¦  «        Z>d$„ Z?d%„ Z@d&„ ZAd'„ ZBd(„ ZCd)„ ZDd*„ ZEd+„ ZFdMd,„ZGe(jH        d-„ ¦   «         ZId.„ ZJd/„ ZKd0„ ZLd1„ ZMd2„ ZNd3„ ZOdNd4„ZPd5„ ZQdOd7„ZRd8„ ZSd9„ ZTd:„ ZUd;„ ZVd<„ ZWd=„ ZXe"jY        fd>„ZZ ej[        e3¦  «        d?„ ¦   «         Z\d@ej]        e+j3        <   dA„ Z^ej_        dB„ ¦   «         Z`dC„ ZadD„ ZbdE„ ZcdF„ Zd eje        e3dG¦  «        dH„ ¦   «         ZfdI„ ZgdJ„ ZhdK„ ZidL„ ZjdS )Pax
+   store some pushes in a remote blob store on the server (EXPERIMENTAL)
+
+IMPORTANT: if you use this extension, please contact
+mercurial-devel@mercurial-scm.org ASAP. This extension is believed to
+be unused and barring learning of users of this functionality, we will
+delete this code at the end of 2020.
+
+    [infinitepush]
+    # Server-side and client-side option. Pattern of the infinitepush bookmark
+    branchpattern = PATTERN
+
+    # Server or client
+    server = False
+
+    # Server-side option. Possible values: 'disk' or 'sql'. Fails if not set
+    indextype = disk
+
+    # Server-side option. Used only if indextype=sql.
+    # Format: 'IP:PORT:DB_NAME:USER:PASSWORD'
+    sqlhost = IP:PORT:DB_NAME:USER:PASSWORD
+
+    # Server-side option. Used only if indextype=disk.
+    # Filesystem path to the index store
+    indexpath = PATH
+
+    # Server-side option. Possible values: 'disk' or 'external'
+    # Fails if not set
+    storetype = disk
+
+    # Server-side option.
+    # Path to the binary that will save bundle to the bundlestore
+    # Formatted cmd line will be passed to it (see `put_args`)
+    put_binary = put
+
+    # Serser-side option. Used only if storetype=external.
+    # Format cmd-line string for put binary. Placeholder: {filename}
+    put_args = {filename}
+
+    # Server-side option.
+    # Path to the binary that get bundle from the bundlestore.
+    # Formatted cmd line will be passed to it (see `get_args`)
+    get_binary = get
+
+    # Serser-side option. Used only if storetype=external.
+    # Format cmd-line string for get binary. Placeholders: {filename} {handle}
+    get_args = {filename} {handle}
+
+    # Server-side option
+    logfile = FIlE
+
+    # Server-side option
+    loglevel = DEBUG
+
+    # Server-side option. Used only if indextype=sql.
+    # Sets mysql wait_timeout option.
+    waittimeout = 300
+
+    # Server-side option. Used only if indextype=sql.
+    # Sets mysql innodb_lock_wait_timeout option.
+    locktimeout = 120
+
+    # Server-side option. Used only if indextype=sql.
+    # Name of the repository
+    reponame = ''
+
+    # Client-side option. Used by --list-remote option. List of remote scratch
+    # patterns to list if no patterns are specified.
+    defaultremotepatterns = ['*']
+
+    # Instructs infinitepush to forward all received bundle2 parts to the
+    # bundle for storage. Defaults to False.
+    storeallparts = True
+
+    # routes each incoming push to the bundlestore. defaults to False
+    pushtobundlestore = True
+
+    [remotenames]
+    # Client-side option
+    # This option should be set only if remotenames extension is enabled.
+    # Whether remote bookmarks are tracked by remotenames extension.
+    bookmarks = True
+é    N)ÚbinÚhex)Ú_)ÚgetattrÚopen)ÚprocutilÚ
+stringutilÚurlutil)Úbundle2ÚchangegroupÚcommandsÚ	discoveryÚencodingÚerrorÚexchangeÚ
+extensionsÚhgÚ	localrepoÚphasesÚpushkeyÚpycompatÚ	registrarÚutilÚwireprototypesÚwireprotov1peerÚwireprotov1serveré   )ÚbundlepartsÚcommons   ships-with-hg-coreó   infinitepushó   serverF)Údefaultó	   storetypeó    ó	   indextypes	   indexpathó   storeallpartsó   reponames   scratchbranchs	   storepathó   branchpatternó   pushtobundlestores   experimentals   server-bundlestore-bookmarks   infinitepush-scratchpushc                 ó   — dS ©NF© )Úxs    ú=/usr/lib/python3/dist-packages/hgext/infinitepush/__init__.pyú<lambda>r/   Ú   s   €  %€ r$   z^[a-f0-9]+$c                 óJ  — |                       ddg ¦  «        }|                      dd¦  «        }|st          j        d¦  «        ‚|                       ddg ¦  «        }|                      dd¦  «        }|st          j        d¦  «        ‚dd	lm} |                     ||||¦  «        S )
+Nr    s   put_argss
+   put_binarys   put binary is not specifieds   get_argss
+   get_binarys   get binary is not specifiedr   ©Ústore)Ú
+configlistÚconfigr   ÚAbortÚ r2   Úexternalbundlestore)ÚuiÚput_argsÚ
+put_binaryÚget_argsÚ
+get_binaryr2   s         r.   Ú_buildexternalbundlestorer=   Ş   s°   € Ø}Š}˜_¨k¸2Ñ>Ô>€HØ—’˜?¨MÑ:Ô:€JØğ :İŒkĞ8Ñ9Ô9Ğ9Ø}Š}˜_¨k¸2Ñ>Ô>€HØ—’˜?¨MÑ:Ô:€JØğ :İŒkĞ8Ñ9Ô9Ğ9ØĞĞĞĞĞà×$Ò$ Z°¸:ÀxÑPÔPĞPr$   c                 ó
+  — |                       dd¦  «        }|s!t          j        t          d¦  «        ¦  «        ‚|                     d¦  «        \  }}}}}|                       dd¦  «        }|s!t          j        t          d¦  «        ¦  «        ‚|                       ddd¦  «        }|                      dd	d
+¦  «        }	|                      ddd¦  «        }
+ddlm} |                     |||||||t          | ¦  «        |	|
+¬¦
+  «
+        S )Nr    s   sqlhosts   please set infinitepush.sqlhostó   :r'   s    please set infinitepush.reponames   logfiler$   s   waittimeouti,  s   locktimeoutéx   r   )Úsqlindexapi)ÚwaittimeoutÚlocktimeout)	r4   r   r5   r   ÚsplitÚ	configintr6   rA   Ú_getloglevel)r8   ÚsqlhostÚhostÚportÚdbÚuserÚpasswordÚreponameÚlogfilerB   rC   rA   s               r.   Ú_buildsqlindexrO   ì   s  € ØiŠi˜¨Ñ4Ô4€GØğ AİŒk!Ğ>Ñ?Ô?Ñ@Ô@Ğ@Ø%,§]¢]°4Ñ%8Ô%8Ñ"€Dˆ$D˜(ØyŠy˜¨+Ñ6Ô6€HØğ BİŒk!Ğ?Ñ@Ô@ÑAÔAĞAàiŠi˜¨°SÑ9Ô9€GØ—,’,˜°ÀÑDÔD€KØ—,’,˜°ÀÑDÔD€KØĞĞĞĞĞà×"Ò"ØØØØ
+ØØØİRÑÔØØğ #ñ ô ğ r$   c                 óö   — |                       ddd¦  «        }t          t          |                     ¦   «         d ¦  «        }t	          |t
+          ¦  «        s$t          j        t          d¦  «        |z  ¦  «        ‚|S )Nr    s   loglevels   DEBUGs   invalid log level %s)	r4   r   ÚloggingÚupperÚ
+isinstanceÚintr   r5   r   )r8   ÚloglevelÚnumeric_loglevels      r.   rF   rF     sk   € ØyŠy˜¨+°xÑ@Ô@€Hİw¨¯ªÑ(8Ô(8¸$Ñ?Ô?ĞİĞ&­Ñ,Ô,ğ AİŒk!Ğ3Ñ4Ô4°xÑ?Ñ@Ô@Ğ@ØĞr$   c                 ó¸   — t          j        | ¦  «        rE|                      dd¦  «        dz   }|                     |¦  «        r|t	          |¦  «        d…         S |S )a)  returns a bookmarks with hoisted part removed
+
+    Remotenames extension has a 'hoist' config that allows to use remote
+    bookmarks without specifying remote path. For example, 'hg update master'
+    works as well as 'hg update remote/master'. We want to allow the same in
+    infinitepush.
+    ó   remotenamess   hoistedpeeró   /N)r   Úisremotebooksenabledr4   Ú
+startswithÚlen)r8   ÚremotebookmarkÚhoists      r.   Ú	_tryhoistr_     s`   € õ Ô" 2Ñ&Ô&ğ 0Ø—	’	˜.¨.Ñ9Ô9¸DÑ@ˆØ×$Ò$ UÑ+Ô+ğ 	0Ø!¥# e¡*¤* , ,Ô/Ğ/ØĞr$   c                   ó   — e Zd Zd„ ZdS )Úbundlestorec                 ó~  — || _         | j         j                             dd¦  «        }|dk    r1ddlm} |                     | j         j        | j         ¦  «        | _        nI|dk    rt          | j         j        ¦  «        | _        n$t          j        t          d¦  «        |z  ¦  «        ‚| j         j                             dd¦  «        }|dk    r'dd	lm
+} | 
+                    | j         ¦  «        | _        d S |d
+k    r t          | j         j        ¦  «        | _        d S t          j        t          d¦  «        |z  ¦  «        ‚)Nr    r#   s   diskr   r1   s   externals,   unknown infinitepush store type specified %sr%   )Úfileindexapis   sqls,   unknown infinitepush index type specified %s)Ú_repor8   r4   r6   r2   Úfilebundlestorer=   r   r5   r   rc   ÚindexrO   )ÚselfÚrepoÚ	storetyper2   Ú	indextyperc   s         r.   Ú__init__zbundlestore.__init__!  s=  € ØˆŒ
+Ø”J”M×(Ò(¨¸,ÑGÔGˆ	Ø˜ÒĞØĞĞĞĞĞà×.Ò.¨t¬z¬}¸d¼jÑIÔIˆDŒJˆJØ˜+Ò%Ğ%İ2°4´:´=ÑAÔAˆDŒJˆJå”+İĞAÑBÔBÀYÑNñô ğ ğ ”J”M×(Ò(¨¸,ÑGÔGˆ	Ø˜ÒĞØ&Ğ&Ğ&Ğ&Ğ&Ğ&à%×2Ò2°4´:Ñ>Ô>ˆDŒJˆJˆJØ˜&Ò Ğ İ'¨¬
+¬Ñ6Ô6ˆDŒJˆJˆJå”+İĞAÑBÔBÀYÑNñô ğ r$   N)Ú__name__Ú
+__module__Ú__qualname__rk   r,   r$   r.   ra   ra      s#   € € € € € ğğ ğ ğ ğ r$   ra   c                 ó.   — |                       dd¦  «        S )Nr    r!   )Ú
+configbool©r8   s    r.   Ú	_isserverrr   <  s   € Ø=Š=˜¨)Ñ4Ô4Ğ4r$   c                 ó|   — t          | ¦  «        r*|                     ¦   «         rt          |¦  «        |_        d S d S d S ©N)rr   Úlocalra   )r8   rh   s     r.   Ú	reposetuprv   @  sI   € İ}„}ğ -˜Ÿš™œğ -İ& tÑ,Ô,ˆÔĞĞğ-ğ -ğ -ğ -r$   c                 ó‚   — t          | ¦  «         t          | ¦  «        rt          | ¦  «         d S t          | ¦  «         d S rt   )Úcommonsetuprr   ÚserverextsetupÚclientextsetuprq   s    r.   Úextsetupr{   E  sC   € İO„O€Oİ}„}ğ İrÑÔĞĞĞårÑÔĞĞĞr$   c                 ó–   — t           dft          j        d<   |                      dd¦  «        }|rt	          j        |¦  «        \  }}ad S d S )Ns   namespace patternss   listkeyspatternsr    r(   )Úwireprotolistkeyspatternsr   r   r4   r	   ÚstringmatcherÚ_scratchbranchmatcher)r8   ÚscratchbranchpatÚkindÚpats       r.   rx   rx   M  se   € å!Øğ7ÕÔĞ2Ñ3ğ —y’y Ğ2BÑCÔCĞØğ 
+å+5Ô+CØñ,
+ô ,
+Ñ(ˆˆcĞ(Ğ(Ğ(ğ
+ğ 
+r$   c                 ó  ‡‡— t           j        d         Šˆfd„}‰j        |_        |t           j        d<   t           j        d         Šˆfd„}‰j        |_        |t           j        d<   t          j        t
+          j        dt          ¦  «         t          t          j
+        d         d         ¦  «        dft          j
+        d<   t          j        t          d	t          ¦  «         t          j        t           d
+t          ¦  «         d S )Nó   pushkeyc                  ó(   •— t          ‰g| ¢R i |¤ d S rt   )Úbundle2pushkey)ÚargsÚkwargsÚorigpushkeyhandlers     €r.   Únewpushkeyhandlerz)serverextsetup.<locals>.newpushkeyhandler]  s(   ø€ İĞ)Ğ;¨DĞ;Ğ;Ğ;°FĞ;Ğ;Ğ;Ğ;Ğ;r$   s   phase-headsc                  ó$   •— t          ‰g| ¢R i |¤S rt   )Úbundle2handlephases)r‡   rˆ   Úorighandlephasehandlers     €r.   r/   z serverextsetup.<locals>.<lambda>d  s/   ø€ Õ3FØğ4Ø!%ğ4ğ 4ğ 4Ø)/ğ4ğ 4€ r$   ó   listkeyss   lookupr   ó   keys   getbundlechunkss   processparts)r   ÚparthandlermappingÚparamsr   Úwrapfunctionr   ÚlocalrepositoryÚlocalrepolistkeysÚ_lookupwrapr   r   r   ÚgetbundlechunksÚprocessparts)r8   rŠ   Únewphaseheadshandlerr   r‰   s      @@r.   ry   ry   Z  s  øø€ İ Ô3°JÔ?Ğğ<ğ <ğ <ğ <ğ <ğ  2Ô8ĞÔØ->…GÔ˜zÑ*å$Ô7¸ÔGĞğğ ğ ğ Ğğ #9Ô"?ĞÔØ1E…GÔ˜~Ñ.åÔİÔ! ;Õ0Añô ğ õ 	Õ%Ô.¨yÔ9¸!Ô<Ñ=Ô=Øğ-ÕÔ˜yÑ)õ ÔHĞ&8½/ÑJÔJĞJåÔG _µlÑCÔCĞCĞCĞCr$   c                 ó"  — t          j        t          j        dt          ¦  «        }|d                              ddd t          d¦  «        f¦  «         t          j        t          j        dt          ¦  «         t          j        t          dt          ¦  «         t          t          j        _        t          j        }|                     d¦  «        }|                     ||                     |                     t&          ¦  «        ¦  «        ¦  «         d S )	Ns   pushr   r$   s   bundle-stores/   force push to go to bundle store (EXPERIMENTAL)ó   pulls
+   checkheadss	   changeset)r   Úwrapcommandr   ÚtableÚ_pushÚappendr   Ú_pullr’   r   Ú_checkheadsÚlistkeyspatternsr   Úwirepeerr   Úb2partsgenorderrf   ÚinsertÚpopÚscratchbranchparttype)r8   ÚentryÚ	partorderrf   s       r.   rz   rz   v  sŞ   € İÔ"¥8¤>°7½EÑBÔB€Eà	ˆ!„H‡O‚OàØØİĞ@ÑAÔAğ		
+ñô ğ õ Ô8œ>¨7µEÑ:Ô:Ğ:åÔI }µkÑBÔBĞBå0@…OÔÔ-åÔ(€IØOŠO˜LÑ)Ô)€EØ×ÒØˆy}Š}˜YŸ_š_Õ-BÑCÔCÑDÔDñô ğ ğ ğ r$   c                 óh   — |j                              t          t          d¦  «        rd S  | |¦  «        S r+   )r8   rp   ÚexperimentalÚconfigscratchpush)ÚorigÚpushops     r.   r    r      s2   € Ø„y×ÒLÕ*;¸UÑCÔCğ ØˆØˆ4‰<Œ<Ğr$   c                 óÆ   — t          j        |¦  «        }|                      t          j        |¦  «        |¦  «                             ¦   «         }t          j        |¦  «        S rt   )r   Ú
+decodelistÚlistkeysr   ÚtolocalÚitemsr   Ú
+encodekeys)rh   ÚprotoÚ	namespaceÚpatternsÚds        r.   r}   r}   •  sM   € İÔ(¨Ñ2Ô2€HØŠ•hÔ& yÑ1Ô1°8Ñ<Ô<×BÒBÑDÔD€AİÔ˜aÑ Ô Ğ r$   c                 óŠ  — |dk    r²|r°|j         j        }i } | ||¦  «        }|D ]‘}|                     |                     |¦  «        ¦  «         |                     d¦  «        rd|d d…         z   dz   }t          j        |¦  «        \  }}	}
+|                     ¦   «         D ]\  }} |
+|¦  «        r|||<   ŒŒ’|S  | ||¦  «        S )Nó	   bookmarksó   *s   re:^éÿÿÿÿs   .*)ra   rf   ÚupdateÚgetbookmarksÚendswithr	   r~   r²   )r¬   rg   rµ   r¶   rf   ÚresultsÚ	bookmarksÚpatternr   r‚   ÚmatcherÚbookmarkÚnodes                r.   r”   r”   ›  sş   € ØLÒ Ğ  XĞ ØÔ Ô&ˆØˆØD˜˜yÑ)Ô)ˆ	Øğ 	-ğ 	-ˆGØNŠN˜5×-Ò-¨gÑ6Ô6Ñ7Ô7Ğ7Ø×Ò Ñ%Ô%ğ 9Ø! G¨C¨R¨C¤LÑ0°5Ñ8İ!+Ô!9¸'Ñ!BÔ!BÑˆD#wØ"+§/¢/Ñ"3Ô"3ğ -ğ -‘˜$Ø7˜8Ñ$Ô$ğ -Ø(,G˜HÑ%øğ-ğ ˆàˆtD˜)Ñ$Ô$Ğ$r$   c                 óÔ   ‡ ‡— ‰                       d¦  «        si d fS ‰ j                             d‰z  ¦  «         ˆˆ fd„}t          j        ‰¦  «        t          j        |¦  «        dœ|fS )Nr„   s   preparing listkeys for "%s"
+c                 ó„   •— ‰j                              d‰t          | ¦  «        fz  ¦  «         t          j        | ¦  «        S )Ns$   received listkey for "%s": %i bytes
+)r8   Údebugr\   r   Ú
+decodekeys)r·   rµ   rg   s    €€r.   Údecodez listkeyspatterns.<locals>.decode³  sA   ø€ ØŒŠØ4¸	Å3ÀqÁ6Ä6Ğ7JÑJñ	
+ô 	
+ğ 	
+õ Ô! !Ñ$Ô$Ğ$r$   )ó	   namespaces   patterns)Úcapabler8   rÇ   r   Ú	fromlocalr   Ú
+encodelist)rg   rµ   r¶   rÉ   s   ``  r.   r¡   r¡   ­  s   øø€ à<Š<˜
+Ñ#Ô#ğ Ø4ˆxˆØ„G‡M‚MĞ2°YÑ>Ñ?Ô?Ğ?ğ%ğ %ğ %ğ %ğ %ğ %õ Ô(¨Ñ3Ô3İ#Ô.¨xÑ8Ô8ğğ ğ ğğ r$   c                 óF   — t          |                      d¦  «        ¦  «        S )Ns   bundle())ÚlistÚrevs)Ú
+bundlerepos    r.   Ú_readbundlerevsrÒ   ¿  s   € İ
+—’ Ñ,Ô,Ñ-Ô-Ğ-r$   c                 óÀ  — t          ¦   «         }|j        }|D ]0}|                     |                     |¦  «        d         ¦  «         Œ1|s| S d                     |¦  «        }g }d}| pg D ]Y}	|	                     d¦  «        r-|                     d                     |	|f¦  «        ¦  «         d}ŒD|                     |	¦  «         ŒZ|s|                     d|z   ¦  «         |S )zÚTells remotefilelog to include all changed files to the changegroup
+
+    By default remotefilelog doesn't include file content to the changegroup.
+    But we need to include it if we are fetching from bundlestore.
+    é   ó    Fs   excludepattern=T)ÚsetÚ	changelogr¼   ÚreadÚjoinr[   r   )
+Ú
+bundlecapsrÑ   Ú
+bundlerevsr8   ÚchangedfilesÚclÚrÚnewcapsÚappendedÚcaps
+             r.   Ú_includefilelogstobundlerâ   Ã  sÿ   € õ ‘5”5€LØ	Ô	€BØğ +ğ +ˆà×Ò˜BŸGšG A™JœJ qœMÑ*Ô*Ğ*Ğ*Øğ ØĞà—:’:˜lÑ+Ô+€LØ€GØ€HØĞ˜Rğ  ğ  ˆØ>Š>Ğ,Ñ-Ô-ğ 	 ØNŠN˜5Ÿ:š: s¨LĞ&9Ñ:Ô:Ñ;Ô;Ğ;ØˆHˆHàNŠN˜3ÑÔĞĞØğ :àŠĞ)¨LÑ8Ñ9Ô9Ğ9à€Nr$   c                 ó:  — g }d}t          j        | ||g¬¦  «        }t          j        | ||d¦  «        }t	          j        |¦  «                             ¦   «         }t          j        d|¬¦  «        }| 	                    d|¦  «         | 
+                    |¦  «         |S )zß
+    Bundle may include more revision then user requested. For example,
+    if user asks for revision but bundle also consists its descendants.
+    This function will filter out all revision that user is not requested.
+    s   02)ÚcommonheadsÚancestorsofrš   ó   changegroup©Údataó   version)r   Úoutgoingr   Ú
+makestreamr   ÚchunkbufferrØ   r   Ú
+bundlepartÚaddparamr   )rÑ   ÚbundlerootsÚunknownheadÚpartsÚversionrê   ÚcgstreamÚcgparts           r.   Ú	_rebundlerõ   á  s¢   € ğ €Eà€GİÔ!Ø ¸+¸ğñ ô €Hõ Ô% j°(¸GÀWÑMÔM€HİÔ Ñ)Ô)×.Ò.Ñ0Ô0€HİÔ °XĞ>Ñ>Ô>€FØ
+‡O‚OJ Ñ(Ô(Ğ(Ø	‡L‚LÑÔĞà€Lr$   c                 ó²   — |j         }g }|D ]J}|                     |¦  «        }|                     |¦  «        }|D ]}|| v r|                     |¦  «         ŒŒK|S rt   )r×   rÄ   Úparentsr   )	ÚoldreporÑ   rÛ   rİ   rï   ÚrevrÄ   r÷   Úparents	            r.   Ú_getbundlerootsrû   ö  s|   € Ø	Ô	€BØ€KØğ +ğ +ˆØwŠws‰|Œ|ˆØ—*’*˜TÑ"Ô"ˆØğ 	+ğ 	+ˆFğ ˜Ğ Ğ Ø×"Ò" 6Ñ*Ô*Ğ*øğ		+ğ
+ Ğr$   c                 ó¶   — t          |                     d¦  «        ¦  «        }t          |¦  «        dk    o#||d                                       ¦   «         | k     S )Nó   heads(bundle())r   r   )rÏ   rĞ   r\   rÄ   )ÚheadrÑ   Úbundleheadss      r.   Ú_needsrebundlingr     sU   € İz—’Ğ'9Ñ:Ô:Ñ;Ô;€KåˆKÑÔ˜AÒĞK *¨[¸¬^Ô"<×"AÒ"AÑ"CÔ"CÀtÒ"Kğğ r$   c                 ó´  — g }t          | |¦  «        s³t          j        |d¦  «        5 }t          j        |j        ||¦  «        }t          |t          j        ¦  «        rYt          j
+        d|j                             ¦   «         ¬¦  «        }|                     dd¦  «         |                     |¦  «         n÷t          |t          j        ¦  «        rÉd}|                     ¦   «         D ]†}|j        dk    rd}t          j
+        |j        |                     ¦   «         ¬¦  «        }	|j                             ¦   «         D ]\  }
+}|	                     |
+|¦  «         Œ|                     |	¦  «         Œ‡|s)t)          j        dd	t-          | ¦  «        z  z   d
+¬¦  «        ‚nt)          j        d¦  «        ‚ddd¦  «         n# 1 swxY w Y   nt/          ||| ¦  «        }|S )zmgenerates bundle that will be send to the user
+
+    returns tuple with raw bundle string and bundle type
+    ó   rbræ   rç   ré   ó   01FTs,   unexpected bundle without changegroup part, s   head: %ss   report to administrator)Úhints   unknown bundle typeN)r   r   Ú	posixfiler   Ú
+readbundler8   rS   r   Úcg1unpackerr   rí   Ú_streamrØ   rî   r   Ú
+unbundle20Ú	iterpartsÚtyper‘   r²   r   r5   r   rõ   )rş   rÑ   rï   Ú
+bundlefilerñ   ÚfÚ	unbundlerÚpartÚhaschangegroupÚnewpartÚkeyÚvalues               r.   Ú_generateoutputpartsr    s   € ğ
+ €Eİ˜D *Ñ-Ô-ñ 9İŒ^˜J¨Ñ.Ô.ğ 	:°!İ Ô+¨J¬M¸1¸jÑIÔIˆIİ˜)¥[Ô%<Ñ=Ô=ğ :İÔ)Ø"¨Ô):×)?Ò)?Ñ)AÔ)Ağñ ô ğ —’˜j¨%Ñ0Ô0Ğ0Ø—’˜TÑ"Ô"Ğ"Ğ"İ˜I¥wÔ'9Ñ:Ô:ğ :Ø!&Ø%×/Ò/Ñ1Ô1ğ *ğ *DØ”y NÒ2Ğ2Ø)-˜İ%Ô0°´ÀÇÂÁÄĞMÑMÔMGØ&*¤k×&7Ò&7Ñ&9Ô&9ğ 5ğ 5™
+˜˜UØ×(Ò(¨¨eÑ4Ô4Ğ4Ğ4Ø—L’L Ñ)Ô)Ğ)Ğ)à%ğ İœ+ØGØ%­¨D©	¬	Ñ1ñ2à7ğñ ô ğ ğõ ”kĞ"8Ñ9Ô9Ğ9ğ3	:ğ 	:ğ 	:ñ 	:ô 	:ğ 	:ğ 	:ğ 	:ğ 	:ğ 	:ğ 	:øøøğ 	:ğ 	:ğ 	:ğ 	:øõ6 ˜* k°4Ñ8Ô8ˆà€Ls   ©FF;Æ;F?ÇF?c                 óZ  ‡‡‡‡— |pg }i Šg Šg }g }i }g }		 |D ]_}
+|j         j                             |
+¦  «        s<|
+|vrèt          j        ||
+¦  «        }d|j        |fz  }t          j        |j        |¦  «        }|	 	                    ||f¦  «         t          t          |¦  «        ¦  «        }t          ||||j        ¦  «        }|j         }t          |||¦  «        }|D ]H}|                     |¦  «        }t          t           j        ¦  «        ‰t%          |¦  «        <   |||f||<   ŒI‰ 	                    t'          |
+g||
+         ¢R  ¦  «         |                     |¦  «         | 	                    |
+¦  «         Œa	 |	D ]E\  }}|                     ¦   «          	 t-          j        |¦  «         Œ/# t0          t2          f$ r Y ŒBw xY wnM# |	D ]E\  }}|                     ¦   «          	 t-          j        |¦  «         Œ/# t0          t2          f$ r Y ŒBw xY ww xY wt5          ‰¦  «        Šd}d}t6          j        d         Š	 ˆˆfd„}|t6          j        d<   d}ˆˆfd„}t;          j        t>          j         d|¦  «         d}tC          t          |¦  «        t          |¦  «        z  t          |¦  «        z
+  ¦  «        } | ||f||dœ|¤}|r‰t6          j        d<   |r t;          j"        t>          j         d|¦  «         n9# |r‰t6          j        d<   |r!t;          j"        t>          j         d|¦  «         w w xY w|S )	Nó   bundle:%s+%sFræ   c                 ó^   •—  ‰| g|¢R i |¤}‰D ]}|D ]}|                       |¦  «         ŒŒ|S rt   )Úaddpart)Úbundlerr‡   rˆ   ÚresultÚbundler  ÚoldchangegrouppartÚscratchbundless         €€r.   Ú_changegrouppartz)getbundlechunks.<locals>._changegroupparth  sb   ø€ ğ (Ğ'¨ĞA°$ĞAĞAĞA¸&ĞAĞAˆFØ(ğ *ğ *Ø"ğ *ğ *DØ—O’O DÑ)Ô)Ğ)Ğ)ğ*àˆMr$   Tc                 ó’   •—  | ||¦  «        }|dk    r3‰r1|                      d¦  «        dk    r|d= |                     ‰¦  «         |S )Ns   phasess
+   publishingó   True)Úgetr¼   )r¬   rg   rµ   Ú
+origvaluesÚ	newphasesÚpullfrombundlestores       €€r.   Ú	_listkeysz"getbundlechunks.<locals>._listkeysu  s^   ø€ Ø˜˜d IÑ.Ô.ˆJØ˜IÒ%Ğ%Ğ*=Ğ%Ø—>’> -Ñ0Ô0°GÒ;Ğ;à" =Ğ1Ø×!Ò! )Ñ,Ô,Ğ,ØĞr$   r   )ÚheadsrÚ   )#r×   rf   Úhas_noder   ÚdownloadbundleÚrootr   Ú
+repositoryr8   r   rÖ   rÒ   râ   rû   rÄ   Ústrr   Údraftr   r  ÚextendÚcloseÚosÚunlinkÚIOErrorÚOSErrorÚboolr   Úgetbundle2partsmappingr   r’   r   r“   rÏ   Úunwrapfunction)r¬   rh   Úsourcer&  rÚ   rˆ   ÚnewheadsÚscratchheadsÚnodestobundleÚallbundlestocleanuprş   ÚnewbundlefileÚ
+bundlepathrÑ   rÛ   rİ   rï   rù   rÄ   r  ÚwrappedchangegrouppartÚwrappedlistkeysr  r%  r  r#  r  r$  r  s                            @@@@r.   r–   r–   2  s  øøøø€ ØˆKR€Eà€IØ€NØ€HØ€LØ€MØĞğ%Øğ 	*ñ 	*ˆDØ”>Ô'×0Ò0°Ñ6Ô6ñ *Ø˜}Ğ,Ğ,İ$*Ô$9¸$ÀÑ$EÔ$EMØ!0°D´I¸}Ğ3MÑ!MJİ!#¤¨t¬w¸
+Ñ!CÔ!CJà'×.Ò.°
+¸MĞ/JÑKÔKĞKİ!$¥_°ZÑ%@Ô%@Ñ!AÔ!AJİ!9Ø" J°
+¸D¼Gñ"ô "Jğ $Ô-Bİ"1°$¸
+ÀJÑ"OÔ"OKØ)ğ ğ ˜Ø!Ÿwšw s™|œ|˜İ/2µ6´<Ñ/@Ô/@˜	¥# d¡)¤)Ñ,à&Ø'Ø)ğ/˜ dÑ+Ğ+ğ ×%Ò%İ(¨ĞD°¸dÔ0CĞDĞDĞDñô ğ ğ —’ Ñ,Ô,Ğ,Ø×#Ò# DÑ)Ô)Ğ)ùğ7	*ğ: ':ğ 	ğ 	Ñ"ˆJ˜
+Ø×ÒÑÔĞğİ”	˜*Ñ%Ô%Ğ%Ğ%øİWĞ%ğ ğ ğ ğ ğøøøğ		øĞ&9ğ 	ğ 	Ñ"ˆJ˜
+Ø×ÒÑÔĞğİ”	˜*Ñ%Ô%Ğ%Ğ%øİWĞ%ğ ğ ğ ğ ğøøøğ		øøøõ ˜~Ñ.Ô.ĞØ"ĞØ€Oİ!Ô8¸ÔHĞğ&ğ	ğ 	ğ 	ğ 	ğ 	ğ 	ğ ;KÔ'¨Ñ7Ø!%Ğğ	ğ 	ğ 	ğ 	ğ 	ğ 	õ 	ÔİÔ% {°Iñ	
+ô 	
+ğ 	
+ğ ˆİ•c˜(‘m”m¥c¨%¡j¤jÑ0µC¸Ñ4EÔ4EÑEÑFÔFˆØØ&ğ
+Ø %°*ğ
+ğ 
+Ø@Fğ
+ğ 
+ˆğ "ğ 	QØ>PHÔ+¨NÑ;Øğ 	İÔ%İÔ)¨;¸	ñô ğ øøğ "ğ 	QØ>PHÔ+¨NÑ;Øğ 	İÔ%İÔ)¨;¸	ñô ğ ğ ğ	øøøğ €MsO   –E#G ÆF+Æ+F?Æ>F?ÇHÇ G5Ç4HÇ5H		ÈHÈH		È	HÈ6BK2 Ë26L(c                 ó   — d„ }|S )Nc                 óä  — t          j        |¦  «        }t          |t          ¦  «        rAt	          |¦  «        r2| j        j                             |¦  «        }|rdd|fz  S ddd|z  fz  S 	 t          |  	                    |¦  «        ¦  «        }dd|fz  S # t          $ rP}| j        j                             |¦  «        rdd|fz  cY d }~S t          j        |¦  «        }dd|fz  cY d }~S d }~ww xY w)Ns   %d %s
+r   r   s   scratch branch %s not found)r   r±   rS   r+  r   ra   rf   Úgetnoder   ÚlookupÚ	ExceptionÚ	getbundler	   Úforcebytestr)rh   r´   r  ÚlocalkeyÚscratchnoderŞ   Úinsts          r.   Ú_lookupz_lookupwrap.<locals>._lookup‘  s6  € İÔ# CÑ(Ô(ˆåh¥Ñ$Ô$ğ 	/Õ)>¸xÑ)HÔ)Hğ 	/ØÔ*Ô0×8Ò8¸ÑBÔBˆKØğ Ø! Q¨Ğ$4Ñ4Ğ4à!ØØ2°XÑ=ğ%ñ ğ ğ
+/İ˜Ÿš HÑ-Ô-Ñ.Ô.Ø! Q¨ FÑ*Ğ*øİğ /ğ /ğ /ØÔ#Ô)×3Ò3°HÑ=Ô=ğ /Ø%¨¨H¨Ñ5Ğ5Ğ5Ğ5Ğ5Ğ5Ğ5å"Ô/°Ñ5Ô5AØ%¨¨A¨Ñ.Ğ.Ğ.Ğ.Ğ.Ğ.Ğ.øøøøğ/øøøs*   Á,(B Â
+C/Â%C*ÃC/Ã
+C*Ã$C/Ã*C/r,   )r¬   rI  s     r.   r•   r•     s   € ğ/ğ /ğ /ğ. €Nr$   ó   defaultc           	      ó  — t          j        |¦  «        }t          j        d||||                     d¦  «        ¬¦  «        \  }}i }|                     ¦   «         }g }|                     dg ¦  «        D ]}	|	|vr|                     |	¦  «         Œ|                     d¦  «        r
+g }
+|                     d¦  «        pg }|                     d¦  «        D ],}t          |¦  «        rd||<   Œ|
+                     |¦  «         Œ-|r£t          j	        |||¦  «        }	 | 
+                    d|¬¦  «        }|D ]C}||vrt          j        d	|z  ¦  «        ‚||         ||<   |                     ||         ¦  «         ŒD	 |                     ¦   «          n# |                     ¦   «          w xY w|
+|d<   ||d<   |s|r t          j        t           d
+t"          ¦  «         	 t%          |||¦  «        } | |||fi t          j        |¦  «        ¤}t)          j        |¦  «        r'|                     |¦  «         t/          |||¦  «         nt1          ||¦  «         ||rt          j        t           d
+¦  «         S S # |rt          j        t           d
+¦  «         w w xY w)Ns   infinite-push's pulls   branch)Údefault_branchess   revó   bookmarks
+   REVTOFETCHr¹   ©r¶   s   remote bookmark %s not found!s   findcommonincoming)r   Úbyteskwargsr
+   Úget_unique_pull_pathr!  Ú
+unfilteredr   r   r   Úpeerr¡   r   r5   r.  r   r’   r   Ú_findcommonincomingÚ_readscratchremotebookmarksÚ	strkwargsr   rZ   r¼   Ú_saveremotebookmarksÚ_savelocalbookmarksr5  )r¬   r8   rh   r6  ÚoptsÚbranchesÚscratchbookmarksÚunfiÚunknownnodesrù   rÀ   rĞ   rÃ   ÚotherÚfetchedbookmarksÚremotescratchbookmarksr  s                    r.   rŸ   rŸ   «  s  € İÔ Ñ%Ô%€DåÔ3ØØØ
+ØØŸš )Ñ,Ô,ğñ ô Ñ€FˆHğ ĞØ?Š?ÑÔ€DØ€LØxŠx˜ Ñ#Ô#ğ %ğ %ˆØdˆ?ˆ?Ø×Ò Ñ$Ô$Ğ$øØ‡x‚xÑÔñ Øˆ	ØxŠx˜ÑÔĞ% 2ˆØŸš Ñ-Ô-ğ 	+ğ 	+ˆHİ$ XÑ.Ô.ğ +ğ .;Ğ  Ñ*Ğ*à× Ò  Ñ*Ô*Ğ*Ğ*àğ 	İ”G˜D $¨Ñ/Ô/ˆEğØ#(×#9Ò#9Ø Ğ+;ğ $:ñ $ô $Ğ ğ !1ğ <ğ <HØĞ'7Ğ7Ğ7İ#œkØ<¸xÑGñô ğ ğ 2BÀ(Ô1KĞ$ XÑ.Ø—K’KĞ 0°Ô :Ñ;Ô;Ğ;Ğ;ğ<ğ —’‘”ø—’‘”øøøØ%ˆˆ[ÑØˆˆV‰àğ 
+˜<ğ 
+åÔİĞ,Õ.Añ	
+ô 	
+ğ 	
+ğHõ "=¸RÀÀvÑ!NÔ!NĞØb˜$ ĞCĞC­(Ô*<¸TÑ*BÔ*BĞCĞCˆõ Ô& rÑ*Ô*ğ 	8Ø"×)Ò)Ğ*:Ñ;Ô;Ğ;İ  Ğ'=¸vÑFÔFĞFĞFå Ğ&6Ñ7Ô7Ğ7Øàğ 	HİÔ%¥iĞ1FÑGÔGĞGĞGğ	HøĞğ 	HİÔ%¥iĞ1FÑGÔGĞGĞGğ	Høøøs   ÄAF ÆF!ÇA:I+ É+J
+c                 óÜ  — t          j        | ¦  «        r×t          j        d¦  «        }|                     |j        |¦  «        }i }|j                             ¦   «          |j        d          	                    |¦  «        D ]j}| 
+                    |¦  «        \  }}||k    rJt          |¦  «        r;|j        d                              ||¦  «        }	|	rt          |	d         ¦  «        ||<   Œk|S i S )NrX   s   remotebookmarksr   )r   rZ   r   ÚfindÚ
+activepathr8   Ú_remotenamesÚ
+clearnamesÚnamesÚ	listnamesÚsplitremotenamer   Únodesr   )
+r8   rh   r]  ÚremotenamesextÚ
+remotepathr  r]   ÚpathÚbooknamerh  s
+             r.   rT  rT  ñ  s÷   € İÔ" 2Ñ&Ô&ğ İ#œ¨Ñ8Ô8ˆØ#×.Ò.¨t¬w¸Ñ>Ô>ˆ
+Øˆğ
+ 	Ô×$Ò$Ñ&Ô&Ğ&Ø"œjĞ);Ô<×FÒFÀtÑLÔLğ 	5ğ 	5ˆNØ+×;Ò;¸NÑKÔK‰NˆD(ØzÒ!Ğ!Õ&;¸HÑ&EÔ&EĞ!Øœ
+Ğ#5Ô6×<Ò<Ø˜.ñô ğ ğ 5İ'*¨5°¬8¡}¤}F˜8Ñ$øØˆàˆ	r$   c                 óÖ  — t          j        d¦  «        }|                     | j        |¦  «        }t	          j        t          ¦  «        }i }|                     | ¦  «        }|D ]O\  }}	}}
+||k    rŒ|	dk    r|
+|v r||
+= |||
+<   Œ!|	dk    r(||
+                              t          |¦  «        ¦  «         ŒP| 
+                    ¦   «         D ]
+\  }}|||<   Œ|                     | |||¦  «         d S )NrX   r¹   ó   branches)r   ra  rb  r8   ÚcollectionsÚdefaultdictrÏ   Úreadremotenamesr   r   r²   Úsaveremotenames)rh   ÚnewbookmarksÚremoteri  rj  rY  rÀ   ÚremotenamesÚhexnodeÚnametypeÚrnamerÃ   s               r.   rV  rV    s  € İ”_ ^Ñ4Ô4€NØ×*Ò*¨4¬7°FÑ;Ô;€JİÔ&¥tÑ,Ô,€HØ€IØ ×0Ò0°Ñ6Ô6€KØ,7ğ 1ğ 1Ñ(ˆ˜6 5ØZÒĞØØ|Ò#Ğ#Ø˜Ğ$Ğ$ğ ! Ğ'Ø&ˆIeÑĞØ˜Ò$Ğ$àUŒO×"Ò"¥3 w¡<¤<Ñ0Ô0Ğ0øà)×/Ò/Ñ1Ô1ğ &ğ &Ñˆ'Ø%ˆ	(ÑĞØ×"Ò" 4¨°X¸yÑIÔIĞIĞIĞIr$   c           	      óì  — |sd S |                       ¦   «         5  |                      ¦   «         5  |                      d¦  «        5 }g }|                     ¦   «         D ]6\  }}| |         }|                     ||                     ¦   «         f¦  «         Œ7| j                             | ||¦  «         d d d ¦  «         n# 1 swxY w Y   d d d ¦  «         n# 1 swxY w Y   d d d ¦  «         d S # 1 swxY w Y   d S )NrM  )ÚwlockÚlockÚtransactionr²   r   rÄ   Ú
+_bookmarksÚapplychanges)rh   rÀ   ÚtrÚchangesÚscratchbookrÄ   Ú	changectxs          r.   rW  rW  !  s²  € Øğ ØˆØ	Š‰Œğ 8ğ 8t—y’y‘{”{ğ 8ğ 8 D×$4Ò$4°[Ñ$AÔ$Ağ 8ÀRØˆØ!*§¢Ñ!2Ô!2ğ 	<ğ 	<ÑˆK˜Ø˜Tœ
+ˆIØNŠN˜K¨¯ªÑ)9Ô)9Ğ:Ñ;Ô;Ğ;Ğ;ØŒ×$Ò$ T¨2¨wÑ7Ô7Ğ7ğ8ğ 8ğ 8ñ 8ô 8ğ 8ğ 8ğ 8ğ 8ğ 8ğ 8øøøğ 8ğ 8ğ 8ğ 8ğ 8ğ 8ğ 8ñ 8ô 8ğ 8ğ 8ğ 8ğ 8ğ 8ğ 8øøøğ 8ğ 8ğ 8ğ 8ğ 8ğ 8ğ 8ñ 8ô 8ğ 8ğ 8ğ 8ğ 8ğ 8ğ 8ğ 8øøøğ 8ğ 8ğ 8ğ 8ğ 8ğ 8sY   ™C)®CÁA*B:Â.CÂ:B>Â>CÃB>ÃCÃC)ÃC	ÃC)ÃC	ÃC)Ã)C-Ã0C-c                 ó$   —  | |i |¤\  }}}|d|fS )NTr,   )r¬   r‡   rˆ   r   ÚincÚremoteheadss         r.   rS  rS  ,  s*   € Ø#˜t TĞ4¨VĞ4Ğ4Ñ€FˆCØ4˜Ğ$Ğ$r$   c                 ó¸  — t          j        |¦  «        }|                     d¦  «        }t          |¦  «        dk    r	|d         }nd}d }t          t
+          f|i}|                     |d¦  «        5  |                     d¦  «        }t          |¦  «        rd}|                     t          dd¦  «         |rFg |d<   |                     t          t          d¦  «         t          j        t          d	t          ¦  «        }t          t          j        |||¦  «        ¦  «        }	t          |	¦  «        dk    r#t#          d
+¦  «        }
+t%          j        |
+¦  «        ‚|	d         }|j        p|j        }t-          |||¦  «        } | ||g|¢R i t          j        |¦  «        ¤}t1          j        |¦  «        r‡|rt|rrt5          j        |||¦  «        }	 |                     d|g¬¦  «        }|                     |¦  «         |                     ¦   «          n# |                     ¦   «          w xY wt?          |||¦  «         d d d ¦  «         n# 1 swxY w Y   |r|t          _         |S )NrM  r   r   r$   r    s   bundle_storeTs   bundle2.pushbacks   _localphasemoves.   cannot push to multiple path with infinitepushr¹   rN  )!r   rO  r!  r\   rª   ÚconfigbookmarkÚconfigoverrider   Ú	setconfigr«   r   r’   r   Ú
+_phasemoverÏ   r
+   Úget_push_pathsr   r   r5   ÚpushlocÚlocrT  rU  r   rZ   r   rR  r¡   r¼   r.  rV  Ú_localphasemove)r¬   r8   rh   ÚdestsrX  rÃ   ÚoldphasemoveÚ	overridesÚscratchpushÚpathsÚmsgrk  Údestpathr_  r  r]  r^  s                    r.   r   r   1  s¼  € İÔ Ñ%Ô%€DØxŠx˜Ñ$Ô$€Hå
+ˆ8}„}˜ÒĞØ˜A”;ˆˆàˆà€Lİ¥Ğ/°Ğ:€Ià	×	Ò	˜9 oÑ	6Ô	6ğ &Iğ &IØ—h’h˜Ñ/Ô/ˆİ  Ñ*Ô*ğ 	BØˆKğ LŠLĞ':¸DÑAÔAĞAàğ 	ğ !#ˆDÑØLŠLÕ'8¸$Ñ?Ô?Ğ?İ%Ô2İĞ,­jñô ˆLõ •WÔ+¨D°"°eÑ<Ô<Ñ=Ô=ˆİˆu‰:Œ:˜Š>ˆ>İĞEÑFÔFˆCİ”+˜cÑ"Ô"Ğ"àQŒxˆØ”<Ğ+ 4¤8ˆõ "=¸RÀÀxÑ!PÔ!PĞØb˜$ĞC ĞCĞCĞC­(Ô*<¸TÑ*BÔ*BĞCĞCˆİÔ& rÑ*Ô*ğ 
+	IØğ "˜Kğ "İœ  d¨HÑ5Ô5ğ"Ø',×'=Ò'=Ø$°¨zğ (>ñ (ô (Ğ$ğ +×1Ò1Ğ2BÑCÔCĞCà—K’K‘M”MMMøE—K’K‘M”MMMøøøİ  Ğ'=¸xÑHÔHĞHğM&Iğ &Iğ &Iñ &Iô &Iğ &Iğ &Iğ &Iğ &Iğ &Iğ &Iøøøğ &Iğ &Iğ &Iğ &IğN ğ 0Ø#/Ô Ø€Ms+   Á0EIÇ	-HÇ6IÈH!È!IÉIÉIc                 ó  ‡‡‡‡— t          j        d¦  «        }dŠdŠdŠˆˆfd„|                     |¦  «        D ¦   «         }ˆˆfd„|D ¦   «         }|D ];}||vr5t          j        t          d¦  «                             |‰¦  «        ¦  «        ‚Œ<i }t          j        t          ¦  «        }	|D ]E\  }
+}}}|dk    r
+||vr|
+||<   Œ|d	k    r(|	|          
+                    t          |
+¦  «        ¦  «         ŒF|                     |‰|	|¦  «         d
+S )zqPrune remote names by removing the bookmarks we don't want anymore,
+    then writing the result back to disk
+    rX   r   é   rÔ   c                 ó,   •— g | ]}|‰         ‰k    ¯|‘ŒS r,   r,   )Ú.0Ú
+remotenamerk  Ú
+remote_idxs     €€r.   ú
+<listcomp>z0_deleteinfinitepushbookmarks.<locals>.<listcomp>t  s3   ø€ ğ ğ ğ àØjÔ! TÒ)Ğ)ğ 	à)Ğ)Ğ)r$   c                 ó8   •— g | ]}|‰         d k    ¯|‰         ‘ŒS )r¹   r,   )r™  rš  Úname_idxÚnametype_idxs     €€r.   rœ  z0_deleteinfinitepushbookmarks.<locals>.<listcomp>y  s8   ø€ ğ ğ ğ àØlÔ# |Ò3Ğ3ğ 	8Ôà3Ğ3Ğ3r$   s6   infinitepush bookmark '{}' does not exist in path '{}'r¹   rn  N)r   ra  rq  r   r5   r   Úformatro  rp  rÏ   r   r   rr  )r8   rh   rk  re  ri  ru  Úremote_bm_namesÚnamerÀ   rY  rÄ   rw  rt  r  rŸ  r›  s     `          @@@r.   Ú_deleteinfinitepushbookmarksr£  i  s  øøøø€ õ  ”_ ^Ñ4Ô4€Nğ €LØ€JØ€Hğğ ğ ğ ğ à(×8Ò8¸Ñ>Ô>ğñ ô €Kğ
+ğ ğ ğ ğ à%ğñ ô €Oğ ğ ğ ˆØĞ&Ğ&İ”+İğ$ñô ÷ ’&˜˜tÑ$Ô$ñ	ô ğ ğ 'ğ €IİÔ&¥tÑ,Ô,€HØ(3ğ -ğ -Ñ$ˆˆh˜ Ø|Ò#Ğ#¨°EĞ(9Ğ(9Ø"ˆId‰OˆOØ˜Ò$Ğ$àTŒN×!Ò!¥# d¡)¤)Ñ,Ô,Ğ,øà×"Ò" 4¨¨x¸ÑCÔCĞCĞCĞCr$   c                 óD   — |t           j        k    r | |||¦  «         dS dS )z€prevent commits from being marked public
+
+    Since these are going to a scratch branch, they aren't really being
+    published.N)r   Úpublic)r¬   r­   rh  Úphases       r.   rŠ  rŠ  ”  s3   € ğ •”ÒĞØˆˆVU˜EÑ"Ô"Ğ"Ğ"Ğ"ğ Ğr$   c                 óh  ‡ — ‰ j                              t          t          ¦  «        }‰ j                              t          t
+          ¦  «        }d‰ j        v s|sd S t          t          j	        ‰ j
+        ¦  «        vrd S ‰ j                             d¦  «         ‰ j        j        s0‰ j                              t          d¦  «        ¦  «         d‰ _        d S |                     dd¦  «         t%          j        ‰ j        ‰ j
+        ‰ j        ‰ j         |¦  «        }|D ]}|                     |¦  «         Œˆ fd„}|S )Ns
+   changesetss   no changes found
+r   r    r   c                 ó   •— d‰_         d S )Nr   )Úcgresult)Úopr­   s    €r.   Úhandlereplyzpartgen.<locals>.handlereplyº  s   ø€ àˆŒˆˆr$   )r8   r4   rª   r‡  rp   r«   Ú	stepsdoner¦   r   Úbundle2capsrt  Úaddrê   ÚmissingÚstatusr   r©  rî   r   Úgetscratchbranchpartsrh   r  )r­   r  rÃ   r’  ÚscratchpartsÚscratchpartr«  s   `      r.   Úpartgenr´    s:  ø€ àŒy×Ò¥­nÑ=Ô=€HØ”)×&Ò&¥|Õ5FÑGÔG€KØ˜Ô(Ğ(Ğ(°Ğ(Øˆå¥GÔ$7¸¼Ñ$FÔ$FĞFĞFØˆà
+Ô×Ò˜Ñ'Ô'Ğ'ØŒ?Ô"ğ ØŒ	×ÒĞ0Ñ1Ô1Ñ2Ô2Ğ2ØˆŒØˆğ
+ ×Ò_ gÑ.Ô.Ğ.åÔ4ØŒV”] F¤O°V´YÀñô €Lğ $ğ %ğ %ˆØŠ˜Ñ$Ô$Ğ$Ğ$ğğ ğ ğ ğ ğ Ğr$   r,   c                 ó¦   ‡ — 	 ˆ fd„‰                       d¦  «        D ¦   «         }|€|S |‰ v r%t          ‰                      d|¦  «        ¦  «        r|S |S )Nc                 ó    •— g | ]
+}‰|         ‘ŒS r,   r,   )r™  rŞ   r  s     €r.   rœ  z_getrevs.<locals>.<listcomp>Æ  s   ø€ Ğ>Ğ>Ğ>˜!ˆF1ŒIĞ>Ğ>Ğ>r$   s   sort(bundle())s   bundle() & %s::)rĞ   rÏ   rÖ   )r  ÚoldnodeÚforcerÃ   rĞ   s   `    r.   Ú_getrevsr¹  Ä  sk   ø€ Ø5Ø>Ğ>Ğ>Ğ>˜vŸ{š{Ğ+<Ñ=Ô=Ğ>Ñ>Ô>€Dğ €Øˆğ &ĞĞT &§*¢*Ğ-?ÀÑ"IÔ"IÑJÔJĞØˆà€Kr$   c           	   +   ó(  K  — t          j         ¦   «         } | |fddi|¤ 	 d V —  | |fdt          j         ¦   «         |z
+  dz  dœ|¤ d S # t          $ r<} | |fdt          j         ¦   «         |z
+  dz  t          j        |¦  «        dœ|¤ ‚ d }~ww xY w)NÚ	eventtypeó   startó   successéè  ©r»  Ú	elapsedmsó   failure©r»  rÀ  Úerrormsg)ÚtimerC  r	   rE  )ÚloggerÚservicerˆ   ÚstartÚes        r.   ÚlogservicecallrÉ  Ó  sü   è è € åŒI‰KŒK€EØ
+€Fˆ7Ğ1Ğ1˜hĞ1¨&Ğ1Ğ1Ğ1ğØˆˆˆØˆØğ	
+à İ”y‘{”{ UÑ*¨dÑ2ğ	
+ğ 	
+ğ ğ		
+ğ 	
+ğ 	
+ğ 	
+ğ 	
+øõ ğ ğ ğ ØˆØğ	
+à İ”y‘{”{ UÑ*¨dÑ2İÔ,¨QÑ/Ô/ğ		
+ğ 	
+ğ
+ ğ	
+ğ 	
+ğ 	
+ğ 	øøøøğøøøs   ¢'A Á
+BÁ7BÂBc                 ó®  — | j         d         }|s½| j        j        }	 t          j        ¦   «         }n# t
+          $ r d}Y nw xY wt          j        ¦   «          t          j        dd¦  «        }t          j
+        ¦   «         }t          j        |j        d||||                     dd¦  «        ¬¦  «        }| j                              d|¦  «         n|d         }|S )Ns   infinitepushloggers   unknownr   i ”5wr    r'   )rK   Ú	requestidÚhostnamerM   )Úrecordsrh   r8   r   ÚgetuserrC  ÚrandomÚseedÚrandintÚsocketÚgethostnameÚ	functoolsÚpartialÚlogr4   r®  )rª  rÅ  r8   ÚusernamerË  rÌ  s         r.   Ú_getorcreateinfinitepushloggerrØ  ê  sè   € ØŒZĞ-Ô.€FØğ ØŒWŒZˆğ	"İÔ'Ñ)Ô)ˆHˆHøİğ 	"ğ 	"ğ 	"Ø!ˆHˆHˆHğ	"øøøõ 	Œ‰Œˆİ”N 1 jÑ1Ô1ˆ	İÔ%Ñ'Ô'ˆİÔ"ØŒFØØØØØ—Y’Y˜°Ñ<Ô<ğ
+ñ 
+ô 
+ˆğ 	Œ
+ŠĞ,¨fÑ5Ô5Ğ5Ğ5à˜”ˆØ€Ms   1 ±A ¿A c                 óT  — |j                              t          d¦  «        ¦  «         t          j        |j         ¦  «        }t          j        |||¦  «        5 }|D ]+}d}|j        dk    rt          j        ||¦  «         nÌt          j        |j        | 	                    ¦   «         ¬¦  «        }|j
+                             ¦   «         D ]\  }}	|                     ||	¦  «         Œ|j        dv ra|j        Z|j                             d|j        z  ¦  «        }
+|
+                     dd|j        z  d	¬
+¦  «         |
+                     ddd	¬
+¦  «         |j                             |j        ddi¦  «         |r|                     |¦  «         Œ-	 ddd¦  «         n# 1 swxY w Y   t'          j        |                     ¦   «         ¦  «        }t-          j        ¦   «         \  }}	 	 t1          j        |d¦  «        }|                     | 	                    ¦   «         ¦  «         |                     ¦   «          n# |                     ¦   «          w xY wt9          |i |¦  «         	 t1          j        |¦  «         dS # t<          $ r Y dS w xY w# 	 t1          j        |¦  «         w # t<          $ r Y w w xY wxY w)zmstores the incoming bundle coming from push command to the bundlestore
+    instead of applying on the revlogss&   storing changesets on the bundlestore
+Nó	   replycapsrç   )r„   ræ   s   reply:%só   in-reply-tos   %dF©Ú	mandatoryó   returnó   1r   Úwb)r8   r°  r   r   Úbundle20Úpartiteratorr  Ú_processpartrí   rØ   r‘   r²   rî   Úreplyr  ÚidrÍ  r®  r  r   rì   Ú	getchunksr   Úmkstempr/  ÚfdopenÚwriter.  Ústorebundler0  rC  )r¬   rh   rª  r  r  rñ   r  rí   r  r  ÚrpartÚbufÚfdr  Úfps                  r.   Ústoretobundlestorerï    sü  € ğ 	„G‡N‚N•1Ğ?Ñ@Ô@ÑAÔAĞAİÔ˜tœwÑ'Ô'€Gõ 
+Ô	˜d B¨	Ñ	2Ô	2ğ ,°eØğ 	,ñ 	,ˆDØˆJØŒy˜LÒ(Ğ(åÔ$ R¨Ñ.Ô.Ğ.Ğ.å$Ô/°´	ÀÇ	Â	ÁÄĞLÑLÔL
+Ø"&¤+×"3Ò"3Ñ"5Ô"5ğ 4ğ 4‘JC˜Ø×'Ò'¨¨UÑ3Ô3Ğ3Ğ3ğ ”9Ğ <Ğ<Ğ<Ø”xĞ+Ø "¤× 0Ò 0°¸t¼yÑ1HÑ IÔ I˜ØŸšØ*¨E°D´G©OÀuğ 'ñ ô ğ ğ Ÿš y°$À%˜ÑHÔHĞHàŒJNŠNØ”	à˜qğñô ğ ğ ğ ,Ø—’ 
+Ñ+Ô+Ğ+ùğ5	,ğ,ğ ,ğ ,ñ ,ô ,ğ ,ğ ,ğ ,ğ ,ğ ,ğ ,øøøğ ,ğ ,ğ ,ğ ,õ< Ô
+˜7×,Ò,Ñ.Ô.Ñ
+/Ô
+/€CİÔ%Ñ'Ô'N€Bˆ
+ğğ	İ”˜2˜tÑ$Ô$ˆBØHŠHS—X’X‘Z”ZÑ Ô Ğ àHŠH‰JŒJˆJˆJøˆBHŠH‰JŒJˆJˆJøøøİB˜˜JÑ'Ô'Ğ'ğ	İŒIjÑ!Ô!Ğ!Ğ!Ğ!øİğ 	ğ 	ğ 	àˆDˆDğ	øøøøğ	İŒIjÑ!Ô!Ğ!Ğ!øİğ 	ğ 	ğ 	àˆDğ	øøøøøøsg   ÁD0FÆFÆFÇ<H. ÈJ  È.IÉJ  ÉI/ É/
+I=É<I=Ê J'ÊJÊJ'Ê
+J$Ê!J'Ê#J$Ê$J'c                 óä  — |j         dk    r | |||¦  «        S |j                             dd¦  «        rt          | |||¦  «        S |j                             d¦  «        dk    r | |||¦  «        S |j                             dd¦  «        }t          j        |j        ¦  «        }d }t          j        |||¦  «        5 }|D ]}d }	|j	        dk    rt          j
+        ||¦  «         n¦|j	        t          j        k    r©|j                             dd¦  «        }
+t          j        d	|                     ¦   «         ¬
+¦  «        }	|	                     d|
+¦  «         |j        }|sF|j                             t          dz   d¦  «         |j                             t          dz   d¦  «         nè|rÑt          j        |j	        |                     ¦   «         ¬
+¦  «        }	|j                             ¦   «         D ]\  }}|	                     ||¦  «         Œ|j	        dk    rc|j        \|j                             d¦  «        }|                     dt+          |j        ¦  «        d¬¦  «         |                     ddd¬¦  «         nt          j
+        ||¦  «         |r"|j                             |j	        ddi¦  «         |	r|                     |	¦  «         Œ
+	 d d d ¦  «         n# 1 swxY w Y   |rt1          j        |                     ¦   «         ¦  «        }t7          j        ¦   «         \  }}	 	 t;          j        |d¦  «        }|                     |                     ¦   «         ¦  «         |                      ¦   «          n# |                      ¦   «          w xY wtC          |||¦  «         	 t;          j"        |¦  «         d S # tF          $ r Y d S w xY w# 	 t;          j"        |¦  «         w # tF          $ r Y w w xY wxY wd S )Ns   unbundler    r)   r   r&   rÚ  ó	   cgversionr  ræ   rç   ré   ó   _skippushkeyTó   _skipphaseheadsr„   ó   reply:pushkeyrÛ  FrÜ  rŞ  rß  r   rà  )$r6  r8   rp   rï  r‘   r!  r   rá  râ  r  rã  r   r¦   rí   rØ   rî   rÍ  r®  r²   rä  r  r+  rå  r  r   rì   ræ  r   rç  r/  rè  ré  r.  rê  r0  rC  )r¬   rh   rª  r  Úhandleallpartsr  Úcgparamsrñ   r  rí   Ú	cgversionr  r  rë  rì  rí  r  rî  s                     r.   r—   r—   >  so  € ğ 
+„yKÒĞØˆtD˜"˜iÑ(Ô(Ğ(ğ „w×Ò˜/Ğ+?Ñ@Ô@ğ =İ! $¨¨b°)Ñ<Ô<Ğ<àÔ×Ò˜OÑ,Ô,°Ò7Ğ7ØˆtD˜"˜iÑ(Ô(Ğ(à”W×'Ò'¨Ğ9IÑJÔJ€NåÔ˜tœwÑ'Ô'€GØ€Hİ	Ô	˜d B¨	Ñ	2Ô	2ğ :,°eØğ 9	,ñ 9	,ˆDØˆJØŒy˜LÒ(Ğ(åÔ$ R¨Ñ.Ô.Ğ.Ñ.Ø”kÔ?Ò?Ğ?ğ !œKŸOšO¨L¸%Ñ@Ô@	İ$Ô/Ø"¨¯ª©¬ğñ ô 
+ğ ×#Ò# J°	Ñ:Ô:Ğ:Øœ;ğ
+ &ğ Ø”J—N’Nİ-°Ñ?Àñô ğ ğ ”J—N’Nİ-Ğ0BÑBÀDñô ğ øğ "ğ 3õ
+ ")Ô!3°D´IÀDÇIÂIÁKÄKĞ!PÑ!PÔ!PJØ&*¤k×&7Ò&7Ñ&9Ô&9ğ 8ğ 8™
+˜˜UØ"×+Ò+¨C°Ñ7Ô7Ğ7Ğ7ğ ”y JÒ.Ğ.Øœ8Ğ/Ø$&¤H×$4Ò$4Ğ5EÑ$FÔ$F˜EØ!ŸNšNØ .µ°D´G±´Èğ +ñ ô ğ ğ "ŸNšN¨9°dÀe˜NÑLÔLĞLøåÔ(¨¨TÑ2Ô2Ğ2àğ Ø”
+—’Ø”Ià! 1ğñô ğ ğ ğ ,Ø—’ 
+Ñ+Ô+Ğ+ùğs9	,ğ:,ğ :,ğ :,ñ :,ô :,ğ :,ğ :,ğ :,ğ :,ğ :,ğ :,øøøğ :,ğ :,ğ :,ğ :,ğz ñ İÔ˜w×0Ò0Ñ2Ô2Ñ3Ô3ˆİ!Ô)Ñ+Ô+‰ˆˆJğ	ğİ”Y˜r 4Ñ(Ô(Ø—’˜Ÿš™œÑ$Ô$Ğ$à—’‘
+”
+
+
+ø—’‘
+”
+
+
+øøøİ˜˜H jÑ1Ô1Ğ1ğİ”	˜*Ñ%Ô%Ğ%Ğ%Ğ%øİğ ğ ğ àğøøøøğİ”	˜*Ñ%Ô%Ğ%Ğ%øİğ ğ ğ àğøøøøøøğğ sg   Â=HKËKËKÌ#<M4 ÍO Í4N
+Î
+O ÎN5 Î5
+OÏOÏO-ÏOÏO-Ï
+O*Ï'O-Ï)O*Ï*O-c           	      ó”
+  ‡‡‡— t          | ¦  «        }t          j        ¦   «         } |t          d¬¦  «         | j        j        j        Š| j        j        j        }| j                             t          dz   d¦  «         d Š	 d| j        j	        |fz  }t          j        | j        j        |¦  «        Š|                     d¦  «        }|                     dd¦  «        }|                     d	¦  «        }	|r‰                     |¦  «        }
+nd }
+‰                     d
+¦  «        }|r4t!          |¦  «        dk    r!t#          j        t'          d¦  «        ¦  «        ‚t)          ‰|
+|	|¦  «        }t!          |¦  «        dk    rdnd}| j        j                             t'          d¦  «        t!          |¦  «        |fz  ¦  «         d}t-          dt/          t!          |¦  «        |¦  «        ¦  «        D ]m}‰||                                       ¦   «                              d¦  «        d         d d…         }| j        j                             d||         |fz  ¦  «         Œnt!          |¦  «        |dz   k    rŠ| j        j                             d¦  «         ‰|d                                       ¦   «                              d¦  «        d         d d…         }| j        j                             d|d         |fz  ¦  «         ˆfd„|D ¦   «         }ˆˆfd„Š|rt5          ˆfd„|D ¦   «         ¦  «        }nd}|r|d                              ¦   «         nd }d }|rÄt9          |d¦  «        5 }|                     ¦   «         }t=          |dt!          |¦  «        ¬¦  «        5  d}t!          |¦  «        |k    r'd}t#          j        |t!          |¦  «        fz  ¦  «        ‚|                     |¦  «        }d d d ¦  «         n# 1 swxY w Y   d d d ¦  «         n# 1 swxY w Y   t=          |d|¬¦  «        5  ‰5  |r‰                      ||¦  «         |r)‰ !                    ||¦  «         tE          | ||||¦  «         d d d ¦  «         n# 1 swxY w Y   d d d ¦  «         n# 1 swxY w Y    |t          d t          j        ¦   «         |z
+  d!z  ¬"¦  «         nP# tF          $ rC} |t          d#t          j        ¦   «         |z
+  d!z  tI          j%        |¦  «        ¬$¦  «         ‚ d }~ww xY w	 ‰r‰ &                    ¦   «          d S d S # ‰r‰ &                    ¦   «          w w xY w)%Nr¼  )r»  rò  Tr  rM  ó   bookprevnoder$   ó   forcerı   r   s2   cannot push more than one head to a scratch branchó   ss   pushing %d commit%s:
+é
+   r   ó   
+é2   s       %s  %s
+s       ...
+r»   c                 ó    •— g | ]
+}‰|         ‘ŒS r,   r,   )r™  rù   r  s     €r.   rœ  zstorebundle.<locals>.<listcomp>È  s   ø€ Ğ0Ğ0Ğ0 CF˜3”KĞ0Ğ0Ğ0r$   c                 óx   •— t          ‰                     ‰|                               ¦   «         ¦  «        ¦  «        S rt   )r3  rD  r   )rù   r  rf   s    €€r.   r/   zstorebundle.<locals>.<lambda>É  s)   ø€ d 5§?¢?°6¸#´;·?²?Ñ3DÔ3DÑ#EÔ#EÑFÔF€ r$   c              3   ó0   •K  — | ]} ‰|¦  «         V — Œd S rt   r,   )r™  rù   Úinindexs     €r.   ú	<genexpr>zstorebundle.<locals>.<genexpr>Ë  s.   øè è € ĞHĞH°S G G¨C¡L¤LĞ 0ĞHĞHĞHĞHĞHĞHr$   r  s   bundlestore)Ú
+bundlesizei  @s7   bundle is too big: %d bytes. max allowed size is 100 MBs   index)Únewheadscountr½  r¾  r¿  rÁ  rÂ  )'rØ  rÄ  r¦   rh   ra   rf   r2   rÍ  r®  r)  r   r*  r8   r!  rA  rĞ   r\   r   r5   r   r¹  ÚwarnÚrangeÚminÚdescriptionrD   Úsumr   r   rØ   rÉ  ré  Ú	addbundleÚaddbookmarkÚ_maybeaddpushbackpartrC  r	   rE  r.  )rª  r‘   r  rÖ  Úparthandlerstartr2   r<  rÃ   Úbookprevnoder¸  r·  rÿ   rĞ   ÚpluralÚ	maxoutputÚiÚ	firstlineÚnodesctxr  Úbookmarknoder  r  Ú
+bundledataÚbundlesizelimitÚ	error_msgrÈ  r  rf   r  s                             @@@r.   rê  rê    su  øøø€ İ
+(¨Ñ
+,Ô
+,€Cİ”y‘{”{ĞØ€CÕ¨Ğ2Ñ2Ô2Ğ2ØŒGÔÔ%€EØŒGÔÔ%€EØ„J‡N‚NÕ(¨?Ñ:¸DÑAÔAĞAà€FğTØ$¨¬¬°jĞ'AÑAˆ
+İ”˜rœwœz¨:Ñ6Ô6ˆà—:’:˜kÑ*Ô*ˆØ—z’z /°3Ñ7Ô7ˆØ—
+’
+˜8Ñ$Ô$ˆàğ 	Ø—m’m HÑ-Ô-ˆGˆGàˆGØ—k’kĞ"4Ñ5Ô5ˆØğ 	˜KÑ(Ô(¨1Ò,Ğ,İ”+İĞGÑHÔHñô ğ õ ˜ ¨°Ñ9Ô9ˆõ ˜T™œ Qš˜¨CˆØ
+ŒŒ
+ŠĞ3Ñ4Ô4½¸D¹	¼	À6Ğ7JÑJÑKÔKĞKØˆ	İq#c $™iœi¨Ñ3Ô3Ñ4Ô4ğ 	Dğ 	DˆAØ˜t Aœwœ×3Ò3Ñ5Ô5×;Ò;¸EÑBÔBÀ1ÔEÀcÀrÀcÔJˆIØŒGŒJOŠO˜O¨t°A¬w¸	Ğ.BÑBÑCÔCĞCĞCåˆt‰9Œ9y 1‘}Ò$Ğ$ØŒGŒJOŠO˜LÑ)Ô)Ğ)Ø˜t BœxÔ(×4Ò4Ñ6Ô6×<Ò<¸UÑCÔCÀAÔFÀsÈÀsÔKˆIØŒGŒJOŠO˜O¨t°B¬x¸Ğ.CÑCÑDÔDĞDà0Ğ0Ğ0Ğ0¨4Ğ0Ñ0Ô0ˆØFĞFĞFĞFĞFˆØğ 	İĞHĞHĞHĞH¸KĞHÑHÔHÑHÔHˆMˆMàˆMğ
+ .6Ğ?x ”|×'Ò'Ñ)Ô)Ğ)¸4ˆØˆØğ 	2İj %Ñ(Ô(ğ 2¨AØŸVšV™XœX
+İ#Ø˜µC¸
+±O´Oğñ ô ğ 
+2ğ 
+2ğ '8Oİ˜:‘”¨Ò8Ğ8ğ<ğ "õ $œk¨)µs¸:±´Ğ6HÑ*HÑIÔIĞIØŸ+š+ jÑ1Ô1Cğ
+2ğ 
+2ğ 
+2ñ 
+2ô 
+2ğ 
+2ğ 
+2ğ 
+2ğ 
+2ğ 
+2ğ 
+2øøøğ 
+2ğ 
+2ğ 
+2ğ 
+2ğ2ğ 2ğ 2ñ 2ô 2ğ 2ğ 2ğ 2ğ 2ğ 2ğ 2øøøğ 2ğ 2ğ 2ğ 2õ ˜C ¸ĞGÑGÔGğ 	ğ 	Èğ 	ğ 	Øğ /Ø—’  XÑ.Ô.Ğ.Øğ Ø×!Ò! (¨LÑ9Ô9Ğ9İ%Ø˜ ,°¸fñô ğ ğ	ğ 	ğ 	ñ 	ô 	ğ 	ğ 	ğ 	ğ 	ğ 	ğ 	øøøğ 	ğ 	ğ 	ğ 	ğ 	ğ 	ğ 	ñ 	ô 	ğ 	ğ 	ğ 	ğ 	ğ 	ğ 	øøøğ 	ğ 	ğ 	ğ 	ğ 	ˆİ!Ø İ”y‘{”{Ğ%5Ñ5¸Ñ=ğ	
+ñ 	
+ô 	
+ğ 	
+ğ 	
+øõ ğ ğ ğ Øˆİ!Ø İ”y‘{”{Ğ%5Ñ5¸Ñ=İÔ,¨QÑ/Ô/ğ		
+ñ 	
+ô 	
+ğ 	
+ğ 	øøøøğøøøğ	
+ğ ğ 	ØLŠL‰NŒNˆNˆNˆNğ	ğ 	øˆ6ğ 	ØLŠL‰NŒNˆNˆNğ	øøøs½   Â KS Í4PÎAO/Ï#PÏ/O3	Ï3PÏ6O3	Ï7PÏ:S ĞP
+Ğ
+S ĞP
+ĞS Ğ#RĞ&AQ6Ñ*RÑ6Q:	Ñ:RÑ=Q:	Ñ>RÒS ÒRÒS ÒRÒ-S ÓT. Ó
+TÓ>TÔTÔT. Ô.U)rM  rù  rú  ó   pushbackbookmarksrñ  c                 ó:  — t          j        | j        j        ¦  «        }|j                             dd¦  «        }t          j        d|                     ¦   «         ¬¦  «        }|                     d|¦  «         | 	                    |¦  «         t          j        |                     ¦   «         ¦  «        }t          j        ¦   «         \  }}	 	 t          j        |d¦  «        }|                     |                     ¦   «         ¦  «         |                     ¦   «          n# |                     ¦   «          w xY wt'          | |j        |¦  «         	 t          j        |¦  «         n:# t*          $ r Y n.w xY w# 	 t          j        |¦  «         w # t*          $ r Y w w xY wxY wdS )z9unbundle a bundle2 part containing a changegroup to storerñ  r  ræ   rç   ré   rà  r   )r   rá  rh   r8   r‘   r!  rí   rØ   rî   r  r   rì   ræ  r   rç  r/  rè  ré  r.  rê  r0  ÚFileNotFoundError)	rª  r  r  r÷  rô   rì  rí  r  rî  s	            r.   Úbundle2scratchbranchr  ş  sƒ  € õ Ô˜rœwœzÑ*Ô*€GØ”—’ ¨eÑ4Ô4€IİÔ °T·Y²Y±[´[ĞAÑAÔA€FØ
+‡O‚OJ 	Ñ*Ô*Ğ*Ø‡O‚OFÑÔĞİ
+Ô
+˜7×,Ò,Ñ.Ô.Ñ
+/Ô
+/€CåÔ%Ñ'Ô'N€Bˆ
+ğğ	İ”˜2˜tÑ$Ô$ˆBØHŠHS—X’X‘Z”ZÑ Ô Ğ àHŠH‰JŒJˆJˆJøˆBHŠH‰JŒJˆJˆJøøøİB˜œ ZÑ0Ô0Ğ0ğ	İŒIjÑ!Ô!Ğ!Ğ!øİ ğ 	ğ 	ğ 	ØˆDğ	øøøøğ	İŒIjÑ!Ô!Ğ!Ğ!øİ ğ 	ğ 	ğ 	ØˆDğ	øøøøøøğ ˆ1sT   Ã<D ÄE1 ÄD2Ä2E1 ÅE! Å!
+E.Å-E.Å1FÅ3FÆFÆ
+FÆFÆFÆFc                 óĞ   — |                      d¦  «        rL| j        rGd| j        j        v r;d|||dœ}| j                             d|                     ¦   «         ¬¦  «         d S d S d S d S )Nr  s   pushbackr¹   )rÊ   r   s   news   oldr„   )Úmandatoryparams)r!  rä  Úcapabilitiesr  r²   )rª  rÃ   Únewnoder·  r‘   s        r.   r  r  #  s“   € Ø‡z‚zĞ&Ñ'Ô'ğ IØŒ8ğ 	I˜ r¤xÔ'<Ğ<Ğ<à*Ø ØØğ	ğ ˆFğ ŒH×Ò˜Z¸¿º¹¼ĞÑHÔHĞHĞHĞHğIğ Iğ	Iğ 	IĞ<Ğ<r$   c                 ó  — |j         t          dz            re|j        \|j                             d¦  «        }|                     dt          |j        ¦  «        d¬¦  «         |                     ddd¬¦  «         d	S  | ||¦  «        S )
+z£Wrapper of bundle2.handlepushkey()
+
+    The only goal is to skip calling the original function if flag is set.
+    It's set if infinitepush push is happening.
+    rò  Nrô  rÛ  FrÜ  rŞ  rß  r   )rÍ  r¦   rä  r  rî   r+  rå  )r¬   rª  r  rë  s       r.   r†   r†   /  s„   € ğ 
+„zÕ'¨/Ñ9Ô:ğ ØŒ8ĞØ”H×$Ò$Ğ%5Ñ6Ô6ˆEØNŠN˜>­3¨t¬w©<¬<À5ˆNÑIÔIĞIØNŠN˜9 d°eˆNÑ<Ô<Ğ<Øˆqàˆ4D‰>Œ>Ğr$   c                 óH   — |j         t          dz            rdS  | ||¦  «        S )z¢Wrapper of bundle2.handlephases()
+
+    The only goal is to skip calling the original function if flag is set.
+    It's set if infinitepush push is happening.
+    ró  N)rÍ  r¦   )r¬   rª  r  s      r.   rŒ   rŒ   ?  s/   € ğ 
+„zÕ'Ğ*<Ñ<Ô=ğ Øˆàˆ4D‰>Œ>Ğr$   c           	      ó  — d}t          |¦  «        |k    rdS g }|D ],}|                     d¦  «         |                     |¦  «         Œ-t          t          j        d¦  «        5 }t          j        ¦   «         dd| g|z   }t          j        t          j
+        t          j        |¦  «        dd|||¬	¦  «         ddd¦  «         dS # 1 swxY w Y   dS )
+zÃstarts a separate process that fills metadata for the nodes
+
+    This function creates a separate process and doesn't wait for it's
+    completion. This was done to avoid slowing down pushes
+    rş  Ns   --nodes   w+bs   debugfillinfinitepushmetadatas   -RTF)Ú	close_fdsÚshellÚstdinÚstdoutÚstderr)r\   r   r   r/  Údevnullr   ÚhgexecutableÚ
+subprocessÚPopenr   Úrapplyr   Útonativestr)r)  rh  ÚmaxnodesÚ	nodesargsrÄ   r)  Úcmdlines          r.   Ú_asyncsavemetadatar2  L  s4  € ğ €Hİ
+ˆ5z„zHÒĞØˆØ€IØğ ğ ˆØ×Ò˜Ñ#Ô#Ğ#Ø×Ò˜ÑÔĞĞİ	bŒj˜&Ñ	!Ô	!ğ 
+ WåÔÑÔØ,ØØğ	
+ğ
+ ñˆõ 	ÔİŒOHÔ0°'Ñ:Ô:ØØØØØğ	
+ñ 	
+ô 	
+ğ 	
+ğ
+ğ 
+ğ 
+ñ 
+ô 
+ğ 
+ğ 
+ğ 
+ğ 
+ğ 
+ğ 
+ğ 
+øøøğ 
+ğ 
+ğ 
+ğ 
+ğ 
+ğ 
+s   Á#ACÃCÃ	Crt   )NN)rJ  )kÚ__doc__ro  Ú
+contextlibrÔ  rQ   r/  rÏ  ÚrerÒ  r+  rÄ  Úmercurial.noder   r   Úmercurial.i18nr   Úmercurial.pycompatr   r   Úmercurial.utilsr   r	   r
+   Ú	mercurialr   r   r   r   r   r   r   r   r   r   r   r   r   r   r   r   r   r   r6   r   r   Ú
+testedwithÚconfigtableÚ
+configitemrª   r‡  r«   r¦   ÚrevsetpredicateÚtemplatekeywordr   ÚcompileÚsearchÚ
+_maybehashr=   rO   rF   r_   ra   rr   rv   r{   rx   ry   rz   r    r}   r”   Ú	batchabler¡   rÒ   râ   rõ   rû   r   r  r–   r•   rŸ   rT  rV  rW  rS  r   r£  r¥  rŠ  Úb2partsgeneratorr´  r  r¹  ÚcontextmanagerrÉ  rØ  rï  r—   rê  Úparthandlerr  r  r†   rŒ   r2  r,   r$   r.   ú<module>rG     s_  ğğQğ Qğh Ğ Ğ Ğ Ø Ğ Ğ Ğ Ø Ğ Ğ Ğ Ø €€€Ø 	€	€	€	Ø €€€Ø 	€	€	€	Ø €€€Ø Ğ Ğ Ğ Ø €€€ğğ ğ ğ ğ ğ ğ ğ ğ
+ Ğ Ğ Ğ Ğ Ğ ğğ ğ ğ ğ ğ ğ ğ ğ
+ğ ğ ğ ğ ğ ğ ğ ğ ğ ğğ ğ ğ ğ ğ ğ ğ ğ ğ ğ ğ ğ ğ ğ ğ ğ ğ ğ ğ ğ ğ ğ ğ ğ ğ ğ ğ ğ ğ ğ ğ ğ ğ ğ ğ ğ ğ ğ ğ ğ*ğ ğ ğ ğ ğ ğ ğ ğ #€
+à€Ø!ˆYÔ! +Ñ.Ô.€
+à 
+€
+ØØØğñ ô ğ ğ
+ €
+ØØØğñ ô ğ ğ
+ €
+ØØØğñ ô ğ ğ
+ €
+ØØØğñ ô ğ ğ
+ €
+ØØØğñ ô ğ ğ
+ €
+ØØØğñ ô ğ ğ
+ €
+ØØØğñ ô ğ ğ
+ €
+ØØØğñ ô ğ ğ
+ €
+ØØØğñ ô ğ ğ
+ €
+ØØ"Øğñ ô ğ ğ
+ €
+ØØØğñ ô ğ ğ €Ø/€Ø/Ğ à#Ô9Ğ Ø+)Ô+Ñ-Ô-€Ø+)Ô+Ñ-Ô-€Ø'˜Ğ ØˆRŒZ˜Ñ&Ô&Ô-€
+ğQğ Qğ Qğğ ğ ğ8ğ ğ ğğ ğ ğ ğ ğ ğ ğ ñ ô ğ ğ85ğ 5ğ 5ğ-ğ -ğ -ğ

@@ -1,0 +1,1000 @@
+            $patchorder{$fn} //= $i++;
+        }
+        @diff_files = sort { $patchorder{$a->[0]} <=> $patchorder{$b->[0]} }
+                      @diff_files;
+    } else {
+        @diff_files = sort { $a->[0] cmp $b->[0] } @diff_files;
+    }
+
+    foreach my $diff_file (@diff_files) {
+        my ($fn, $mode, $size,
+            $old_file, $new_file, $label_old, $label_new) = @$diff_file;
+        my $success = $self->add_diff_file($old_file, $new_file,
+                                           filename => $fn,
+                                           label_old => $label_old,
+                                           label_new => $label_new, %opts);
+        if ($success and
+            $old_file eq '/dev/null' and $new_file ne '/dev/null') {
+            if (not $size) {
+                warning(g_("newly created empty file '%s' will not " .
+                           'be represented in diff'), $fn);
+            } else {
+                if ($mode & (S_IXUSR | S_IXGRP | S_IXOTH)) {
+                    warning(g_("executable mode %04o of '%s' will " .
+                               'not be represented in diff'), $mode, $fn)
+                        unless $fn eq 'debian/rules';
+                }
+                if ($mode & (S_ISUID | S_ISGID | S_ISVTX)) {
+                    warning(g_("special mode %04o of '%s' will not " .
+                               'be represented in diff'), $mode, $fn);
+                }
+            }
+        }
+    }
+}
+
+sub finish {
+    my $self = shift;
+    close($self) or syserr(g_('cannot close %s'), $self->get_filename());
+    return not *$self->{errors};
+}
+
+sub register_error {
+    my $self = shift;
+    *$self->{errors}++;
+}
+sub _fail_with_msg {
+    my ($self, $file, $msg) = @_;
+    errormsg(g_('cannot represent change to %s: %s'), $file, $msg);
+    $self->register_error();
+}
+sub _fail_not_same_type {
+    my ($self, $old, $new, $file) = @_;
+    my $old_type = get_type($old);
+    my $new_type = get_type($new);
+    errormsg(g_('cannot represent change to %s:'), $file);
+    errormsg(g_('  new version is %s'), $new_type);
+    errormsg(g_('  old version is %s'), $old_type);
+    $self->register_error();
+}
+
+sub _getline {
+    my $handle = shift;
+
+    my $line = <$handle>;
+    if (defined $line) {
+        # Strip end-of-line chars
+        chomp($line);
+        $line =~ s/\r$//;
+    }
+    return $line;
+}
+
+# Fetch the header filename ignoring the optional timestamp
+sub _fetch_filename {
+    my ($diff, $header) = @_;
+
+    # Strip any leading spaces.
+    $header =~ s/^\s+//;
+
+    # Is it a C-style string?
+    if ($header =~ m/^"/) {
+        error(g_('diff %s patches file with C-style encoded filename'), $diff);
+    } else {
+        # Tab is the official separator, it's always used when
+        # filename contain spaces. Try it first, otherwise strip on space
+        # if there's no tab
+        $header =~ s/\s.*// unless $header =~ s/\t.*//;
+    }
+
+    return $header;
+}
+
+sub _intuit_file_patched {
+    my ($old, $new) = @_;
+
+    return $new unless defined $old;
+    return $old unless defined $new;
+    return $new if -e $new and not -e $old;
+    return $old if -e $old and not -e $new;
+
+    # We don't consider the case where both files are non-existent and
+    # where patch picks the one with the fewest directories to create
+    # since dpkg-source will pre-create the required directories
+
+    # Precalculate metrics used by patch
+    my ($tmp_o, $tmp_n) = ($old, $new);
+    my ($len_o, $len_n) = (length($old), length($new));
+    $tmp_o =~ s{[/\\]+}{/}g;
+    $tmp_n =~ s{[/\\]+}{/}g;
+    my $nb_comp_o = ($tmp_o =~ tr{/}{/});
+    my $nb_comp_n = ($tmp_n =~ tr{/}{/});
+    $tmp_o =~ s{^.*/}{};
+    $tmp_n =~ s{^.*/}{};
+    my ($blen_o, $blen_n) = (length($tmp_o), length($tmp_n));
+
+    # Decide like patch would
+    if ($nb_comp_o != $nb_comp_n) {
+        return ($nb_comp_o < $nb_comp_n) ? $old : $new;
+    } elsif ($blen_o != $blen_n) {
+        return ($blen_o < $blen_n) ? $old : $new;
+    } elsif ($len_o != $len_n) {
+        return ($len_o < $len_n) ? $old : $new;
+    }
+    return $old;
+}
+
+# check diff for sanity, find directories to create as a side effect
+sub analyze {
+    my ($self, $destdir, %opts) = @_;
+
+    $opts{verbose} //= 1;
+    my $diff = $self->get_filename();
+    my %filepatched;
+    my %dirtocreate;
+    my @patchorder;
+    my $patch_header = '';
+    my $diff_count = 0;
+
+    my $line = _getline($self);
+
+  HUNK:
+    while (defined $line or not eof $self) {
+	my (%path, %fn);
+
+	# Skip comments leading up to the patch (if any). Although we do not
+	# look for an Index: pseudo-header in the comments, because we would
+	# not use it anyway, as we require both ---/+++ filename headers.
+	while (1) {
+	    if ($line =~ /^(?:--- |\+\+\+ |@@ -)/) {
+		last;
+	    } else {
+		$patch_header .= "$line\n";
+	    }
+	    $line = _getline($self);
+	    last HUNK if not defined $line;
+	}
+	$diff_count++;
+	# read file header (---/+++ pair)
+	unless ($line =~ s/^--- //) {
+	    error(g_("expected ^--- in line %d of diff '%s'"), $., $diff);
+	}
+	$path{old} = $line = _fetch_filename($diff, $line);
+	if ($line ne '/dev/null' and $line =~ s{^[^/]*/+}{$destdir/}) {
+	    $fn{old} = $line;
+	}
+	if ($line =~ /\.dpkg-orig$/) {
+	    error(g_("diff '%s' patches file with name ending in .dpkg-orig"),
+	          $diff);
+	}
+
+	$line = _getline($self);
+	unless (defined $line) {
+	    error(g_("diff '%s' finishes in middle of ---/+++ (line %d)"),
+	          $diff, $.);
+	}
+	unless ($line =~ s/^\+\+\+ //) {
+	    error(g_("line after --- isn't as expected in diff '%s' (line %d)"),
+	          $diff, $.);
+	}
+	$path{new} = $line = _fetch_filename($diff, $line);
+	if ($line ne '/dev/null' and $line =~ s{^[^/]*/+}{$destdir/}) {
+	    $fn{new} = $line;
+	}
+
+	unless (defined $fn{old} or defined $fn{new}) {
+	    error(g_("none of the filenames in ---/+++ are valid in diff '%s' (line %d)"),
+		  $diff, $.);
+	}
+
+	# Safety checks on both filenames that patch could use
+	foreach my $key ('old', 'new') {
+	    next unless defined $fn{$key};
+	    if ($path{$key} =~ m{/\.\./}) {
+		error(g_('%s contains an insecure path: %s'), $diff, $path{$key});
+	    }
+	    my $path = $fn{$key};
+	    while (1) {
+		if (-l $path) {
+		    error(g_('diff %s modifies file %s through a symlink: %s'),
+			  $diff, $fn{$key}, $path);
+		}
+		last unless $path =~ s{/+[^/]*$}{};
+		last if length($path) <= length($destdir); # $destdir is assumed safe
+	    }
+	}
+
+        if ($path{old} eq '/dev/null' and $path{new} eq '/dev/null') {
+            error(g_("original and modified files are /dev/null in diff '%s' (line %d)"),
+                  $diff, $.);
+        } elsif ($path{new} eq '/dev/null') {
+            error(g_("file removal without proper filename in diff '%s' (line %d)"),
+                  $diff, $. - 1) unless defined $fn{old};
+            if ($opts{verbose}) {
+                warning(g_('diff %s removes a non-existing file %s (line %d)'),
+                        $diff, $fn{old}, $.) unless -e $fn{old};
+            }
+        }
+	my $fn = _intuit_file_patched($fn{old}, $fn{new});
+
+	my $dirname = $fn;
+	if ($dirname =~ s{/[^/]+$}{} and not -d $dirname) {
+	    $dirtocreate{$dirname} = 1;
+	}
+
+	if (-e $fn and not -f _) {
+	    error(g_("diff '%s' patches something which is not a plain file"),
+	          $diff);
+	}
+
+	if ($filepatched{$fn}) {
+            $filepatched{$fn}++;
+
+            if ($opts{fatal_dupes}) {
+                error(g_("diff '%s' patches files multiple times; split the " .
+                         'diff in multiple files or merge the hunks into a ' .
+                         'single one'), $diff);
+            } elsif ($opts{verbose} and $filepatched{$fn} == 2) {
+                warning(g_("diff '%s' patches file %s more than once"), $diff, $fn)
+            }
+	} else {
+	    $filepatched{$fn} = 1;
+	    push @patchorder, $fn;
+	}
+
+	# read hunks
+	my $hunk = 0;
+	while (defined($line = _getline($self))) {
+	    # read hunk header (@@)
+	    next if $line =~ /^\\ /;
+	    last unless $line =~ /^@@ -\d+(,(\d+))? \+\d+(,(\d+))? @\@(?: .*)?$/;
+	    my ($olines, $nlines) = ($1 ? $2 : 1, $3 ? $4 : 1);
+	    # read hunk
+	    while ($olines || $nlines) {
+		unless (defined($line = _getline($self))) {
+                    if (($olines == $nlines) and ($olines < 3)) {
+                        warning(g_("unexpected end of diff '%s'"), $diff)
+                            if $opts{verbose};
+                        last;
+                    } else {
+                        error(g_("unexpected end of diff '%s'"), $diff);
+                    }
+		}
+		next if $line =~ /^\\ /;
+		# Check stats
+		if ($line =~ /^ / or length $line == 0) {
+		    --$olines;
+		    --$nlines;
+		} elsif ($line =~ /^-/) {
+		    --$olines;
+		} elsif ($line =~ /^\+/) {
+		    --$nlines;
+		} else {
+		    error(g_("expected [ +-] at start of line %d of diff '%s'"),
+		          $., $diff);
+		}
+	    }
+	    $hunk++;
+	}
+	unless ($hunk) {
+	    error(g_("expected ^\@\@ at line %d of diff '%s'"), $., $diff);
+	}
+    }
+    close($self);
+    unless ($diff_count) {
+	warning(g_("diff '%s' doesn't contain any patch"), $diff)
+	    if $opts{verbose};
+    }
+    *$self->{analysis}{$destdir}{dirtocreate} = \%dirtocreate;
+    *$self->{analysis}{$destdir}{filepatched} = \%filepatched;
+    *$self->{analysis}{$destdir}{patchorder} = \@patchorder;
+    *$self->{analysis}{$destdir}{patchheader} = $patch_header;
+    return *$self->{analysis}{$destdir};
+}
+
+sub prepare_apply {
+    my ($self, $analysis, %opts) = @_;
+    if ($opts{create_dirs}) {
+	foreach my $dir (keys %{$analysis->{dirtocreate}}) {
+	    eval { make_path($dir, { mode => 0777 }) };
+	    syserr(g_('cannot create directory %s'), $dir) if $@;
+	}
+    }
+}
+
+sub apply {
+    my ($self, $destdir, %opts) = @_;
+    # Set default values to options
+    $opts{force_timestamp} //= 1;
+    $opts{remove_backup} //= 1;
+    $opts{create_dirs} //= 1;
+    $opts{options} ||= [
+        '-t',
+        '-F', '0',
+        '-N',
+        '-p1',
+        '-u',
+        '-V', 'never',
+        '-b',
+        '-z', '.dpkg-orig',
+    ];
+    $opts{add_options} //= [];
+    push @{$opts{options}}, @{$opts{add_options}};
+    # Check the diff and create missing directories
+    my $analysis = $self->analyze($destdir, %opts);
+    $self->prepare_apply($analysis, %opts);
+    # Apply the patch
+    $self->ensure_open('r');
+    my ($stdout, $stderr) = ('', '');
+    spawn(
+	exec => [ $Dpkg::PROGPATCH, @{$opts{options}} ],
+	chdir => $destdir,
+	env => { LC_ALL => 'C', LANG => 'C', PATCH_GET => '0' },
+	delete_env => [ 'POSIXLY_CORRECT' ], # ensure expected patch behaviour
+	wait_child => 1,
+	nocheck => 1,
+	from_handle => $self->get_filehandle(),
+	to_string => \$stdout,
+	error_to_string => \$stderr,
+    );
+    if ($?) {
+	print { *STDOUT } $stdout;
+	print { *STDERR } $stderr;
+	subprocerr("LC_ALL=C $Dpkg::PROGPATCH " . join(' ', @{$opts{options}}) .
+	           ' < ' . $self->get_filename());
+    }
+    $self->close();
+    # Reset the timestamp of all the patched files
+    # and remove .dpkg-orig files
+    my @files = keys %{$analysis->{filepatched}};
+    my $now = $opts{timestamp};
+    $now //= fs_time($files[0]) if $opts{force_timestamp} && scalar @files;
+    foreach my $fn (@files) {
+	if ($opts{force_timestamp}) {
+	    utime($now, $now, $fn) or $! == ENOENT
+		or syserr(g_('cannot change timestamp for %s'), $fn);
+	}
+	if ($opts{remove_backup}) {
+	    $fn .= '.dpkg-orig';
+	    unlink($fn) or syserr(g_('remove patch backup file %s'), $fn);
+	}
+    }
+    return $analysis;
+}
+
+# Verify if check will work...
+sub check_apply {
+    my ($self, $destdir, %opts) = @_;
+    # Set default values to options
+    $opts{create_dirs} //= 1;
+    $opts{options} ||= [
+        '--dry-run',
+        '-s',
+        '-t',
+        '-F', '0',
+        '-N',
+        '-p1',
+        '-u',
+        '-V', 'never',
+        '-b',
+        '-z', '.dpkg-orig',
+    ];
+    $opts{add_options} //= [];
+    push @{$opts{options}}, @{$opts{add_options}};
+    # Check the diff and create missing directories
+    my $analysis = $self->analyze($destdir, %opts);
+    $self->prepare_apply($analysis, %opts);
+    # Apply the patch
+    $self->ensure_open('r');
+    my $patch_pid = spawn(
+	exec => [ $Dpkg::PROGPATCH, @{$opts{options}} ],
+	chdir => $destdir,
+	env => { LC_ALL => 'C', LANG => 'C', PATCH_GET => '0' },
+	delete_env => [ 'POSIXLY_CORRECT' ], # ensure expected patch behaviour
+	from_handle => $self->get_filehandle(),
+	to_file => '/dev/null',
+	error_to_file => '/dev/null',
+    );
+    wait_child($patch_pid, nocheck => 1);
+    my $exit = WEXITSTATUS($?);
+    subprocerr("$Dpkg::PROGPATCH --dry-run") unless WIFEXITED($?);
+    $self->close();
+    return ($exit == 0);
+}
+
+# Helper functions
+sub get_type {
+    my $file = shift;
+    if (not lstat($file)) {
+        return g_('nonexistent') if $! == ENOENT;
+        syserr(g_('cannot stat %s'), $file);
+    } else {
+        -f _ && return g_('plain file');
+        -d _ && return g_('directory');
+        -l _ && return sprintf(g_('symlink to %s'), readlink($file));
+        -b _ && return g_('block device');
+        -c _ && return g_('character device');
+        -p _ && return g_('named pipe');
+        -S _ && return g_('named socket');
+    }
+}
+
+1;
+                                                                                                                                                                                                                                                                                                                                                                                                                                                         usr/share/perl5/Dpkg/Source/Quilt.pm                                                                0000644 0000000 0000000 00000025650 14427046421 016003  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        # Copyright © 2008-2012 Raphaël Hertzog <hertzog@debian.org>
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 2 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+package Dpkg::Source::Quilt;
+
+use strict;
+use warnings;
+
+our $VERSION = '0.02';
+
+use List::Util qw(any none);
+use File::Spec;
+use File::Copy;
+use File::Find;
+use File::Path qw(make_path);
+use File::Basename;
+
+use Dpkg::Gettext;
+use Dpkg::ErrorHandling;
+use Dpkg::File;
+use Dpkg::Source::Patch;
+use Dpkg::Source::Functions qw(erasedir chmod_if_needed fs_time);
+use Dpkg::Vendor qw(get_current_vendor);
+
+sub new {
+    my ($this, $dir, %opts) = @_;
+    my $class = ref($this) || $this;
+
+    my $self = {
+        dir => $dir,
+    };
+    bless $self, $class;
+
+    $self->load_series();
+    $self->load_db();
+
+    return $self;
+}
+
+sub setup_db {
+    my $self = shift;
+    my $db_dir = $self->get_db_file();
+    if (not -d $db_dir) {
+        mkdir $db_dir or syserr(g_('cannot mkdir %s'), $db_dir);
+    }
+    my $file = $self->get_db_file('.version');
+    if (not -e $file) {
+        file_dump($file, "2\n");
+    }
+    # The files below are used by quilt to know where patches are stored
+    # and what file contains the patch list (supported by quilt >= 0.48-5
+    # in Debian).
+    $file = $self->get_db_file('.quilt_patches');
+    if (not -e $file) {
+        file_dump($file, "debian/patches\n");
+    }
+    $file = $self->get_db_file('.quilt_series');
+    if (not -e $file) {
+        my $series = $self->get_series_file();
+        $series = (File::Spec->splitpath($series))[2];
+        file_dump($file, "$series\n");
+    }
+}
+
+sub load_db {
+    my $self = shift;
+
+    my $pc_applied = $self->get_db_file('applied-patches');
+    $self->{applied_patches} = [ $self->read_patch_list($pc_applied) ];
+}
+
+sub save_db {
+    my $self = shift;
+
+    $self->setup_db();
+    my $pc_applied = $self->get_db_file('applied-patches');
+    $self->write_patch_list($pc_applied, $self->{applied_patches});
+}
+
+sub load_series {
+    my ($self, %opts) = @_;
+
+    my $series = $self->get_series_file();
+    $self->{series} = [ $self->read_patch_list($series, %opts) ];
+}
+
+sub series {
+    my $self = shift;
+    return @{$self->{series}};
+}
+
+sub applied {
+    my $self = shift;
+    return @{$self->{applied_patches}};
+}
+
+sub top {
+    my $self = shift;
+    my $count = scalar @{$self->{applied_patches}};
+    return $self->{applied_patches}[$count - 1] if $count;
+    return;
+}
+
+sub register {
+    my ($self, $patch_name) = @_;
+
+    return if any { $_ eq $patch_name } @{$self->{series}};
+
+    # Add patch to series files.
+    $self->setup_db();
+    $self->_file_add_line($self->get_series_file(), $patch_name);
+    $self->_file_add_line($self->get_db_file('applied-patches'), $patch_name);
+    $self->load_db();
+    $self->load_series();
+
+    # Ensure quilt meta-data is created and in sync with some trickery:
+    # Reverse-apply the patch, drop .pc/$patch, and re-apply it with the
+    # correct options to recreate the backup files.
+    $self->pop(reverse_apply => 1);
+    $self->push();
+}
+
+sub unregister {
+    my ($self, $patch_name) = @_;
+
+    return if none { $_ eq $patch_name } @{$self->{series}};
+
+    my $series = $self->get_series_file();
+
+    $self->_file_drop_line($series, $patch_name);
+    $self->_file_drop_line($self->get_db_file('applied-patches'), $patch_name);
+    erasedir($self->get_db_file($patch_name));
+    $self->load_db();
+    $self->load_series();
+
+    # Clean up empty series.
+    unlink $series if -z $series;
+}
+
+sub next {
+    my $self = shift;
+    my $count_applied = scalar @{$self->{applied_patches}};
+    my $count_series = scalar @{$self->{series}};
+    return $self->{series}[$count_applied] if ($count_series > $count_applied);
+    return;
+}
+
+sub push {
+    my ($self, %opts) = @_;
+    $opts{verbose} //= 0;
+    $opts{timestamp} //= fs_time($self->{dir});
+
+    my $patch = $self->next();
+    return unless defined $patch;
+
+    my $path = $self->get_patch_file($patch);
+    my $obj = Dpkg::Source::Patch->new(filename => $path);
+
+    info(g_('applying %s'), $patch) if $opts{verbose};
+    eval {
+        $obj->apply($self->{dir}, timestamp => $opts{timestamp},
+                    verbose => $opts{verbose},
+                    force_timestamp => 1, create_dirs => 1, remove_backup => 0,
+                    options => [ '-t', '-F', '0', '-N', '-p1', '-u',
+                                 '-V', 'never', '-E', '-b',
+                                 '-B', ".pc/$patch/", '--reject-file=-' ]);
+    };
+    if ($@) {
+        info(g_('the patch has fuzz which is not allowed, or is malformed'));
+        info(g_("if patch '%s' is correctly applied by quilt, use '%s' to update it"),
+             $patch, 'quilt refresh');
+        info(g_('if the file is present in the unpacked source, make sure it ' .
+                'is also present in the orig tarball'));
+        $self->restore_quilt_backup_files($patch, %opts);
+        erasedir($self->get_db_file($patch));
+        die $@;
+    }
+    CORE::push @{$self->{applied_patches}}, $patch;
+    $self->save_db();
+}
+
+sub pop {
+    my ($self, %opts) = @_;
+    $opts{verbose} //= 0;
+    $opts{timestamp} //= fs_time($self->{dir});
+    $opts{reverse_apply} //= 0;
+
+    my $patch = $self->top();
+    return unless defined $patch;
+
+    info(g_('unapplying %s'), $patch) if $opts{verbose};
+    my $backup_dir = $self->get_db_file($patch);
+    if (-d $backup_dir and not $opts{reverse_apply}) {
+        # Use the backup copies to restore
+        $self->restore_quilt_backup_files($patch);
+    } else {
+        # Otherwise reverse-apply the patch
+        my $path = $self->get_patch_file($patch);
+        my $obj = Dpkg::Source::Patch->new(filename => $path);
+
+        $obj->apply($self->{dir}, timestamp => $opts{timestamp},
+                    verbose => 0, force_timestamp => 1, remove_backup => 0,
+                    options => [ '-R', '-t', '-N', '-p1',
+                                 '-u', '-V', 'never', '-E',
+                                 '--no-backup-if-mismatch' ]);
+    }
+
+    erasedir($backup_dir);
+    pop @{$self->{applied_patches}};
+    $self->save_db();
+}
+
+sub get_db_version {
+    my $self = shift;
+    my $pc_ver = $self->get_db_file('.version');
+    if (-f $pc_ver) {
+        my $version = file_slurp($pc_ver);
+        chomp $version;
+        return $version;
+    }
+    return;
+}
+
+sub find_problems {
+    my $self = shift;
+    my $patch_dir = $self->get_patch_file();
+    if (-e $patch_dir and not -d _) {
+        return sprintf(g_('%s should be a directory or non-existing'), $patch_dir);
+    }
+    my $series = $self->get_series_file();
+    if (-e $series and not -f _) {
+        return sprintf(g_('%s should be a file or non-existing'), $series);
+    }
+    return;
+}
+
+sub get_series_file {
+    my $self = shift;
+    my $vendor = lc(get_current_vendor() || 'debian');
+    # Series files are stored alongside patches
+    my $default_series = $self->get_patch_file('series');
+    my $vendor_series = $self->get_patch_file("$vendor.series");
+    return $vendor_series if -e $vendor_series;
+    return $default_series;
+}
+
+sub get_db_file {
+    my $self = shift;
+    return File::Spec->catfile($self->{dir}, '.pc', @_);
+}
+
+sub get_db_dir {
+    my $self = shift;
+    return $self->get_db_file();
+}
+
+sub get_patch_file {
+    my $self = shift;
+    return File::Spec->catfile($self->{dir}, 'debian', 'patches', @_);
+}
+
+sub get_patch_dir {
+    my $self = shift;
+    return $self->get_patch_file();
+}
+
+## METHODS BELOW ARE INTERNAL ##
+
+sub _file_load {
+    my ($self, $file) = @_;
+
+    open my $file_fh, '<', $file or syserr(g_('cannot read %s'), $file);
+    my @lines = <$file_fh>;
+    close $file_fh;
+
+    return @lines;
+}
+
+sub _file_add_line {
+    my ($self, $file, $line) = @_;
+
+    my @lines;
+    @lines = $self->_file_load($file) if -f $file;
+    CORE::push @lines, $line;
+    chomp @lines;
+
+    open my $file_fh, '>', $file or syserr(g_('cannot write %s'), $file);
+    print { $file_fh } "$_\n" foreach @lines;
+    close $file_fh;
+}
+
+sub _file_drop_line {
+    my ($self, $file, $re) = @_;
+
+    my @lines = $self->_file_load($file);
+    open my $file_fh, '>', $file or syserr(g_('cannot write %s'), $file);
+    print { $file_fh } $_ foreach grep { not /^\Q$re\E\s*$/ } @lines;
+    close $file_fh;
+}
+
+sub read_patch_list {
+    my ($self, $file, %opts) = @_;
+    return () if not defined $file or not -f $file;
+    $opts{warn_options} //= 0;
+    my @patches;
+    open(my $series_fh, '<' , $file) or syserr(g_('cannot read %s'), $file);
+    while (defined(my $line = <$series_fh>)) {
+        chomp $line;
+        # Strip leading/trailing spaces
+        $line =~ s/^\s+//;
+        $line =~ s/\s+$//;
+        # Strip comment
+        $line =~ s/(?:^|\s+)#.*$//;
+        next unless $line;
+        if ($line =~ /^(\S+)\s+(.*)$/) {
+            $line = $1;
+            if ($2 ne '-p1') {
+                warning(g_('the series file (%s) contains unsupported ' .
+                           "options ('%s', line %s); dpkg-source might " .
+                           'fail when applying patches'),
+                        $file, $2, $.) if $opts{warn_options};
+            }
+        }
+        if ($line =~ m{(^|/)\.\./}) {
+            error(g_('%s contains an insecure path: %s'), $file, $line);
+        }
+        CORE::push @patches, $line;
+    }
+    close($series_fh);
+    return @patches;
+}
+
+sub write_patch_list {
+    my ($self, $series, $patches) = @_;
+
+    open my $series_fh, '>', $series or syserr(g_('cannot write %s'), $series);
+    foreach my $patch (@{$patches}) {
+        print { $series_fh } "$patch\n";
+    }
+    close $series_fh;
+}
+
+sub restore_quilt_backup_files {
+    my ($self, $patch, %opts) = @_;
+    my $patch_dir = $self->get_db_file($patch);
+    return unless -d $patch_dir;
+    info(g_('restoring quilt backup files for %s'), $patch) if $opts{verbose};
+    find({
+        no_chdir => 1,
+        wanted => sub {
+            return if -d;
+            my $relpath_in_srcpkg = File::Spec->abs2rel($_, $patch_dir);
+            my $target = File::Spec->catfile($self->{dir}, $relpath_in_srcpkg);
+            if (-s) {
+                unlink($target);
+                make_path(dirname($target));
+                unless (link($_, $target)) {
+                    copy($_, $target)
+                        or syserr(g_('failed to copy %s to %s'), $_, $target);
+                    chmod_if_needed((stat _)[2], $target)
+                        or syserr(g_("unable to change permission of '%s'"), $target);
+                }
+            } else {
+                # empty files are "backups" for new files that patch created
+                unlink($target);
+            }
+        }
+    }, $patch_dir);
+}
+
+1;
+                                                                                        usr/share/perl5/Dpkg/Substvars.pm                                                                   0000644 0000000 0000000 00000027113 14427046421 015435  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        # Copyright © 2006-2009, 2012-2020, 2022 Guillem Jover <guillem@debian.org>
+# Copyright © 2007-2010 Raphaël Hertzog <hertzog@debian.org>
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 2 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+package Dpkg::Substvars;
+
+use strict;
+use warnings;
+
+our $VERSION = '2.01';
+
+use Dpkg ();
+use Dpkg::Arch qw(get_host_arch);
+use Dpkg::Vendor qw(get_current_vendor);
+use Dpkg::Version;
+use Dpkg::ErrorHandling;
+use Dpkg::Gettext;
+
+use parent qw(Dpkg::Interface::Storable);
+
+my $maxsubsts = 50;
+
+=encoding utf8
+
+=head1 NAME
+
+Dpkg::Substvars - handle variable substitution in strings
+
+=head1 DESCRIPTION
+
+It provides a class which is able to substitute variables in strings.
+
+=cut
+
+use constant {
+    SUBSTVAR_ATTR_USED => 1,
+    SUBSTVAR_ATTR_AUTO => 2,
+    SUBSTVAR_ATTR_AGED => 4,
+    SUBSTVAR_ATTR_OPT  => 8,
+};
+
+=head1 METHODS
+
+=over 8
+
+=item $s = Dpkg::Substvars->new($file)
+
+Create a new object that can do substitutions. By default it contains
+generic substitutions like ${Newline}, ${Space}, ${Tab}, ${dpkg:Version}
+and ${dpkg:Upstream-Version}.
+
+Additional substitutions will be read from the $file passed as parameter.
+
+It keeps track of which substitutions were actually used (only counting
+substvars(), not get()), and warns about unused substvars when asked to. The
+substitutions that are always present are not included in these warnings.
+
+=cut
+
+sub new {
+    my ($this, $arg) = @_;
+    my $class = ref($this) || $this;
+    my $self = {
+        vars => {
+            'Newline' => "\n",
+            'Space' => ' ',
+            'Tab' => "\t",
+            'dpkg:Version' => $Dpkg::PROGVERSION,
+            'dpkg:Upstream-Version' => $Dpkg::PROGVERSION,
+            },
+        attr => {},
+	msg_prefix => '',
+    };
+    $self->{vars}{'dpkg:Upstream-Version'} =~ s/-[^-]+$//;
+    bless $self, $class;
+
+    my $attr = SUBSTVAR_ATTR_USED | SUBSTVAR_ATTR_AUTO;
+    $self->{attr}{$_} = $attr foreach keys %{$self->{vars}};
+    if ($arg) {
+        $self->load($arg) if -e $arg;
+    }
+    return $self;
+}
+
+=item $s->set($key, $value)
+
+Add/replace a substitution.
+
+=cut
+
+sub set {
+    my ($self, $key, $value, $attr) = @_;
+
+    $attr //= 0;
+
+    $self->{vars}{$key} = $value;
+    $self->{attr}{$key} = $attr;
+}
+
+=item $s->set_as_used($key, $value)
+
+Add/replace a substitution and mark it as used (no warnings will be produced
+even if unused).
+
+=cut
+
+sub set_as_used {
+    my ($self, $key, $value) = @_;
+
+    $self->set($key, $value, SUBSTVAR_ATTR_USED);
+}
+
+=item $s->set_as_auto($key, $value)
+
+Add/replace a substitution and mark it as used and automatic (no warnings
+will be produced even if unused).
+
+=cut
+
+sub set_as_auto {
+    my ($self, $key, $value) = @_;
+
+    $self->set($key, $value, SUBSTVAR_ATTR_USED | SUBSTVAR_ATTR_AUTO);
+}
+
+=item $s->get($key)
+
+Get the value of a given substitution.
+
+=cut
+
+sub get {
+    my ($self, $key) = @_;
+    return $self->{vars}{$key};
+}
+
+=item $s->delete($key)
+
+Remove a given substitution.
+
+=cut
+
+sub delete {
+    my ($self, $key) = @_;
+    delete $self->{attr}{$key};
+    return delete $self->{vars}{$key};
+}
+
+=item $s->mark_as_used($key)
+
+Prevents warnings about a unused substitution, for example if it is provided by
+default.
+
+=cut
+
+sub mark_as_used {
+    my ($self, $key) = @_;
+    $self->{attr}{$key} |= SUBSTVAR_ATTR_USED;
+}
+
+=item $s->parse($fh, $desc)
+
+Add new substitutions read from the filehandle. $desc is used to identify
+the filehandle in error messages.
+
+Returns the number of substitutions that have been parsed with success.
+
+=cut
+
+sub parse {
+    my ($self, $fh, $varlistfile) = @_;
+    my $count = 0;
+    local $_;
+
+    binmode($fh);
+    while (<$fh>) {
+        my $attr;
+
+	next if m/^\s*\#/ || !m/\S/;
+	s/\s*\n$//;
+	if (! m/^(\w[-:0-9A-Za-z]*)(\?)?\=(.*)$/) {
+	    error(g_('bad line in substvars file %s at line %d'),
+		  $varlistfile, $.);

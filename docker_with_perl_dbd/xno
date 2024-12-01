@@ -1,0 +1,1000 @@
+
+        # Test the other direction -- that this path from p2 isn't a directory
+        # in p1 (test that p1 doesn't have any paths matching `path/*`).
+        match = self.match([path], default=b'path')
+        mfiles = list(self.p1().manifest().walk(match))
+        if len(mfiles) > 0:
+            if len(mfiles) == 1 and mfiles[0] == path:
+                return
+            # omit the files which are deleted in current IMM wctx
+            mfiles = [m for m in mfiles if m in self]
+            if not mfiles:
+                return
+            raise error.Abort(
+                b"error: file '%s' cannot be written because "
+                b" '%s/' is a directory in %s (containing %d "
+                b"entries: %s)"
+                % (path, path, self.p1(), len(mfiles), b', '.join(mfiles))
+            )
+
+    def write(self, path, data, flags=b'', **kwargs):
+        if data is None:
+            raise error.ProgrammingError(b"data must be non-None")
+        self._auditconflicts(path)
+        self._markdirty(
+            path, exists=True, data=data, date=dateutil.makedate(), flags=flags
+        )
+
+    def setflags(self, path, l, x):
+        flag = b''
+        if l:
+            flag = b'l'
+        elif x:
+            flag = b'x'
+        self._markdirty(path, exists=True, date=dateutil.makedate(), flags=flag)
+
+    def remove(self, path):
+        self._markdirty(path, exists=False)
+
+    def exists(self, path):
+        """exists behaves like `lexists`, but needs to follow symlinks and
+        return False if they are broken.
+        """
+        if self.isdirty(path):
+            # If this path exists and is a symlink, "follow" it by calling
+            # exists on the destination path.
+            if (
+                self._cache[path][b'exists']
+                and b'l' in self._cache[path][b'flags']
+            ):
+                return self.exists(self._cache[path][b'data'].strip())
+            else:
+                return self._cache[path][b'exists']
+
+        return self._existsinparent(path)
+
+    def lexists(self, path):
+        """lexists returns True if the path exists"""
+        if self.isdirty(path):
+            return self._cache[path][b'exists']
+
+        return self._existsinparent(path)
+
+    def size(self, path):
+        if self.isdirty(path):
+            if self._cache[path][b'exists']:
+                return len(self._cache[path][b'data'])
+            else:
+                raise error.ProgrammingError(
+                    b"No such file or directory: %s" % path
+                )
+        return self._wrappedctx[path].size()
+
+    def tomemctx(
+        self,
+        text,
+        branch=None,
+        extra=None,
+        date=None,
+        parents=None,
+        user=None,
+        editor=None,
+    ):
+        """Converts this ``overlayworkingctx`` into a ``memctx`` ready to be
+        committed.
+
+        ``text`` is the commit message.
+        ``parents`` (optional) are rev numbers.
+        """
+        # Default parents to the wrapped context if not passed.
+        if parents is None:
+            parents = self.parents()
+            if len(parents) == 1:
+                parents = (parents[0], None)
+
+        # ``parents`` is passed as rev numbers; convert to ``commitctxs``.
+        if parents[1] is None:
+            parents = (self._repo[parents[0]], None)
+        else:
+            parents = (self._repo[parents[0]], self._repo[parents[1]])
+
+        files = self.files()
+
+        def getfile(repo, memctx, path):
+            if self._cache[path][b'exists']:
+                return memfilectx(
+                    repo,
+                    memctx,
+                    path,
+                    self._cache[path][b'data'],
+                    b'l' in self._cache[path][b'flags'],
+                    b'x' in self._cache[path][b'flags'],
+                    self._cache[path][b'copied'],
+                )
+            else:
+                # Returning None, but including the path in `files`, is
+                # necessary for memctx to register a deletion.
+                return None
+
+        if branch is None:
+            branch = self._wrappedctx.branch()
+
+        return memctx(
+            self._repo,
+            parents,
+            text,
+            files,
+            getfile,
+            date=date,
+            extra=extra,
+            user=user,
+            branch=branch,
+            editor=editor,
+        )
+
+    def tomemctx_for_amend(self, precursor):
+        extra = precursor.extra().copy()
+        extra[b'amend_source'] = precursor.hex()
+        return self.tomemctx(
+            text=precursor.description(),
+            branch=precursor.branch(),
+            extra=extra,
+            date=precursor.date(),
+            user=precursor.user(),
+        )
+
+    def isdirty(self, path):
+        return path in self._cache
+
+    def clean(self):
+        self._mergestate = None
+        self._cache = {}
+
+    def _compact(self):
+        """Removes keys from the cache that are actually clean, by comparing
+        them with the underlying context.
+
+        This can occur during the merge process, e.g. by passing --tool :local
+        to resolve a conflict.
+        """
+        keys = []
+        # This won't be perfect, but can help performance significantly when
+        # using things like remotefilelog.
+        scmutil.prefetchfiles(
+            self.repo(),
+            [
+                (
+                    self.p1().rev(),
+                    scmutil.matchfiles(self.repo(), self._cache.keys()),
+                )
+            ],
+        )
+
+        for path in self._cache.keys():
+            cache = self._cache[path]
+            try:
+                underlying = self._wrappedctx[path]
+                if (
+                    underlying.data() == cache[b'data']
+                    and underlying.flags() == cache[b'flags']
+                ):
+                    keys.append(path)
+            except error.ManifestLookupError:
+                # Path not in the underlying manifest (created).
+                continue
+
+        for path in keys:
+            del self._cache[path]
+        return keys
+
+    def _markdirty(
+        self, path, exists, data=None, date=None, flags=b'', copied=None
+    ):
+        # data not provided, let's see if we already have some; if not, let's
+        # grab it from our underlying context, so that we always have data if
+        # the file is marked as existing.
+        if exists and data is None:
+            oldentry = self._cache.get(path) or {}
+            data = oldentry.get(b'data')
+            if data is None:
+                data = self._wrappedctx[path].data()
+
+        self._cache[path] = {
+            b'exists': exists,
+            b'data': data,
+            b'date': date,
+            b'flags': flags,
+            b'copied': copied,
+        }
+        util.clearcachedproperty(self, b'_manifest')
+
+    def filectx(self, path, filelog=None):
+        return overlayworkingfilectx(
+            self._repo, path, parent=self, filelog=filelog
+        )
+
+    def mergestate(self, clean=False):
+        if clean or self._mergestate is None:
+            self._mergestate = mergestatemod.memmergestate(self._repo)
+        return self._mergestate
+
+
+class overlayworkingfilectx(committablefilectx):
+    """Wrap a ``workingfilectx`` but intercepts all writes into an in-memory
+    cache, which can be flushed through later by calling ``flush()``."""
+
+    def __init__(self, repo, path, filelog=None, parent=None):
+        super(overlayworkingfilectx, self).__init__(repo, path, filelog, parent)
+        self._repo = repo
+        self._parent = parent
+        self._path = path
+
+    def cmp(self, fctx):
+        return self.data() != fctx.data()
+
+    def changectx(self):
+        return self._parent
+
+    def data(self):
+        return self._parent.data(self._path)
+
+    def date(self):
+        return self._parent.filedate(self._path)
+
+    def exists(self):
+        return self.lexists()
+
+    def lexists(self):
+        return self._parent.exists(self._path)
+
+    def copysource(self):
+        return self._parent.copydata(self._path)
+
+    def size(self):
+        return self._parent.size(self._path)
+
+    def markcopied(self, origin):
+        self._parent.markcopied(self._path, origin)
+
+    def audit(self):
+        pass
+
+    def flags(self):
+        return self._parent.flags(self._path)
+
+    def setflags(self, islink, isexec):
+        return self._parent.setflags(self._path, islink, isexec)
+
+    def write(self, data, flags, backgroundclose=False, **kwargs):
+        return self._parent.write(self._path, data, flags, **kwargs)
+
+    def remove(self, ignoremissing=False):
+        return self._parent.remove(self._path)
+
+    def clearunknown(self):
+        pass
+
+
+class workingcommitctx(workingctx):
+    """A workingcommitctx object makes access to data related to
+    the revision being committed convenient.
+
+    This hides changes in the working directory, if they aren't
+    committed in this context.
+    """
+
+    def __init__(
+        self, repo, changes, text=b"", user=None, date=None, extra=None
+    ):
+        super(workingcommitctx, self).__init__(
+            repo, text, user, date, extra, changes
+        )
+
+    def _dirstatestatus(self, match, ignored=False, clean=False, unknown=False):
+        """Return matched files only in ``self._status``
+
+        Uncommitted files appear "clean" via this context, even if
+        they aren't actually so in the working directory.
+        """
+        if clean:
+            clean = [f for f in self._manifest if f not in self._changedset]
+        else:
+            clean = []
+        return scmutil.status(
+            [f for f in self._status.modified if match(f)],
+            [f for f in self._status.added if match(f)],
+            [f for f in self._status.removed if match(f)],
+            [],
+            [],
+            [],
+            clean,
+        )
+
+    @propertycache
+    def _changedset(self):
+        """Return the set of files changed in this context"""
+        changed = set(self._status.modified)
+        changed.update(self._status.added)
+        changed.update(self._status.removed)
+        return changed
+
+
+def makecachingfilectxfn(func):
+    """Create a filectxfn that caches based on the path.
+
+    We can't use util.cachefunc because it uses all arguments as the cache
+    key and this creates a cycle since the arguments include the repo and
+    memctx.
+    """
+    cache = {}
+
+    def getfilectx(repo, memctx, path):
+        if path not in cache:
+            cache[path] = func(repo, memctx, path)
+        return cache[path]
+
+    return getfilectx
+
+
+def memfilefromctx(ctx):
+    """Given a context return a memfilectx for ctx[path]
+
+    This is a convenience method for building a memctx based on another
+    context.
+    """
+
+    def getfilectx(repo, memctx, path):
+        fctx = ctx[path]
+        copysource = fctx.copysource()
+        return memfilectx(
+            repo,
+            memctx,
+            path,
+            fctx.data(),
+            islink=fctx.islink(),
+            isexec=fctx.isexec(),
+            copysource=copysource,
+        )
+
+    return getfilectx
+
+
+def memfilefrompatch(patchstore):
+    """Given a patch (e.g. patchstore object) return a memfilectx
+
+    This is a convenience method for building a memctx based on a patchstore.
+    """
+
+    def getfilectx(repo, memctx, path):
+        data, mode, copysource = patchstore.getfile(path)
+        if data is None:
+            return None
+        islink, isexec = mode
+        return memfilectx(
+            repo,
+            memctx,
+            path,
+            data,
+            islink=islink,
+            isexec=isexec,
+            copysource=copysource,
+        )
+
+    return getfilectx
+
+
+class memctx(committablectx):
+    """Use memctx to perform in-memory commits via localrepo.commitctx().
+
+    Revision information is supplied at initialization time while
+    related files data and is made available through a callback
+    mechanism.  'repo' is the current localrepo, 'parents' is a
+    sequence of two parent revisions identifiers (pass None for every
+    missing parent), 'text' is the commit message and 'files' lists
+    names of files touched by the revision (normalized and relative to
+    repository root).
+
+    filectxfn(repo, memctx, path) is a callable receiving the
+    repository, the current memctx object and the normalized path of
+    requested file, relative to repository root. It is fired by the
+    commit function for every file in 'files', but calls order is
+    undefined. If the file is available in the revision being
+    committed (updated or added), filectxfn returns a memfilectx
+    object. If the file was removed, filectxfn return None for recent
+    Mercurial. Moved files are represented by marking the source file
+    removed and the new file added with copy information (see
+    memfilectx).
+
+    user receives the committer name and defaults to current
+    repository username, date is the commit date in any format
+    supported by dateutil.parsedate() and defaults to current date, extra
+    is a dictionary of metadata or is left empty.
+    """
+
+    # Mercurial <= 3.1 expects the filectxfn to raise IOError for missing files.
+    # Extensions that need to retain compatibility across Mercurial 3.1 can use
+    # this field to determine what to do in filectxfn.
+    _returnnoneformissingfiles = True
+
+    def __init__(
+        self,
+        repo,
+        parents,
+        text,
+        files,
+        filectxfn,
+        user=None,
+        date=None,
+        extra=None,
+        branch=None,
+        editor=None,
+    ):
+        super(memctx, self).__init__(
+            repo, text, user, date, extra, branch=branch
+        )
+        self._rev = None
+        self._node = None
+        parents = [(p or self._repo.nodeconstants.nullid) for p in parents]
+        p1, p2 = parents
+        self._parents = [self._repo[p] for p in (p1, p2)]
+        files = sorted(set(files))
+        self._files = files
+        self.substate = {}
+
+        if isinstance(filectxfn, patch.filestore):
+            filectxfn = memfilefrompatch(filectxfn)
+        elif not callable(filectxfn):
+            # if store is not callable, wrap it in a function
+            filectxfn = memfilefromctx(filectxfn)
+
+        # memoizing increases performance for e.g. vcs convert scenarios.
+        self._filectxfn = makecachingfilectxfn(filectxfn)
+
+        if editor:
+            self._text = editor(self._repo, self, [])
+            self._repo.savecommitmessage(self._text)
+
+    def filectx(self, path, filelog=None):
+        """get a file context from the working directory
+
+        Returns None if file doesn't exist and should be removed."""
+        return self._filectxfn(self._repo, self, path)
+
+    def commit(self):
+        """commit context to the repo"""
+        return self._repo.commitctx(self)
+
+    @propertycache
+    def _manifest(self):
+        """generate a manifest based on the return values of filectxfn"""
+
+        # keep this simple for now; just worry about p1
+        pctx = self._parents[0]
+        man = pctx.manifest().copy()
+
+        for f in self._status.modified:
+            man[f] = self._repo.nodeconstants.modifiednodeid
+
+        for f in self._status.added:
+            man[f] = self._repo.nodeconstants.addednodeid
+
+        for f in self._status.removed:
+            if f in man:
+                del man[f]
+
+        return man
+
+    @propertycache
+    def _status(self):
+        """Calculate exact status from ``files`` specified at construction"""
+        man1 = self.p1().manifest()
+        p2 = self._parents[1]
+        # "1 < len(self._parents)" can't be used for checking
+        # existence of the 2nd parent, because "memctx._parents" is
+        # explicitly initialized by the list, of which length is 2.
+        if p2.rev() != nullrev:
+            man2 = p2.manifest()
+            managing = lambda f: f in man1 or f in man2
+        else:
+            managing = lambda f: f in man1
+
+        modified, added, removed = [], [], []
+        for f in self._files:
+            if not managing(f):
+                added.append(f)
+            elif self[f]:
+                modified.append(f)
+            else:
+                removed.append(f)
+
+        return scmutil.status(modified, added, removed, [], [], [], [])
+
+    def parents(self):
+        if self._parents[1].rev() == nullrev:
+            return [self._parents[0]]
+        return self._parents
+
+
+class memfilectx(committablefilectx):
+    """memfilectx represents an in-memory file to commit.
+
+    See memctx and committablefilectx for more details.
+    """
+
+    def __init__(
+        self,
+        repo,
+        changectx,
+        path,
+        data,
+        islink=False,
+        isexec=False,
+        copysource=None,
+    ):
+        """
+        path is the normalized file path relative to repository root.
+        data is the file content as a string.
+        islink is True if the file is a symbolic link.
+        isexec is True if the file is executable.
+        copied is the source file path if current file was copied in the
+        revision being committed, or None."""
+        super(memfilectx, self).__init__(repo, path, None, changectx)
+        self._data = data
+        if islink:
+            self._flags = b'l'
+        elif isexec:
+            self._flags = b'x'
+        else:
+            self._flags = b''
+        self._copysource = copysource
+
+    def copysource(self):
+        return self._copysource
+
+    def cmp(self, fctx):
+        return self.data() != fctx.data()
+
+    def data(self):
+        return self._data
+
+    def remove(self, ignoremissing=False):
+        """wraps unlink for a repo's working directory"""
+        # need to figure out what to do here
+        del self._changectx[self._path]
+
+    def write(self, data, flags, **kwargs):
+        """wraps repo.wwrite"""
+        self._data = data
+
+
+class metadataonlyctx(committablectx):
+    """Like memctx but it's reusing the manifest of different commit.
+    Intended to be used by lightweight operations that are creating
+    metadata-only changes.
+
+    Revision information is supplied at initialization time.  'repo' is the
+    current localrepo, 'ctx' is original revision which manifest we're reuisng
+    'parents' is a sequence of two parent revisions identifiers (pass None for
+    every missing parent), 'text' is the commit.
+
+    user receives the committer name and defaults to current repository
+    username, date is the commit date in any format supported by
+    dateutil.parsedate() and defaults to current date, extra is a dictionary of
+    metadata or is left empty.
+    """
+
+    def __init__(
+        self,
+        repo,
+        originalctx,
+        parents=None,
+        text=None,
+        user=None,
+        date=None,
+        extra=None,
+        editor=None,
+    ):
+        if text is None:
+            text = originalctx.description()
+        super(metadataonlyctx, self).__init__(repo, text, user, date, extra)
+        self._rev = None
+        self._node = None
+        self._originalctx = originalctx
+        self._manifestnode = originalctx.manifestnode()
+        if parents is None:
+            parents = originalctx.parents()
+        else:
+            parents = [repo[p] for p in parents if p is not None]
+        parents = parents[:]
+        while len(parents) < 2:
+            parents.append(repo[nullrev])
+        p1, p2 = self._parents = parents
+
+        # sanity check to ensure that the reused manifest parents are
+        # manifests of our commit parents
+        mp1, mp2 = self.manifestctx().parents
+        if p1 != self._repo.nodeconstants.nullid and p1.manifestnode() != mp1:
+            raise RuntimeError(
+                r"can't reuse the manifest: its p1 "
+                r"doesn't match the new ctx p1"
+            )
+        if p2 != self._repo.nodeconstants.nullid and p2.manifestnode() != mp2:
+            raise RuntimeError(
+                r"can't reuse the manifest: "
+                r"its p2 doesn't match the new ctx p2"
+            )
+
+        self._files = originalctx.files()
+        self.substate = {}
+
+        if editor:
+            self._text = editor(self._repo, self, [])
+            self._repo.savecommitmessage(self._text)
+
+    def manifestnode(self):
+        return self._manifestnode
+
+    @property
+    def _manifestctx(self):
+        return self._repo.manifestlog[self._manifestnode]
+
+    def filectx(self, path, filelog=None):
+        return self._originalctx.filectx(path, filelog=filelog)
+
+    def commit(self):
+        """commit context to the repo"""
+        return self._repo.commitctx(self)
+
+    @property
+    def _manifest(self):
+        return self._originalctx.manifest()
+
+    @propertycache
+    def _status(self):
+        """Calculate exact status from ``files`` specified in the ``origctx``
+        and parents manifests.
+        """
+        man1 = self.p1().manifest()
+        p2 = self._parents[1]
+        # "1 < len(self._parents)" can't be used for checking
+        # existence of the 2nd parent, because "metadataonlyctx._parents" is
+        # explicitly initialized by the list, of which length is 2.
+        if p2.rev() != nullrev:
+            man2 = p2.manifest()
+            managing = lambda f: f in man1 or f in man2
+        else:
+            managing = lambda f: f in man1
+
+        modified, added, removed = [], [], []
+        for f in self._files:
+            if not managing(f):
+                added.append(f)
+            elif f in self:
+                modified.append(f)
+            else:
+                removed.append(f)
+
+        return scmutil.status(modified, added, removed, [], [], [], [])
+
+
+class arbitraryfilectx:
+    """Allows you to use filectx-like functions on a file in an arbitrary
+    location on disk, possibly not in the working directory.
+    """
+
+    def __init__(self, path, repo=None):
+        # Repo is optional because contrib/simplemerge uses this class.
+        self._repo = repo
+        self._path = path
+
+    def cmp(self, fctx):
+        # filecmp follows symlinks whereas `cmp` should not, so skip the fast
+        # path if either side is a symlink.
+        symlinks = b'l' in self.flags() or b'l' in fctx.flags()
+        if not symlinks and isinstance(fctx, workingfilectx) and self._repo:
+            # Add a fast-path for merge if both sides are disk-backed.
+            # Note that filecmp uses the opposite return values (True if same)
+            # from our cmp functions (True if different).
+            return not filecmp.cmp(self.path(), self._repo.wjoin(fctx.path()))
+        return self.data() != fctx.data()
+
+    def path(self):
+        return self._path
+
+    def flags(self):
+        return b''
+
+    def data(self):
+        return util.readfile(self._path)
+
+    def decodeddata(self):
+        return util.readfile(self._path)
+
+    def remove(self):
+        util.unlink(self._path)
+
+    def write(self, data, flags, **kwargs):
+        assert not flags
+        util.writefile(self._path, data)
+                                                                                                                    usr/lib/python3/dist-packages/mercurial/copies.py                                                   0000644 0000000 0000000 00000133554 14355257011 020603  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        # coding: utf8
+# copies.py - copy detection for Mercurial
+#
+# Copyright 2008 Olivia Mackall <olivia@selenic.com>
+#
+# This software may be used and distributed according to the terms of the
+# GNU General Public License version 2 or any later version.
+
+
+import collections
+import os
+
+from .i18n import _
+from .node import nullrev
+
+from . import (
+    match as matchmod,
+    pathutil,
+    policy,
+    util,
+)
+
+
+from .utils import stringutil
+
+from .revlogutils import (
+    flagutil,
+    sidedata as sidedatamod,
+)
+
+rustmod = policy.importrust("copy_tracing")
+
+
+def _filter(src, dst, t):
+    """filters out invalid copies after chaining"""
+
+    # When _chain()'ing copies in 'a' (from 'src' via some other commit 'mid')
+    # with copies in 'b' (from 'mid' to 'dst'), we can get the different cases
+    # in the following table (not including trivial cases). For example, case 6
+    # is where a file existed in 'src' and remained under that name in 'mid' and
+    # then was renamed between 'mid' and 'dst'.
+    #
+    # case src mid dst result
+    #   1   x   y   -    -
+    #   2   x   y   y   x->y
+    #   3   x   y   x    -
+    #   4   x   y   z   x->z
+    #   5   -   x   y    -
+    #   6   x   x   y   x->y
+    #
+    # _chain() takes care of chaining the copies in 'a' and 'b', but it
+    # cannot tell the difference between cases 1 and 2, between 3 and 4, or
+    # between 5 and 6, so it includes all cases in its result.
+    # Cases 1, 3, and 5 are then removed by _filter().
+
+    for k, v in list(t.items()):
+        if k == v:  # case 3
+            del t[k]
+        elif v not in src:  # case 5
+            # remove copies from files that didn't exist
+            del t[k]
+        elif k not in dst:  # case 1
+            # remove copies to files that were then removed
+            del t[k]
+
+
+def _chain(prefix, suffix):
+    """chain two sets of copies 'prefix' and 'suffix'"""
+    result = prefix.copy()
+    for key, value in suffix.items():
+        result[key] = prefix.get(value, value)
+    return result
+
+
+def _tracefile(fctx, am, basemf):
+    """return file context that is the ancestor of fctx present in ancestor
+    manifest am
+
+    Note: we used to try and stop after a given limit, however checking if that
+    limit is reached turned out to be very expensive. we are better off
+    disabling that feature."""
+
+    for f in fctx.ancestors():
+        path = f.path()
+        if am.get(path, None) == f.filenode():
+            return path
+        if basemf and basemf.get(path, None) == f.filenode():
+            return path
+
+
+def _dirstatecopies(repo, match=None):
+    ds = repo.dirstate
+    c = ds.copies().copy()
+    for k in list(c):
+        if not ds.get_entry(k).tracked or (match and not match(k)):
+            del c[k]
+    return c
+
+
+def _computeforwardmissing(a, b, match=None):
+    """Computes which files are in b but not a.
+    This is its own function so extensions can easily wrap this call to see what
+    files _forwardcopies is about to process.
+    """
+    ma = a.manifest()
+    mb = b.manifest()
+    return mb.filesnotin(ma, match=match)
+
+
+def usechangesetcentricalgo(repo):
+    """Checks if we should use changeset-centric copy algorithms"""
+    if repo.filecopiesmode == b'changeset-sidedata':
+        return True
+    readfrom = repo.ui.config(b'experimental', b'copies.read-from')
+    changesetsource = (b'changeset-only', b'compatibility')
+    return readfrom in changesetsource
+
+
+def _committedforwardcopies(a, b, base, match):
+    """Like _forwardcopies(), but b.rev() cannot be None (working copy)"""
+    # files might have to be traced back to the fctx parent of the last
+    # one-side-only changeset, but not further back than that
+    repo = a._repo
+
+    if usechangesetcentricalgo(repo):
+        return _changesetforwardcopies(a, b, match)
+
+    debug = repo.ui.debugflag and repo.ui.configbool(b'devel', b'debug.copies')
+    dbg = repo.ui.debug
+    if debug:
+        dbg(b'debug.copies:    looking into rename from %s to %s\n' % (a, b))
+    am = a.manifest()
+    basemf = None if base is None else base.manifest()
+
+    # find where new files came from
+    # we currently don't try to find where old files went, too expensive
+    # this means we can miss a case like 'hg rm b; hg cp a b'
+    cm = {}
+
+    # Computing the forward missing is quite expensive on large manifests, since
+    # it compares the entire manifests. We can optimize it in the common use
+    # case of computing what copies are in a commit versus its parent (like
+    # during a rebase or histedit). Note, we exclude merge commits from this
+    # optimization, since the ctx.files() for a merge commit is not correct for
+    # this comparison.
+    forwardmissingmatch = match
+    if b.p1() == a and b.p2().rev() == nullrev:
+        filesmatcher = matchmod.exact(b.files())
+        forwardmissingmatch = matchmod.intersectmatchers(match, filesmatcher)
+    if repo.ui.configbool(b'devel', b'copy-tracing.trace-all-files'):
+        missing = list(b.walk(match))
+        # _computeforwardmissing(a, b, match=forwardmissingmatch)
+        if debug:
+            dbg(b'debug.copies:      searching all files: %d\n' % len(missing))
+    else:
+        missing = _computeforwardmissing(a, b, match=forwardmissingmatch)
+        if debug:
+            dbg(
+                b'debug.copies:      missing files to search: %d\n'
+                % len(missing)
+            )
+
+    ancestrycontext = a._repo.changelog.ancestors([b.rev()], inclusive=True)
+
+    for f in sorted(missing):
+        if debug:
+            dbg(b'debug.copies:        tracing file: %s\n' % f)
+        fctx = b[f]
+        fctx._ancestrycontext = ancestrycontext
+
+        if debug:
+            start = util.timer()
+        opath = _tracefile(fctx, am, basemf)
+        if opath:
+            if debug:
+                dbg(b'debug.copies:          rename of: %s\n' % opath)
+            cm[f] = opath
+        if debug:
+            dbg(
+                b'debug.copies:          time: %f seconds\n'
+                % (util.timer() - start)
+            )
+    return cm
+
+
+def _revinfo_getter(repo, match):
+    """returns a function that returns the following data given a <rev>"
+
+    * p1: revision number of first parent
+    * p2: revision number of first parent
+    * changes: a ChangingFiles object
+    """
+    cl = repo.changelog
+    parents = cl.parentrevs
+    flags = cl.flags
+
+    HASCOPIESINFO = flagutil.REVIDX_HASCOPIESINFO
+
+    changelogrevision = cl.changelogrevision
+
+    if rustmod is not None:
+
+        def revinfo(rev):
+            p1, p2 = parents(rev)
+            if flags(rev) & HASCOPIESINFO:
+                raw = changelogrevision(rev)._sidedata.get(sidedatamod.SD_FILES)
+            else:
+                raw = None
+            return (p1, p2, raw)
+
+    else:
+
+        def revinfo(rev):
+            p1, p2 = parents(rev)
+            if flags(rev) & HASCOPIESINFO:
+                changes = changelogrevision(rev).changes
+            else:
+                changes = None
+            return (p1, p2, changes)
+
+    return revinfo
+
+
+def cached_is_ancestor(is_ancestor):
+    """return a cached version of is_ancestor"""
+    cache = {}
+
+    def _is_ancestor(anc, desc):
+        if anc > desc:
+            return False
+        elif anc == desc:
+            return True
+        key = (anc, desc)
+        ret = cache.get(key)
+        if ret is None:
+            ret = cache[key] = is_ancestor(anc, desc)
+        return ret
+
+    return _is_ancestor
+
+
+def _changesetforwardcopies(a, b, match):
+    if a.rev() in (nullrev, b.rev()):
+        return {}
+
+    repo = a.repo().unfiltered()
+
+    cl = repo.changelog
+    isancestor = cl.isancestorrev
+
+    # To track rename from "A" to B, we need to gather all parent → children
+    # edges that are contains in `::B` but not in `::A`.
+    #
+    #
+    # To do so, we need to gather all revisions exclusive¹ to "B" (ie¹: `::b -
+    # ::a`) and also all the "roots point", ie the parents of the exclusive set
+    # that belong to ::a. These are exactly all the revisions needed to express
+    # the parent → children we need to combine.
+    #
+    # [1] actually, we need to gather all the edges within `(::a)::b`, ie:
+    # excluding paths that leads to roots that are not ancestors of `a`. We
+    # keep this out of the explanation because it is hard enough without this special case..
+
+    parents = cl._uncheckedparentrevs
+    graph_roots = (nullrev, nullrev)
+
+    ancestors = cl.ancestors([a.rev()], inclusive=True)
+    revs = cl.findmissingrevs(common=[a.rev()], heads=[b.rev()])
+    roots = set()
+    has_graph_roots = False
+    multi_thread = repo.ui.configbool(b'devel', b'copy-tracing.multi-thread')
+
+    # iterate over `only(B, A)`
+    for r in revs:
+        ps = parents(r)
+        if ps == graph_roots:
+            has_graph_roots = True
+        else:
+            p1, p2 = ps
+
+            # find all the "root points" (see larger comment above)
+            if p1 != nullrev and p1 in ancestors:

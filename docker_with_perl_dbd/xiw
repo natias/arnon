@@ -1,0 +1,1000 @@
+
+
+def _edithisteditplan(ui, repo, state, rules):
+    state.read()
+    if not rules:
+        comment = geteditcomment(
+            ui, short(state.parentctxnode), short(state.topmost)
+        )
+        rules = ruleeditor(repo, ui, state.actions, comment)
+    else:
+        rules = _readfile(ui, rules)
+    actions = parserules(rules, state)
+    ctxs = [repo[act.node] for act in state.actions if act.node]
+    warnverifyactions(ui, repo, actions, state, ctxs)
+    state.actions = actions
+    state.write()
+
+
+def _newhistedit(ui, repo, state, revs, freeargs, opts):
+    outg = opts.get(b'outgoing')
+    rules = opts.get(b'commands', b'')
+    force = opts.get(b'force')
+
+    cmdutil.checkunfinished(repo)
+    cmdutil.bailifchanged(repo)
+
+    topmost = repo.dirstate.p1()
+    if outg:
+        if freeargs:
+            remote = freeargs[0]
+        else:
+            remote = None
+        root = findoutgoing(ui, repo, remote, force, opts)
+    else:
+        rr = list(repo.set(b'roots(%ld)', logcmdutil.revrange(repo, revs)))
+        if len(rr) != 1:
+            raise error.InputError(
+                _(
+                    b'The specified revisions must have '
+                    b'exactly one common root'
+                )
+            )
+        root = rr[0].node()
+
+    revs = between(repo, root, topmost, state.keep)
+    if not revs:
+        raise error.InputError(
+            _(b'%s is not an ancestor of working directory') % short(root)
+        )
+
+    ctxs = [repo[r] for r in revs]
+
+    wctx = repo[None]
+    # Please don't ask me why `ancestors` is this value. I figured it
+    # out with print-debugging, not by actually understanding what the
+    # merge code is doing. :(
+    ancs = [repo[b'.']]
+    # Sniff-test to make sure we won't collide with untracked files in
+    # the working directory. If we don't do this, we can get a
+    # collision after we've started histedit and backing out gets ugly
+    # for everyone, especially the user.
+    for c in [ctxs[0].p1()] + ctxs:
+        try:
+            mergemod.calculateupdates(
+                repo,
+                wctx,
+                c,
+                ancs,
+                # These parameters were determined by print-debugging
+                # what happens later on inside histedit.
+                branchmerge=False,
+                force=False,
+                acceptremote=False,
+                followcopies=False,
+            )
+        except error.Abort:
+            raise error.StateError(
+                _(
+                    b"untracked files in working directory conflict with files in %s"
+                )
+                % c
+            )
+
+    if not rules:
+        comment = geteditcomment(ui, short(root), short(topmost))
+        actions = [pick(state, r) for r in revs]
+        rules = ruleeditor(repo, ui, actions, comment)
+    else:
+        rules = _readfile(ui, rules)
+    actions = parserules(rules, state)
+    warnverifyactions(ui, repo, actions, state, ctxs)
+
+    parentctxnode = repo[root].p1().node()
+
+    state.parentctxnode = parentctxnode
+    state.actions = actions
+    state.topmost = topmost
+    state.replacements = []
+
+    ui.log(
+        b"histedit",
+        b"%d actions to histedit\n",
+        len(actions),
+        histedit_num_actions=len(actions),
+    )
+
+    # Create a backup so we can always abort completely.
+    backupfile = None
+    if not obsolete.isenabled(repo, obsolete.createmarkersopt):
+        backupfile = repair.backupbundle(
+            repo, [parentctxnode], [topmost], root, b'histedit'
+        )
+    state.backupfile = backupfile
+
+
+def _getsummary(ctx):
+    return stringutil.firstline(ctx.description())
+
+
+def bootstrapcontinue(ui, state, opts):
+    repo = state.repo
+
+    ms = mergestatemod.mergestate.read(repo)
+    mergeutil.checkunresolved(ms)
+
+    if state.actions:
+        actobj = state.actions.pop(0)
+
+        if _isdirtywc(repo):
+            actobj.continuedirty()
+            if _isdirtywc(repo):
+                abortdirty()
+
+        parentctx, replacements = actobj.continueclean()
+
+        state.parentctxnode = parentctx.node()
+        state.replacements.extend(replacements)
+
+    return state
+
+
+def between(repo, old, new, keep):
+    """select and validate the set of revision to edit
+
+    When keep is false, the specified set can't have children."""
+    revs = repo.revs(b'%n::%n', old, new)
+    if revs and not keep:
+        rewriteutil.precheck(repo, revs, b'edit')
+        if repo.revs(b'(%ld) and merge()', revs):
+            raise error.StateError(
+                _(b'cannot edit history that contains merges')
+            )
+    return pycompat.maplist(repo.changelog.node, revs)
+
+
+def ruleeditor(repo, ui, actions, editcomment=b""):
+    """open an editor to edit rules
+
+    rules are in the format [ [act, ctx], ...] like in state.rules
+    """
+    if repo.ui.configbool(b"experimental", b"histedit.autoverb"):
+        newact = util.sortdict()
+        for act in actions:
+            ctx = repo[act.node]
+            summary = _getsummary(ctx)
+            fword = summary.split(b' ', 1)[0].lower()
+            added = False
+
+            # if it doesn't end with the special character '!' just skip this
+            if fword.endswith(b'!'):
+                fword = fword[:-1]
+                if fword in primaryactions | secondaryactions | tertiaryactions:
+                    act.verb = fword
+                    # get the target summary
+                    tsum = summary[len(fword) + 1 :].lstrip()
+                    # safe but slow: reverse iterate over the actions so we
+                    # don't clash on two commits having the same summary
+                    for na, l in reversed(list(newact.items())):
+                        actx = repo[na.node]
+                        asum = _getsummary(actx)
+                        if asum == tsum:
+                            added = True
+                            l.append(act)
+                            break
+
+            if not added:
+                newact[act] = []
+
+        # copy over and flatten the new list
+        actions = []
+        for na, l in newact.items():
+            actions.append(na)
+            actions += l
+
+    rules = b'\n'.join([act.torule() for act in actions])
+    rules += b'\n\n'
+    rules += editcomment
+    rules = ui.edit(
+        rules,
+        ui.username(),
+        {b'prefix': b'histedit'},
+        repopath=repo.path,
+        action=b'histedit',
+    )
+
+    # Save edit rules in .hg/histedit-last-edit.txt in case
+    # the user needs to ask for help after something
+    # surprising happens.
+    with repo.vfs(b'histedit-last-edit.txt', b'wb') as f:
+        f.write(rules)
+
+    return rules
+
+
+def parserules(rules, state):
+    """Read the histedit rules string and return list of action objects"""
+    rules = [
+        l
+        for l in (r.strip() for r in rules.splitlines())
+        if l and not l.startswith(b'#')
+    ]
+    actions = []
+    for r in rules:
+        if b' ' not in r:
+            raise error.ParseError(_(b'malformed line "%s"') % r)
+        verb, rest = r.split(b' ', 1)
+
+        if verb not in actiontable:
+            raise error.ParseError(_(b'unknown action "%s"') % verb)
+
+        action = actiontable[verb].fromrule(state, rest)
+        actions.append(action)
+    return actions
+
+
+def warnverifyactions(ui, repo, actions, state, ctxs):
+    try:
+        verifyactions(actions, state, ctxs)
+    except error.ParseError:
+        if repo.vfs.exists(b'histedit-last-edit.txt'):
+            ui.warn(
+                _(
+                    b'warning: histedit rules saved '
+                    b'to: .hg/histedit-last-edit.txt\n'
+                )
+            )
+        raise
+
+
+def verifyactions(actions, state, ctxs):
+    """Verify that there exists exactly one action per given changeset and
+    other constraints.
+
+    Will abort if there are to many or too few rules, a malformed rule,
+    or a rule on a changeset outside of the user-given range.
+    """
+    expected = {c.node() for c in ctxs}
+    seen = set()
+    prev = None
+
+    if actions and actions[0].verb in [b'roll', b'fold']:
+        raise error.ParseError(
+            _(b'first changeset cannot use verb "%s"') % actions[0].verb
+        )
+
+    for action in actions:
+        action.verify(prev, expected, seen)
+        prev = action
+        if action.node is not None:
+            seen.add(action.node)
+    missing = sorted(expected - seen)  # sort to stabilize output
+
+    if state.repo.ui.configbool(b'histedit', b'dropmissing'):
+        if len(actions) == 0:
+            raise error.ParseError(
+                _(b'no rules provided'),
+                hint=_(b'use strip extension to remove commits'),
+            )
+
+        drops = [drop(state, n) for n in missing]
+        # put the in the beginning so they execute immediately and
+        # don't show in the edit-plan in the future
+        actions[:0] = drops
+    elif missing:
+        raise error.ParseError(
+            _(b'missing rules for changeset %s') % short(missing[0]),
+            hint=_(
+                b'use "drop %s" to discard, see also: '
+                b"'hg help -e histedit.config'"
+            )
+            % short(missing[0]),
+        )
+
+
+def adjustreplacementsfrommarkers(repo, oldreplacements):
+    """Adjust replacements from obsolescence markers
+
+    Replacements structure is originally generated based on
+    histedit's state and does not account for changes that are
+    not recorded there. This function fixes that by adding
+    data read from obsolescence markers"""
+    if not obsolete.isenabled(repo, obsolete.createmarkersopt):
+        return oldreplacements
+
+    unfi = repo.unfiltered()
+    get_rev = unfi.changelog.index.get_rev
+    obsstore = repo.obsstore
+    newreplacements = list(oldreplacements)
+    oldsuccs = [r[1] for r in oldreplacements]
+    # successors that have already been added to succstocheck once
+    seensuccs = set().union(
+        *oldsuccs
+    )  # create a set from an iterable of tuples
+    succstocheck = list(seensuccs)
+    while succstocheck:
+        n = succstocheck.pop()
+        missing = get_rev(n) is None
+        markers = obsstore.successors.get(n, ())
+        if missing and not markers:
+            # dead end, mark it as such
+            newreplacements.append((n, ()))
+        for marker in markers:
+            nsuccs = marker[1]
+            newreplacements.append((n, nsuccs))
+            for nsucc in nsuccs:
+                if nsucc not in seensuccs:
+                    seensuccs.add(nsucc)
+                    succstocheck.append(nsucc)
+
+    return newreplacements
+
+
+def processreplacement(state):
+    """process the list of replacements to return
+
+    1) the final mapping between original and created nodes
+    2) the list of temporary node created by histedit
+    3) the list of new commit created by histedit"""
+    replacements = adjustreplacementsfrommarkers(state.repo, state.replacements)
+    allsuccs = set()
+    replaced = set()
+    fullmapping = {}
+    # initialize basic set
+    # fullmapping records all operations recorded in replacement
+    for rep in replacements:
+        allsuccs.update(rep[1])
+        replaced.add(rep[0])
+        fullmapping.setdefault(rep[0], set()).update(rep[1])
+    new = allsuccs - replaced
+    tmpnodes = allsuccs & replaced
+    # Reduce content fullmapping into direct relation between original nodes
+    # and final node created during history edition
+    # Dropped changeset are replaced by an empty list
+    toproceed = set(fullmapping)
+    final = {}
+    while toproceed:
+        for x in list(toproceed):
+            succs = fullmapping[x]
+            for s in list(succs):
+                if s in toproceed:
+                    # non final node with unknown closure
+                    # We can't process this now
+                    break
+                elif s in final:
+                    # non final node, replace with closure
+                    succs.remove(s)
+                    succs.update(final[s])
+            else:
+                final[x] = succs
+                toproceed.remove(x)
+    # remove tmpnodes from final mapping
+    for n in tmpnodes:
+        del final[n]
+    # we expect all changes involved in final to exist in the repo
+    # turn `final` into list (topologically sorted)
+    get_rev = state.repo.changelog.index.get_rev
+    for prec, succs in final.items():
+        final[prec] = sorted(succs, key=get_rev)
+
+    # computed topmost element (necessary for bookmark)
+    if new:
+        newtopmost = sorted(new, key=state.repo.changelog.rev)[-1]
+    elif not final:
+        # Nothing rewritten at all. we won't need `newtopmost`
+        # It is the same as `oldtopmost` and `processreplacement` know it
+        newtopmost = None
+    else:
+        # every body died. The newtopmost is the parent of the root.
+        r = state.repo.changelog.rev
+        newtopmost = state.repo[sorted(final, key=r)[0]].p1().node()
+
+    return final, tmpnodes, new, newtopmost
+
+
+def movetopmostbookmarks(repo, oldtopmost, newtopmost):
+    """Move bookmark from oldtopmost to newly created topmost
+
+    This is arguably a feature and we may only want that for the active
+    bookmark. But the behavior is kept compatible with the old version for now.
+    """
+    if not oldtopmost or not newtopmost:
+        return
+    oldbmarks = repo.nodebookmarks(oldtopmost)
+    if oldbmarks:
+        with repo.lock(), repo.transaction(b'histedit') as tr:
+            marks = repo._bookmarks
+            changes = []
+            for name in oldbmarks:
+                changes.append((name, newtopmost))
+            marks.applychanges(repo, tr, changes)
+
+
+def cleanupnode(ui, repo, nodes, nobackup=False):
+    """strip a group of nodes from the repository
+
+    The set of node to strip may contains unknown nodes."""
+    with repo.lock():
+        # do not let filtering get in the way of the cleanse
+        # we should probably get rid of obsolescence marker created during the
+        # histedit, but we currently do not have such information.
+        repo = repo.unfiltered()
+        # Find all nodes that need to be stripped
+        # (we use %lr instead of %ln to silently ignore unknown items)
+        has_node = repo.changelog.index.has_node
+        nodes = sorted(n for n in nodes if has_node(n))
+        roots = [c.node() for c in repo.set(b"roots(%ln)", nodes)]
+        if roots:
+            backup = not nobackup
+            repair.strip(ui, repo, roots, backup=backup)
+
+
+def stripwrapper(orig, ui, repo, nodelist, *args, **kwargs):
+    if isinstance(nodelist, bytes):
+        nodelist = [nodelist]
+    state = histeditstate(repo)
+    if state.inprogress():
+        state.read()
+        histedit_nodes = {
+            action.node for action in state.actions if action.node
+        }
+        common_nodes = histedit_nodes & set(nodelist)
+        if common_nodes:
+            raise error.Abort(
+                _(b"histedit in progress, can't strip %s")
+                % b', '.join(short(x) for x in common_nodes)
+            )
+    return orig(ui, repo, nodelist, *args, **kwargs)
+
+
+extensions.wrapfunction(repair, b'strip', stripwrapper)
+
+
+def summaryhook(ui, repo):
+    state = histeditstate(repo)
+    if not state.inprogress():
+        return
+    state.read()
+    if state.actions:
+        # i18n: column positioning for "hg summary"
+        ui.write(
+            _(b'hist:   %s (histedit --continue)\n')
+            % (
+                ui.label(_(b'%d remaining'), b'histedit.remaining')
+                % len(state.actions)
+            )
+        )
+
+
+def extsetup(ui):
+    cmdutil.summaryhooks.add(b'histedit', summaryhook)
+    statemod.addunfinished(
+        b'histedit',
+        fname=b'histedit-state',
+        allowcommit=True,
+        continueflag=True,
+        abortfunc=hgaborthistedit,
+    )
+                                                                                                                                                                                                                                                                                                                                                                                         usr/lib/python3/dist-packages/hgext/hooklib/                                                        0000755 0000000 0000000 00000000000 14714551121 017515  5                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        usr/lib/python3/dist-packages/hgext/hooklib/__init__.py                                             0000644 0000000 0000000 00000001747 14355257011 021641  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        """collection of simple hooks for common tasks (EXPERIMENTAL)
+
+This extension provides a number of simple hooks to handle issues
+commonly found in repositories with many contributors:
+- email notification when changesets move from draft to public phase
+- email notification when changesets are obsoleted
+- enforcement of draft phase for all incoming changesets
+- enforcement of a no-branch-merge policy
+- enforcement of a no-multiple-heads policy
+
+The implementation of the hooks is subject to change, e.g. whether to
+implement them as individual hooks or merge them into the notify
+extension as option. The functionality itself is planned to be supported
+long-term.
+"""
+from . import (
+    changeset_obsoleted,
+    changeset_published,
+)
+
+# configtable is only picked up from the "top-level" module of the extension,
+# so expand it here to ensure all items are properly loaded
+configtable = {}
+configtable.update(changeset_published.configtable)
+configtable.update(changeset_obsoleted.configtable)
+                         usr/lib/python3/dist-packages/hgext/hooklib/__pycache__/                                            0000755 0000000 0000000 00000000000 14714551121 021725  5                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        usr/lib/python3/dist-packages/hgext/hooklib/__pycache__/__init__.cpython-311.pyc                    0000644 0000000 0000000 00000002177 14714551121 026175  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        §
+    	^µcç  ã                   ó†   — d Z ddlmZmZ i Ze                     ej        ¦  «         e                     ej        ¦  «         dS )a˜  collection of simple hooks for common tasks (EXPERIMENTAL)
+
+This extension provides a number of simple hooks to handle issues
+commonly found in repositories with many contributors:
+- email notification when changesets move from draft to public phase
+- email notification when changesets are obsoleted
+- enforcement of draft phase for all incoming changesets
+- enforcement of a no-branch-merge policy
+- enforcement of a no-multiple-heads policy
+
+The implementation of the hooks is subject to change, e.g. whether to
+implement them as individual hooks or merge them into the notify
+extension as option. The functionality itself is planned to be supported
+long-term.
+é   )Úchangeset_obsoletedÚchangeset_publishedN)Ú__doc__Ú r   r   ÚconfigtableÚupdate© ó    ú8/usr/lib/python3/dist-packages/hgext/hooklib/__init__.pyú<module>r      st   ğğğ ğğ ğ ğ ğ ğ ğ ğ ğ €Ø × Ò Ğ&Ô2Ñ 3Ô 3Ğ 3Ø × Ò Ğ&Ô2Ñ 3Ô 3Ğ 3Ğ 3Ğ 3r
+                                                                                                                                                                                                                                                                                                                                                                                                    usr/lib/python3/dist-packages/hgext/hooklib/__pycache__/changeset_obsoleted.cpython-311.pyc         0000644 0000000 0000000 00000015465 14714551121 030443  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        §
+    	^µcM  ã                   óú   — d Z ddlmZ ddlmZ ddlmZ ddl	m
+Z
+mZmZmZmZmZmZmZ ddlmZ ddlmZ i Z ej        e¦  «        Z edd	d¬
+¦  «          eddd¬
+¦  «          eddd¬
+¦  «         d„ Zd„ Zdd„ZdS )aƒ  changeset_obsoleted is a hook to send a mail when an
+existing draft changeset is obsoleted by an obsmarker without successor.
+
+Correct message threading requires the same messageidseed to be used for both
+the original notification and the new mail.
+
+Usage:
+  [notify]
+  messageidseed = myseed
+
+  [hooks]
+  txnclose.changeset_obsoleted =     python:hgext.hooklib.changeset_obsoleted.hook
+é    N)Ú_)ÚencodingÚerrorÚ	formatterÚ
+logcmdutilÚmailÚobsutilÚpycompatÚ	registrar)Údateutilé   )Únotifyó   notify_obsoletedó   domain)Údefaultó   messageidseedó   templatesA   Subject: changeset abandoned
+
+This changeset has been abandoned.
+c                 óÌ  — |                       dd¦  «        p|                       dd¦  «        }|                       dd¦  «        p|                       dd¦  «        }|                       dd¦  «        }t          j        |¦  «        }t          j        | ||¦  «        }|                      ¦   «          t          j        | |d¦  «        }t          ¦   «         }	|j	        D ]k\  }
+}|€|	 
+                    |
+¦  «         Œ|                     d||                     ¦   «         ¦  «        }t          |¦  «        r|	 
+                    |
+¦  «         ŒkŒlt          |	¦  «        dk    r|                      d	¦  «         d S |                     ||                     ¦   «         |                       d
+d¦  «        |j        |j        ¬¦  «         |                      ¦   «         }	 t'          j        |¦  «        }n+# t*          j        $ r}t/          j        |¦  «        ‚d }~ww xY wt          j        |||¦  «        |d<   t          j        |||dz   ¦  «        |d<   t5          j        t9          j        d¬¦  «        ¦  «        |d<   |d         sk|                       dd¦  «        p|                      ¦   «         }d|vsd|v r|                     |¦  «        }t'          j         | ||j!        |j"        ¦  «        |d<   d #                    tI          |	¦  «        ¦  «        |d<   | %                    ¦   «         }|  &                    dd¦  «        rC|  '                    |¦  «         | (                    d¦  «        s|  '                    d¦  «         d S d S |  )                    tU          d¦  «        |                     ¦   «         z  ¦  «         t'          j+        | tY          j-        |d         ¦  «        d         |	||j.        ¬¦  «         d S )Nr   r   s   notifyr   r   s   incomings
+   %r and %d:r   s=   notify_obsoleted: no subscribers to selected repo and revset
+s   webs   baseurl)ÚchangesÚbaseurlÚrootÚwebrootzIn-reply-tos
+   -obsoletedz
+Message-Ids   %a, %d %b %Y %H:%M:%S %1%2)ÚformatÚDateÚFroms   emails   fromó   @s
+   @localhostz, ÚTos   testó   
+s&   notify_obsoleted: sending mail for %d
+é   )Úmbox)/Úconfigr   Úliteral_templatespecr   ÚchangesettemplaterÚ
+pushbufferr   ÚnotifierÚsetÚsubsÚaddÚrevsÚrevÚlenÚdebugÚshowÚ	changesetr   Ú	popbufferr   Ú
+parsebytesÚemailerrorsÚMessageParseErrorr   ÚAbortÚ	messageidr   Ústrfromlocalr   ÚdatestrÚusernameÚfixmailÚaddressencodeÚcharsetsÚtestÚjoinÚsortedÚas_bytesÚ
+configboolÚwriteÚendswithÚstatusr   ÚsendmailÚ
+emailutilsÚ	parseaddrr    )ÚuiÚrepoÚctxÚdomainÚmessageidseedÚtemplateÚspecÚ	templaterÚnr'   Úsubr)   ÚdataÚmsgÚinstÚsenderÚmsgtexts                    úC/usr/lib/python3/dist-packages/hgext/hooklib/changeset_obsoleted.pyÚ_report_commitrV   =   sÎ  € ØYŠYĞ*¨IÑ6Ô6ğ ¸"¿)º)Ø9ñ;ô ;€Fğ —I’IØĞ-ñô ğ 0à	Š9Ğ.Ñ	/Ô	/ğ ğ yŠyĞ,¨kÑ:Ô:€HİÔ)¨(Ñ3Ô3€DİÔ-¨b°$¸Ñ=Ô=€IØ‡M‚MO„O€OİŒ˜˜D +Ñ.Ô.€Aå‰5Œ5€DØ”Vğ ğ ‰	ˆˆTØˆ<ØHŠHS‰MŒMˆMØØyŠy˜¨¨c¯gªg©i¬iÑ8Ô8ˆİˆt‰9Œ9ğ 	ØHŠHS‰MŒMˆMØğ	õ ˆ4y„yA‚~€~Ø
+ŠØMñ	
+ô 	
+ğ 	
+ğ 	ˆà‡N‚NØØ—’‘”Ø—	’	˜& *Ñ-Ô-ØŒYØ”ğ ñ ô ğ ğ <Š<‰>Œ>€Dğ İŒo˜dÑ#Ô#ˆˆøİÔ(ğ  ğ  ğ  İŒk˜$ÑÔĞøøøøğ øøøõ  Ô)¨#¨v°}ÑEÔE€CˆÑİÔ(ØˆV] ]Ñ2ñô €CˆÑõ Ô'İÔĞ =Ğ>Ñ>Ô>ñô €CˆKğ ˆvŒ;ğ IØ—’˜8 WÑ-Ô-Ğ>°·²±´ˆØvĞĞ °&Ğ!8Ğ!8Ø—Y’Y˜vÑ&Ô&ˆFİÔ(¨¨V°Q´ZÀÄÑHÔHˆˆF‰Ø—	’	& ™,œ,Ñ'Ô'€CˆIàlŠl‰nŒn€GØ	‡}‚}Y Ñ(Ô(ğ 
+Ø
+ŠÑÔĞØ×Ò Ñ&Ô&ğ 	ØHŠHU‰OŒOˆOˆOˆOğ	ğ 	ğ 		Š	•!Ğ>Ñ?Ô?À#Ç'Â'Á)Ä)ÑKÑLÔLĞLİŒØ•
+Ô$ S¨¤[Ñ1Ô1°!Ô4°d¸GÈ!Ì&ğ	
+ñ 	
+ô 	
+ğ 	
+ğ 	
+ğ 	
+s   ÇG" Ç"H
+Ç1HÈH
+c                 ól   ‡— t          ˆfd„t          j        | j        ‰g¦  «        D ¦   «         ¦  «        S )Nc              3   ó(   •K  — | ]}|‰k    ¯|V — Œd S ©N© )Ú.0Úrr*   s     €rU   ú	<genexpr>z has_successor.<locals>.<genexpr>‚   s0   øè è € ğ ğ ØÀ!ÀsÂ(À(ˆÀ(À(À(À(ğğ ó    )Úanyr	   ÚallsuccessorsÚobsstore)rG   r*   s    `rU   Úhas_successorrb      sL   ø€ İğ ğ ğ ğ İÔ(¨¬¸¸Ñ>Ô>ğñ ô ñ ô ğ r^   c                 óV  — |dk    r6t          j        t          d¦  «        t          j        |¦  «        z  ¦  «        ‚t          j        ||d         ¬¦  «        D ]O}|                     ¦   «         |         }t          || 	                    ¦   «         ¦  «        st          | ||¦  «         ŒPd S )Ns   txncloses   Unsupported hook type %rr   )r   )r   r3   r   r
+   Úbytestrr	   ÚgetobsoletedÚ
+unfilteredrb   ÚnoderV   )rF   rG   Úhooktyperg   Úkwargsr*   rH   s          rU   Úhookrj   ‡   s®   € Ø;ÒĞİŒkİĞ)Ñ*Ô*­XÔ-=¸hÑ-GÔ-GÑGñ
+ô 
+ğ 	
+õ Ô# D°&¸Ô2CĞDÑDÔDğ *ğ *ˆØoŠoÑÔ Ô$ˆİ˜T 3§8¢8¡:¤:Ñ.Ô.ğ 	*İ˜2˜t SÑ)Ô)Ğ)øğ*ğ *r^   rY   )Ú__doc__Úemail.errorsÚerrorsr1   Úemail.utilsÚutilsrD   Úmercurial.i18nr   Ú	mercurialr   r   r   r   r   r	   r
+   r   Úmercurial.utilsr   Ú r   ÚconfigtableÚ
+configitemrV   rb   rj   rZ   r^   rU   ú<module>rv      s”  ğğ
+ğ ğ  #Ğ "Ğ "Ğ "Ğ "Ğ "Ø  Ğ  Ğ  Ğ  Ğ  Ğ  à Ğ Ğ Ğ Ğ Ğ ğ	ğ 	ğ 	ğ 	ğ 	ğ 	ğ 	ğ 	ğ 	ğ 	ğ 	ğ 	ğ 	ğ 	ğ 	ğ 	ğ 	ğ 	ğ 	ğ 	ğ %Ğ $Ğ $Ğ $Ğ $Ğ $Ø Ğ Ğ Ğ Ğ Ğ à€Ø!ˆYÔ! +Ñ.Ô.€
+à 
+€
+ØØØğñ ô ğ ğ
+ €
+ØØØğñ ô ğ ğ
+ €
+ØØğğñ ô ğ ğA
+ğ A
+ğ A
+ğHğ ğ ğ*ğ *ğ *ğ *ğ *ğ *r^                                                                                                                                                                                                              usr/lib/python3/dist-packages/hgext/hooklib/__pycache__/changeset_published.cpython-311.pyc         0000644 0000000 0000000 00000014212 14714551121 030427  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        §
+    	^µc„  ã                   óğ   — d Z ddlmZ ddlmZ ddlmZ ddl	m
+Z
+mZmZmZmZmZmZ ddlmZ ddlmZ i Z ej        e¦  «        Z edd	d¬
+¦  «          eddd¬
+¦  «          eddd¬
+¦  «         d„ Zdd„ZdS )aw  changeset_published is a hook to send a mail when an
+existing draft changeset is moved to the public phase.
+
+Correct message threading requires the same messageidseed to be used for both
+the original notification and the new mail.
+
+Usage:
+  [notify]
+  messageidseed = myseed
+
+  [hooks]
+  txnclose-phase.changeset_published =     python:hgext.hooklib.changeset_published.hook
+é    N)Ú_)ÚencodingÚerrorÚ	formatterÚ
+logcmdutilÚmailÚpycompatÚ	registrar)Údateutilé   )Únotifyó   notify_publishedó   domain)Údefaultó   messageidseedó   templatesA   Subject: changeset published
+
+This changeset has been published.
+c                 óÌ  — |                       dd¦  «        p|                       dd¦  «        }|                       dd¦  «        p|                       dd¦  «        }|                       dd¦  «        }t          j        |¦  «        }t          j        | ||¦  «        }|                      ¦   «          t          j        | |d¦  «        }t          ¦   «         }	|j	        D ]k\  }
+}|€|	 
+                    |
+¦  «         Œ|                     d||                     ¦   «         ¦  «        }t          |¦  «        r|	 
+                    |
+¦  «         ŒkŒlt          |	¦  «        dk    r|                      d	¦  «         d S |                     ||                     ¦   «         |                       d
+d¦  «        |j        |j        ¬¦  «         |                      ¦   «         }	 t'          j        |¦  «        }n+# t*          j        $ r}t/          j        |¦  «        ‚d }~ww xY wt          j        |||¦  «        |d<   t          j        |||dz   ¦  «        |d<   t5          j        t9          j        d¬¦  «        ¦  «        |d<   |d         sk|                       dd¦  «        p|                      ¦   «         }d|vsd|v r|                     |¦  «        }t'          j         | ||j!        |j"        ¦  «        |d<   d #                    tI          |	¦  «        ¦  «        |d<   | %                    ¦   «         }|  &                    dd¦  «        rC|  '                    |¦  «         | (                    d¦  «        s|  '                    d¦  «         d S d S |  )                    tU          d¦  «        |                     ¦   «         z  ¦  «         t'          j+        | tY          j-        |d         ¦  «        d         |	||j.        ¬¦  «         d S )Nr   r   s   notifyr   r   s   incomings
+   %r and %d:r   s=   notify_published: no subscribers to selected repo and revset
+s   webs   baseurl)ÚchangesÚbaseurlÚrootÚwebrootzIn-reply-tos
+   -publishedz
+Message-Ids   %a, %d %b %Y %H:%M:%S %1%2)ÚformatÚDateÚFroms   emails   fromó   @s
+   @localhostz, ÚTos   testó   
+s&   notify_published: sending mail for %d
+é   )Úmbox)/Úconfigr   Úliteral_templatespecr   ÚchangesettemplaterÚ
+pushbufferr   ÚnotifierÚsetÚsubsÚaddÚrevsÚrevÚlenÚdebugÚshowÚ	changesetr   Ú	popbufferr   Ú
+parsebytesÚemailerrorsÚMessageParseErrorr   ÚAbortÚ	messageidr   Ústrfromlocalr   ÚdatestrÚusernameÚfixmailÚaddressencodeÚcharsetsÚtestÚjoinÚsortedÚas_bytesÚ
+configboolÚwriteÚendswithÚstatusr   ÚsendmailÚ
+emailutilsÚ	parseaddrr   )ÚuiÚrepoÚctxÚdomainÚmessageidseedÚtemplateÚspecÚ	templaterÚnr&   Úsubr(   ÚdataÚmsgÚinstÚsenderÚmsgtexts                    úC/usr/lib/python3/dist-packages/hgext/hooklib/changeset_published.pyÚ_report_commitrU   <   sÎ  € ØYŠYĞ*¨IÑ6Ô6ğ ¸"¿)º)Ø9ñ;ô ;€Fğ —I’IØĞ-ñô ğ 0à	Š9Ğ.Ñ	/Ô	/ğ ğ yŠyĞ,¨kÑ:Ô:€HİÔ)¨(Ñ3Ô3€DİÔ-¨b°$¸Ñ=Ô=€IØ‡M‚MO„O€OİŒ˜˜D +Ñ.Ô.€Aå‰5Œ5€DØ”Vğ ğ ‰	ˆˆTØˆ<ØHŠHS‰MŒMˆMØØyŠy˜¨¨c¯gªg©i¬iÑ8Ô8ˆİˆt‰9Œ9ğ 	ØHŠHS‰MŒMˆMØğ	õ ˆ4y„yA‚~€~Ø
+ŠØMñ	
+ô 	
+ğ 	
+ğ 	ˆà‡N‚NØØ—’‘”Ø—	’	˜& *Ñ-Ô-ØŒYØ”ğ ñ ô ğ ğ <Š<‰>Œ>€Dğ İŒo˜dÑ#Ô#ˆˆøİÔ(ğ  ğ  ğ  İŒk˜$ÑÔĞøøøøğ øøøõ  Ô)¨#¨v°}ÑEÔE€CˆÑİÔ(ØˆV] ]Ñ2ñô €CˆÑõ Ô'İÔĞ =Ğ>Ñ>Ô>ñô €CˆKğ ˆvŒ;ğ IØ—’˜8 WÑ-Ô-Ğ>°·²±´ˆØvĞĞ °&Ğ!8Ğ!8Ø—Y’Y˜vÑ&Ô&ˆFİÔ(¨¨V°Q´ZÀÄÑHÔHˆˆF‰Ø—	’	& ™,œ,Ñ'Ô'€CˆIàlŠl‰nŒn€GØ	‡}‚}Y Ñ(Ô(ğ 
+Ø
+ŠÑÔĞØ×Ò Ñ&Ô&ğ 	ØHŠHU‰OŒOˆOˆOˆOğ	ğ 	ğ 		Š	•!Ğ>Ñ?Ô?À#Ç'Â'Á)Ä)ÑKÑLÔLĞLİŒØ•
+Ô$ S¨¤[Ñ1Ô1°!Ô4°d¸GÈ!Ì&ğ	
+ñ 	
+ô 	
+ğ 	
+ğ 	
+ğ 	
+s   ÇG" Ç"H
+Ç1HÈH
+c                 ó  — |dk    r6t          j        t          d¦  «        t          j        |¦  «        z  ¦  «        ‚|                     ¦   «         |         }|d         dk    r|d         dk    rt          | ||¦  «         d S d S d S )Ns   txnclose-phases   Unsupported hook type %rÚoldphases   draftÚphases   public)r   r2   r   r	   ÚbytestrÚ
+unfilteredrU   )rE   rF   ÚhooktypeÚnodeÚkwargsrG   s         rT   Úhookr^   €   s˜   € ØĞ$Ò$Ğ$İŒkİĞ)Ñ*Ô*­XÔ-=¸hÑ-GÔ-GÑGñ
+ô 
+ğ 	
+ğ /Š/Ñ
+Ô
+˜DÔ
+!€CØˆjÔ˜XÒ%Ğ%¨&°¬/¸YÒ*FĞ*Fİr˜4 Ñ%Ô%Ğ%Ğ%Ğ%ğ &Ğ%Ğ*FĞ*Fó    )N)Ú__doc__Úemail.errorsÚerrorsr0   Úemail.utilsÚutilsrC   Úmercurial.i18nr   Ú	mercurialr   r   r   r   r   r	   r
+   Úmercurial.utilsr   Ú r   ÚconfigtableÚ
+configitemrU   r^   © r_   rT   ú<module>rl      s{  ğğ
+ğ ğ  #Ğ "Ğ "Ğ "Ğ "Ğ "Ø  Ğ  Ğ  Ğ  Ğ  Ğ  à Ğ Ğ Ğ Ğ Ğ ğğ ğ ğ ğ ğ ğ ğ ğ ğ ğ ğ ğ ğ ğ ğ ğ ğ ğ %Ğ $Ğ $Ğ $Ğ $Ğ $Ø Ğ Ğ Ğ Ğ Ğ à€Ø!ˆYÔ! +Ñ.Ô.€
+à 
+€
+ØØØğñ ô ğ ğ
+ €
+ØØØğñ ô ğ ğ
+ €
+ØØğğñ ô ğ ğA
+ğ A
+ğ A
+ğH&ğ &ğ &ğ &ğ &ğ &r_                                                                                                                                                                                                                                                                                                                                                                                         usr/lib/python3/dist-packages/hgext/hooklib/__pycache__/enforce_draft_commits.cpython-311.pyc       0000644 0000000 0000000 00000003543 14714551121 030770  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        §
+    	^µc^  ã                   ó.   — d Z ddlmZ ddlmZmZ dd„ZdS )a†  enforce_draft_commits us a hook to ensure that all new changesets are
+in the draft phase. This allows enforcing policies for work-in-progress
+changes in overlay repositories, i.e. a shared hidden repositories with
+different views for work-in-progress code and public history.
+
+Usage:
+  [hooks]
+  pretxnclose-phase.enforce_draft_commits =     python:hgext.hooklib.enforce_draft_commits.hook
+é    )Ú_)ÚerrorÚpycompatNc                 ó  — |dk    r6t          j        t          d¦  «        t          j        |¦  «        z  ¦  «        ‚|                     ¦   «         |         }|d         rWt          j        t          d¦  «        t          j        |d         ¦  «        t          j        |d         ¦  «        |fz  ¦  «        ‚|d         dk    r>t          j        t          d¦  «        |t          j        |d         ¦  «        fz  ¦  «        ‚d S )Ns   pretxnclose-phases   Unsupported hook type %rÚoldphases*   Phase change from %r to %r for %s rejectedÚphases   drafts%   New changeset %s in phase %r rejected)r   ÚAbortr   r   ÚbytestrÚ
+unfiltered)ÚuiÚrepoÚhooktypeÚnodeÚkwargsÚctxs         úE/usr/lib/python3/dist-packages/hgext/hooklib/enforce_draft_commits.pyÚhookr      s  € ØĞ'Ò'Ğ'İŒkİĞ)Ñ*Ô*­XÔ-=¸hÑ-GÔ-GÑGñ
+ô 
+ğ 	
+ğ /Š/Ñ
+Ô
+˜DÔ
+!€CØˆjÔğ 
+İŒkİĞ;Ñ<Ô<åÔ  ¨
+Ô!3Ñ4Ô4İÔ  ¨¤Ñ1Ô1Øğññ
+ô 
+ğ 	
+ğ 
+Œ˜HÒ	$Ğ	$İŒkİĞ6Ñ7Ô7Ø•HÔ$ V¨G¤_Ñ5Ô5Ğ6ñ7ñ
+ô 
+ğ 	
+ğ 
+%Ğ	$ó    )N)Ú__doc__Úmercurial.i18nr   Ú	mercurialr   r   r   © r   r   ú<module>r      si   ğğ	ğ 	ğ Ğ Ğ Ğ Ğ Ğ ğğ ğ ğ ğ ğ ğ ğ ğ
+ğ 
+ğ 
+ğ 
+ğ 
+ğ 
+r                                                                                                                                                                usr/lib/python3/dist-packages/hgext/hooklib/__pycache__/reject_merge_commits.cpython-311.pyc        0000644 0000000 0000000 00000004224 14714551121 030617  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        §
+    	^µc7  ã                   ó.   — d Z ddlmZ ddlmZmZ dd„ZdS )aw  reject_merge_commits is a hook to check new changesets for merge commits.
+Merge commits are allowed only between different branches, i.e. merging
+a feature branch into the main development branch. This can be used to
+enforce policies for linear commit histories.
+
+Usage:
+  [hooks]
+  pretxnchangegroup.reject_merge_commits =     python:hgext.hooklib.reject_merge_commits.hook
+é    )Ú_)ÚerrorÚpycompatNc                 óö  ‡‡— |dk    r6t          j        t          d¦  «        t          j        |¦  «        z  ¦  «        ‚‰                     ¦   «         |         }‰j                             |                     ¦   «         ¬¦  «        D ]rŠ‰‰         Š‰ 	                    ¦   «         }t          |¦  «        dk     rŒ2t          ˆˆfd„|D ¦   «         ¦  «        r$t          j        t          d¦  «        ‰z  ¦  «        ‚Œsd S )Ns   pretxnchangegroups   Unsupported hook type %r)Ústarté   c              3   óx   •K  — | ]4}‰|                               ¦   «         ‰                      ¦   «         k    V — Œ5d S ©N)Úbranch)Ú.0ÚpÚrepoÚrevs     €€úD/usr/lib/python3/dist-packages/hgext/hooklib/reject_merge_commits.pyú	<genexpr>zhook.<locals>.<genexpr>%   s>   øè è € ĞAĞA°AˆtAŒw~Š~ÑÔ 3§:¢:¡<¤<Ò/ĞAĞAĞAĞAĞAĞAó    s@   %s rejected as merge on the same branch. Please consider rebase.)r   ÚAbortr   r   ÚbytestrÚ
+unfilteredÚ	changelogÚrevsr   ÚparentsÚlenÚall)Úuir   ÚhooktypeÚnodeÚkwargsÚctxr   r   s    `     @r   Úhookr       s  øø€ ØĞ'Ò'Ğ'İŒkİĞ)Ñ*Ô*­XÔ-=¸hÑ-GÔ-GÑGñ
+ô 
+ğ 	
+ğ /Š/Ñ
+Ô
+˜DÔ
+!€CØŒ~×"Ò"¨¯ª©¬Ğ"Ñ3Ô3ğ ğ ˆØ3ŒiˆØ—+’+‘-”-ˆİˆw‰<Œ<˜!ÒĞØİĞAĞAĞAĞAĞA¸ĞAÑAÔAÑAÔAğ 	İ”+İğ/ñô ğ ñ	ñô ğ ğ	ğğ r   r
+   )Ú__doc__Úmercurial.i18nr   Ú	mercurialr   r   r    © r   r   ú<module>r%      si   ğğ	ğ 	ğ Ğ Ğ Ğ Ğ Ğ ğğ ğ ğ ğ ğ ğ ğ ğğ ğ ğ ğ ğ r                                                                                                                                                                                                                                                                                                                                                                               usr/lib/python3/dist-packages/hgext/hooklib/__pycache__/reject_new_heads.cpython-311.pyc            0000644 0000000 0000000 00000003662 14714551121 027727  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        §
+    	^µcÑ  ã                   ó.   — d Z ddlmZ ddlmZmZ dd„ZdS )aB  reject_new_heads is a hook to check that branches touched by new changesets
+have at most one open head. It can be used to enforce policies for
+merge-before-push or rebase-before-push. It does not handle pre-existing
+hydras.
+
+Usage:
+  [hooks]
+  pretxnclose.reject_new_heads =     python:hgext.hooklib.reject_new_heads.hook
+é    )Ú_)ÚerrorÚpycompatNc                 óP  — |dk    r6t          j        t          d¦  «        t          j        |¦  «        z  ¦  «        ‚|                     ¦   «         |         }t          ¦   «         }|j                             | 	                    ¦   «         ¬¦  «        D ]1}||         }| 
+                    |                     ¦   «         ¦  «         Œ2|D ]_}t          |                     d|¦  «        ¦  «        dk    r6t          j        t          d¦  «        t          j        |¦  «        z  ¦  «        ‚Œ`d S )Ns   pretxncloses   Unsupported hook type %r)Ústartz&head() and not closed() and branch(%s)é   s/   Changes on branch %r resulted in multiple heads)r   ÚAbortr   r   ÚbytestrÚ
+unfilteredÚsetÚ	changelogÚrevsÚrevÚaddÚbranchÚlen)	ÚuiÚrepoÚhooktypeÚnodeÚkwargsÚctxÚbranchesr   r   s	            ú@/usr/lib/python3/dist-packages/hgext/hooklib/reject_new_heads.pyÚhookr      s   € Ø>Ò!Ğ!İŒkİĞ)Ñ*Ô*­XÔ-=¸hÑ-GÔ-GÑGñ
+ô 
+ğ 	
+ğ /Š/Ñ
+Ô
+˜DÔ
+!€Cİ‰uŒu€HØŒ~×"Ò"¨¯ª©¬Ğ"Ñ3Ô3ğ #ğ #ˆØ3ŒiˆØŠS—Z’Z‘\”\Ñ"Ô"Ğ"Ğ"Øğ ğ ˆİˆtyŠyĞAÀ6ÑJÔJÑKÔKÈaÒOĞOİ”+İĞDÑEÔEİÔ" 6Ñ*Ô*ñ+ñô ğ ğ Pğğ ó    )N)Ú__doc__Úmercurial.i18nr   Ú	mercurialr   r   r   © r   r   ú<module>r!      si   ğğ	ğ 	ğ Ğ Ğ Ğ Ğ Ğ ğğ ğ ğ ğ ğ ğ ğ ğğ ğ ğ ğ ğ r                                                                                 usr/lib/python3/dist-packages/hgext/hooklib/changeset_obsoleted.py                                  0000644 0000000 0000000 00000007515 14355257011 024102  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        # Copyright 2020 Joerg Sonnenberger <joerg@bec.de>
+#
+# This software may be used and distributed according to the terms of the
+# GNU General Public License version 2 or any later version.
+"""changeset_obsoleted is a hook to send a mail when an
+existing draft changeset is obsoleted by an obsmarker without successor.
+
+Correct message threading requires the same messageidseed to be used for both
+the original notification and the new mail.
+
+Usage:
+  [notify]
+  messageidseed = myseed
+
+  [hooks]
+  txnclose.changeset_obsoleted = \
+    python:hgext.hooklib.changeset_obsoleted.hook
+"""
+
+
+import email.errors as emailerrors
+import email.utils as emailutils
+
+from mercurial.i18n import _
+from mercurial import (
+    encoding,
+    error,
+    formatter,
+    logcmdutil,
+    mail,
+    obsutil,
+    pycompat,
+    registrar,
+)
+from mercurial.utils import dateutil
+from .. import notify
+
+configtable = {}
+configitem = registrar.configitem(configtable)
+
+configitem(
+    b'notify_obsoleted',
+    b'domain',
+    default=None,
+)
+configitem(
+    b'notify_obsoleted',
+    b'messageidseed',
+    default=None,
+)
+configitem(
+    b'notify_obsoleted',
+    b'template',
+    default=b'''Subject: changeset abandoned
+
+This changeset has been abandoned.
+''',
+)
+
+
+def _report_commit(ui, repo, ctx):
+    domain = ui.config(b'notify_obsoleted', b'domain') or ui.config(
+        b'notify', b'domain'
+    )
+    messageidseed = ui.config(
+        b'notify_obsoleted', b'messageidseed'
+    ) or ui.config(b'notify', b'messageidseed')
+    template = ui.config(b'notify_obsoleted', b'template')
+    spec = formatter.literal_templatespec(template)
+    templater = logcmdutil.changesettemplater(ui, repo, spec)
+    ui.pushbuffer()
+    n = notify.notifier(ui, repo, b'incoming')
+
+    subs = set()
+    for sub, spec in n.subs:
+        if spec is None:
+            subs.add(sub)
+            continue
+        revs = repo.revs(b'%r and %d:', spec, ctx.rev())
+        if len(revs):
+            subs.add(sub)
+            continue
+    if len(subs) == 0:
+        ui.debug(
+            b'notify_obsoleted: no subscribers to selected repo and revset\n'
+        )
+        return
+
+    templater.show(
+        ctx,
+        changes=ctx.changeset(),
+        baseurl=ui.config(b'web', b'baseurl'),
+        root=repo.root,
+        webroot=n.root,
+    )
+    data = ui.popbuffer()
+
+    try:
+        msg = mail.parsebytes(data)
+    except emailerrors.MessageParseError as inst:
+        raise error.Abort(inst)
+
+    msg['In-reply-to'] = notify.messageid(ctx, domain, messageidseed)
+    msg['Message-Id'] = notify.messageid(
+        ctx, domain, messageidseed + b'-obsoleted'
+    )
+    msg['Date'] = encoding.strfromlocal(
+        dateutil.datestr(format=b"%a, %d %b %Y %H:%M:%S %1%2")
+    )
+    if not msg['From']:
+        sender = ui.config(b'email', b'from') or ui.username()
+        if b'@' not in sender or b'@localhost' in sender:
+            sender = n.fixmail(sender)
+        msg['From'] = mail.addressencode(ui, sender, n.charsets, n.test)
+    msg['To'] = ', '.join(sorted(subs))
+
+    msgtext = msg.as_bytes()
+    if ui.configbool(b'notify', b'test'):
+        ui.write(msgtext)
+        if not msgtext.endswith(b'\n'):
+            ui.write(b'\n')
+    else:
+        ui.status(_(b'notify_obsoleted: sending mail for %d\n') % ctx.rev())
+        mail.sendmail(
+            ui, emailutils.parseaddr(msg['From'])[1], subs, msgtext, mbox=n.mbox
+        )
+
+
+def has_successor(repo, rev):
+    return any(
+        r for r in obsutil.allsuccessors(repo.obsstore, [rev]) if r != rev
+    )
+
+
+def hook(ui, repo, hooktype, node=None, **kwargs):
+    if hooktype != b"txnclose":
+        raise error.Abort(
+            _(b'Unsupported hook type %r') % pycompat.bytestr(hooktype)
+        )
+    for rev in obsutil.getobsoleted(repo, changes=kwargs['changes']):
+        ctx = repo.unfiltered()[rev]
+        if not has_successor(repo, ctx.node()):
+            _report_commit(ui, repo, ctx)
+                                                                                                                                                                                   usr/lib/python3/dist-packages/hgext/hooklib/changeset_published.py                                  0000644 0000000 0000000 00000007204 14355257011 024074  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        # Copyright 2020 Joerg Sonnenberger <joerg@bec.de>
+#
+# This software may be used and distributed according to the terms of the
+# GNU General Public License version 2 or any later version.
+"""changeset_published is a hook to send a mail when an
+existing draft changeset is moved to the public phase.
+
+Correct message threading requires the same messageidseed to be used for both
+the original notification and the new mail.
+
+Usage:
+  [notify]
+  messageidseed = myseed
+
+  [hooks]
+  txnclose-phase.changeset_published = \
+    python:hgext.hooklib.changeset_published.hook
+"""
+
+
+import email.errors as emailerrors
+import email.utils as emailutils
+
+from mercurial.i18n import _
+from mercurial import (
+    encoding,
+    error,
+    formatter,
+    logcmdutil,
+    mail,
+    pycompat,
+    registrar,
+)
+from mercurial.utils import dateutil
+from .. import notify
+
+configtable = {}
+configitem = registrar.configitem(configtable)
+
+configitem(
+    b'notify_published',
+    b'domain',
+    default=None,
+)
+configitem(
+    b'notify_published',
+    b'messageidseed',
+    default=None,
+)
+configitem(
+    b'notify_published',
+    b'template',
+    default=b'''Subject: changeset published
+
+This changeset has been published.
+''',
+)
+
+
+def _report_commit(ui, repo, ctx):
+    domain = ui.config(b'notify_published', b'domain') or ui.config(
+        b'notify', b'domain'
+    )
+    messageidseed = ui.config(
+        b'notify_published', b'messageidseed'
+    ) or ui.config(b'notify', b'messageidseed')
+    template = ui.config(b'notify_published', b'template')
+    spec = formatter.literal_templatespec(template)
+    templater = logcmdutil.changesettemplater(ui, repo, spec)
+    ui.pushbuffer()
+    n = notify.notifier(ui, repo, b'incoming')
+
+    subs = set()
+    for sub, spec in n.subs:
+        if spec is None:
+            subs.add(sub)
+            continue
+        revs = repo.revs(b'%r and %d:', spec, ctx.rev())
+        if len(revs):
+            subs.add(sub)
+            continue
+    if len(subs) == 0:
+        ui.debug(
+            b'notify_published: no subscribers to selected repo and revset\n'
+        )
+        return
+
+    templater.show(
+        ctx,
+        changes=ctx.changeset(),
+        baseurl=ui.config(b'web', b'baseurl'),
+        root=repo.root,
+        webroot=n.root,
+    )
+    data = ui.popbuffer()
+
+    try:
+        msg = mail.parsebytes(data)
+    except emailerrors.MessageParseError as inst:
+        raise error.Abort(inst)
+
+    msg['In-reply-to'] = notify.messageid(ctx, domain, messageidseed)
+    msg['Message-Id'] = notify.messageid(
+        ctx, domain, messageidseed + b'-published'
+    )
+    msg['Date'] = encoding.strfromlocal(
+        dateutil.datestr(format=b"%a, %d %b %Y %H:%M:%S %1%2")
+    )
+    if not msg['From']:
+        sender = ui.config(b'email', b'from') or ui.username()
+        if b'@' not in sender or b'@localhost' in sender:
+            sender = n.fixmail(sender)
+        msg['From'] = mail.addressencode(ui, sender, n.charsets, n.test)
+    msg['To'] = ', '.join(sorted(subs))
+
+    msgtext = msg.as_bytes()
+    if ui.configbool(b'notify', b'test'):
+        ui.write(msgtext)
+        if not msgtext.endswith(b'\n'):
+            ui.write(b'\n')
+    else:
+        ui.status(_(b'notify_published: sending mail for %d\n') % ctx.rev())
+        mail.sendmail(
+            ui, emailutils.parseaddr(msg['From'])[1], subs, msgtext, mbox=n.mbox
+        )
+
+

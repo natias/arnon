@@ -1,0 +1,1000 @@
+        }
+        else {
+            ($file, $comment) = /^(\S+)\s*(.*)/;
+        }
+        next unless $file;
+
+        if ($Is_MacOS) {
+            $file = _macify($file);
+            $file =~ s/\\([0-3][0-7][0-7])/sprintf("%c", oct($1))/ge;
+        }
+        elsif ($Is_VMS_mode) {
+            require File::Basename;
+            my($base,$dir) = File::Basename::fileparse($file);
+            # Resolve illegal file specifications in the same way as tar
+            if ($Is_VMS_nodot) {
+                $dir =~ tr/./_/;
+                my(@pieces) = split(/\./,$base);
+                if (@pieces > 2)
+                    { $base = shift(@pieces) . '.' . join('_',@pieces); }
+                my $okfile = "$dir$base";
+                warn "Debug: Illegal name $file changed to $okfile\n" if $Debug;
+                $file = $okfile;
+            }
+            if( $Is_VMS_lc ) {
+                $file = lc($file);
+                $file = uc($file) if $file =~ /^MANIFEST(\.SKIP)?$/i;
+            }
+        }
+
+        $read->{$file} = $comment;
+    }
+    close M;
+    $read;
+}
+
+=head2 maniskip
+
+    my $skipchk = maniskip();
+    my $skipchk = maniskip($manifest_skip_file);
+
+    if ($skipchk->($file)) { .. }
+
+reads a named C<MANIFEST.SKIP> file (defaults to C<MANIFEST.SKIP> in
+the current directory) and returns a CODE reference that tests whether
+a given filename should be skipped.
+
+=cut
+
+# returns an anonymous sub that decides if an argument matches
+sub maniskip {
+    my @skip ;
+    my $mfile = shift || "$MANIFEST.SKIP";
+    _check_mskip_directives($mfile) if -f $mfile;
+    local(*M, $_);
+    open M, "< $mfile" or open M, "< $DEFAULT_MSKIP" or return sub {0};
+    while (<M>){
+      chomp;
+      s/\r//;
+      $_ =~ qr{^\s*(?:(?:'([^\\']*(?:\\.[^\\']*)*)')|([^#\s]\S*))?(?:(?:\s*)|(?:\s+(.*?)\s*))$};
+      #my $comment = $3;
+      my $filename = $2;
+      if ( defined($1) ) {
+        $filename = $1;
+        $filename =~ s/\\(['\\])/$1/g;
+      }
+      next if (not defined($filename) or not $filename);
+      push @skip, _macify($filename);
+    }
+    close M;
+    return sub {0} unless (scalar @skip > 0);
+
+    my $opts = $Is_VMS_mode ? '(?i)' : '';
+
+    # Make sure each entry is isolated in its own parentheses, in case
+    # any of them contain alternations
+    my $regex = join '|', map "(?:$_)", @skip;
+
+    return sub { $_[0] =~ qr{$opts$regex} };
+}
+
+# checks for the special directives
+#   #!include_default
+#   #!include /path/to/some/manifest.skip
+# in a custom MANIFEST.SKIP for, for including
+# the content of, respectively, the default MANIFEST.SKIP
+# and an external manifest.skip file
+sub _check_mskip_directives {
+    my $mfile = shift;
+    local (*M, $_);
+    my @lines = ();
+    my $flag = 0;
+    unless (open M, "< $mfile") {
+        warn "Problem opening $mfile: $!";
+        return;
+    }
+    while (<M>) {
+        if (/^#!include_default\s*$/) {
+	    if (my @default = _include_mskip_file()) {
+	        push @lines, @default;
+		warn "Debug: Including default MANIFEST.SKIP\n" if $Debug;
+		$flag++;
+	    }
+	    next;
+        }
+	if (/^#!include\s+(.*)\s*$/) {
+	    my $external_file = $1;
+	    if (my @external = _include_mskip_file($external_file)) {
+	        push @lines, @external;
+		warn "Debug: Including external $external_file\n" if $Debug;
+		$flag++;
+	    }
+            next;
+        }
+        push @lines, $_;
+    }
+    close M;
+    return unless $flag;
+    my $bakbase = $mfile;
+    $bakbase =~ s/\./_/g if $Is_VMS_nodot;  # avoid double dots
+    rename $mfile, "$bakbase.bak";
+    warn "Debug: Saving original $mfile as $bakbase.bak\n" if $Debug;
+    unless (open M, "> $mfile") {
+        warn "Problem opening $mfile: $!";
+        return;
+    }
+    binmode M, ':raw';
+    print M $_ for (@lines);
+    close M;
+    return;
+}
+
+# returns an array containing the lines of an external
+# manifest.skip file, if given, or $DEFAULT_MSKIP
+sub _include_mskip_file {
+    my $mskip = shift || $DEFAULT_MSKIP;
+    unless (-f $mskip) {
+        warn qq{Included file "$mskip" not found - skipping};
+        return;
+    }
+    local (*M, $_);
+    unless (open M, "< $mskip") {
+        warn "Problem opening $mskip: $!";
+        return;
+    }
+    my @lines = ();
+    push @lines, "\n#!start included $mskip\n";
+    push @lines, $_ while <M>;
+    close M;
+    push @lines, "#!end included $mskip\n\n";
+    return @lines;
+}
+
+=head2 manicopy
+
+    manicopy(\%src, $dest_dir);
+    manicopy(\%src, $dest_dir, $how);
+
+Copies the files that are the keys in %src to the $dest_dir.  %src is
+typically returned by the maniread() function.
+
+    manicopy( maniread(), $dest_dir );
+
+This function is useful for producing a directory tree identical to the
+intended distribution tree.
+
+$how can be used to specify a different methods of "copying".  Valid
+values are C<cp>, which actually copies the files, C<ln> which creates
+hard links, and C<best> which mostly links the files but copies any
+symbolic link to make a tree without any symbolic link.  C<cp> is the
+default.
+
+=cut
+
+sub manicopy {
+    my($read,$target,$how)=@_;
+    croak "manicopy() called without target argument" unless defined $target;
+    $how ||= 'cp';
+    require File::Path;
+    require File::Basename;
+
+    $target = VMS::Filespec::unixify($target) if $Is_VMS_mode;
+    File::Path::mkpath([ $target ],! $Quiet,$Is_VMS ? undef : 0755);
+    foreach my $file (keys %$read){
+	if ($Is_MacOS) {
+	    if ($file =~ m!:!) {
+		my $dir = _maccat($target, $file);
+		$dir =~ s/[^:]+$//;
+		File::Path::mkpath($dir,1,0755);
+	    }
+	    cp_if_diff($file, _maccat($target, $file), $how);
+	} else {
+	    $file = VMS::Filespec::unixify($file) if $Is_VMS_mode;
+	    if ($file =~ m!/!) { # Ilya, that hurts, I fear, or maybe not?
+		my $dir = File::Basename::dirname($file);
+		$dir = VMS::Filespec::unixify($dir) if $Is_VMS_mode;
+		File::Path::mkpath(["$target/$dir"],! $Quiet,$Is_VMS ? undef : 0755);
+	    }
+	    cp_if_diff($file, "$target/$file", $how);
+	}
+    }
+}
+
+sub cp_if_diff {
+    my($from, $to, $how)=@_;
+    if (! -f $from) {
+        carp "$from not found";
+        return;
+    }
+    my($diff) = 0;
+    local(*F,*T);
+    open(F,"< $from\0") or die "Can't read $from: $!\n";
+    if (open(T,"< $to\0")) {
+        local $_;
+	while (<F>) { $diff++,last if $_ ne <T>; }
+	$diff++ unless eof(T);
+	close T;
+    }
+    else { $diff++; }
+    close F;
+    if ($diff) {
+	if (-e $to) {
+	    unlink($to) or confess "unlink $to: $!";
+	}
+        STRICT_SWITCH: {
+	    best($from,$to), last STRICT_SWITCH if $how eq 'best';
+	    cp($from,$to), last STRICT_SWITCH if $how eq 'cp';
+	    ln($from,$to), last STRICT_SWITCH if $how eq 'ln';
+	    croak("ExtUtils::Manifest::cp_if_diff " .
+		  "called with illegal how argument [$how]. " .
+		  "Legal values are 'best', 'cp', and 'ln'.");
+	}
+    }
+}
+
+sub cp {
+    my ($srcFile, $dstFile) = @_;
+    my ($access,$mod) = (stat $srcFile)[8,9];
+
+    copy($srcFile,$dstFile);
+    utime $access, $mod + ($Is_VMS ? 1 : 0), $dstFile;
+    _manicopy_chmod($srcFile, $dstFile);
+}
+
+
+sub ln {
+    my ($srcFile, $dstFile) = @_;
+    # Fix-me - VMS can support links.
+    return &cp if $Is_VMS or ($^O eq 'MSWin32' and Win32::IsWin95());
+    link($srcFile, $dstFile);
+
+    unless( _manicopy_chmod($srcFile, $dstFile) ) {
+        unlink $dstFile;
+        return;
+    }
+    1;
+}
+
+# 1) Strip off all group and world permissions.
+# 2) Let everyone read it.
+# 3) If the owner can execute it, everyone can.
+sub _manicopy_chmod {
+    my($srcFile, $dstFile) = @_;
+
+    my $perm = 0444 | (stat $srcFile)[2] & 0700;
+    chmod( $perm | ( $perm & 0100 ? 0111 : 0 ), $dstFile );
+}
+
+# Files that are often modified in the distdir.  Don't hard link them.
+my @Exceptions = qw(MANIFEST META.yml SIGNATURE);
+sub best {
+    my ($srcFile, $dstFile) = @_;
+
+    my $is_exception = grep $srcFile =~ /$_/, @Exceptions;
+    if ($is_exception or !$Config{d_link} or -l $srcFile) {
+	cp($srcFile, $dstFile);
+    } else {
+	ln($srcFile, $dstFile) or cp($srcFile, $dstFile);
+    }
+}
+
+sub _macify {
+    my($file) = @_;
+
+    return $file unless $Is_MacOS;
+
+    $file =~ s|^\./||;
+    if ($file =~ m|/|) {
+	$file =~ s|/+|:|g;
+	$file = ":$file";
+    }
+
+    $file;
+}
+
+sub _maccat {
+    my($f1, $f2) = @_;
+
+    return "$f1/$f2" unless $Is_MacOS;
+
+    $f1 .= ":$f2";
+    $f1 =~ s/([^:]:):/$1/g;
+    return $f1;
+}
+
+sub _unmacify {
+    my($file) = @_;
+
+    return $file unless $Is_MacOS;
+
+    $file =~ s|^:||;
+    $file =~ s|([/ \n])|sprintf("\\%03o", unpack("c", $1))|ge;
+    $file =~ y|:|/|;
+
+    $file;
+}
+
+
+=head2 maniadd
+
+  maniadd({ $file => $comment, ...});
+
+Adds an entry to an existing F<MANIFEST> unless its already there.
+
+$file will be normalized (ie. Unixified).  B<UNIMPLEMENTED>
+
+=cut
+
+sub maniadd {
+    my($additions) = shift;
+
+    _normalize($additions);
+    _fix_manifest($MANIFEST);
+
+    my $manifest = maniread();
+    my @needed = grep !exists $manifest->{$_}, keys %$additions;
+    return 1 unless @needed;
+
+    open(MANIFEST, ">>$MANIFEST") or
+      die "maniadd() could not open $MANIFEST: $!";
+    binmode MANIFEST, ':raw';
+
+    foreach my $file (_sort @needed) {
+        my $comment = $additions->{$file} || '';
+        if ($file =~ /\s/) {
+            $file =~ s/([\\'])/\\$1/g;
+            $file = "'$file'";
+        }
+        printf MANIFEST "%-40s %s\n", $file, $comment;
+    }
+    close MANIFEST or die "Error closing $MANIFEST: $!";
+
+    return 1;
+}
+
+
+# Make sure this MANIFEST is consistently written with native
+# newlines and has a terminal newline.
+sub _fix_manifest {
+    my $manifest_file = shift;
+
+    open MANIFEST, $MANIFEST or die "Could not open $MANIFEST: $!";
+    local $/;
+    my @manifest = split /(\015\012|\012|\015)/, <MANIFEST>, -1;
+    close MANIFEST;
+    my $must_rewrite = "";
+    if ($manifest[-1] eq ""){
+        # sane case: last line had a terminal newline
+        pop @manifest;
+        for (my $i=1; $i<=$#manifest; $i+=2) {
+            unless ($manifest[$i] eq "\n") {
+                $must_rewrite = "not a newline at pos $i";
+                last;
+            }
+        }
+    } else {
+        $must_rewrite = "last line without newline";
+    }
+
+    if ( $must_rewrite ) {
+        1 while unlink $MANIFEST; # avoid multiple versions on VMS
+        open MANIFEST, ">", $MANIFEST or die "(must_rewrite=$must_rewrite) Could not open >$MANIFEST: $!";
+	binmode MANIFEST, ':raw';
+        for (my $i=0; $i<=$#manifest; $i+=2) {
+            print MANIFEST "$manifest[$i]\n";
+        }
+        close MANIFEST or die "could not write $MANIFEST: $!";
+    }
+}
+
+
+# UNIMPLEMENTED
+sub _normalize {
+    return;
+}
+
+=head2 MANIFEST
+
+A list of files in the distribution, one file per line.  The MANIFEST
+always uses Unix filepath conventions even if you're not on Unix.  This
+means F<foo/bar> style not F<foo\bar>.
+
+Anything between white space and an end of line within a C<MANIFEST>
+file is considered to be a comment.  Any line beginning with # is also
+a comment. Beginning with ExtUtils::Manifest 1.52, a filename may
+contain whitespace characters if it is enclosed in single quotes; single
+quotes or backslashes in that filename must be backslash-escaped.
+
+    # this a comment
+    some/file
+    some/other/file            comment about some/file
+    'some/third file'          comment
+
+
+=head2 MANIFEST.SKIP
+
+The file MANIFEST.SKIP may contain regular expressions of files that
+should be ignored by mkmanifest() and filecheck(). The regular
+expressions should appear one on each line. Blank lines and lines
+which start with C<#> are skipped.  Use C<\#> if you need a regular
+expression to start with a C<#>.
+
+For example:
+
+    # Version control files and dirs.
+    \bRCS\b
+    \bCVS\b
+    ,v$
+    \B\.svn\b
+
+    # Makemaker generated files and dirs.
+    ^MANIFEST\.
+    ^Makefile$
+    ^blib/
+    ^MakeMaker-\d
+
+    # Temp, old and emacs backup files.
+    ~$
+    \.old$
+    ^#.*#$
+    ^\.#
+
+If no MANIFEST.SKIP file is found, a default set of skips will be
+used, similar to the example above.  If you want nothing skipped,
+simply make an empty MANIFEST.SKIP file.
+
+In one's own MANIFEST.SKIP file, certain directives
+can be used to include the contents of other MANIFEST.SKIP
+files. At present two such directives are recognized.
+
+=over 4
+
+=item #!include_default
+
+This inserts the contents of the default MANIFEST.SKIP file
+
+=item #!include /Path/to/another/manifest.skip
+
+This inserts the contents of the specified external file
+
+=back
+
+The included contents will be inserted into the MANIFEST.SKIP
+file in between I<#!start included /path/to/manifest.skip>
+and I<#!end included /path/to/manifest.skip> markers.
+The original MANIFEST.SKIP is saved as MANIFEST.SKIP.bak.
+
+=head2 EXPORT_OK
+
+C<&mkmanifest>, C<&manicheck>, C<&filecheck>, C<&fullcheck>,
+C<&maniread>, and C<&manicopy> are exportable.
+
+=head2 GLOBAL VARIABLES
+
+C<$ExtUtils::Manifest::MANIFEST> defaults to C<MANIFEST>. Changing it
+results in both a different C<MANIFEST> and a different
+C<MANIFEST.SKIP> file. This is useful if you want to maintain
+different distributions for different audiences (say a user version
+and a developer version including RCS).
+
+C<$ExtUtils::Manifest::Quiet> defaults to 0. If set to a true value,
+all functions act silently.
+
+C<$ExtUtils::Manifest::Debug> defaults to 0.  If set to a true value,
+or if PERL_MM_MANIFEST_DEBUG is true, debugging output will be
+produced.
+
+=head1 DIAGNOSTICS
+
+All diagnostic output is sent to C<STDERR>.
+
+=over 4
+
+=item C<Not in MANIFEST:> I<file>
+
+is reported if a file is found which is not in C<MANIFEST>.
+
+=item C<Skipping> I<file>
+
+is reported if a file is skipped due to an entry in C<MANIFEST.SKIP>.
+
+=item C<No such file:> I<file>
+
+is reported if a file mentioned in a C<MANIFEST> file does not
+exist.
+
+=item C<MANIFEST:> I<$!>
+
+is reported if C<MANIFEST> could not be opened.
+
+=item C<Added to MANIFEST:> I<file>
+
+is reported by mkmanifest() if $Verbose is set and a file is added
+to MANIFEST. $Verbose is set to 1 by default.
+
+=back
+
+=head1 ENVIRONMENT
+
+=over 4
+
+=item B<PERL_MM_MANIFEST_DEBUG>
+
+Turns on debugging
+
+=back
+
+=head1 SEE ALSO
+
+L<ExtUtils::MakeMaker> which has handy targets for most of the functionality.
+
+=head1 AUTHOR
+
+Andreas Koenig C<andreas.koenig@anima.de>
+
+Currently maintained by the Perl Toolchain Gang.
+
+=head1 COPYRIGHT AND LICENSE
+
+This software is copyright (c) 1996- by Andreas Koenig.
+
+This is free software; you can redistribute it and/or modify it under
+the same terms as the Perl 5 programming language system itself.
+
+=cut
+
+1;
+                                                             usr/share/perl/5.36.0/ExtUtils/Miniperl.pm                                                          0000644 0000000 0000000 00000014726 14530460112 016556  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        #!./perl -w
+package ExtUtils::Miniperl;
+use strict;
+use Exporter 'import';
+use ExtUtils::Embed 1.31, qw(xsi_header xsi_protos xsi_body);
+
+our @EXPORT = qw(writemain);
+our $VERSION = '1.11';
+
+# blead will run this with miniperl, hence we can't use autodie or File::Temp
+my $temp;
+
+END {
+    return if !defined $temp || !-e $temp;
+    unlink $temp or warn "Can't unlink '$temp': $!";
+}
+
+sub writemain{
+    my ($fh, $real);
+
+    if (ref $_[0] eq 'SCALAR') {
+        $real = ${+shift};
+        $temp = $real;
+        $temp =~ s/(?:.c)?\z/.new/;
+        open $fh, '>', $temp
+            or die "Can't open '$temp' for writing: $!";
+    } elsif (ref $_[0]) {
+        $fh = shift;
+    } else {
+        $fh = \*STDOUT;
+    }
+
+    my(@exts) = @_;
+
+    printf $fh <<'EOF!HEAD', xsi_header();
+/*    miniperlmain.c or perlmain.c - a generated file
+ *
+ *    Copyright (C) 1994, 1995, 1996, 1997, 1999, 2000, 2001, 2002, 2003,
+ *    2004, 2005, 2006, 2007, 2016 by Larry Wall and others
+ *
+ *    You may distribute under the terms of either the GNU General Public
+ *    License or the Artistic License, as specified in the README file.
+ *
+ */
+
+/*
+ *      The Road goes ever on and on
+ *          Down from the door where it began.
+ *
+ *     [Bilbo on p.35 of _The Lord of the Rings_, I/i: "A Long-Expected Party"]
+ *     [Frodo on p.73 of _The Lord of the Rings_, I/iii: "Three Is Company"]
+ */
+
+/* This file contains the main() function for the perl interpreter.
+ * Note that miniperlmain.c contains main() for the 'miniperl' binary,
+ * while perlmain.c contains main() for the 'perl' binary. The typical
+ * difference being that the latter includes Dynaloader.
+ *
+ * Miniperl is like perl except that it does not support dynamic loading,
+ * and in fact is used to build the dynamic modules needed for the 'real'
+ * perl executable.
+ *
+ * The content of the body of this generated file is mostly contained
+ * in Miniperl.pm - edit that file if you want to change anything.
+ * miniperlmain.c is generated by running regen/miniperlmain.pl, while
+ * perlmain.c is built automatically by Makefile (so the former is
+ * included in the tarball while the latter isn't).
+ */
+
+#ifdef OEMVS
+#ifdef MYMALLOC
+/* sbrk is limited to first heap segment so make it big */
+#pragma runopts(HEAP(8M,500K,ANYWHERE,KEEP,8K,4K) STACK(,,ANY,) ALL31(ON))
+#else
+#pragma runopts(HEAP(2M,500K,ANYWHERE,KEEP,8K,4K) STACK(,,ANY,) ALL31(ON))
+#endif
+#endif
+
+#define PERL_IN_MINIPERLMAIN_C
+
+/* work round bug in MakeMaker which doesn't currently (2019) supply this
+ * flag when making a statically linked perl */
+#define PERL_CORE 1
+
+%s
+static void xs_init (pTHX);
+static PerlInterpreter *my_perl;
+
+#ifdef NO_ENV_ARRAY_IN_MAIN
+extern char **environ;
+int
+main(int argc, char **argv)
+#else
+int
+main(int argc, char **argv, char **env)
+#endif
+{
+    int exitstatus, i;
+#ifndef NO_ENV_ARRAY_IN_MAIN
+    PERL_UNUSED_ARG(env);
+#endif
+#ifndef PERL_USE_SAFE_PUTENV
+    PL_use_safe_putenv = FALSE;
+#endif /* PERL_USE_SAFE_PUTENV */
+
+    /* if user wants control of gprof profiling off by default */
+    /* noop unless Configure is given -Accflags=-DPERL_GPROF_CONTROL */
+    PERL_GPROF_MONCONTROL(0);
+
+#ifdef NO_ENV_ARRAY_IN_MAIN
+    PERL_SYS_INIT3(&argc,&argv,&environ);
+#else
+    PERL_SYS_INIT3(&argc,&argv,&env);
+#endif
+
+#if defined(USE_ITHREADS)
+    /* XXX Ideally, this should really be happening in perl_alloc() or
+     * perl_construct() to keep libperl.a transparently fork()-safe.
+     * It is currently done here only because Apache/mod_perl have
+     * problems due to lack of a call to cancel pthread_atfork()
+     * handlers when shared objects that contain the handlers may
+     * be dlclose()d.  This forces applications that embed perl to
+     * call PTHREAD_ATFORK() explicitly, but if and only if it hasn't
+     * been called at least once before in the current process.
+     * --GSAR 2001-07-20 */
+    PTHREAD_ATFORK(Perl_atfork_lock,
+                   Perl_atfork_unlock,
+                   Perl_atfork_unlock);
+#endif
+
+    PERL_SYS_FPU_INIT;
+
+    if (!PL_do_undump) {
+	my_perl = perl_alloc();
+	if (!my_perl)
+	    exit(1);
+	perl_construct(my_perl);
+	PL_perl_destruct_level = 0;
+    }
+    PL_exit_flags |= PERL_EXIT_DESTRUCT_END;
+    if (!perl_parse(my_perl, xs_init, argc, argv, (char **)NULL))
+        perl_run(my_perl);
+
+#ifndef PERL_MICRO
+    /* Unregister our signal handler before destroying my_perl */
+    for (i = 1; PL_sig_name[i]; i++) {
+	if (rsignal_state(PL_sig_num[i]) == (Sighandler_t) PL_csighandlerp) {
+	    rsignal(PL_sig_num[i], (Sighandler_t) SIG_DFL);
+	}
+    }
+#endif
+
+    exitstatus = perl_destruct(my_perl);
+
+    perl_free(my_perl);
+
+#if defined(USE_ENVIRON_ARRAY) && defined(PERL_TRACK_MEMPOOL) && !defined(NO_ENV_ARRAY_IN_MAIN)
+    /*
+     * The old environment may have been freed by perl_free()
+     * when PERL_TRACK_MEMPOOL is defined, but without having
+     * been restored by perl_destruct() before (this is only
+     * done if destruct_level > 0).
+     *
+     * It is important to have a valid environment for atexit()
+     * routines that are eventually called.
+     */
+    environ = env;
+#endif
+
+    PERL_SYS_TERM();
+
+    exit(exitstatus);
+}
+
+/* Register any extra external extensions */
+
+EOF!HEAD
+
+    print $fh xsi_protos(@exts), <<'EOT', xsi_body(@exts), "}\n";
+
+static void
+xs_init(pTHX)
+{
+EOT
+
+    if ($real) {
+        close $fh or die "Can't close '$temp': $!";
+        rename $temp, $real or die "Can't rename '$temp' to '$real': $!";
+    }
+}
+
+1;
+__END__
+
+=head1 NAME
+
+ExtUtils::Miniperl - write the C code for miniperlmain.c and perlmain.c
+
+=head1 SYNOPSIS
+
+    use ExtUtils::Miniperl;
+    writemain(@directories);
+    # or
+    writemain($fh, @directories);
+    # or
+    writemain(\$filename, @directories);
+
+=head1 DESCRIPTION
+
+C<writemain()> takes an argument list of zero or more directories
+containing archive
+libraries that relate to perl modules and should be linked into a new
+perl binary. It writes a corresponding F<miniperlmain.c> or F<perlmain.c>
+file that
+is a plain C file containing all the bootstrap code to make the
+modules associated with the libraries available from within perl.
+If the first argument to C<writemain()> is a reference to a scalar it is
+used as the filename to open for output. Any other reference is used as
+the filehandle to write to. Otherwise output defaults to C<STDOUT>.
+
+The typical usage is from within perl's own Makefile (to build
+F<perlmain.c>) or from F<regen/miniperlmain.pl> (to build miniperlmain.c).
+So under normal circumstances you won't have to deal with this module
+directly.
+
+=head1 SEE ALSO
+
+L<ExtUtils::MakeMaker>
+
+=cut
+
+# ex: set ts=8 sts=4 sw=4 et:
+                                          usr/share/perl/5.36.0/ExtUtils/Mkbootstrap.pm                                                       0000644 0000000 0000000 00000006312 14530460112 017274  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        package ExtUtils::Mkbootstrap;
+
+use strict;
+use warnings;
+
+our $VERSION = '7.64';
+$VERSION =~ tr/_//d;
+
+require Exporter;
+our @ISA = ('Exporter');
+our @EXPORT = ('&Mkbootstrap');
+
+use Config;
+
+our $Verbose = 0;
+
+
+sub Mkbootstrap {
+    my($baseext, @bsloadlibs)=@_;
+    @bsloadlibs = grep($_, @bsloadlibs); # strip empty libs
+
+    print "	bsloadlibs=@bsloadlibs\n" if $Verbose;
+
+    # We need DynaLoader here because we and/or the *_BS file may
+    # call dl_findfile(). We don't say `use' here because when
+    # first building perl extensions the DynaLoader will not have
+    # been built when MakeMaker gets first used.
+    require DynaLoader;
+
+    rename "$baseext.bs", "$baseext.bso"
+      if -s "$baseext.bs";
+
+    if (-f "${baseext}_BS"){
+	$_ = "${baseext}_BS";
+	package DynaLoader; # execute code as if in DynaLoader
+	no strict 'vars';
+	local($osname, $dlsrc) = (); # avoid warnings
+	($osname, $dlsrc) = @Config::Config{qw(osname dlsrc)};
+	$bscode = "";
+	unshift @INC, ".";
+	require $_;
+	shift @INC;
+    }
+
+    if ($Config{'dlsrc'} =~ /^dl_dld/){
+	package DynaLoader;
+	no strict 'vars';
+	push(@dl_resolve_using, dl_findfile('-lc'));
+    }
+
+    my(@all) = (@bsloadlibs, @DynaLoader::dl_resolve_using);
+    my($method) = '';
+    if (@all || (defined $DynaLoader::bscode && length $DynaLoader::bscode)){
+	open my $bs, ">", "$baseext.bs"
+		or die "Unable to open $baseext.bs: $!";
+	print "Writing $baseext.bs\n";
+	print "	containing: @all" if $Verbose;
+	print $bs "# $baseext DynaLoader bootstrap file for $^O architecture.\n";
+	print $bs "# Do not edit this file, changes will be lost.\n";
+	print $bs "# This file was automatically generated by the\n";
+	print $bs "# Mkbootstrap routine in ExtUtils::Mkbootstrap (v$VERSION).\n";
+	if (@all) {
+	    print $bs "\@DynaLoader::dl_resolve_using = ";
+	    # If @all contains names in the form -lxxx or -Lxxx then it's asking for
+	    # runtime library location so we automatically add a call to dl_findfile()
+	    if (" @all" =~ m/ -[lLR]/){
+		print $bs "  dl_findfile(qw(\n  @all\n  ));\n";
+	    } else {
+		print $bs "  qw(@all);\n";
+	    }
+	}
+	# write extra code if *_BS says so
+	print $bs $DynaLoader::bscode if $DynaLoader::bscode;
+	print $bs "\n1;\n";
+	close $bs;
+    }
+}
+
+1;
+
+__END__
+
+=head1 NAME
+
+ExtUtils::Mkbootstrap - make a bootstrap file for use by DynaLoader
+
+=head1 SYNOPSIS
+
+  Mkbootstrap
+
+=head1 DESCRIPTION
+
+Mkbootstrap typically gets called from an extension Makefile.
+
+There is no C<*.bs> file supplied with the extension. Instead, there may
+be a C<*_BS> file which has code for the special cases, like posix for
+berkeley db on the NeXT.
+
+This file will get parsed, and produce a maybe empty
+C<@DynaLoader::dl_resolve_using> array for the current architecture.
+That will be extended by $BSLOADLIBS, which was computed by
+ExtUtils::Liblist::ext(). If this array still is empty, we do nothing,
+else we write a .bs file with an C<@DynaLoader::dl_resolve_using>
+array.
+
+The C<*_BS> file can put some code into the generated C<*.bs> file by
+placing it in C<$bscode>. This is a handy 'escape' mechanism that may
+prove useful in complex situations.
+
+If @DynaLoader::dl_resolve_using contains C<-L*> or C<-l*> entries then
+Mkbootstrap will automatically add a dl_findfile() call to the
+generated C<*.bs> file.
+
+=cut
+                                                                                                                                                                                                                                                                                                                      usr/share/perl/5.36.0/ExtUtils/Mksymlists.pm                                                        0000644 0000000 0000000 00000025405 14530460112 017152  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        package ExtUtils::Mksymlists;
+
+use 5.006;
+use strict qw[ subs refs ];
+# no strict 'vars';  # until filehandles are exempted
+use warnings;
+
+use Carp;
+use Exporter;
+use Config;
+
+our @ISA = qw(Exporter);
+our @EXPORT = qw(&Mksymlists);
+our $VERSION = '7.64';
+$VERSION =~ tr/_//d;
+
+sub Mksymlists {
+    my(%spec) = @_;
+    my($osname) = $^O;
+
+    croak("Insufficient information specified to Mksymlists")
+        unless ( $spec{NAME} or
+                 ($spec{FILE} and ($spec{DL_FUNCS} or $spec{FUNCLIST})) );
+
+    $spec{DL_VARS} = [] unless $spec{DL_VARS};
+    ($spec{FILE} = $spec{NAME}) =~ s/.*::// unless $spec{FILE};
+    $spec{FUNCLIST} = [] unless $spec{FUNCLIST};
+    $spec{DL_FUNCS} = { $spec{NAME} => [] }
+        unless ( ($spec{DL_FUNCS} and keys %{$spec{DL_FUNCS}}) or
+                 @{$spec{FUNCLIST}});
+    if (defined $spec{DL_FUNCS}) {
+        foreach my $package (sort keys %{$spec{DL_FUNCS}}) {
+            my($packprefix,$bootseen);
+            ($packprefix = $package) =~ s/\W/_/g;
+            foreach my $sym (@{$spec{DL_FUNCS}->{$package}}) {
+                if ($sym =~ /^boot_/) {
+                    push(@{$spec{FUNCLIST}},$sym);
+                    $bootseen++;
+                }
+                else {
+                    push(@{$spec{FUNCLIST}},"XS_${packprefix}_$sym");
+                }
+            }
+            push(@{$spec{FUNCLIST}},"boot_$packprefix") unless $bootseen;
+        }
+    }
+
+#    We'll need this if we ever add any OS which uses mod2fname
+#    not as pseudo-builtin.
+#    require DynaLoader;
+    if (defined &DynaLoader::mod2fname and not $spec{DLBASE}) {
+        $spec{DLBASE} = DynaLoader::mod2fname([ split(/::/,$spec{NAME}) ]);
+    }
+
+    if    ($osname eq 'aix') { _write_aix(\%spec); }
+    elsif ($osname eq 'MacOS'){ _write_aix(\%spec) }
+    elsif ($osname eq 'VMS') { _write_vms(\%spec) }
+    elsif ($osname eq 'os2') { _write_os2(\%spec) }
+    elsif ($osname eq 'MSWin32') { _write_win32(\%spec) }
+    else {
+        croak("Don't know how to create linker option file for $osname\n");
+    }
+}
+
+
+sub _write_aix {
+    my($data) = @_;
+
+    rename "$data->{FILE}.exp", "$data->{FILE}.exp_old";
+
+    open( my $exp, ">", "$data->{FILE}.exp")
+        or croak("Can't create $data->{FILE}.exp: $!\n");
+    print $exp join("\n",@{$data->{DL_VARS}}, "\n") if @{$data->{DL_VARS}};
+    print $exp join("\n",@{$data->{FUNCLIST}}, "\n") if @{$data->{FUNCLIST}};
+    close $exp;
+}
+
+
+sub _write_os2 {
+    my($data) = @_;
+    require Config;
+    my $threaded = ($Config::Config{archname} =~ /-thread/ ? " threaded" : "");
+
+    if (not $data->{DLBASE}) {
+        ($data->{DLBASE} = $data->{NAME}) =~ s/.*:://;
+        $data->{DLBASE} = substr($data->{DLBASE},0,7) . '_';
+    }
+    my $distname = $data->{DISTNAME} || $data->{NAME};
+    $distname = "Distribution $distname";
+    my $patchlevel = " pl$Config{perl_patchlevel}" || '';
+    my $comment = sprintf "Perl (v%s%s%s) module %s",
+      $Config::Config{version}, $threaded, $patchlevel, $data->{NAME};
+    chomp $comment;
+    if ($data->{INSTALLDIRS} and $data->{INSTALLDIRS} eq 'perl') {
+        $distname = 'perl5-porters@perl.org';
+        $comment = "Core $comment";
+    }
+    $comment = "$comment (Perl-config: $Config{config_args})";
+    $comment = substr($comment, 0, 200) . "...)" if length $comment > 203;
+    rename "$data->{FILE}.def", "$data->{FILE}_def.old";
+
+    open(my $def, ">", "$data->{FILE}.def")
+        or croak("Can't create $data->{FILE}.def: $!\n");
+    print $def "LIBRARY '$data->{DLBASE}' INITINSTANCE TERMINSTANCE\n";
+    print $def "DESCRIPTION '\@#$distname:$data->{VERSION}#\@ $comment'\n";
+    print $def "CODE LOADONCALL\n";
+    print $def "DATA LOADONCALL NONSHARED MULTIPLE\n";
+    print $def "EXPORTS\n  ";

@@ -1,0 +1,1000 @@
+                    self.ui.write(
+                        _(b'note: commit message saved in %s\n') % msg_path
+                    )
+                    self.ui.write(
+                        _(
+                            b"note: use 'hg commit --logfile "
+                            b"%s --edit' to reuse it\n"
+                        )
+                        % msg_path
+                    )
+                raise
+
+        def commithook(unused_success):
+            # hack for command that use a temporary commit (eg: histedit)
+            # temporary commit got stripped before hook release
+            if self.changelog.hasnode(ret):
+                self.hook(
+                    b"commit", node=hex(ret), parent1=hookp1, parent2=hookp2
+                )
+
+        self._afterlock(commithook)
+        return ret
+
+    @unfilteredmethod
+    def commitctx(self, ctx, error=False, origctx=None):
+        return commit.commitctx(self, ctx, error=error, origctx=origctx)
+
+    @unfilteredmethod
+    def destroying(self):
+        """Inform the repository that nodes are about to be destroyed.
+        Intended for use by strip and rollback, so there's a common
+        place for anything that has to be done before destroying history.
+
+        This is mostly useful for saving state that is in memory and waiting
+        to be flushed when the current lock is released. Because a call to
+        destroyed is imminent, the repo will be invalidated causing those
+        changes to stay in memory (waiting for the next unlock), or vanish
+        completely.
+        """
+        # When using the same lock to commit and strip, the phasecache is left
+        # dirty after committing. Then when we strip, the repo is invalidated,
+        # causing those changes to disappear.
+        if '_phasecache' in vars(self):
+            self._phasecache.write()
+
+    @unfilteredmethod
+    def destroyed(self):
+        """Inform the repository that nodes have been destroyed.
+        Intended for use by strip and rollback, so there's a common
+        place for anything that has to be done after destroying history.
+        """
+        # When one tries to:
+        # 1) destroy nodes thus calling this method (e.g. strip)
+        # 2) use phasecache somewhere (e.g. commit)
+        #
+        # then 2) will fail because the phasecache contains nodes that were
+        # removed. We can either remove phasecache from the filecache,
+        # causing it to reload next time it is accessed, or simply filter
+        # the removed nodes now and write the updated cache.
+        self._phasecache.filterunknown(self)
+        self._phasecache.write()
+
+        # refresh all repository caches
+        self.updatecaches()
+
+        # Ensure the persistent tag cache is updated.  Doing it now
+        # means that the tag cache only has to worry about destroyed
+        # heads immediately after a strip/rollback.  That in turn
+        # guarantees that "cachetip == currenttip" (comparing both rev
+        # and node) always means no nodes have been added or destroyed.
+
+        # XXX this is suboptimal when qrefresh'ing: we strip the current
+        # head, refresh the tag cache, then immediately add a new head.
+        # But I think doing it this way is necessary for the "instant
+        # tag cache retrieval" case to work.
+        self.invalidate()
+
+    def status(
+        self,
+        node1=b'.',
+        node2=None,
+        match=None,
+        ignored=False,
+        clean=False,
+        unknown=False,
+        listsubrepos=False,
+    ):
+        '''a convenience method that calls node1.status(node2)'''
+        return self[node1].status(
+            node2, match, ignored, clean, unknown, listsubrepos
+        )
+
+    def addpostdsstatus(self, ps):
+        """Add a callback to run within the wlock, at the point at which status
+        fixups happen.
+
+        On status completion, callback(wctx, status) will be called with the
+        wlock held, unless the dirstate has changed from underneath or the wlock
+        couldn't be grabbed.
+
+        Callbacks should not capture and use a cached copy of the dirstate --
+        it might change in the meanwhile. Instead, they should access the
+        dirstate via wctx.repo().dirstate.
+
+        This list is emptied out after each status run -- extensions should
+        make sure it adds to this list each time dirstate.status is called.
+        Extensions should also make sure they don't call this for statuses
+        that don't involve the dirstate.
+        """
+
+        # The list is located here for uniqueness reasons -- it is actually
+        # managed by the workingctx, but that isn't unique per-repo.
+        self._postdsstatus.append(ps)
+
+    def postdsstatus(self):
+        """Used by workingctx to get the list of post-dirstate-status hooks."""
+        return self._postdsstatus
+
+    def clearpostdsstatus(self):
+        """Used by workingctx to clear post-dirstate-status hooks."""
+        del self._postdsstatus[:]
+
+    def heads(self, start=None):
+        if start is None:
+            cl = self.changelog
+            headrevs = reversed(cl.headrevs())
+            return [cl.node(rev) for rev in headrevs]
+
+        heads = self.changelog.heads(start)
+        # sort the output in rev descending order
+        return sorted(heads, key=self.changelog.rev, reverse=True)
+
+    def branchheads(self, branch=None, start=None, closed=False):
+        """return a (possibly filtered) list of heads for the given branch
+
+        Heads are returned in topological order, from newest to oldest.
+        If branch is None, use the dirstate branch.
+        If start is not None, return only heads reachable from start.
+        If closed is True, return heads that are marked as closed as well.
+        """
+        if branch is None:
+            branch = self[None].branch()
+        branches = self.branchmap()
+        if not branches.hasbranch(branch):
+            return []
+        # the cache returns heads ordered lowest to highest
+        bheads = list(reversed(branches.branchheads(branch, closed=closed)))
+        if start is not None:
+            # filter out the heads that cannot be reached from startrev
+            fbheads = set(self.changelog.nodesbetween([start], bheads)[2])
+            bheads = [h for h in bheads if h in fbheads]
+        return bheads
+
+    def branches(self, nodes):
+        if not nodes:
+            nodes = [self.changelog.tip()]
+        b = []
+        for n in nodes:
+            t = n
+            while True:
+                p = self.changelog.parents(n)
+                if p[1] != self.nullid or p[0] == self.nullid:
+                    b.append((t, n, p[0], p[1]))
+                    break
+                n = p[0]
+        return b
+
+    def between(self, pairs):
+        r = []
+
+        for top, bottom in pairs:
+            n, l, i = top, [], 0
+            f = 1
+
+            while n != bottom and n != self.nullid:
+                p = self.changelog.parents(n)[0]
+                if i == f:
+                    l.append(n)
+                    f = f * 2
+                n = p
+                i += 1
+
+            r.append(l)
+
+        return r
+
+    def checkpush(self, pushop):
+        """Extensions can override this function if additional checks have
+        to be performed before pushing, or call it if they override push
+        command.
+        """
+
+    @unfilteredpropertycache
+    def prepushoutgoinghooks(self):
+        """Return util.hooks consists of a pushop with repo, remote, outgoing
+        methods, which are called before pushing changesets.
+        """
+        return util.hooks()
+
+    def pushkey(self, namespace, key, old, new):
+        try:
+            tr = self.currenttransaction()
+            hookargs = {}
+            if tr is not None:
+                hookargs.update(tr.hookargs)
+            hookargs = pycompat.strkwargs(hookargs)
+            hookargs['namespace'] = namespace
+            hookargs['key'] = key
+            hookargs['old'] = old
+            hookargs['new'] = new
+            self.hook(b'prepushkey', throw=True, **hookargs)
+        except error.HookAbort as exc:
+            self.ui.write_err(_(b"pushkey-abort: %s\n") % exc)
+            if exc.hint:
+                self.ui.write_err(_(b"(%s)\n") % exc.hint)
+            return False
+        self.ui.debug(b'pushing key for "%s:%s"\n' % (namespace, key))
+        ret = pushkey.push(self, namespace, key, old, new)
+
+        def runhook(unused_success):
+            self.hook(
+                b'pushkey',
+                namespace=namespace,
+                key=key,
+                old=old,
+                new=new,
+                ret=ret,
+            )
+
+        self._afterlock(runhook)
+        return ret
+
+    def listkeys(self, namespace):
+        self.hook(b'prelistkeys', throw=True, namespace=namespace)
+        self.ui.debug(b'listing keys for "%s"\n' % namespace)
+        values = pushkey.list(self, namespace)
+        self.hook(b'listkeys', namespace=namespace, values=values)
+        return values
+
+    def debugwireargs(self, one, two, three=None, four=None, five=None):
+        '''used to test argument passing over the wire'''
+        return b"%s %s %s %s %s" % (
+            one,
+            two,
+            pycompat.bytestr(three),
+            pycompat.bytestr(four),
+            pycompat.bytestr(five),
+        )
+
+    def savecommitmessage(self, text):
+        fp = self.vfs(b'last-message.txt', b'wb')
+        try:
+            fp.write(text)
+        finally:
+            fp.close()
+        return self.pathto(fp.name[len(self.root) + 1 :])
+
+    def register_wanted_sidedata(self, category):
+        if repository.REPO_FEATURE_SIDE_DATA not in self.features:
+            # Only revlogv2 repos can want sidedata.
+            return
+        self._wanted_sidedata.add(pycompat.bytestr(category))
+
+    def register_sidedata_computer(
+        self, kind, category, keys, computer, flags, replace=False
+    ):
+        if kind not in revlogconst.ALL_KINDS:
+            msg = _(b"unexpected revlog kind '%s'.")
+            raise error.ProgrammingError(msg % kind)
+        category = pycompat.bytestr(category)
+        already_registered = category in self._sidedata_computers.get(kind, [])
+        if already_registered and not replace:
+            msg = _(
+                b"cannot register a sidedata computer twice for category '%s'."
+            )
+            raise error.ProgrammingError(msg % category)
+        if replace and not already_registered:
+            msg = _(
+                b"cannot replace a sidedata computer that isn't registered "
+                b"for category '%s'."
+            )
+            raise error.ProgrammingError(msg % category)
+        self._sidedata_computers.setdefault(kind, {})
+        self._sidedata_computers[kind][category] = (keys, computer, flags)
+
+
+# used to avoid circular references so destructors work
+def aftertrans(files):
+    renamefiles = [tuple(t) for t in files]
+
+    def a():
+        for vfs, src, dest in renamefiles:
+            # if src and dest refer to a same file, vfs.rename is a no-op,
+            # leaving both src and dest on disk. delete dest to make sure
+            # the rename couldn't be such a no-op.
+            vfs.tryunlink(dest)
+            try:
+                vfs.rename(src, dest)
+            except FileNotFoundError:  # journal file does not yet exist
+                pass
+
+    return a
+
+
+def undoname(fn):
+    base, name = os.path.split(fn)
+    assert name.startswith(b'journal')
+    return os.path.join(base, name.replace(b'journal', b'undo', 1))
+
+
+def instance(ui, path, create, intents=None, createopts=None):
+
+    # prevent cyclic import localrepo -> upgrade -> localrepo
+    from . import upgrade
+
+    localpath = urlutil.urllocalpath(path)
+    if create:
+        createrepository(ui, localpath, createopts=createopts)
+
+    def repo_maker():
+        return makelocalrepository(ui, localpath, intents=intents)
+
+    repo = repo_maker()
+    repo = upgrade.may_auto_upgrade(repo, repo_maker)
+    return repo
+
+
+def islocal(path):
+    return True
+
+
+def defaultcreateopts(ui, createopts=None):
+    """Populate the default creation options for a repository.
+
+    A dictionary of explicitly requested creation options can be passed
+    in. Missing keys will be populated.
+    """
+    createopts = dict(createopts or {})
+
+    if b'backend' not in createopts:
+        # experimental config: storage.new-repo-backend
+        createopts[b'backend'] = ui.config(b'storage', b'new-repo-backend')
+
+    return createopts
+
+
+def clone_requirements(ui, createopts, srcrepo):
+    """clone the requirements of a local repo for a local clone
+
+    The store requirements are unchanged while the working copy requirements
+    depends on the configuration
+    """
+    target_requirements = set()
+    if not srcrepo.requirements:
+        # this is a legacy revlog "v0" repository, we cannot do anything fancy
+        # with it.
+        return target_requirements
+    createopts = defaultcreateopts(ui, createopts=createopts)
+    for r in newreporequirements(ui, createopts):
+        if r in requirementsmod.WORKING_DIR_REQUIREMENTS:
+            target_requirements.add(r)
+
+    for r in srcrepo.requirements:
+        if r not in requirementsmod.WORKING_DIR_REQUIREMENTS:
+            target_requirements.add(r)
+    return target_requirements
+
+
+def newreporequirements(ui, createopts):
+    """Determine the set of requirements for a new local repository.
+
+    Extensions can wrap this function to specify custom requirements for
+    new repositories.
+    """
+
+    if b'backend' not in createopts:
+        raise error.ProgrammingError(
+            b'backend key not present in createopts; '
+            b'was defaultcreateopts() called?'
+        )
+
+    if createopts[b'backend'] != b'revlogv1':
+        raise error.Abort(
+            _(
+                b'unable to determine repository requirements for '
+                b'storage backend: %s'
+            )
+            % createopts[b'backend']
+        )
+
+    requirements = {requirementsmod.REVLOGV1_REQUIREMENT}
+    if ui.configbool(b'format', b'usestore'):
+        requirements.add(requirementsmod.STORE_REQUIREMENT)
+        if ui.configbool(b'format', b'usefncache'):
+            requirements.add(requirementsmod.FNCACHE_REQUIREMENT)
+            if ui.configbool(b'format', b'dotencode'):
+                requirements.add(requirementsmod.DOTENCODE_REQUIREMENT)
+
+    compengines = ui.configlist(b'format', b'revlog-compression')
+    for compengine in compengines:
+        if compengine in util.compengines:
+            engine = util.compengines[compengine]
+            if engine.available() and engine.revlogheader():
+                break
+    else:
+        raise error.Abort(
+            _(
+                b'compression engines %s defined by '
+                b'format.revlog-compression not available'
+            )
+            % b', '.join(b'"%s"' % e for e in compengines),
+            hint=_(
+                b'run "hg debuginstall" to list available '
+                b'compression engines'
+            ),
+        )
+
+    # zlib is the historical default and doesn't need an explicit requirement.
+    if compengine == b'zstd':
+        requirements.add(b'revlog-compression-zstd')
+    elif compengine != b'zlib':
+        requirements.add(b'exp-compression-%s' % compengine)
+
+    if scmutil.gdinitconfig(ui):
+        requirements.add(requirementsmod.GENERALDELTA_REQUIREMENT)
+        if ui.configbool(b'format', b'sparse-revlog'):
+            requirements.add(requirementsmod.SPARSEREVLOG_REQUIREMENT)
+
+    # experimental config: format.use-dirstate-v2
+    # Keep this logic in sync with `has_dirstate_v2()` in `tests/hghave.py`
+    if ui.configbool(b'format', b'use-dirstate-v2'):
+        requirements.add(requirementsmod.DIRSTATE_V2_REQUIREMENT)
+
+    # experimental config: format.exp-use-copies-side-data-changeset
+    if ui.configbool(b'format', b'exp-use-copies-side-data-changeset'):
+        requirements.add(requirementsmod.CHANGELOGV2_REQUIREMENT)
+        requirements.add(requirementsmod.COPIESSDC_REQUIREMENT)
+    if ui.configbool(b'experimental', b'treemanifest'):
+        requirements.add(requirementsmod.TREEMANIFEST_REQUIREMENT)
+
+    changelogv2 = ui.config(b'format', b'exp-use-changelog-v2')
+    if changelogv2 == b'enable-unstable-format-and-corrupt-my-data':
+        requirements.add(requirementsmod.CHANGELOGV2_REQUIREMENT)
+
+    revlogv2 = ui.config(b'experimental', b'revlogv2')
+    if revlogv2 == b'enable-unstable-format-and-corrupt-my-data':
+        requirements.discard(requirementsmod.REVLOGV1_REQUIREMENT)
+        requirements.add(requirementsmod.REVLOGV2_REQUIREMENT)
+    # experimental config: format.internal-phase
+    if ui.configbool(b'format', b'use-internal-phase'):
+        requirements.add(requirementsmod.INTERNAL_PHASE_REQUIREMENT)
+
+    # experimental config: format.exp-archived-phase
+    if ui.configbool(b'format', b'exp-archived-phase'):
+        requirements.add(requirementsmod.ARCHIVED_PHASE_REQUIREMENT)
+
+    if createopts.get(b'narrowfiles'):
+        requirements.add(requirementsmod.NARROW_REQUIREMENT)
+
+    if createopts.get(b'lfs'):
+        requirements.add(b'lfs')
+
+    if ui.configbool(b'format', b'bookmarks-in-store'):
+        requirements.add(requirementsmod.BOOKMARKS_IN_STORE_REQUIREMENT)
+
+    if ui.configbool(b'format', b'use-persistent-nodemap'):
+        requirements.add(requirementsmod.NODEMAP_REQUIREMENT)
+
+    # if share-safe is enabled, let's create the new repository with the new
+    # requirement
+    if ui.configbool(b'format', b'use-share-safe'):
+        requirements.add(requirementsmod.SHARESAFE_REQUIREMENT)
+
+    # if we are creating a share-repo¹  we have to handle requirement
+    # differently.
+    #
+    # [1] (i.e. reusing the store from another repository, just having a
+    # working copy)
+    if b'sharedrepo' in createopts:
+        source_requirements = set(createopts[b'sharedrepo'].requirements)
+
+        if requirementsmod.SHARESAFE_REQUIREMENT not in source_requirements:
+            # share to an old school repository, we have to copy the
+            # requirements and hope for the best.
+            requirements = source_requirements
+        else:
+            # We have control on the working copy only, so "copy" the non
+            # working copy part over, ignoring previous logic.
+            to_drop = set()
+            for req in requirements:
+                if req in requirementsmod.WORKING_DIR_REQUIREMENTS:
+                    continue
+                if req in source_requirements:
+                    continue
+                to_drop.add(req)
+            requirements -= to_drop
+            requirements |= source_requirements
+
+        if createopts.get(b'sharedrelative'):
+            requirements.add(requirementsmod.RELATIVE_SHARED_REQUIREMENT)
+        else:
+            requirements.add(requirementsmod.SHARED_REQUIREMENT)
+
+    if ui.configbool(b'format', b'use-dirstate-tracked-hint'):
+        version = ui.configint(b'format', b'use-dirstate-tracked-hint.version')
+        msg = _(b"ignoring unknown tracked key version: %d\n")
+        hint = _(
+            b"see `hg help config.format.use-dirstate-tracked-hint-version"
+        )
+        if version != 1:
+            ui.warn(msg % version, hint=hint)
+        else:
+            requirements.add(requirementsmod.DIRSTATE_TRACKED_HINT_V1)
+
+    return requirements
+
+
+def checkrequirementscompat(ui, requirements):
+    """Checks compatibility of repository requirements enabled and disabled.
+
+    Returns a set of requirements which needs to be dropped because dependend
+    requirements are not enabled. Also warns users about it"""
+
+    dropped = set()
+
+    if requirementsmod.STORE_REQUIREMENT not in requirements:
+        if requirementsmod.BOOKMARKS_IN_STORE_REQUIREMENT in requirements:
+            ui.warn(
+                _(
+                    b'ignoring enabled \'format.bookmarks-in-store\' config '
+                    b'beacuse it is incompatible with disabled '
+                    b'\'format.usestore\' config\n'
+                )
+            )
+            dropped.add(requirementsmod.BOOKMARKS_IN_STORE_REQUIREMENT)
+
+        if (
+            requirementsmod.SHARED_REQUIREMENT in requirements
+            or requirementsmod.RELATIVE_SHARED_REQUIREMENT in requirements
+        ):
+            raise error.Abort(
+                _(
+                    b"cannot create shared repository as source was created"
+                    b" with 'format.usestore' config disabled"
+                )
+            )
+
+        if requirementsmod.SHARESAFE_REQUIREMENT in requirements:
+            if ui.hasconfig(b'format', b'use-share-safe'):
+                msg = _(
+                    b"ignoring enabled 'format.use-share-safe' config because "
+                    b"it is incompatible with disabled 'format.usestore'"
+                    b" config\n"
+                )
+                ui.warn(msg)
+            dropped.add(requirementsmod.SHARESAFE_REQUIREMENT)
+
+    return dropped
+
+
+def filterknowncreateopts(ui, createopts):
+    """Filters a dict of repo creation options against options that are known.
+
+    Receives a dict of repo creation options and returns a dict of those
+    options that we don't know how to handle.
+
+    This function is called as part of repository creation. If the
+    returned dict contains any items, repository creation will not
+    be allowed, as it means there was a request to create a repository
+    with options not recognized by loaded code.
+
+    Extensions can wrap this function to filter out creation options
+    they know how to handle.
+    """
+    known = {
+        b'backend',
+        b'lfs',
+        b'narrowfiles',
+        b'sharedrepo',
+        b'sharedrelative',
+        b'shareditems',
+        b'shallowfilestore',
+    }
+
+    return {k: v for k, v in createopts.items() if k not in known}
+
+
+def createrepository(ui, path, createopts=None, requirements=None):
+    """Create a new repository in a vfs.
+
+    ``path`` path to the new repo's working directory.
+    ``createopts`` options for the new repository.
+    ``requirement`` predefined set of requirements.
+                    (incompatible with ``createopts``)
+
+    The following keys for ``createopts`` are recognized:
+
+    backend
+       The storage backend to use.
+    lfs
+       Repository will be created with ``lfs`` requirement. The lfs extension
+       will automatically be loaded when the repository is accessed.
+    narrowfiles
+       Set up repository to support narrow file storage.
+    sharedrepo
+       Repository object from which storage should be shared.
+    sharedrelative
+       Boolean indicating if the path to the shared repo should be
+       stored as relative. By default, the pointer to the "parent" repo
+       is stored as an absolute path.
+    shareditems
+       Set of items to share to the new repository (in addition to storage).
+    shallowfilestore
+       Indicates that storage for files should be shallow (not all ancestor
+       revisions are known).
+    """
+
+    if requirements is not None:
+        if createopts is not None:
+            msg = b'cannot specify both createopts and requirements'
+            raise error.ProgrammingError(msg)
+        createopts = {}
+    else:
+        createopts = defaultcreateopts(ui, createopts=createopts)
+
+        unknownopts = filterknowncreateopts(ui, createopts)
+
+        if not isinstance(unknownopts, dict):
+            raise error.ProgrammingError(
+                b'filterknowncreateopts() did not return a dict'
+            )
+
+        if unknownopts:
+            raise error.Abort(
+                _(
+                    b'unable to create repository because of unknown '
+                    b'creation option: %s'
+                )
+                % b', '.join(sorted(unknownopts)),
+                hint=_(b'is a required extension not loaded?'),
+            )
+
+        requirements = newreporequirements(ui, createopts=createopts)
+        requirements -= checkrequirementscompat(ui, requirements)
+
+    wdirvfs = vfsmod.vfs(path, expandpath=True, realpath=True)
+
+    hgvfs = vfsmod.vfs(wdirvfs.join(b'.hg'))
+    if hgvfs.exists():
+        raise error.RepoError(_(b'repository %s already exists') % path)
+
+    if b'sharedrepo' in createopts:
+        sharedpath = createopts[b'sharedrepo'].sharedpath
+
+        if createopts.get(b'sharedrelative'):
+            try:
+                sharedpath = os.path.relpath(sharedpath, hgvfs.base)
+                sharedpath = util.pconvert(sharedpath)
+            except (IOError, ValueError) as e:
+                # ValueError is raised on Windows if the drive letters differ
+                # on each path.
+                raise error.Abort(
+                    _(b'cannot calculate relative path'),
+                    hint=stringutil.forcebytestr(e),
+                )
+
+    if not wdirvfs.exists():
+        wdirvfs.makedirs()
+
+    hgvfs.makedir(notindexed=True)
+    if b'sharedrepo' not in createopts:
+        hgvfs.mkdir(b'cache')
+    hgvfs.mkdir(b'wcache')
+
+    has_store = requirementsmod.STORE_REQUIREMENT in requirements
+    if has_store and b'sharedrepo' not in createopts:
+        hgvfs.mkdir(b'store')
+
+        # We create an invalid changelog outside the store so very old
+        # Mercurial versions (which didn't know about the requirements
+        # file) encounter an error on reading the changelog. This
+        # effectively locks out old clients and prevents them from
+        # mucking with a repo in an unknown format.
+        #
+        # The revlog header has version 65535, which won't be recognized by
+        # such old clients.
+        hgvfs.append(
+            b'00changelog.i',
+            b'\0\0\xFF\xFF dummy changelog to prevent using the old repo '
+            b'layout',
+        )
+
+    # Filter the requirements into working copy and store ones
+    wcreq, storereq = scmutil.filterrequirements(requirements)
+    # write working copy ones
+    scmutil.writerequires(hgvfs, wcreq)
+    # If there are store requirements and the current repository
+    # is not a shared one, write stored requirements
+    # For new shared repository, we don't need to write the store
+    # requirements as they are already present in store requires
+    if storereq and b'sharedrepo' not in createopts:
+        storevfs = vfsmod.vfs(hgvfs.join(b'store'), cacheaudited=True)
+        scmutil.writerequires(storevfs, storereq)
+
+    # Write out file telling readers where to find the shared store.
+    if b'sharedrepo' in createopts:
+        hgvfs.write(b'sharedpath', sharedpath)
+
+    if createopts.get(b'shareditems'):
+        shared = b'\n'.join(sorted(createopts[b'shareditems'])) + b'\n'
+        hgvfs.write(b'shared', shared)
+
+
+def poisonrepository(repo):
+    """Poison a repository instance so it can no longer be used."""
+    # Perform any cleanup on the instance.
+    repo.close()
+
+    # Our strategy is to replace the type of the object with one that
+    # has all attribute lookups result in error.
+    #
+    # But we have to allow the close() method because some constructors
+    # of repos call close() on repo references.
+    class poisonedrepository:
+        def __getattribute__(self, item):
+            if item == 'close':
+                return object.__getattribute__(self, item)
+
+            raise error.ProgrammingError(
+                b'repo instances should not be used after unshare'
+            )
+
+        def close(self):
+            pass
+
+    # We may have a repoview, which intercepts __setattr__. So be sure
+    # we operate at the lowest level possible.
+    object.__setattr__(repo, '__class__', poisonedrepository)
+                                                                                                                                                                     usr/lib/python3/dist-packages/mercurial/lock.py                                                     0000644 0000000 0000000 00000027364 14355257011 020252  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        # lock.py - simple advisory locking scheme for mercurial
+#
+# Copyright 2005, 2006 Olivia Mackall <olivia@selenic.com>
+#
+# This software may be used and distributed according to the terms of the
+# GNU General Public License version 2 or any later version.
+
+
+import contextlib
+import errno
+import os
+import signal
+import socket
+import time
+import warnings
+
+from .i18n import _
+from .pycompat import getattr
+
+from . import (
+    encoding,
+    error,
+    pycompat,
+    util,
+)
+
+from .utils import procutil
+
+
+def _getlockprefix():
+    """Return a string which is used to differentiate pid namespaces
+
+    It's useful to detect "dead" processes and remove stale locks with
+    confidence. Typically it's just hostname. On modern linux, we include an
+    extra Linux-specific pid namespace identifier.
+    """
+    result = encoding.strtolocal(socket.gethostname())
+    if pycompat.sysplatform.startswith(b'linux'):
+        try:
+            result += b'/%x' % os.stat(b'/proc/self/ns/pid').st_ino
+        except (FileNotFoundError, PermissionError, NotADirectoryError):
+            pass
+    return result
+
+
+@contextlib.contextmanager
+def _delayedinterrupt():
+    """Block signal interrupt while doing something critical
+
+    This makes sure that the code block wrapped by this context manager won't
+    be interrupted.
+
+    For Windows developers: It appears not possible to guard time.sleep()
+    from CTRL_C_EVENT, so please don't use time.sleep() to test if this is
+    working.
+    """
+    assertedsigs = []
+    blocked = False
+    orighandlers = {}
+
+    def raiseinterrupt(num):
+        if num == getattr(signal, 'SIGINT', None) or num == getattr(
+            signal, 'CTRL_C_EVENT', None
+        ):
+            raise KeyboardInterrupt
+        else:
+            raise error.SignalInterrupt
+
+    def catchterm(num, frame):
+        if blocked:
+            assertedsigs.append(num)
+        else:
+            raiseinterrupt(num)
+
+    try:
+        # save handlers first so they can be restored even if a setup is
+        # interrupted between signal.signal() and orighandlers[] =.
+        for name in [
+            b'CTRL_C_EVENT',
+            b'SIGINT',
+            b'SIGBREAK',
+            b'SIGHUP',
+            b'SIGTERM',
+        ]:
+            num = getattr(signal, name, None)
+            if num and num not in orighandlers:
+                orighandlers[num] = signal.getsignal(num)
+        try:
+            for num in orighandlers:
+                signal.signal(num, catchterm)
+        except ValueError:
+            pass  # in a thread? no luck
+
+        blocked = True
+        yield
+    finally:
+        # no simple way to reliably restore all signal handlers because
+        # any loops, recursive function calls, except blocks, etc. can be
+        # interrupted. so instead, make catchterm() raise interrupt.
+        blocked = False
+        try:
+            for num, handler in orighandlers.items():
+                signal.signal(num, handler)
+        except ValueError:
+            pass  # in a thread?
+
+    # re-raise interrupt exception if any, which may be shadowed by a new
+    # interrupt occurred while re-raising the first one
+    if assertedsigs:
+        raiseinterrupt(assertedsigs[0])
+
+
+def trylock(ui, vfs, lockname, timeout, warntimeout, *args, **kwargs):
+    """return an acquired lock or raise an a LockHeld exception
+
+    This function is responsible to issue warnings and or debug messages about
+    the held lock while trying to acquires it."""
+
+    def printwarning(printer, locker):
+        """issue the usual "waiting on lock" message through any channel"""
+        # show more details for new-style locks
+        if b':' in locker:
+            host, pid = locker.split(b":", 1)
+            msg = _(
+                b"waiting for lock on %s held by process %r on host %r\n"
+            ) % (
+                pycompat.bytestr(l.desc),
+                pycompat.bytestr(pid),
+                pycompat.bytestr(host),
+            )
+        else:
+            msg = _(b"waiting for lock on %s held by %r\n") % (
+                l.desc,
+                pycompat.bytestr(locker),
+            )
+        printer(msg)
+
+    l = lock(vfs, lockname, 0, *args, dolock=False, **kwargs)
+
+    debugidx = 0 if (warntimeout and timeout) else -1
+    warningidx = 0
+    if not timeout:
+        warningidx = -1
+    elif warntimeout:
+        warningidx = warntimeout
+
+    delay = 0
+    while True:
+        try:
+            l._trylock()
+            break
+        except error.LockHeld as inst:
+            if delay == debugidx:
+                printwarning(ui.debug, inst.locker)
+            if delay == warningidx:
+                printwarning(ui.warn, inst.locker)
+            if timeout <= delay:
+                raise error.LockHeld(
+                    errno.ETIMEDOUT, inst.filename, l.desc, inst.locker
+                )
+            time.sleep(1)
+            delay += 1
+
+    l.delay = delay
+    if l.delay:
+        if 0 <= warningidx <= l.delay:
+            ui.warn(_(b"got lock after %d seconds\n") % l.delay)
+        else:
+            ui.debug(b"got lock after %d seconds\n" % l.delay)
+    if l.acquirefn:
+        l.acquirefn()
+    return l
+
+
+class lock:
+    """An advisory lock held by one process to control access to a set
+    of files.  Non-cooperating processes or incorrectly written scripts
+    can ignore Mercurial's locking scheme and stomp all over the
+    repository, so don't do that.
+
+    Typically used via localrepository.lock() to lock the repository
+    store (.hg/store/) or localrepository.wlock() to lock everything
+    else under .hg/."""
+
+    # lock is symlink on platforms that support it, file on others.
+
+    # symlink is used because create of directory entry and contents
+    # are atomic even over nfs.
+
+    # old-style lock: symlink to pid
+    # new-style lock: symlink to hostname:pid
+
+    _host = None
+
+    def __init__(
+        self,
+        vfs,
+        fname,
+        timeout=-1,
+        releasefn=None,
+        acquirefn=None,
+        desc=None,
+        signalsafe=True,
+        dolock=True,
+    ):
+        self.vfs = vfs
+        self.f = fname
+        self.held = 0
+        self.timeout = timeout
+        self.releasefn = releasefn
+        self.acquirefn = acquirefn
+        self.desc = desc
+        if signalsafe:
+            self._maybedelayedinterrupt = _delayedinterrupt
+        else:
+            self._maybedelayedinterrupt = util.nullcontextmanager
+        self.postrelease = []
+        self.pid = self._getpid()
+        if dolock:
+            self.delay = self.lock()
+            if self.acquirefn:
+                self.acquirefn()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, exc_tb):
+        success = all(a is None for a in (exc_type, exc_value, exc_tb))
+        self.release(success=success)
+
+    def __del__(self):
+        if self.held:
+            warnings.warn(
+                "use lock.release instead of del lock",
+                category=DeprecationWarning,
+                stacklevel=2,
+            )
+
+            # ensure the lock will be removed
+            # even if recursive locking did occur
+            self.held = 1
+
+        self.release()
+
+    def _getpid(self):
+        # wrapper around procutil.getpid() to make testing easier
+        return procutil.getpid()
+
+    def lock(self):
+        timeout = self.timeout
+        while True:
+            try:
+                self._trylock()
+                return self.timeout - timeout
+            except error.LockHeld as inst:
+                if timeout != 0:
+                    time.sleep(1)
+                    if timeout > 0:
+                        timeout -= 1
+                    continue
+                raise error.LockHeld(
+                    errno.ETIMEDOUT, inst.filename, self.desc, inst.locker

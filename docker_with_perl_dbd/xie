@@ -1,0 +1,1000 @@
+            force=True,
+            acceptremote=False,
+            followcopies=False,
+        )
+
+        for file, (action, info, msg) in mresult.filemap():
+            if source.targetfilebelongstosource(file):
+                # If the file belongs to the source repo, ignore the p2
+                # since it will be covered by the existing fileset.
+                continue
+
+            # If the file requires actual merging, abort. We don't have enough
+            # context to resolve merges correctly.
+            if action in mergestate.CONVERT_MERGE_ACTIONS:
+                raise error.Abort(
+                    _(
+                        b"unable to convert merge commit "
+                        b"since target parents do not merge cleanly (file "
+                        b"%s, parents %s and %s)"
+                    )
+                    % (file, p1ctx, p2ctx)
+                )
+            elif action == mergestate.ACTION_KEEP:
+                # 'keep' means nothing changed from p1
+                continue
+            else:
+                # Any other change means we want to take the p2 version
+                yield file
+
+    def putcommit(
+        self, files, copies, parents, commit, source, revmap, full, cleanp2
+    ):
+        files = dict(files)
+
+        def getfilectx(repo, memctx, f):
+            if p2ctx and f in p2files and f not in copies:
+                self.ui.debug(b'reusing %s from p2\n' % f)
+                try:
+                    return p2ctx[f]
+                except error.ManifestLookupError:
+                    # If the file doesn't exist in p2, then we're syncing a
+                    # delete, so just return None.
+                    return None
+            try:
+                v = files[f]
+            except KeyError:
+                return None
+            data, mode = source.getfile(f, v)
+            if data is None:
+                return None
+            if f == b'.hgtags':
+                data = self._rewritetags(source, revmap, data)
+            if f == b'.hgsubstate':
+                data = self._rewritesubstate(source, data)
+            return context.memfilectx(
+                self.repo,
+                memctx,
+                f,
+                data,
+                b'l' in mode,
+                b'x' in mode,
+                copies.get(f),
+            )
+
+        pl = []
+        for p in parents:
+            if p not in pl:
+                pl.append(p)
+        parents = pl
+        nparents = len(parents)
+        if self.filemapmode and nparents == 1:
+            m1node = self.repo.changelog.read(bin(parents[0]))[0]
+            parent = parents[0]
+
+        if len(parents) < 2:
+            parents.append(self.repo.nullid)
+        if len(parents) < 2:
+            parents.append(self.repo.nullid)
+        p2 = parents.pop(0)
+
+        text = commit.desc
+
+        sha1s = re.findall(sha1re, text)
+        for sha1 in sha1s:
+            oldrev = source.lookuprev(sha1)
+            newrev = revmap.get(oldrev)
+            if newrev is not None:
+                text = text.replace(sha1, newrev[: len(sha1)])
+
+        extra = commit.extra.copy()
+
+        sourcename = self.repo.ui.config(b'convert', b'hg.sourcename')
+        if sourcename:
+            extra[b'convert_source'] = sourcename
+
+        for label in (
+            b'source',
+            b'transplant_source',
+            b'rebase_source',
+            b'intermediate-source',
+        ):
+            node = extra.get(label)
+
+            if node is None:
+                continue
+
+            # Only transplant stores its reference in binary
+            if label == b'transplant_source':
+                node = hex(node)
+
+            newrev = revmap.get(node)
+            if newrev is not None:
+                if label == b'transplant_source':
+                    newrev = bin(newrev)
+
+                extra[label] = newrev
+
+        if self.branchnames and commit.branch:
+            extra[b'branch'] = commit.branch
+        if commit.rev and commit.saverev:
+            extra[b'convert_revision'] = commit.rev
+
+        while parents:
+            p1 = p2
+            p2 = parents.pop(0)
+            p1ctx = self.repo[p1]
+            p2ctx = None
+            if p2 != self.repo.nullid:
+                p2ctx = self.repo[p2]
+            fileset = set(files)
+            if full:
+                fileset.update(self.repo[p1])
+                fileset.update(self.repo[p2])
+
+            if p2ctx:
+                p2files = set(cleanp2)
+                for file in self._calculatemergedfiles(source, p1ctx, p2ctx):
+                    p2files.add(file)
+                    fileset.add(file)
+
+            ctx = context.memctx(
+                self.repo,
+                (p1, p2),
+                text,
+                fileset,
+                getfilectx,
+                commit.author,
+                commit.date,
+                extra,
+            )
+
+            # We won't know if the conversion changes the node until after the
+            # commit, so copy the source's phase for now.
+            self.repo.ui.setconfig(
+                b'phases',
+                b'new-commit',
+                phases.phasenames[commit.phase],
+                b'convert',
+            )
+
+            with self.repo.transaction(b"convert") as tr:
+                if self.repo.ui.config(b'convert', b'hg.preserve-hash'):
+                    origctx = commit.ctx
+                else:
+                    origctx = None
+                node = hex(self.repo.commitctx(ctx, origctx=origctx))
+
+                # If the node value has changed, but the phase is lower than
+                # draft, set it back to draft since it hasn't been exposed
+                # anywhere.
+                if commit.rev != node:
+                    ctx = self.repo[node]
+                    if ctx.phase() < phases.draft:
+                        phases.registernew(
+                            self.repo, tr, phases.draft, [ctx.rev()]
+                        )
+
+            text = b"(octopus merge fixup)\n"
+            p2 = node
+
+        if self.filemapmode and nparents == 1:
+            man = self.repo.manifestlog.getstorage(b'')
+            mnode = self.repo.changelog.read(bin(p2))[0]
+            closed = b'close' in commit.extra
+            if not closed and not man.cmp(m1node, man.revision(mnode)):
+                self.ui.status(_(b"filtering out empty revision\n"))
+                self.repo.rollback(force=True)
+                return parent
+        return p2
+
+    def puttags(self, tags):
+        tagparent = self.repo.branchtip(self.tagsbranch, ignoremissing=True)
+        tagparent = tagparent or self.repo.nullid
+
+        oldlines = set()
+        for branch, heads in self.repo.branchmap().items():
+            for h in heads:
+                if b'.hgtags' in self.repo[h]:
+                    oldlines.update(
+                        set(self.repo[h][b'.hgtags'].data().splitlines(True))
+                    )
+        oldlines = sorted(list(oldlines))
+
+        newlines = sorted([(b"%s %s\n" % (tags[tag], tag)) for tag in tags])
+        if newlines == oldlines:
+            return None, None
+
+        # if the old and new tags match, then there is nothing to update
+        oldtags = set()
+        newtags = set()
+        for line in oldlines:
+            s = line.strip().split(b' ', 1)
+            if len(s) != 2:
+                continue
+            oldtags.add(s[1])
+        for line in newlines:
+            s = line.strip().split(b' ', 1)
+            if len(s) != 2:
+                continue
+            if s[1] not in oldtags:
+                newtags.add(s[1].strip())
+
+        if not newtags:
+            return None, None
+
+        data = b"".join(newlines)
+
+        def getfilectx(repo, memctx, f):
+            return context.memfilectx(repo, memctx, f, data, False, False, None)
+
+        self.ui.status(_(b"updating tags\n"))
+        date = b"%d 0" % int(time.mktime(time.gmtime()))
+        extra = {b'branch': self.tagsbranch}
+        ctx = context.memctx(
+            self.repo,
+            (tagparent, None),
+            b"update tags",
+            [b".hgtags"],
+            getfilectx,
+            b"convert-repo",
+            date,
+            extra,
+        )
+        node = self.repo.commitctx(ctx)
+        return hex(node), hex(tagparent)
+
+    def setfilemapmode(self, active):
+        self.filemapmode = active
+
+    def putbookmarks(self, updatedbookmark):
+        if not len(updatedbookmark):
+            return
+        wlock = lock = tr = None
+        try:
+            wlock = self.repo.wlock()
+            lock = self.repo.lock()
+            tr = self.repo.transaction(b'bookmark')
+            self.ui.status(_(b"updating bookmarks\n"))
+            destmarks = self.repo._bookmarks
+            changes = [
+                (bookmark, bin(updatedbookmark[bookmark]))
+                for bookmark in updatedbookmark
+            ]
+            destmarks.applychanges(self.repo, tr, changes)
+            tr.close()
+        finally:
+            lockmod.release(lock, wlock, tr)
+
+    def hascommitfrommap(self, rev):
+        # the exact semantics of clonebranches is unclear so we can't say no
+        return rev in self.repo or self.clonebranches
+
+    def hascommitforsplicemap(self, rev):
+        if rev not in self.repo and self.clonebranches:
+            raise error.Abort(
+                _(
+                    b'revision %s not found in destination '
+                    b'repository (lookups with clonebranches=true '
+                    b'are not implemented)'
+                )
+                % rev
+            )
+        return rev in self.repo
+
+
+class mercurial_source(common.converter_source):
+    def __init__(self, ui, repotype, path, revs=None):
+        common.converter_source.__init__(self, ui, repotype, path, revs)
+        self.ignoreerrors = ui.configbool(b'convert', b'hg.ignoreerrors')
+        self.ignored = set()
+        self.saverev = ui.configbool(b'convert', b'hg.saverev')
+        try:
+            self.repo = hg.repository(self.ui, path)
+            # try to provoke an exception if this isn't really a hg
+            # repo, but some other bogus compatible-looking url
+            if not self.repo.local():
+                raise error.RepoError
+        except error.RepoError:
+            ui.traceback()
+            raise NoRepo(_(b"%s is not a local Mercurial repository") % path)
+        self.lastrev = None
+        self.lastctx = None
+        self._changescache = None, None
+        self.convertfp = None
+        # Restrict converted revisions to startrev descendants
+        startnode = ui.config(b'convert', b'hg.startrev')
+        hgrevs = ui.config(b'convert', b'hg.revs')
+        if hgrevs is None:
+            if startnode is not None:
+                try:
+                    startnode = self.repo.lookup(startnode)
+                except error.RepoError:
+                    raise error.Abort(
+                        _(b'%s is not a valid start revision') % startnode
+                    )
+                startrev = self.repo.changelog.rev(startnode)
+                children = {startnode: 1}
+                for r in self.repo.changelog.descendants([startrev]):
+                    children[self.repo.changelog.node(r)] = 1
+                self.keep = children.__contains__
+            else:
+                self.keep = util.always
+            if revs:
+                self._heads = [self.repo.lookup(r) for r in revs]
+            else:
+                self._heads = self.repo.heads()
+        else:
+            if revs or startnode is not None:
+                raise error.Abort(
+                    _(
+                        b'hg.revs cannot be combined with '
+                        b'hg.startrev or --rev'
+                    )
+                )
+            nodes = set()
+            parents = set()
+            for r in logcmdutil.revrange(self.repo, [hgrevs]):
+                ctx = self.repo[r]
+                nodes.add(ctx.node())
+                parents.update(p.node() for p in ctx.parents())
+            self.keep = nodes.__contains__
+            self._heads = nodes - parents
+
+    def _changectx(self, rev):
+        if self.lastrev != rev:
+            self.lastctx = self.repo[rev]
+            self.lastrev = rev
+        return self.lastctx
+
+    def _parents(self, ctx):
+        return [p for p in ctx.parents() if p and self.keep(p.node())]
+
+    def getheads(self):
+        return [hex(h) for h in self._heads if self.keep(h)]
+
+    def getfile(self, name, rev):
+        try:
+            fctx = self._changectx(rev)[name]
+            return fctx.data(), fctx.flags()
+        except error.LookupError:
+            return None, None
+
+    def _changedfiles(self, ctx1, ctx2):
+        ma, r = [], []
+        maappend = ma.append
+        rappend = r.append
+        d = ctx1.manifest().diff(ctx2.manifest())
+        for f, ((node1, flag1), (node2, flag2)) in d.items():
+            if node2 is None:
+                rappend(f)
+            else:
+                maappend(f)
+        return ma, r
+
+    def getchanges(self, rev, full):
+        ctx = self._changectx(rev)
+        parents = self._parents(ctx)
+        if full or not parents:
+            files = copyfiles = ctx.manifest()
+        if parents:
+            if self._changescache[0] == rev:
+                ma, r = self._changescache[1]
+            else:
+                ma, r = self._changedfiles(parents[0], ctx)
+            if not full:
+                files = ma + r
+            copyfiles = ma
+        # _getcopies() is also run for roots and before filtering so missing
+        # revlogs are detected early
+        copies = self._getcopies(ctx, parents, copyfiles)
+        cleanp2 = set()
+        if len(parents) == 2:
+            d = parents[1].manifest().diff(ctx.manifest(), clean=True)
+            for f, value in d.items():
+                if value is None:
+                    cleanp2.add(f)
+        changes = [(f, rev) for f in files if f not in self.ignored]
+        changes.sort()
+        return changes, copies, cleanp2
+
+    def _getcopies(self, ctx, parents, files):
+        copies = {}
+        for name in files:
+            if name in self.ignored:
+                continue
+            try:
+                copysource = ctx.filectx(name).copysource()
+                if copysource in self.ignored:
+                    continue
+                # Ignore copy sources not in parent revisions
+                if not any(copysource in p for p in parents):
+                    continue
+                copies[name] = copysource
+            except TypeError:
+                pass
+            except error.LookupError as e:
+                if not self.ignoreerrors:
+                    raise
+                self.ignored.add(name)
+                self.ui.warn(_(b'ignoring: %s\n') % e)
+        return copies
+
+    def getcommit(self, rev):
+        ctx = self._changectx(rev)
+        _parents = self._parents(ctx)
+        parents = [p.hex() for p in _parents]
+        optparents = [p.hex() for p in ctx.parents() if p and p not in _parents]
+        crev = rev
+
+        return common.commit(
+            author=ctx.user(),
+            date=dateutil.datestr(ctx.date(), b'%Y-%m-%d %H:%M:%S %1%2'),
+            desc=ctx.description(),
+            rev=crev,
+            parents=parents,
+            optparents=optparents,
+            branch=ctx.branch(),
+            extra=ctx.extra(),
+            sortkey=ctx.rev(),
+            saverev=self.saverev,
+            phase=ctx.phase(),
+            ctx=ctx,
+        )
+
+    def numcommits(self):
+        return len(self.repo)
+
+    def gettags(self):
+        # This will get written to .hgtags, filter non global tags out.
+        tags = [
+            t
+            for t in self.repo.tagslist()
+            if self.repo.tagtype(t[0]) == b'global'
+        ]
+        return {name: hex(node) for name, node in tags if self.keep(node)}
+
+    def getchangedfiles(self, rev, i):
+        ctx = self._changectx(rev)
+        parents = self._parents(ctx)
+        if not parents and i is None:
+            i = 0
+            ma, r = ctx.manifest().keys(), []
+        else:
+            i = i or 0
+            ma, r = self._changedfiles(parents[i], ctx)
+        ma, r = [[f for f in l if f not in self.ignored] for l in (ma, r)]
+
+        if i == 0:
+            self._changescache = (rev, (ma, r))
+
+        return ma + r
+
+    def converted(self, rev, destrev):
+        if self.convertfp is None:
+            self.convertfp = open(self.repo.vfs.join(b'shamap'), b'ab')
+        self.convertfp.write(util.tonativeeol(b'%s %s\n' % (destrev, rev)))
+        self.convertfp.flush()
+
+    def before(self):
+        self.ui.debug(b'run hg source pre-conversion action\n')
+
+    def after(self):
+        self.ui.debug(b'run hg source post-conversion action\n')
+
+    def hasnativeorder(self):
+        return True
+
+    def hasnativeclose(self):
+        return True
+
+    def lookuprev(self, rev):
+        try:
+            return hex(self.repo.lookup(rev))
+        except (error.RepoError, error.LookupError):
+            return None
+
+    def getbookmarks(self):
+        return bookmarks.listbookmarks(self.repo)
+
+    def checkrevformat(self, revstr, mapname=b'splicemap'):
+        """Mercurial, revision string is a 40 byte hex"""
+        self.checkhexformat(revstr, mapname)
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     usr/lib/python3/dist-packages/hgext/convert/monotone.py                                             0000644 0000000 0000000 00000033022 14374730616 021770  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        # monotone.py - monotone support for the convert extension
+#
+#  Copyright 2008, 2009 Mikkel Fahnoe Jorgensen <mikkel@dvide.com> and
+#  others
+#
+# This software may be used and distributed according to the terms of the
+# GNU General Public License version 2 or any later version.
+
+import os
+import re
+
+from mercurial.i18n import _
+from mercurial.pycompat import open
+from mercurial import (
+    error,
+    pycompat,
+)
+from mercurial.utils import dateutil
+
+from . import common
+
+
+class monotone_source(common.converter_source, common.commandline):
+    def __init__(self, ui, repotype, path=None, revs=None):
+        common.converter_source.__init__(self, ui, repotype, path, revs)
+        if revs and len(revs) > 1:
+            raise error.Abort(
+                _(
+                    b'monotone source does not support specifying '
+                    b'multiple revs'
+                )
+            )
+        common.commandline.__init__(self, ui, b'mtn')
+
+        self.ui = ui
+        self.path = path
+        self.automatestdio = False
+        self.revs = revs
+
+        norepo = common.NoRepo(
+            _(b"%s does not look like a monotone repository") % path
+        )
+        if not os.path.exists(os.path.join(path, b'_MTN')):
+            # Could be a monotone repository (SQLite db file)
+            try:
+                f = open(path, b'rb')
+                header = f.read(16)
+                f.close()
+            except IOError:
+                header = b''
+            if header != b'SQLite format 3\x00':
+                raise norepo
+
+        # regular expressions for parsing monotone output
+        space = br'\s*'
+        name = br'\s+"((?:\\"|[^"])*)"\s*'
+        value = name
+        revision = br'\s+\[(\w+)\]\s*'
+        lines = br'(?:.|\n)+'
+
+        self.dir_re = re.compile(space + b"dir" + name)
+        self.file_re = re.compile(
+            space + b"file" + name + b"content" + revision
+        )
+        self.add_file_re = re.compile(
+            space + b"add_file" + name + b"content" + revision
+        )
+        self.patch_re = re.compile(
+            space + b"patch" + name + b"from" + revision + b"to" + revision
+        )
+        self.rename_re = re.compile(space + b"rename" + name + b"to" + name)
+        self.delete_re = re.compile(space + b"delete" + name)
+        self.tag_re = re.compile(space + b"tag" + name + b"revision" + revision)
+        self.cert_re = re.compile(
+            lines + space + b"name" + name + b"value" + value
+        )
+
+        attr = space + b"file" + lines + space + b"attr" + space
+        self.attr_execute_re = re.compile(
+            attr + b'"mtn:execute"' + space + b'"true"'
+        )
+
+        # cached data
+        self.manifest_rev = None
+        self.manifest = None
+        self.files = None
+        self.dirs = None
+
+        common.checktool(b'mtn', abort=False, debname=b'monotone')
+
+    def mtnrun(self, *args, **kwargs):
+        if self.automatestdio:
+            return self.mtnrunstdio(*args, **kwargs)
+        else:
+            return self.mtnrunsingle(*args, **kwargs)
+
+    def mtnrunsingle(self, *args, **kwargs):
+        kwargs['d'] = self.path
+        return self.run0(b'automate', *args, **kwargs)
+
+    def mtnrunstdio(self, *args, **kwargs):
+        # Prepare the command in automate stdio format
+        kwargs = pycompat.byteskwargs(kwargs)
+        command = []
+        for k, v in kwargs.items():
+            command.append(b"%d:%s" % (len(k), k))
+            if v:
+                command.append(b"%d:%s" % (len(v), v))
+        if command:
+            command.insert(0, b'o')
+            command.append(b'e')
+
+        command.append(b'l')
+        for arg in args:
+            command.append(b"%d:%s" % (len(arg), arg))
+        command.append(b'e')
+        command = b''.join(command)
+
+        self.ui.debug(b"mtn: sending '%s'\n" % command)
+        self.mtnwritefp.write(command)
+        self.mtnwritefp.flush()
+
+        return self.mtnstdioreadcommandoutput(command)
+
+    def mtnstdioreadpacket(self):
+        read = None
+        commandnbr = b''
+        while read != b':':
+            read = self.mtnreadfp.read(1)
+            if not read:
+                raise error.Abort(_(b'bad mtn packet - no end of commandnbr'))
+            commandnbr += read
+        commandnbr = commandnbr[:-1]
+
+        stream = self.mtnreadfp.read(1)
+        if stream not in b'mewptl':
+            raise error.Abort(
+                _(b'bad mtn packet - bad stream type %s') % stream
+            )
+
+        read = self.mtnreadfp.read(1)
+        if read != b':':
+            raise error.Abort(_(b'bad mtn packet - no divider before size'))
+
+        read = None
+        lengthstr = b''
+        while read != b':':
+            read = self.mtnreadfp.read(1)
+            if not read:
+                raise error.Abort(_(b'bad mtn packet - no end of packet size'))
+            lengthstr += read
+        try:
+            length = int(lengthstr[:-1])
+        except TypeError:
+            raise error.Abort(
+                _(b'bad mtn packet - bad packet size %s') % lengthstr
+            )
+
+        read = self.mtnreadfp.read(length)
+        if len(read) != length:
+            raise error.Abort(
+                _(
+                    b"bad mtn packet - unable to read full packet "
+                    b"read %s of %s"
+                )
+                % (len(read), length)
+            )
+
+        return (commandnbr, stream, length, read)
+
+    def mtnstdioreadcommandoutput(self, command):
+        retval = []
+        while True:
+            commandnbr, stream, length, output = self.mtnstdioreadpacket()
+            self.ui.debug(
+                b'mtn: read packet %s:%s:%d\n' % (commandnbr, stream, length)
+            )
+
+            if stream == b'l':
+                # End of command
+                if output != b'0':
+                    raise error.Abort(
+                        _(b"mtn command '%s' returned %s") % (command, output)
+                    )
+                break
+            elif stream in b'ew':
+                # Error, warning output
+                self.ui.warn(_(b'%s error:\n') % self.command)
+                self.ui.warn(output)
+            elif stream == b'p':
+                # Progress messages
+                self.ui.debug(b'mtn: ' + output)
+            elif stream == b'm':
+                # Main stream - command output
+                retval.append(output)
+
+        return b''.join(retval)
+
+    def mtnloadmanifest(self, rev):
+        if self.manifest_rev == rev:
+            return
+        self.manifest = self.mtnrun(b"get_manifest_of", rev).split(b"\n\n")
+        self.manifest_rev = rev
+        self.files = {}
+        self.dirs = {}
+
+        for e in self.manifest:
+            m = self.file_re.match(e)
+            if m:
+                attr = b""
+                name = m.group(1)
+                node = m.group(2)
+                if self.attr_execute_re.match(e):
+                    attr += b"x"
+                self.files[name] = (node, attr)
+            m = self.dir_re.match(e)
+            if m:
+                self.dirs[m.group(1)] = True
+
+    def mtnisfile(self, name, rev):
+        # a non-file could be a directory or a deleted or renamed file
+        self.mtnloadmanifest(rev)
+        return name in self.files
+
+    def mtnisdir(self, name, rev):
+        self.mtnloadmanifest(rev)
+        return name in self.dirs
+
+    def mtngetcerts(self, rev):
+        certs = {
+            b"author": b"<missing>",
+            b"date": b"<missing>",
+            b"changelog": b"<missing>",
+            b"branch": b"<missing>",
+        }
+        certlist = self.mtnrun(b"certs", rev)
+        # mtn < 0.45:
+        #   key "test@selenic.com"
+        # mtn >= 0.45:
+        #   key [ff58a7ffb771907c4ff68995eada1c4da068d328]
+        certlist = re.split(br'\n\n {6}key ["\[]', certlist)
+        for e in certlist:
+            m = self.cert_re.match(e)
+            if m:
+                name, value = m.groups()
+                value = value.replace(br'\"', b'"')
+                value = value.replace(br'\\', b'\\')
+                certs[name] = value
+        # Monotone may have subsecond dates: 2005-02-05T09:39:12.364306
+        # and all times are stored in UTC
+        certs[b"date"] = certs[b"date"].split(b'.')[0] + b" UTC"
+        return certs
+
+    # implement the converter_source interface:
+
+    def getheads(self):
+        if not self.revs:
+            return self.mtnrun(b"leaves").splitlines()
+        else:
+            return self.revs
+
+    def getchanges(self, rev, full):
+        if full:
+            raise error.Abort(
+                _(b"convert from monotone does not support --full")
+            )
+        revision = self.mtnrun(b"get_revision", rev).split(b"\n\n")
+        files = {}
+        ignoremove = {}
+        renameddirs = []
+        copies = {}
+        for e in revision:
+            m = self.add_file_re.match(e)
+            if m:
+                files[m.group(1)] = rev
+                ignoremove[m.group(1)] = rev
+            m = self.patch_re.match(e)
+            if m:
+                files[m.group(1)] = rev
+            # Delete/rename is handled later when the convert engine
+            # discovers an IOError exception from getfile,
+            # but only if we add the "from" file to the list of changes.
+            m = self.delete_re.match(e)
+            if m:
+                files[m.group(1)] = rev
+            m = self.rename_re.match(e)
+            if m:
+                toname = m.group(2)
+                fromname = m.group(1)
+                if self.mtnisfile(toname, rev):
+                    ignoremove[toname] = 1
+                    copies[toname] = fromname
+                    files[toname] = rev
+                    files[fromname] = rev
+                elif self.mtnisdir(toname, rev):
+                    renameddirs.append((fromname, toname))
+
+        # Directory renames can be handled only once we have recorded
+        # all new files
+        for fromdir, todir in renameddirs:
+            renamed = {}
+            for tofile in self.files:
+                if tofile in ignoremove:
+                    continue
+                if tofile.startswith(todir + b'/'):
+                    renamed[tofile] = fromdir + tofile[len(todir) :]
+                    # Avoid chained moves like:
+                    # d1(/a) => d3/d1(/a)
+                    # d2 => d3
+                    ignoremove[tofile] = 1
+            for tofile, fromfile in renamed.items():
+                self.ui.debug(
+                    b"copying file in renamed directory from '%s' to '%s'"
+                    % (fromfile, tofile),
+                    b'\n',
+                )
+                files[tofile] = rev
+                copies[tofile] = fromfile
+            for fromfile in renamed.values():
+                files[fromfile] = rev
+
+        return (files.items(), copies, set())
+
+    def getfile(self, name, rev):
+        if not self.mtnisfile(name, rev):
+            return None, None
+        try:
+            data = self.mtnrun(b"get_file_of", name, r=rev)
+        except Exception:
+            return None, None
+        self.mtnloadmanifest(rev)
+        node, attr = self.files.get(name, (None, b""))
+        return data, attr
+
+    def getcommit(self, rev):
+        extra = {}
+        certs = self.mtngetcerts(rev)
+        if certs.get(b'suspend') == certs[b"branch"]:
+            extra[b'close'] = b'1'
+        dateformat = b"%Y-%m-%dT%H:%M:%S"
+        return common.commit(
+            author=certs[b"author"],
+            date=dateutil.datestr(dateutil.strdate(certs[b"date"], dateformat)),
+            desc=certs[b"changelog"],
+            rev=rev,
+            parents=self.mtnrun(b"parents", rev).splitlines(),
+            branch=certs[b"branch"],
+            extra=extra,
+        )
+
+    def gettags(self):
+        tags = {}
+        for e in self.mtnrun(b"tags").split(b"\n\n"):
+            m = self.tag_re.match(e)
+            if m:
+                tags[m.group(1)] = m.group(2)
+        return tags
+
+    def getchangedfiles(self, rev, i):
+        # This function is only needed to support --filemap
+        # ... and we don't support that
+        raise NotImplementedError
+
+    def before(self):
+        # Check if we have a new enough version to use automate stdio
+        try:
+            versionstr = self.mtnrunsingle(b"interface_version")
+            version = float(versionstr)
+        except Exception:
+            raise error.Abort(
+                _(b"unable to determine mtn automate interface version")
+            )
+
+        if version >= 12.0:
+            self.automatestdio = True
+            self.ui.debug(
+                b"mtn automate version %f - using automate stdio\n" % version
+            )
+
+            # launch the long-running automate stdio process
+            self.mtnwritefp, self.mtnreadfp = self._run2(
+                b'automate', b'stdio', b'-d', self.path
+            )
+            # read the headers
+            read = self.mtnreadfp.readline()
+            if read != b'format-version: 2\n':
+                raise error.Abort(
+                    _(b'mtn automate stdio header unexpected: %s') % read
+                )
+            while read != b'\n':
+                read = self.mtnreadfp.readline()
+                if not read:
+                    raise error.Abort(
+                        _(
+                            b"failed to reach end of mtn automate "
+                            b"stdio headers"
+                        )
+                    )
+        else:
+            self.ui.debug(
+                b"mtn automate version %s - not using automate stdio "
+                b"(automate >= 12.0 - mtn >= 0.46 is needed)\n" % version
+            )
+
+    def after(self):
+        if self.automatestdio:
+            self.mtnwritefp.close()
+            self.mtnwritefp = None
+            self.mtnreadfp.close()
+            self.mtnreadfp = None
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              usr/lib/python3/dist-packages/hgext/convert/p4.py                                                   0000644 0000000 0000000 00000031342 14355257011 020450  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        # Perforce source for convert extension.
+#
+# Copyright 2009, Frank Kingswood <frank@kingswood-consulting.co.uk>
+#
+# This software may be used and distributed according to the terms of the
+# GNU General Public License version 2 or any later version.
+
+import marshal
+import re
+
+from mercurial.i18n import _
+from mercurial import (
+    error,
+    util,
+)
+from mercurial.utils import (
+    dateutil,
+    procutil,
+    stringutil,
+)
+
+from . import common
+
+
+def loaditer(f):
+    """Yield the dictionary objects generated by p4"""
+    try:
+        while True:
+            d = marshal.load(f)
+            if not d:
+                break
+            yield d
+    except EOFError:
+        pass
+
+
+def decodefilename(filename):
+    """Perforce escapes special characters @, #, *, or %
+    with %40, %23, %2A, or %25 respectively
+
+    >>> decodefilename(b'portable-net45%252Bnetcore45%252Bwp8%252BMonoAndroid')
+    'portable-net45%2Bnetcore45%2Bwp8%2BMonoAndroid'
+    >>> decodefilename(b'//Depot/Directory/%2525/%2523/%23%40.%2A')
+    '//Depot/Directory/%25/%23/#@.*'
+    """
+    replacements = [
+        (b'%2A', b'*'),
+        (b'%23', b'#'),
+        (b'%40', b'@'),
+        (b'%25', b'%'),
+    ]
+    for k, v in replacements:
+        filename = filename.replace(k, v)
+    return filename
+
+
+class p4_source(common.converter_source):
+    def __init__(self, ui, repotype, path, revs=None):
+        # avoid import cycle
+        from . import convcmd
+
+        super(p4_source, self).__init__(ui, repotype, path, revs=revs)
+
+        if b"/" in path and not path.startswith(b'//'):
+            raise common.NoRepo(
+                _(b'%s does not look like a P4 repository') % path
+            )
+
+        common.checktool(b'p4', abort=False)
+
+        self.revmap = {}
+        self.encoding = self.ui.config(
+            b'convert', b'p4.encoding', convcmd.orig_encoding
+        )
+        self.re_type = re.compile(
+            br"([a-z]+)?(text|binary|symlink|apple|resource|unicode|utf\d+)"
+            br"(\+\w+)?$"
+        )
+        self.re_keywords = re.compile(
+            br"\$(Id|Header|Date|DateTime|Change|File|Revision|Author)"
+            br":[^$\n]*\$"
+        )
+        self.re_keywords_old = re.compile(br"\$(Id|Header):[^$\n]*\$")
+
+        if revs and len(revs) > 1:
+            raise error.Abort(
+                _(
+                    b"p4 source does not support specifying "

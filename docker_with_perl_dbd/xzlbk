@@ -1,0 +1,1000 @@
+            # the directory is 'pods' or 'pod'. However, we can avoid tight
+            # coupling to that by simply checking the "non-standard" 'pods'
+            # first.
+            my $pods = "$Config::Config{privlibexp}/pods";
+            $pods = "$Config::Config{privlibexp}/pod"
+                unless -d $pods;
+            if (-f "$pods/perl$page.pod") {
+                CORE::system( $doccmd,
+                    ( ( $manpath && !$nopathopt ) ? ( "-M", $manpath ) : () ),
+                    "perl$page" );
+            }
+        }
+    } ## end if (CORE::system($doccmd...
+} ## end sub runman
+
+#use Carp;                          # This did break, left for debugging
+
+=head1 DEBUGGER INITIALIZATION - THE SECOND BEGIN BLOCK
+
+Because of the way the debugger interface to the Perl core is designed, any
+debugger package globals that C<DB::sub()> requires have to be defined before
+any subroutines can be called. These are defined in the second C<BEGIN> block.
+
+This block sets things up so that (basically) the world is sane
+before the debugger starts executing. We set up various variables that the
+debugger has to have set up before the Perl core starts running:
+
+=over 4
+
+=item *
+
+The debugger's own filehandles (copies of STD and STDOUT for now).
+
+=item *
+
+Characters for shell escapes, the recall command, and the history command.
+
+=item *
+
+The maximum recursion depth.
+
+=item *
+
+The size of a C<w> command's window.
+
+=item *
+
+The before-this-line context to be printed in a C<v> (view a window around this line) command.
+
+=item *
+
+The fact that we're not in a sub at all right now.
+
+=item *
+
+The default SIGINT handler for the debugger.
+
+=item *
+
+The appropriate value of the flag in C<$^D> that says the debugger is running
+
+=item *
+
+The current debugger recursion level
+
+=item *
+
+The list of postponed items and the C<$single> stack (XXX define this)
+
+=item *
+
+That we want no return values and no subroutine entry/exit trace.
+
+=back
+
+=cut
+
+# The following BEGIN is very handy if debugger goes havoc, debugging debugger?
+
+use vars qw($db_stop);
+
+BEGIN {    # This does not compile, alas. (XXX eh?)
+    $IN  = \*STDIN;     # For bugs before DB::OUT has been opened
+    $OUT = \*STDERR;    # For errors before DB::OUT has been opened
+
+    # Define characters used by command parsing.
+    $sh       = '!';      # Shell escape (does not work)
+    $rc       = ',';      # Recall command (does not work)
+    @hist     = ('?');    # Show history (does not work)
+    @truehist = ();       # Can be saved for replay (per session)
+
+    # This defines the point at which you get the 'deep recursion'
+    # warning. It MUST be defined or the debugger will not load.
+    $deep = 1000;
+
+    # Number of lines around the current one that are shown in the
+    # 'w' command.
+    $window = 10;
+
+    # How much before-the-current-line context the 'v' command should
+    # use in calculating the start of the window it will display.
+    $preview = 3;
+
+    # We're not in any sub yet, but we need this to be a defined value.
+    $sub = '';
+
+    # Set up the debugger's interrupt handler. It simply sets a flag
+    # ($signal) that DB::DB() will check before each command is executed.
+    $SIG{INT} = \&DB::catch;
+
+    # The following lines supposedly, if uncommented, allow the debugger to
+    # debug itself. Perhaps we can try that someday.
+    # This may be enabled to debug debugger:
+    #$warnLevel = 1 unless defined $warnLevel;
+    #$dieLevel = 1 unless defined $dieLevel;
+    #$signalLevel = 1 unless defined $signalLevel;
+
+    # This is the flag that says "a debugger is running, please call
+    # DB::DB and DB::sub". We will turn it on forcibly before we try to
+    # execute anything in the user's context, because we always want to
+    # get control back.
+    $db_stop = 0;          # Compiler warning ...
+    $db_stop = 1 << 30;    # ... because this is only used in an eval() later.
+
+    # This variable records how many levels we're nested in debugging.
+    # Used in the debugger prompt, and in determining whether it's all over or
+    # not.
+    $level = 0;            # Level of recursive debugging
+
+    # "Triggers bug (?) in perl if we postpone this until runtime."
+    # XXX No details on this yet, or whether we should fix the bug instead
+    # of work around it. Stay tuned.
+    @stack = (0);
+
+    # Used to track the current stack depth using the auto-stacked-variable
+    # trick.
+    $stack_depth = 0;      # Localized repeatedly; simple way to track $#stack
+
+    # Don't print return values on exiting a subroutine.
+    $doret = -2;
+
+    # No extry/exit tracing.
+    $frame = 0;
+
+} ## end BEGIN
+
+BEGIN { $^W = $ini_warn; }    # Switch warnings back
+
+=head1 READLINE SUPPORT - COMPLETION FUNCTION
+
+=head2 db_complete
+
+C<readline> support - adds command completion to basic C<readline>.
+
+Returns a list of possible completions to C<readline> when invoked. C<readline>
+will print the longest common substring following the text already entered.
+
+If there is only a single possible completion, C<readline> will use it in full.
+
+This code uses C<map> and C<grep> heavily to create lists of possible
+completion. Think LISP in this section.
+
+=cut
+
+sub db_complete {
+
+    # Specific code for b c l V m f O, &blah, $blah, @blah, %blah
+    # $text is the text to be completed.
+    # $line is the incoming line typed by the user.
+    # $start is the start of the text to be completed in the incoming line.
+    my ( $text, $line, $start ) = @_;
+
+    # Save the initial text.
+    # The search pattern is current package, ::, extract the next qualifier
+    # Prefix and pack are set to undef.
+    my ( $itext, $search, $prefix, $pack ) =
+      ( $text, "^\Q${package}::\E([^:]+)\$" );
+
+=head3 C<b postpone|compile>
+
+=over 4
+
+=item *
+
+Find all the subroutines that might match in this package
+
+=item *
+
+Add C<postpone>, C<load>, and C<compile> as possibles (we may be completing the keyword itself)
+
+=item *
+
+Include all the rest of the subs that are known
+
+=item *
+
+C<grep> out the ones that match the text we have so far
+
+=item *
+
+Return this as the list of possible completions
+
+=back
+
+=cut
+
+    return sort grep /^\Q$text/, ( keys %sub ),
+      qw(postpone load compile),    # subroutines
+      ( map { /$search/ ? ($1) : () } keys %sub )
+      if ( substr $line, 0, $start ) =~ /^\|*[blc]\s+((postpone|compile)\s+)?$/;
+
+=head3 C<b load>
+
+Get all the possible files from C<@INC> as it currently stands and
+select the ones that match the text so far.
+
+=cut
+
+    return sort grep /^\Q$text/, values %INC    # files
+      if ( substr $line, 0, $start ) =~ /^\|*b\s+load\s+$/;
+
+=head3  C<V> (list variable) and C<m> (list modules)
+
+There are two entry points for these commands:
+
+=head4 Unqualified package names
+
+Get the top-level packages and grab everything that matches the text
+so far. For each match, recursively complete the partial packages to
+get all possible matching packages. Return this sorted list.
+
+=cut
+
+    return sort map { ( $_, db_complete( $_ . "::", "V ", 2 ) ) }
+      grep /^\Q$text/, map { /^(.*)::$/ ? ($1) : () } keys %::    # top-packages
+      if ( substr $line, 0, $start ) =~ /^\|*[Vm]\s+$/ and $text =~ /^\w*$/;
+
+=head4 Qualified package names
+
+Take a partially-qualified package and find all subpackages for it
+by getting all the subpackages for the package so far, matching all
+the subpackages against the text, and discarding all of them which
+start with 'main::'. Return this list.
+
+=cut
+
+    return sort map { ( $_, db_complete( $_ . "::", "V ", 2 ) ) }
+      grep !/^main::/, grep /^\Q$text/,
+      map { /^(.*)::$/ ? ( $prefix . "::$1" ) : () }
+      do { no strict 'refs'; keys %{ $prefix . '::' } }
+      if ( substr $line, 0, $start ) =~ /^\|*[Vm]\s+$/
+      and $text =~ /^(.*[^:])::?(\w*)$/
+      and $prefix = $1;
+
+=head3 C<f> - switch files
+
+Here, we want to get a fully-qualified filename for the C<f> command.
+Possibilities are:
+
+=over 4
+
+=item 1. The original source file itself
+
+=item 2. A file from C<@INC>
+
+=item 3. An C<eval> (the debugger gets a C<(eval N)> fake file for each C<eval>).
+
+=back
+
+=cut
+
+    if ( $line =~ /^\|*f\s+(.*)/ ) {    # Loaded files
+           # We might possibly want to switch to an eval (which has a "filename"
+           # like '(eval 9)'), so we may need to clean up the completion text
+           # before proceeding.
+        $prefix = length($1) - length($text);
+        $text   = $1;
+
+=pod
+
+Under the debugger, source files are represented as C<_E<lt>/fullpath/to/file>
+(C<eval>s are C<_E<lt>(eval NNN)>) keys in C<%main::>. We pull all of these
+out of C<%main::>, add the initial source file, and extract the ones that
+match the completion text so far.
+
+=cut
+
+        return sort
+          map { substr $_, 2 + $prefix } grep /^_<\Q$text/, ( keys %main:: ),
+          $0;
+    } ## end if ($line =~ /^\|*f\s+(.*)/)
+
+=head3 Subroutine name completion
+
+We look through all of the defined subs (the keys of C<%sub>) and
+return both all the possible matches to the subroutine name plus
+all the matches qualified to the current package.
+
+=cut
+
+    if ( ( substr $text, 0, 1 ) eq '&' ) {    # subroutines
+        $text = substr $text, 1;
+        $prefix = "&";
+        return sort map "$prefix$_", grep /^\Q$text/, ( keys %sub ),
+          (
+            map { /$search/ ? ($1) : () }
+              keys %sub
+          );
+    } ## end if ((substr $text, 0, ...
+
+=head3  Scalar, array, and hash completion: partially qualified package
+
+Much like the above, except we have to do a little more cleanup:
+
+=cut
+
+    if ( $text =~ /^[\$@%](.*)::(.*)/ ) {    # symbols in a package
+
+=pod
+
+=over 4
+
+=item *
+
+Determine the package that the symbol is in. Put it in C<::> (effectively C<main::>) if no package is specified.
+
+=cut
+
+        $pack = ( $1 eq 'main' ? '' : $1 ) . '::';
+
+=pod
+
+=item *
+
+Figure out the prefix vs. what needs completing.
+
+=cut
+
+        $prefix = ( substr $text, 0, 1 ) . $1 . '::';
+        $text   = $2;
+
+=pod
+
+=item *
+
+Look through all the symbols in the package. C<grep> out all the possible hashes/arrays/scalars, and then C<grep> the possible matches out of those. C<map> the prefix onto all the possibilities.
+
+=cut
+
+        my @out = do {
+            no strict 'refs';
+            map "$prefix$_", grep /^\Q$text/, grep /^_?[a-zA-Z]/,
+            keys %$pack;
+        };
+
+=pod
+
+=item *
+
+If there's only one hit, and it's a package qualifier, and it's not equal to the initial text, re-complete it using the symbol we actually found.
+
+=cut
+
+        if ( @out == 1 and $out[0] =~ /::$/ and $out[0] ne $itext ) {
+            return db_complete( $out[0], $line, $start );
+        }
+
+        # Return the list of possibles.
+        return sort @out;
+
+    } ## end if ($text =~ /^[\$@%](.*)::(.*)/)
+
+=pod
+
+=back
+
+=head3 Symbol completion: current package or package C<main>
+
+=cut
+
+    if ( $text =~ /^[\$@%]/ ) {    # symbols (in $package + packages in main)
+=pod
+
+=over 4
+
+=item *
+
+If it's C<main>, delete main to just get C<::> leading.
+
+=cut
+
+        $pack = ( $package eq 'main' ? '' : $package ) . '::';
+
+=pod
+
+=item *
+
+We set the prefix to the item's sigil, and trim off the sigil to get the text to be completed.
+
+=cut
+
+        $prefix = substr $text, 0, 1;
+        $text   = substr $text, 1;
+
+        my @out;
+
+=pod
+
+=item *
+
+We look for the lexical scope above DB::DB and auto-complete lexical variables
+if PadWalker could be loaded.
+
+=cut
+
+        if (not $text =~ /::/ and eval {
+            local @INC = @INC;
+            pop @INC if $INC[-1] eq '.';
+            require PadWalker } ) {
+            my $level = 1;
+            while (1) {
+                my @info = caller($level);
+                $level++;
+                $level = -1, last
+                  if not @info;
+                last if $info[3] eq 'DB::DB';
+            }
+            if ($level > 0) {
+                my $lexicals = PadWalker::peek_my($level);
+                push @out, grep /^\Q$prefix$text/, keys %$lexicals;
+            }
+        }
+
+=pod
+
+=item *
+
+If the package is C<::> (C<main>), create an empty list; if it's something else, create a list of all the packages known.  Append whichever list to a list of all the possible symbols in the current package. C<grep> out the matches to the text entered so far, then C<map> the prefix back onto the symbols.
+
+=cut
+
+        push @out, map "$prefix$_", grep /^\Q$text/,
+          ( grep /^_?[a-zA-Z]/, do { no strict 'refs'; keys %$pack } ),
+          ( $pack eq '::' ? () : ( grep /::$/, keys %:: ) );
+
+=item *
+
+If there's only one hit, it's a package qualifier, and it's not equal to the initial text, recomplete using this symbol.
+
+=back
+
+=cut
+
+        if ( @out == 1 and $out[0] =~ /::$/ and $out[0] ne $itext ) {
+            return db_complete( $out[0], $line, $start );
+        }
+
+        # Return the list of possibles.
+        return sort @out;
+    } ## end if ($text =~ /^[\$@%]/)
+
+=head3 Options
+
+We use C<option_val()> to look up the current value of the option. If there's
+only a single value, we complete the command in such a way that it is a
+complete command for setting the option in question. If there are multiple
+possible values, we generate a command consisting of the option plus a trailing
+question mark, which, if executed, will list the current value of the option.
+
+=cut
+
+    if ( ( substr $line, 0, $start ) =~ /^\|*[oO]\b.*\s$/ )
+    {    # Options after space
+           # We look for the text to be matched in the list of possible options,
+           # and fetch the current value.
+        my @out = grep /^\Q$text/, @options;
+        my $val = option_val( $out[0], undef );
+
+        # Set up a 'query option's value' command.
+        my $out = '? ';
+        if ( not defined $val or $val =~ /[\n\r]/ ) {
+
+            # There's really nothing else we can do.
+        }
+
+        # We have a value. Create a proper option-setting command.
+        elsif ( $val =~ /\s/ ) {
+
+            # XXX This may be an extraneous variable.
+            my $found;
+
+            # We'll want to quote the string (because of the embedded
+            # whtespace), but we want to make sure we don't end up with
+            # mismatched quote characters. We try several possibilities.
+            foreach my $l ( split //, qq/\"\'\#\|/ ) {
+
+                # If we didn't find this quote character in the value,
+                # quote it using this quote character.
+                $out = "$l$val$l ", last if ( index $val, $l ) == -1;
+            }
+        } ## end elsif ($val =~ /\s/)
+
+        # Don't need any quotes.
+        else {
+            $out = "=$val ";
+        }
+
+        # If there were multiple possible values, return '? ', which
+        # makes the command into a query command. If there was just one,
+        # have readline append that.
+        $rl_attribs->{completer_terminator_character} =
+          ( @out == 1 ? $out : '? ' );
+
+        # Return list of possibilities.
+        return sort @out;
+    } ## end if ((substr $line, 0, ...
+
+=head3 Filename completion
+
+For entering filenames. We simply call C<readline>'s C<filename_list()>
+method with the completion text to get the possible completions.
+
+=cut
+
+    return $term->filename_list($text);    # filenames
+
+} ## end sub db_complete
+
+=head1 MISCELLANEOUS SUPPORT FUNCTIONS
+
+Functions that possibly ought to be somewhere else.
+
+=head2 end_report
+
+Say we're done.
+
+=cut
+
+sub end_report {
+    local $\ = '';
+    print $OUT "Use 'q' to quit or 'R' to restart.  'h q' for details.\n";
+}
+
+=head2 clean_ENV
+
+If we have $ini_pids, save it in the environment; else remove it from the
+environment. Used by the C<R> (restart) command.
+
+=cut
+
+sub clean_ENV {
+    if ( defined($ini_pids) ) {
+        $ENV{PERLDB_PIDS} = $ini_pids;
+    }
+    else {
+        delete( $ENV{PERLDB_PIDS} );
+    }
+} ## end sub clean_ENV
+
+# PERLDBf_... flag names from perl.h
+our ( %DollarCaretP_flags, %DollarCaretP_flags_r );
+
+BEGIN {
+    %DollarCaretP_flags = (
+        PERLDBf_SUB       => 0x01,     # Debug sub enter/exit
+        PERLDBf_LINE      => 0x02,     # Keep line #
+        PERLDBf_NOOPT     => 0x04,     # Switch off optimizations
+        PERLDBf_INTER     => 0x08,     # Preserve more data
+        PERLDBf_SUBLINE   => 0x10,     # Keep subr source lines
+        PERLDBf_SINGLE    => 0x20,     # Start with single-step on
+        PERLDBf_NONAME    => 0x40,     # For _SUB: no name of the subr
+        PERLDBf_GOTO      => 0x80,     # Report goto: call DB::goto
+        PERLDBf_NAMEEVAL  => 0x100,    # Informative names for evals
+        PERLDBf_NAMEANON  => 0x200,    # Informative names for anon subs
+        PERLDBf_SAVESRC   => 0x400,    # Save source lines into @{"_<$filename"}
+        PERLDB_ALL        => 0x33f,    # No _NONAME, _GOTO
+    );
+    # PERLDBf_LINE also enables the actions of PERLDBf_SAVESRC, so the debugger
+    # doesn't need to set it. It's provided for the benefit of profilers and
+    # other code analysers.
+
+    %DollarCaretP_flags_r = reverse %DollarCaretP_flags;
+}
+
+sub parse_DollarCaretP_flags {
+    my $flags = shift;
+    $flags =~ s/^\s+//;
+    $flags =~ s/\s+$//;
+    my $acu = 0;
+    foreach my $f ( split /\s*\|\s*/, $flags ) {
+        my $value;
+        if ( $f =~ /^0x([[:xdigit:]]+)$/ ) {
+            $value = hex $1;
+        }
+        elsif ( $f =~ /^(\d+)$/ ) {
+            $value = int $1;
+        }
+        elsif ( $f =~ /^DEFAULT$/i ) {
+            $value = $DollarCaretP_flags{PERLDB_ALL};
+        }
+        else {
+            $f =~ /^(?:PERLDBf_)?(.*)$/i;
+            $value = $DollarCaretP_flags{ 'PERLDBf_' . uc($1) };
+            unless ( defined $value ) {
+                print $OUT (
+                    "Unrecognized \$^P flag '$f'!\n",
+                    "Acceptable flags are: "
+                      . join( ', ', sort keys %DollarCaretP_flags ),
+                    ", and hexadecimal and decimal numbers.\n"
+                );
+                return undef;
+            }
+        }
+        $acu |= $value;
+    }
+    $acu;
+}
+
+sub expand_DollarCaretP_flags {
+    my $DollarCaretP = shift;
+    my @bits         = (
+        map {
+            my $n = ( 1 << $_ );
+            ( $DollarCaretP & $n )
+              ? ( $DollarCaretP_flags_r{$n}
+                  || sprintf( '0x%x', $n ) )
+              : ()
+          } 0 .. 31
+    );
+    return @bits ? join( '|', @bits ) : 0;
+}
+
+=over 4
+
+=item rerun
+
+Rerun the current session to:
+
+    rerun        current position
+
+    rerun 4      command number 4
+
+    rerun -4     current command minus 4 (go back 4 steps)
+
+Whether this always makes sense, in the current context is unknowable, and is
+in part left as a useful exercise for the reader.  This sub returns the
+appropriate arguments to rerun the current session.
+
+=cut
+
+sub rerun {
+    my $i = shift;
+    my @args;
+    pop(@truehist);                      # strim
+    unless (defined $truehist[$i]) {
+        print "Unable to return to non-existent command: $i\n";
+    } else {
+        $#truehist = ($i < 0 ? $#truehist + $i : $i > 0 ? $i : $#truehist);
+        my @temp = @truehist;            # store
+        push(@DB::typeahead, @truehist); # saved
+        @truehist = @hist = ();          # flush
+        @args = restart();              # setup
+        get_list("PERLDB_HIST");        # clean
+        set_list("PERLDB_HIST", @temp); # reset
+    }
+    return @args;
+}
+
+=item restart
+
+Restarting the debugger is a complex operation that occurs in several phases.
+First, we try to reconstruct the command line that was used to invoke Perl
+and the debugger.
+
+=cut
+
+sub restart {
+    # I may not be able to resurrect you, but here goes ...
+    print $OUT
+"Warning: some settings and command-line options may be lost!\n";
+    my ( @script, @flags, $cl );
+
+    # If warn was on before, turn it on again.
+    push @flags, '-w' if $ini_warn;
+
+    # Rebuild the -I flags that were on the initial
+    # command line.
+    for (@ini_INC) {
+        push @flags, '-I', $_;
+    }
+
+    # Turn on taint if it was on before.
+    push @flags, '-T' if ${^TAINT};
+
+    # Arrange for setting the old INC:
+    # Save the current @init_INC in the environment.
+    set_list( "PERLDB_INC", @ini_INC );
+
+    # If this was a perl one-liner, go to the "file"
+    # corresponding to the one-liner read all the lines
+    # out of it (except for the first one, which is going
+    # to be added back on again when 'perl -d' runs: that's
+    # the 'require perl5db.pl;' line), and add them back on
+    # to the command line to be executed.
+    if ( $0 eq '-e' ) {
+        my $lines = *{$main::{'_<-e'}}{ARRAY};
+        for ( 1 .. $#$lines ) {  # The first line is PERL5DB
+            chomp( $cl = $lines->[$_] );
+            push @script, '-e', $cl;
+        }
+    } ## end if ($0 eq '-e')
+
+    # Otherwise we just reuse the original name we had
+    # before.
+    else {
+        @script = $0;
+    }
+
+=pod
+
+After the command line  has been reconstructed, the next step is to save
+the debugger's status in environment variables. The C<DB::set_list> routine
+is used to save aggregate variables (both hashes and arrays); scalars are
+just popped into environment variables directly.
+
+=cut
+
+    # If the terminal supported history, grab it and
+    # save that in the environment.
+    set_list( "PERLDB_HIST",
+          $term->Features->{getHistory}
+        ? $term->GetHistory
+        : @hist );
+
+    # Find all the files that were visited during this
+    # session (i.e., the debugger had magic hashes
+    # corresponding to them) and stick them in the environment.
+    my @had_breakpoints = keys %had_breakpoints;
+    set_list( "PERLDB_VISITED", @had_breakpoints );
+
+    # Save the debugger options we chose.
+    set_list( "PERLDB_OPT", %option );
+    # set_list( "PERLDB_OPT", options2remember() );
+
+    # Save the break-on-loads.
+    set_list( "PERLDB_ON_LOAD", %break_on_load );
+
+=pod
+
+The most complex part of this is the saving of all of the breakpoints. They
+can live in an awful lot of places, and we have to go through all of them,
+find the breakpoints, and then save them in the appropriate environment
+variable via C<DB::set_list>.
+
+=cut
+
+    # Go through all the breakpoints and make sure they're
+    # still valid.
+    my @hard;
+    for ( 0 .. $#had_breakpoints ) {
+
+        # We were in this file.
+        my $file = $had_breakpoints[$_];
+
+        # Grab that file's magic line hash.
+        *dbline = $main::{ '_<' . $file };
+
+        # Skip out if it doesn't exist, or if the breakpoint
+        # is in a postponed file (we'll do postponed ones
+        # later).
+        next unless %dbline or $postponed_file{$file};
+
+        # In an eval. This is a little harder, so we'll
+        # do more processing on that below.
+        ( push @hard, $file ), next
+          if $file =~ /^\(\w*eval/;
+
+        # XXX I have no idea what this is doing. Yet.
+        my @add;
+        @add = %{ $postponed_file{$file} }
+          if $postponed_file{$file};
+
+        # Save the list of all the breakpoints for this file.
+        set_list( "PERLDB_FILE_$_", %dbline, @add );
+
+        # Serialize the extra data %breakpoints_data hash.
+        # That's a bug fix.
+        set_list( "PERLDB_FILE_ENABLED_$_",
+            map { _is_breakpoint_enabled($file, $_) ? 1 : 0 }
+            sort { $a <=> $b } keys(%dbline)
+        )
+    } ## end for (0 .. $#had_breakpoints)
+
+    # The breakpoint was inside an eval. This is a little
+    # more difficult. XXX and I don't understand it.
+    foreach my $hard_file (@hard) {
+        # Get over to the eval in question.
+        *dbline = $main::{ '_<' . $hard_file };
+        my $quoted = quotemeta $hard_file;
+        my %subs;
+        for my $sub ( keys %sub ) {
+            if (my ($n1, $n2) = $sub{$sub} =~ /\A$quoted:(\d+)-(\d+)\z/) {
+                $subs{$sub} = [ $n1, $n2 ];
+            }
+        }
+        unless (%subs) {
+            print {$OUT}
+            "No subroutines in $hard_file, ignoring breakpoints.\n";
+            next;
+        }
+        LINES: foreach my $line ( keys %dbline ) {
+
+            # One breakpoint per sub only:
+            my ( $offset, $found );
+            SUBS: foreach my $sub ( keys %subs ) {
+                if (
+                    $subs{$sub}->[1] >= $line    # Not after the subroutine
+                    and (
+                        not defined $offset    # Not caught
+                            or $offset < 0
+                    )
+                )
+                {                              # or badly caught
+                    $found  = $sub;
+                    $offset = $line - $subs{$sub}->[0];
+                    if ($offset >= 0) {
+                        $offset = "+$offset";
+                        last SUBS;
+                    }
+                } ## end if ($subs{$sub}->[1] >=...
+            } ## end for $sub (keys %subs)
+            if ( defined $offset ) {
+                $postponed{$found} =
+                "break $offset if $dbline{$line}";
+            }
+            else {
+                print {$OUT}
+                ("Breakpoint in ${hard_file}:$line ignored:"
+                . " after all the subroutines.\n");
+            }
+        } ## end for $line (keys %dbline)
+    } ## end for (@hard)
+
+    # Save the other things that don't need to be
+    # processed.
+    set_list( "PERLDB_POSTPONE",  %postponed );
+    set_list( "PERLDB_PRETYPE",   @$pretype );
+    set_list( "PERLDB_PRE",       @$pre );
+    set_list( "PERLDB_POST",      @$post );
+    set_list( "PERLDB_TYPEAHEAD", @typeahead );
+
+    # We are officially restarting.
+    $ENV{PERLDB_RESTART} = 1;
+
+    # We are junking all child debuggers.
+    delete $ENV{PERLDB_PIDS};    # Restore ini state
+
+    # Set this back to the initial pid.
+    $ENV{PERLDB_PIDS} = $ini_pids if defined $ini_pids;
+
+=pod
+
+After all the debugger status has been saved, we take the command we built up
+and then return it, so we can C<exec()> it. The debugger will spot the
+C<PERLDB_RESTART> environment variable and realize it needs to reload its state
+from the environment.
+
+=cut
+
+    # And run Perl again. Add the "-d" flag, all the
+    # flags we built up, the script (whether a one-liner
+    # or a file), add on the -emacs flag for a client editor,
+    # and then the old arguments.
+
+    return ($^X, '-d', @flags, @script, ($client_editor ? '-emacs' : ()), @ARGS);
+
+};  # end restart
+
+=back
+
+=head1 END PROCESSING - THE C<END> BLOCK
+
+Come here at the very end of processing. We want to go into a
+loop where we allow the user to enter commands and interact with the
+debugger, but we don't want anything else to execute.
+
+First we set the C<$finished> variable, so that some commands that
+shouldn't be run after the end of program quit working.
+
+We then figure out whether we're truly done (as in the user entered a C<q>
+command, or we finished execution while running nonstop). If we aren't,
+we set C<$single> to 1 (causing the debugger to get control again).
+
+We then call C<DB::fake::at_exit()>, which returns the C<Use 'q' to quit ...>
+message and returns control to the debugger. Repeat.
+
+When the user finally enters a C<q> command, C<$fall_off_end> is set to
+1 and the C<END> block simply exits with C<$single> set to 0 (don't
+break, run to completion.).
+
+=cut
+
+END {
+    $finished = 1 if $inhibit_exit;    # So that some commands may be disabled.
+    $fall_off_end = 1 unless $inhibit_exit;
+
+    # Do not stop in at_exit() and destructors on exit:
+    if ($fall_off_end or $runnonstop) {
+        save_hist();
+    } else {
+        $DB::single = 1;
+        DB::fake::at_exit();
+    }
+} ## end END
+
+=head1 PRE-5.8 COMMANDS
+
+Some of the commands changed function quite a bit in the 5.8 command
+realignment, so much so that the old code had to be replaced completely.
+Because we wanted to retain the option of being able to go back to the
+former command set, we moved the old code off to this section.
+
+There's an awful lot of duplicated code here. We've duplicated the
+comments to keep things clear.
+
+=head2 Null command
+
+Does nothing. Used to I<turn off> commands.
+
+=cut
+
+sub cmd_pre580_null {
+
+    # do nothing...
+}
+
+=head2 Old C<a> command
+
+This version added actions if you supplied them, and deleted them
+if you didn't.
+
+=cut
+
+sub cmd_pre580_a {
+    my $xcmd = shift;
+    my $cmd  = shift;
+
+    # Argument supplied. Add the action.
+    if ( $cmd =~ /^(\d*)\s*(.*)/ ) {
+
+        # If the line isn't there, use the current line.
+        my $i = $1 || $line;
+        my $j = $2;
+
+        # If there is an action ...
+        if ( length $j ) {
+
+            # ... but the line isn't breakable, skip it.
+            if ( $dbline[$i] == 0 ) {
+                print $OUT "Line $i may not have an action.\n";
+            }
+            else {
+
+                # ... and the line is breakable:
+                # Mark that there's an action in this file.
+                $had_breakpoints{$filename} |= 2;
+
+                # Delete any current action.
+                $dbline{$i} =~ s/\0[^\0]*//;
+
+                # Add the new action, continuing the line as needed.
+                $dbline{$i} .= "\0" . action($j);
+            }
+        } ## end if (length $j)
+
+        # No action supplied.
+        else {
+
+            # Delete the action.
+            $dbline{$i} =~ s/\0[^\0]*//;
+
+            # Mark as having no break or action if nothing's left.
+            delete $dbline{$i} if $dbline{$i} eq '';
+        }
+    } ## end if ($cmd =~ /^(\d*)\s*(.*)/)
+} ## end sub cmd_pre580_a
+
+=head2 Old C<b> command
+
+Add breakpoints.
+
+=cut
+
+sub cmd_pre580_b {
+    my $xcmd   = shift;
+    my $cmd    = shift;
+    my $dbline = shift;
+
+    # Break on load.
+    if ( $cmd =~ /^load\b\s*(.*)/ ) {

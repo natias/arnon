@@ -1,0 +1,1000 @@
+                    if (/^patch\s+([\d\.]+)/) {
+                        $pversion = $1;
+                        last PARSEVERSION;
+                    }
+                }
+                if ($pversion) {
+                    $stdpatchargs = "-N --fuzz=3";
+                } else {
+                    $stdpatchargs = "-N";
+                }
+            }
+            my $countedpatches = @$patches == 1 ? "1 patch" : (scalar @$patches . " patches");
+            $CPAN::Frontend->myprint("Applying $countedpatches:\n");
+            my $patches_dir = $CPAN::Config->{patches_dir};
+            for my $patch (@$patches) {
+                if ($patches_dir && !File::Spec->file_name_is_absolute($patch)) {
+                    my $f = File::Spec->catfile($patches_dir, $patch);
+                    $patch = $f if -f $f;
+                }
+                unless (-f $patch) {
+                    CPAN->debug("not on disk: patch[$patch]") if $CPAN::DEBUG;
+                    if (my $trydl = $self->try_download($patch)) {
+                        $patch = $trydl;
+                    } else {
+                        my $fail = "Could not find patch '$patch'";
+                        $CPAN::Frontend->mywarn("$fail; cannot continue\n");
+                        $self->{unwrapped} = CPAN::Distrostatus->new("NO -- $fail");
+                        delete $self->{build_dir};
+                        return;
+                    }
+                }
+                $CPAN::Frontend->myprint("  $patch\n");
+                my $readfh = CPAN::Tarzip->TIEHANDLE($patch);
+
+                my $pcommand;
+                my($ppp,$pfiles) = $self->_patch_p_parameter($readfh);
+                if ($ppp eq "applypatch") {
+                    $pcommand = "$CPAN::Config->{applypatch} -verbose";
+                } else {
+                    my $thispatchargs = join " ", $stdpatchargs, $ppp;
+                    $pcommand = "$patchbin $thispatchargs";
+                    require Config; # usually loaded from CPAN.pm
+                    if ($Config::Config{osname} eq "solaris") {
+                        # native solaris patch cannot patch readonly files
+                        for my $file (@{$pfiles||[]}) {
+                            my @stat = stat $file or next;
+                            chmod $stat[2] | 0600, $file; # may fail
+                        }
+                    }
+                }
+
+                $readfh = CPAN::Tarzip->TIEHANDLE($patch); # open again
+                my $writefh = FileHandle->new;
+                $CPAN::Frontend->myprint("  $pcommand\n");
+                unless (open $writefh, "|$pcommand") {
+                    my $fail = "Could not fork '$pcommand'";
+                    $CPAN::Frontend->mywarn("$fail; cannot continue\n");
+                    $self->{unwrapped} = CPAN::Distrostatus->new("NO -- $fail");
+                    delete $self->{build_dir};
+                    return;
+                }
+                binmode($writefh);
+                while (my $x = $readfh->READLINE) {
+                    print $writefh $x;
+                }
+                unless (close $writefh) {
+                    my $fail = "Could not apply patch '$patch'";
+                    $CPAN::Frontend->mywarn("$fail; cannot continue\n");
+                    $self->{unwrapped} = CPAN::Distrostatus->new("NO -- $fail");
+                    delete $self->{build_dir};
+                    return;
+                }
+            }
+            $self->{patched}++;
+        }
+        return 1;
+    }
+}
+
+# may return
+# - "applypatch"
+# - ("-p0"|"-p1", $files)
+sub _patch_p_parameter {
+    my($self,$fh) = @_;
+    my $cnt_files   = 0;
+    my $cnt_p0files = 0;
+    my @files;
+    local($_);
+    while ($_ = $fh->READLINE) {
+        if (
+            $CPAN::Config->{applypatch}
+            &&
+            /\#\#\#\# ApplyPatch data follows \#\#\#\#/
+           ) {
+            return "applypatch"
+        }
+        next unless /^[\*\+]{3}\s(\S+)/;
+        my $file = $1;
+        push @files, $file;
+        $cnt_files++;
+        $cnt_p0files++ if -f $file;
+        CPAN->debug("file[$file]cnt_files[$cnt_files]cnt_p0files[$cnt_p0files]")
+            if $CPAN::DEBUG;
+    }
+    return "-p1" unless $cnt_files;
+    my $opt_p = $cnt_files==$cnt_p0files ? "-p0" : "-p1";
+    return ($opt_p, \@files);
+}
+
+#-> sub CPAN::Distribution::_edge_cases
+# with "configure" or "Makefile" or single file scripts
+sub _edge_cases {
+    my($self,$mpl,$local_file) = @_;
+    $self->debug(sprintf("makefilepl[%s]anycwd[%s]",
+                         $mpl,
+                         CPAN::anycwd(),
+                        )) if $CPAN::DEBUG;
+    my $build_dir = $self->{build_dir};
+    my($configure) = File::Spec->catfile($build_dir,"Configure");
+    if (-f $configure) {
+        # do we have anything to do?
+        $self->{configure} = $configure;
+    } elsif (-f File::Spec->catfile($build_dir,"Makefile")) {
+        $CPAN::Frontend->mywarn(qq{
+Package comes with a Makefile and without a Makefile.PL.
+We\'ll try to build it with that Makefile then.
+});
+        $self->{writemakefile} = CPAN::Distrostatus->new("YES");
+        $CPAN::Frontend->mysleep(2);
+    } else {
+        my $cf = $self->called_for || "unknown";
+        if ($cf =~ m|/|) {
+            $cf =~ s|.*/||;
+            $cf =~ s|\W.*||;
+        }
+        $cf =~ s|[/\\:]||g;     # risk of filesystem damage
+        $cf = "unknown" unless length($cf);
+        if (my $crud = $self->_contains_crud($build_dir)) {
+            my $why = qq{Package contains $crud; not recognized as a perl package, giving up};
+            $CPAN::Frontend->mywarn("$why\n");
+            $self->{writemakefile} = CPAN::Distrostatus->new(qq{NO -- $why});
+            return;
+        }
+        $CPAN::Frontend->mywarn(qq{Package seems to come without Makefile.PL.
+  (The test -f "$mpl" returned false.)
+  Writing one on our own (setting NAME to $cf)\a\n});
+        $self->{had_no_makefile_pl}++;
+        $CPAN::Frontend->mysleep(3);
+
+        # Writing our own Makefile.PL
+
+        my $exefile_stanza = "";
+        if ($self->{archived} eq "maybe_pl") {
+            $exefile_stanza = $self->_exefile_stanza($build_dir,$local_file);
+        }
+
+        my $fh = FileHandle->new;
+        $fh->open(">$mpl")
+            or Carp::croak("Could not open >$mpl: $!");
+        $fh->print(
+                   qq{# This Makefile.PL has been autogenerated by the module CPAN.pm
+# because there was no Makefile.PL supplied.
+# Autogenerated on: }.scalar localtime().qq{
+
+use ExtUtils::MakeMaker;
+WriteMakefile(
+              NAME => q[$cf],$exefile_stanza
+             );
+});
+        $fh->close;
+    }
+}
+
+#-> CPAN;:Distribution::_contains_crud
+sub _contains_crud {
+    my($self,$dir) = @_;
+    my(@dirs, $dh, @files);
+    opendir $dh, $dir or return;
+    my $dirent;
+    for $dirent (readdir $dh) {
+        next if $dirent =~ /^\.\.?$/;
+        my $path = File::Spec->catdir($dir,$dirent);
+        if (-d $path) {
+            push @dirs, $dirent;
+        } elsif (-f $path) {
+            push @files, $dirent;
+        }
+    }
+    if (@dirs && @files) {
+        return "both files[@files] and directories[@dirs]";
+    } elsif (@files > 2) {
+        return "several files[@files] but no Makefile.PL or Build.PL";
+    }
+    return;
+}
+
+#-> CPAN;:Distribution::_exefile_stanza
+sub _exefile_stanza {
+    my($self,$build_dir,$local_file) = @_;
+
+            my $fh = FileHandle->new;
+            my $script_file = File::Spec->catfile($build_dir,$local_file);
+            $fh->open($script_file)
+                or Carp::croak("Could not open script '$script_file': $!");
+            local $/ = "\n";
+            # parse name and prereq
+            my($state) = "poddir";
+            my($name, $prereq) = ("", "");
+            while (<$fh>) {
+                if ($state eq "poddir" && /^=head\d\s+(\S+)/) {
+                    if ($1 eq 'NAME') {
+                        $state = "name";
+                    } elsif ($1 eq 'PREREQUISITES') {
+                        $state = "prereq";
+                    }
+                } elsif ($state =~ m{^(name|prereq)$}) {
+                    if (/^=/) {
+                        $state = "poddir";
+                    } elsif (/^\s*$/) {
+                        # nop
+                    } elsif ($state eq "name") {
+                        if ($name eq "") {
+                            ($name) = /^(\S+)/;
+                            $state = "poddir";
+                        }
+                    } elsif ($state eq "prereq") {
+                        $prereq .= $_;
+                    }
+                } elsif (/^=cut\b/) {
+                    last;
+                }
+            }
+            $fh->close;
+
+            for ($name) {
+                s{.*<}{};       # strip X<...>
+                s{>.*}{};
+            }
+            chomp $prereq;
+            $prereq = join " ", split /\s+/, $prereq;
+            my($PREREQ_PM) = join("\n", map {
+                s{.*<}{};       # strip X<...>
+                s{>.*}{};
+                if (/[\s\'\"]/) { # prose?
+                } else {
+                    s/[^\w:]$//; # period?
+                    " "x28 . "'$_' => 0,";
+                }
+            } split /\s*,\s*/, $prereq);
+
+            if ($name) {
+                my $to_file = File::Spec->catfile($build_dir, $name);
+                rename $script_file, $to_file
+                    or die "Can't rename $script_file to $to_file: $!";
+            }
+
+    return "
+              EXE_FILES => ['$name'],
+              PREREQ_PM => {
+$PREREQ_PM
+                           },
+";
+}
+
+#-> CPAN::Distribution::_signature_business
+sub _signature_business {
+    my($self) = @_;
+    my $check_sigs = CPAN::HandleConfig->prefs_lookup($self,
+                                                      q{check_sigs});
+    if ($check_sigs) {
+        if ($CPAN::META->has_inst("Module::Signature")) {
+            if (-f "SIGNATURE") {
+                $self->debug("Module::Signature is installed, verifying") if $CPAN::DEBUG;
+                my $rv = Module::Signature::verify();
+                if ($rv != Module::Signature::SIGNATURE_OK() and
+                    $rv != Module::Signature::SIGNATURE_MISSING()) {
+                    $CPAN::Frontend->mywarn(
+                                            qq{\nSignature invalid for }.
+                                            qq{distribution file. }.
+                                            qq{Please investigate.\n\n}
+                                           );
+
+                    my $wrap =
+                        sprintf(qq{I'd recommend removing %s. Some error occurred   }.
+                                qq{while checking its signature, so it could        }.
+                                qq{be invalid. Maybe you have configured            }.
+                                qq{your 'urllist' with a bad URL. Please check this }.
+                                qq{array with 'o conf urllist' and retry. Or        }.
+                                qq{examine the distribution in a subshell. Try
+  look %s
+and run
+  cpansign -v
+},
+                                $self->{localfile},
+                                $self->pretty_id,
+                               );
+                    $self->{signature_verify} = CPAN::Distrostatus->new("NO");
+                    $CPAN::Frontend->mywarn(Text::Wrap::wrap("","",$wrap));
+                    $CPAN::Frontend->mysleep(5) if $CPAN::Frontend->can("mysleep");
+                } else {
+                    $self->{signature_verify} = CPAN::Distrostatus->new("YES");
+                    $self->debug("Module::Signature has verified") if $CPAN::DEBUG;
+                }
+            } else {
+                $CPAN::Frontend->mywarn(qq{Package came without SIGNATURE\n\n});
+            }
+        } else {
+            $self->debug("Module::Signature is NOT installed") if $CPAN::DEBUG;
+        }
+    }
+}
+
+#-> CPAN::Distribution::untar_me ;
+sub untar_me {
+    my($self,$ct) = @_;
+    $self->{archived} = "tar";
+    my $result = eval { $ct->untar() };
+    if ($result) {
+        $self->{unwrapped} = CPAN::Distrostatus->new("YES");
+    } else {
+        # unfortunately we have no $@ here, Tarzip is using mydie which dies with "\n"
+        $self->{unwrapped} = CPAN::Distrostatus->new("NO -- untar failed");
+    }
+}
+
+# CPAN::Distribution::unzip_me ;
+sub unzip_me {
+    my($self,$ct) = @_;
+    $self->{archived} = "zip";
+    if (eval { $ct->unzip() }) {
+        $self->{unwrapped} = CPAN::Distrostatus->new("YES");
+    } else {
+        $self->{unwrapped} = CPAN::Distrostatus->new("NO -- unzip failed during unzip");
+    }
+    return;
+}
+
+sub handle_singlefile {
+    my($self,$local_file) = @_;
+
+    if ( $local_file =~ /\.pm(\.(gz|Z))?(?!\n)\Z/ ) {
+        $self->{archived} = "pm";
+    } elsif ( $local_file =~ /\.patch(\.(gz|bz2))?(?!\n)\Z/ ) {
+        $self->{archived} = "patch";
+    } else {
+        $self->{archived} = "maybe_pl";
+    }
+
+    my $to = File::Basename::basename($local_file);
+    if ($to =~ s/\.(gz|Z)(?!\n)\Z//) {
+        if (eval{CPAN::Tarzip->new($local_file)->gunzip($to)}) {
+            $self->{unwrapped} = CPAN::Distrostatus->new("YES");
+        } else {
+            $self->{unwrapped} = CPAN::Distrostatus->new("NO -- uncompressing failed");
+        }
+    } else {
+        if (File::Copy::cp($local_file,".")) {
+            $self->{unwrapped} = CPAN::Distrostatus->new("YES");
+        } else {
+            $self->{unwrapped} = CPAN::Distrostatus->new("NO -- copying failed");
+        }
+    }
+    return $to;
+}
+
+#-> sub CPAN::Distribution::new ;
+sub new {
+    my($class,%att) = @_;
+
+    # $CPAN::META->{cachemgr} ||= CPAN::CacheMgr->new();
+
+    my $this = { %att };
+    return bless $this, $class;
+}
+
+#-> sub CPAN::Distribution::look ;
+sub look {
+    my($self) = @_;
+
+    if ($^O eq 'MacOS') {
+      $self->Mac::BuildTools::look;
+      return;
+    }
+
+    if (  $CPAN::Config->{'shell'} ) {
+        $CPAN::Frontend->myprint(qq{
+Trying to open a subshell in the build directory...
+});
+    } else {
+        $CPAN::Frontend->myprint(qq{
+Your configuration does not define a value for subshells.
+Please define it with "o conf shell <your shell>"
+});
+        return;
+    }
+    my $dist = $self->id;
+    my $dir;
+    unless ($dir = $self->dir) {
+        $self->get;
+    }
+    unless ($dir ||= $self->dir) {
+        $CPAN::Frontend->mywarn(qq{
+Could not determine which directory to use for looking at $dist.
+});
+        return;
+    }
+    my $pwd  = CPAN::anycwd();
+    $self->safe_chdir($dir);
+    $CPAN::Frontend->myprint(qq{Working directory is $dir\n});
+    {
+        local $ENV{CPAN_SHELL_LEVEL} = $ENV{CPAN_SHELL_LEVEL}||0;
+        $ENV{CPAN_SHELL_LEVEL} += 1;
+        my $shell = CPAN::HandleConfig->safe_quote($CPAN::Config->{'shell'});
+
+        local $ENV{PERL5LIB} = defined($ENV{PERL5LIB})
+            ? $ENV{PERL5LIB}
+                : ($ENV{PERLLIB} || "");
+
+        local $ENV{PERL5OPT} = defined $ENV{PERL5OPT} ? $ENV{PERL5OPT} : "";
+        # local $ENV{PERL_USE_UNSAFE_INC} = exists $ENV{PERL_USE_UNSAFE_INC} ? $ENV{PERL_USE_UNSAFE_INC} : 1; # look
+        $CPAN::META->set_perl5lib;
+        local $ENV{MAKEFLAGS}; # protect us from outer make calls
+
+        unless (system($shell) == 0) {
+            my $code = $? >> 8;
+            $CPAN::Frontend->mywarn("Subprocess shell exit code $code\n");
+        }
+    }
+    $self->safe_chdir($pwd);
+}
+
+# CPAN::Distribution::cvs_import ;
+sub cvs_import {
+    my($self) = @_;
+    $self->get;
+    my $dir = $self->dir;
+
+    my $package = $self->called_for;
+    my $module = $CPAN::META->instance('CPAN::Module', $package);
+    my $version = $module->cpan_version;
+
+    my $userid = $self->cpan_userid;
+
+    my $cvs_dir = (split /\//, $dir)[-1];
+    $cvs_dir =~ s/-\d+[^-]+(?!\n)\Z//;
+    my $cvs_root =
+      $CPAN::Config->{cvsroot} || $ENV{CVSROOT};
+    my $cvs_site_perl =
+      $CPAN::Config->{cvs_site_perl} || $ENV{CVS_SITE_PERL};
+    if ($cvs_site_perl) {
+        $cvs_dir = "$cvs_site_perl/$cvs_dir";
+    }
+    my $cvs_log = qq{"imported $package $version sources"};
+    $version =~ s/\./_/g;
+    # XXX cvs: undocumented and unclear how it was meant to work
+    my @cmd = ('cvs', '-d', $cvs_root, 'import', '-m', $cvs_log,
+               "$cvs_dir", $userid, "v$version");
+
+    my $pwd  = CPAN::anycwd();
+    chdir($dir) or $CPAN::Frontend->mydie(qq{Could not chdir to "$dir": $!});
+
+    $CPAN::Frontend->myprint(qq{Working directory is $dir\n});
+
+    $CPAN::Frontend->myprint(qq{@cmd\n});
+    system(@cmd) == 0 or
+    # XXX cvs
+        $CPAN::Frontend->mydie("cvs import failed");
+    chdir($pwd) or $CPAN::Frontend->mydie(qq{Could not chdir to "$pwd": $!});
+}
+
+#-> sub CPAN::Distribution::readme ;
+sub readme {
+    my($self) = @_;
+    my($dist) = $self->id;
+    my($sans,$suffix) = $dist =~ /(.+)\.(tgz|tar[\._-]gz|tar\.Z|zip)$/;
+    $self->debug("sans[$sans] suffix[$suffix]\n") if $CPAN::DEBUG;
+    my($local_file);
+    my($local_wanted) =
+        File::Spec->catfile(
+                            $CPAN::Config->{keep_source_where},
+                            "authors",
+                            "id",
+                            split(/\//,"$sans.readme"),
+                           );
+    my $readme = "authors/id/$sans.readme";
+    $self->debug("Doing localize for '$readme'") if $CPAN::DEBUG;
+    $local_file = CPAN::FTP->localize($readme,
+                                      $local_wanted)
+        or $CPAN::Frontend->mydie(qq{No $sans.readme found});
+
+    if ($^O eq 'MacOS') {
+        Mac::BuildTools::launch_file($local_file);
+        return;
+    }
+
+    my $fh_pager = FileHandle->new;
+    local($SIG{PIPE}) = "IGNORE";
+    my $pager = $CPAN::Config->{'pager'} || "cat";
+    $fh_pager->open("|$pager")
+        or die "Could not open pager $pager\: $!";
+    my $fh_readme = FileHandle->new;
+    $fh_readme->open($local_file)
+        or $CPAN::Frontend->mydie(qq{Could not open "$local_file": $!});
+    $CPAN::Frontend->myprint(qq{
+Displaying file
+  $local_file
+with pager "$pager"
+});
+    $fh_pager->print(<$fh_readme>);
+    $fh_pager->close;
+}
+
+#-> sub CPAN::Distribution::verifyCHECKSUM ;
+sub verifyCHECKSUM {
+    my($self) = @_;
+  EXCUSE: {
+        my @e;
+        $self->{CHECKSUM_STATUS} ||= "";
+        $self->{CHECKSUM_STATUS} eq "OK" and push @e, "Checksum was ok";
+        $CPAN::Frontend->myprint(join "", map {"  $_\n"} @e) and return if @e;
+    }
+    my($lc_want,$lc_file,@local,$basename);
+    @local = split(/\//,$self->id);
+    pop @local;
+    push @local, "CHECKSUMS";
+    $lc_want =
+        File::Spec->catfile($CPAN::Config->{keep_source_where},
+                            "authors", "id", @local);
+    local($") = "/";
+    if (my $size = -s $lc_want) {
+        $self->debug("lc_want[$lc_want]size[$size]") if $CPAN::DEBUG;
+        my @stat = stat $lc_want;
+        my $epoch_starting_support_of_cpan_path = 1637471530;
+        if ($stat[9] >= $epoch_starting_support_of_cpan_path) {
+            if ($self->CHECKSUM_check_file($lc_want, 1)) {
+                return $self->{CHECKSUM_STATUS} = "OK";
+            }
+        } else {
+            unlink $lc_want;
+        }
+    }
+    $lc_file = CPAN::FTP->localize("authors/id/@local",
+                                   $lc_want,1);
+    unless ($lc_file) {
+        $CPAN::Frontend->myprint("Trying $lc_want.gz\n");
+        $local[-1] .= ".gz";
+        $lc_file = CPAN::FTP->localize("authors/id/@local",
+                                       "$lc_want.gz",1);
+        if ($lc_file) {
+            $lc_file =~ s/\.gz(?!\n)\Z//;
+            eval{CPAN::Tarzip->new("$lc_file.gz")->gunzip($lc_file)};
+        } else {
+            return;
+        }
+    }
+    if ($self->CHECKSUM_check_file($lc_file)) {
+        return $self->{CHECKSUM_STATUS} = "OK";
+    }
+}
+
+#-> sub CPAN::Distribution::SIG_check_file ;
+sub SIG_check_file {
+    my($self,$chk_file) = @_;
+    my $rv = eval { Module::Signature::_verify($chk_file) };
+
+    if ($rv eq Module::Signature::CANNOT_VERIFY()) {
+        $CPAN::Frontend->myprint(qq{\nSignature for }.
+                                 qq{file $chk_file could not be verified for an unknown reason. }.
+                                 $self->as_string.
+                                 qq{Module::Signature verification returned value $rv\n\n}
+                                );
+
+        my $wrap = qq{The manual says for this case: Cannot verify the
+OpenPGP signature, maybe due to the lack of a network connection to
+the key server, or if neither gnupg nor Crypt::OpenPGP exists on the
+system. You probably want to analyse the situation and if you cannot
+fix it you will have to decide whether you want to stop this session
+or you want to turn off signature verification. The latter would be
+done with the command 'o conf init check_sigs'};
+
+        $CPAN::Frontend->mydie(Text::Wrap::wrap("","",$wrap));
+    } if ($rv == Module::Signature::SIGNATURE_OK()) {
+        $CPAN::Frontend->myprint("Signature for $chk_file ok\n");
+        return $self->{SIG_STATUS} = "OK";
+    } else {
+        $CPAN::Frontend->mywarn(qq{\nSignature invalid for }.
+                                 qq{file $chk_file. }.
+                                 qq{Please investigate.\n\n}.
+                                 $self->as_string.
+                                 qq{Module::Signature verification returned value $rv\n\n}
+                                );
+
+        my $wrap = qq{I\'d recommend removing $chk_file. Its signature
+is invalid. Maybe you have configured your 'urllist' with
+a bad URL. Please check this array with 'o conf urllist', and
+retry.};
+
+        $CPAN::Frontend->mydie(Text::Wrap::wrap("","",$wrap));
+    }
+}
+
+#-> sub CPAN::Distribution::CHECKSUM_check_file ;
+
+# sloppy is 1 when we have an old checksums file that maybe is good
+# enough
+
+sub CHECKSUM_check_file {
+    my($self,$chk_file,$sloppy) = @_;
+    my($cksum,$file,$basename);
+
+    $sloppy ||= 0;
+    $self->debug("chk_file[$chk_file]sloppy[$sloppy]") if $CPAN::DEBUG;
+    my $check_sigs = CPAN::HandleConfig->prefs_lookup($self,
+                                                      q{check_sigs});
+    if ($check_sigs) {
+        if ($CPAN::META->has_inst("Module::Signature")) {
+            $self->debug("Module::Signature is installed, verifying") if $CPAN::DEBUG;
+            $self->SIG_check_file($chk_file);
+        } else {
+            $self->debug("Module::Signature is NOT installed") if $CPAN::DEBUG;
+        }
+    }
+
+    $file = $self->{localfile};
+    $basename = File::Basename::basename($file);
+    my($signed_data);
+    my $fh = FileHandle->new;
+    if ($check_sigs) {
+        my $tempdir;
+        if ($CPAN::META->has_usable("File::Temp")) {
+            $tempdir = File::Temp::tempdir("CHECKSUMS-XXXX", CLEANUP => 1, DIR => "/tmp" );
+        } else {
+            $tempdir = File::Spec->catdir(File::Spec->tmpdir, "CHECKSUMS-$$");
+            File::Path::mkpath($tempdir);
+        }
+        my $tempfile = File::Spec->catfile($tempdir, "CHECKSUMS.$$");
+        unlink $tempfile; # ignore missing file
+        my $devnull = File::Spec->devnull;
+        my $gpg = $CPAN::Config->{gpg} or
+            $CPAN::Frontend->mydie("Your configuration suggests that you do not have 'gpg' installed. This is needed to verify checksums with the config variable 'check_sigs' on. Please configure it with 'o conf init gpg'");
+        my $system = qq{"$gpg" --verify --batch --no-tty --output "$tempfile" "$chk_file" 2> "$devnull"};
+        0 == system $system or $CPAN::Frontend->mydie("gpg run was failing, cannot continue: $system");
+        open $fh, $tempfile or $CPAN::Frontend->mydie("Could not open $tempfile: $!");
+        local $/;
+        $signed_data = <$fh>;
+        close $fh;
+        File::Path::rmtree($tempdir);
+    } else {
+        my $fh = FileHandle->new;
+        if (open $fh, $chk_file) {
+            local($/);
+            $signed_data = <$fh>;
+        } else {
+            $CPAN::Frontend->mydie("Could not open $chk_file for reading");
+        }
+        close $fh;
+    }
+    $signed_data =~ s/\015?\012/\n/g;
+    my($compmt) = Safe->new();
+    $cksum = $compmt->reval($signed_data);
+    if ($@) {
+        rename $chk_file, "$chk_file.bad";
+        Carp::confess($@) if $@;
+    }
+
+    if (! ref $cksum or ref $cksum ne "HASH") {
+        $CPAN::Frontend->mywarn(qq{
+Warning: checksum file '$chk_file' broken.
+
+When trying to read that file I expected to get a hash reference
+for further processing, but got garbage instead.
+});
+        my $answer = CPAN::Shell::colorable_makemaker_prompt("Proceed nonetheless?", "no");
+        $answer =~ /^\s*y/i or $CPAN::Frontend->mydie("Aborted.\n");
+        $self->{CHECKSUM_STATUS} = "NIL -- CHECKSUMS file broken";
+        return;
+    } elsif (exists $cksum->{$basename} && ! exists $cksum->{$basename}{cpan_path}) {
+        $CPAN::Frontend->mywarn(qq{
+Warning: checksum file '$chk_file' not conforming.
+
+The cksum does not contain the key 'cpan_path' for '$basename'.
+});
+        my $answer = CPAN::Shell::colorable_makemaker_prompt("Proceed nonetheless?", "no");
+        $answer =~ /^\s*y/i or $CPAN::Frontend->mydie("Aborted.\n");
+        $self->{CHECKSUM_STATUS} = "NIL -- CHECKSUMS file without cpan_path";
+        return;
+    } elsif (exists $cksum->{$basename} && substr($self->{ID},0,length($cksum->{$basename}{cpan_path}))
+             ne $cksum->{$basename}{cpan_path}) {
+        $CPAN::Frontend->mywarn(qq{
+Warning: checksum file not matching path '$self->{ID}'.
+
+The cksum contain the key 'cpan_path=$cksum->{$basename}{cpan_path}'
+which does not match the ID of the distribution '$self->{ID}'.
+Something's suspicious might be going on here. Please investigate.
+
+});
+        my $answer = CPAN::Shell::colorable_makemaker_prompt("Proceed nonetheless?", "no");
+        $answer =~ /^\s*y/i or $CPAN::Frontend->mydie("Aborted.\n");
+        $self->{CHECKSUM_STATUS} = "NIL -- CHECKSUMS non-matching cpan_path vs. ID";
+        return;
+    } elsif (exists $cksum->{$basename}{sha256}) {
+        $self->debug("Found checksum for $basename:" .
+                     "$cksum->{$basename}{sha256}\n") if $CPAN::DEBUG;
+
+        open($fh, $file);
+        binmode $fh;
+        my $eq = $self->eq_CHECKSUM($fh,$cksum->{$basename}{sha256});
+        $fh->close;
+        $fh = CPAN::Tarzip->TIEHANDLE($file);
+
+        unless ($eq) {
+            my $dg = Digest::SHA->new(256);
+            my($data,$ref);
+            $ref = \$data;
+            while ($fh->READ($ref, 4096) > 0) {
+                $dg->add($data);
+            }
+            my $hexdigest = $dg->hexdigest;
+            $eq += $hexdigest eq $cksum->{$basename}{'sha256-ungz'};
+        }
+
+        if ($eq) {
+            $CPAN::Frontend->myprint("Checksum for $file ok\n");
+            return $self->{CHECKSUM_STATUS} = "OK";
+        } else {
+            $CPAN::Frontend->myprint(qq{\nChecksum mismatch for }.
+                                     qq{distribution file. }.
+                                     qq{Please investigate.\n\n}.
+                                     $self->as_string,
+                                     $CPAN::META->instance(
+                                                           'CPAN::Author',
+                                                           $self->cpan_userid
+                                                          )->as_string);
+
+            my $wrap = qq{I\'d recommend removing $file. Its
+checksum is incorrect. Maybe you have configured your 'urllist' with
+a bad URL. Please check this array with 'o conf urllist', and
+retry.};
+
+            $CPAN::Frontend->mydie(Text::Wrap::wrap("","",$wrap));
+
+            # former versions just returned here but this seems a
+            # serious threat that deserves a die
+
+            # $CPAN::Frontend->myprint("\n\n");
+            # sleep 3;
+            # return;
+        }
+        # close $fh if fileno($fh);
+    } else {
+        return if $sloppy;
+        unless ($self->{CHECKSUM_STATUS}) {
+            $CPAN::Frontend->mywarn(qq{
+Warning: No checksum for $basename in $chk_file.
+
+The cause for this may be that the file is very new and the checksum
+has not yet been calculated, but it may also be that something is
+going awry right now.
+});
+            my $answer = CPAN::Shell::colorable_makemaker_prompt("Proceed?", "yes");
+            $answer =~ /^\s*y/i or $CPAN::Frontend->mydie("Aborted.\n");
+        }
+        $self->{CHECKSUM_STATUS} = "NIL -- distro not in CHECKSUMS file";
+        return;
+    }
+}
+
+#-> sub CPAN::Distribution::eq_CHECKSUM ;
+sub eq_CHECKSUM {
+    my($self,$fh,$expect) = @_;
+    if ($CPAN::META->has_inst("Digest::SHA")) {
+        my $dg = Digest::SHA->new(256);
+        my($data);
+        while (read($fh, $data, 4096)) {
+            $dg->add($data);
+        }
+        my $hexdigest = $dg->hexdigest;
+        # warn "fh[$fh] hex[$hexdigest] aexp[$expectMD5]";
+        return $hexdigest eq $expect;
+    }
+    return 1;
+}
+
+#-> sub CPAN::Distribution::force ;
+
+# Both CPAN::Modules and CPAN::Distributions know if "force" is in
+# effect by autoinspection, not by inspecting a global variable. One
+# of the reason why this was chosen to work that way was the treatment
+# of dependencies. They should not automatically inherit the force
+# status. But this has the downside that ^C and die() will return to
+# the prompt but will not be able to reset the force_update
+# attributes. We try to correct for it currently in the read_metadata
+# routine, and immediately before we check for a Signal. I hope this
+# works out in one of v1.57_53ff
+
+# "Force get forgets previous error conditions"
+
+#-> sub CPAN::Distribution::fforce ;
+sub fforce {
+  my($self, $method) = @_;
+  $self->force($method,1);
+}
+
+#-> sub CPAN::Distribution::force ;
+sub force {
+  my($self, $method,$fforce) = @_;
+  my %phase_map = (
+                   get => [
+                           "unwrapped",
+                           "build_dir",
+                           "archived",
+                           "localfile",
+                           "CHECKSUM_STATUS",
+                           "signature_verify",
+                           "prefs",
+                           "prefs_file",
+                           "prefs_file_doc",
+                           "cleanup_after_install_done",
+                          ],
+                   make => [
+                            "writemakefile",
+                            "make",
+                            "modulebuild",
+                            "prereq_pm",
+                            "cleanup_after_install_done",
+                           ],
+                   test => [
+                            "badtestcnt",
+                            "make_test",
+                            "cleanup_after_install_done",
+                          ],
+                   install => [
+                               "install",
+                               "cleanup_after_install_done",
+                              ],
+                   unknown => [
+                               "reqtype",
+                               "yaml_content",
+                               "cleanup_after_install_done",
+                              ],
+                  );
+  my $methodmatch = 0;
+  my $ldebug = 0;
+ PHASE: for my $phase (qw(unknown get make test install)) { # order matters
+      $methodmatch = 1 if $fforce || ($method && $phase eq $method);
+      next unless $methodmatch;
+    ATTRIBUTE: for my $att (@{$phase_map{$phase}}) {
+          if ($phase eq "get") {
+              if (substr($self->id,-1,1) eq "."
+                  && $att =~ /(unwrapped|build_dir|archived)/ ) {
+                  # cannot be undone for local distros
+                  next ATTRIBUTE;
+              }
+              if ($att eq "build_dir"
+                  && $self->{build_dir}
+                  && $CPAN::META->{is_tested}
+                 ) {
+                  delete $CPAN::META->{is_tested}{$self->{build_dir}};
+              }
+          } elsif ($phase eq "test") {
+              if ($att eq "make_test"
+                  && $self->{make_test}
+                  && $self->{make_test}{COMMANDID}
+                  && $self->{make_test}{COMMANDID} == $CPAN::CurrentCommandId
+                 ) {
+                  # endless loop too likely
+                  next ATTRIBUTE;
+              }
+          }
+          delete $self->{$att};
+          if ($ldebug || $CPAN::DEBUG) {
+              # local $CPAN::DEBUG = 16; # Distribution
+              CPAN->debug(sprintf "id[%s]phase[%s]att[%s]", $self->id, $phase, $att);
+          }
+      }
+  }
+  if ($method && $method =~ /make|test|install/) {
+    $self->{force_update} = 1; # name should probably have been force_install
+  }
+}
+
+#-> sub CPAN::Distribution::notest ;
+sub notest {
+  my($self, $method) = @_;
+  # $CPAN::Frontend->mywarn("XDEBUG: set notest for $self $method");
+  $self->{"notest"}++; # name should probably have been force_install
+}
+
+#-> sub CPAN::Distribution::unnotest ;
+sub unnotest {
+  my($self) = @_;
+  # warn "XDEBUG: deleting notest";
+  delete $self->{notest};
+}
+
+#-> sub CPAN::Distribution::unforce ;
+sub unforce {
+  my($self) = @_;
+  delete $self->{force_update};
+}
+
+#-> sub CPAN::Distribution::isa_perl ;
+sub isa_perl {
+  my($self) = @_;
+  my $file = File::Basename::basename($self->id);
+  if ($file =~ m{ ^ perl
+                  (
+                   -(5\.\d+\.\d+)
+                   |
+                   (5)[._-](00[0-5](?:_[0-4][0-9])?)
+                  )
+                  \.tar[._-](?:gz|bz2)
+                  (?!\n)\Z
+                }xs) {
+    my $perl_version;
+    if ($2) {
+        $perl_version = $2;
+    } else {
+        $perl_version = "$3.$4";
+    }
+    return $perl_version;
+  } elsif ($self->cpan_comment
+           &&
+           $self->cpan_comment =~ /isa_perl\(.+?\)/) {
+    return $1;
+  }
+}
+
+
+#-> sub CPAN::Distribution::perl ;
+sub perl {
+    my ($self) = @_;
+    if (! $self) {
+        use Carp qw(carp);
+        carp __PACKAGE__ . "::perl was called without parameters.";
+    }
+    return CPAN::HandleConfig->safe_quote($CPAN::Perl);
+}
+
+#-> sub CPAN::Distribution::shortcut_prepare ;
+# return values: undef means don't shortcut; 0 means shortcut as fail;
+# and 1 means shortcut as success
+
+sub shortcut_prepare {
+    my ($self) = @_;
+
+    $self->debug("checking archive type[$self->{ID}]") if $CPAN::DEBUG;
+    if (!$self->{archived} || $self->{archived} eq "NO") {
+        return $self->goodbye("Is neither a tar nor a zip archive.");
+    }
+
+    $self->debug("checking unwrapping[$self->{ID}]") if $CPAN::DEBUG;
+    if (!$self->{unwrapped}
+        || (
+            UNIVERSAL::can($self->{unwrapped},"failed") ?
+            $self->{unwrapped}->failed :
+            $self->{unwrapped} =~ /^NO/
+            )) {
+        return $self->goodbye("Had problems unarchiving. Please build manually");
+    }
+
+    $self->debug("checking signature[$self->{ID}]") if $CPAN::DEBUG;
+    if ( ! $self->{force_update}
+        && exists $self->{signature_verify}
+        && (
+                UNIVERSAL::can($self->{signature_verify},"failed") ?
+                $self->{signature_verify}->failed :
+                $self->{signature_verify} =~ /^NO/
+            )
+    ) {
+        return $self->goodbye("Did not pass the signature test.");
+    }
+
+    $self->debug("checking writemakefile[$self->{ID}]") if $CPAN::DEBUG;
+    if ($self->{writemakefile}) {
+        if (
+                UNIVERSAL::can($self->{writemakefile},"failed") ?
+                $self->{writemakefile}->failed :
+                $self->{writemakefile} =~ /^NO/
+            ) {
+            # XXX maybe a retry would be in order?
+            my $err = UNIVERSAL::can($self->{writemakefile},"text") ?
+                $self->{writemakefile}->text :
+                    $self->{writemakefile};
+            $err =~ s/^NO\s*(--\s+)?//;
+            $err ||= "Had some problem writing Makefile";
+            $err .= ", not re-running";
+            return $self->goodbye($err);
+        } else {
+            return $self->success("Has already been prepared");
+        }
+    }
+
+    $self->debug("checking configure_requires_later[$self->{ID}]") if $CPAN::DEBUG;
+    if( my $later = $self->{configure_requires_later} ) { # see also undelay
+        return $self->goodbye($later);
+    }
+
+    return undef; # no shortcut
+}

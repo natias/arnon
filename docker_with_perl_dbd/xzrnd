@@ -1,0 +1,1000 @@
+C<@variables> should be defined in the same conditions as C<$var> is
+defined.
+
+=cut
+
+sub requires_variables ($$@)
+{
+  my ($var, $reason, @args) = @_;
+  my $res = 0;
+  for my $cond ($var->conditions->conds)
+    {
+      $res += require_variables ($var->rdef ($cond)->location, $reason,
+				 $cond, @args);
+    }
+  return $res;
+}
+
+
+=item C<variable_value ($var)>
+
+Get the C<TRUE> value of a variable, warn if the variable is
+conditionally defined.  C<$var> can be either a variable name
+or a C<Automake::Variable> instance (this allows calls such
+as C<$var-E<gt>variable_value>).
+
+=cut
+
+sub variable_value ($)
+{
+    my ($var) = @_;
+    my $v = ref ($var) ? $var : var ($var);
+    return () unless $v;
+    $v->check_defined_unconditionally;
+    my $d = $v->def (TRUE);
+    return $d ? $d->value : "";
+}
+
+=item C<$str = output_variables>
+
+Format definitions for all variables.
+
+=cut
+
+sub output_variables ()
+{
+  my $res = '';
+  # We output variables it in the same order in which they were
+  # defined (skipping duplicates).
+  my @vars = uniq @_var_order;
+
+  # Output all the Automake variables.  If the user changed one,
+  # then it is now marked as VAR_CONFIGURE or VAR_MAKEFILE.
+  foreach my $var (@vars)
+    {
+      my $v = rvar $var;
+      foreach my $cond ($v->conditions->conds)
+	{
+	  $res .= $v->output ($cond)
+	    if $v->rdef ($cond)->owner == VAR_AUTOMAKE;
+	}
+    }
+
+  # Now dump the user variables that were defined.
+  foreach my $var (@vars)
+    {
+      my $v = rvar $var;
+      foreach my $cond ($v->conditions->conds)
+	{
+	  $res .= $v->output ($cond)
+	    if $v->rdef ($cond)->owner != VAR_AUTOMAKE;
+	}
+    }
+  return $res;
+}
+
+=item C<$var-E<gt>traverse_recursively (&fun_item, &fun_collect, [cond_filter =E<gt> $cond_filter], [inner_expand =E<gt> 1], [skip_ac_subst =E<gt> 1])>
+
+Split the value of the Automake::Variable C<$var> on space, and
+traverse its components recursively.
+
+If C<$cond_filter> is an C<Automake::Condition>, process any
+conditions which are true when C<$cond_filter> is true.  Otherwise,
+process all conditions.
+
+We distinguish two kinds of items in the content of C<$var>.
+Terms that look like C<$(foo)> or C<${foo}> are subvariables
+and cause recursion.  Other terms are assumed to be filenames.
+
+Each time a filename is encountered, C<&fun_item> is called with the
+following arguments:
+
+  ($var,        -- the Automake::Variable we are currently
+                   traversing
+   $val,        -- the item (i.e., filename) to process
+   $cond,       -- the Condition for the $var definition we are
+                   examining (ignoring the recursion context)
+   $full_cond)  -- the full Condition, taking into account
+                   conditions inherited from parent variables
+                   during recursion
+
+If C<inner_expand> is set, variable references occurring in filename
+(as in C<$(BASE).ext>) are expanded before the filename is passed to
+C<&fun_item>.
+
+If C<skip_ac_subst> is set, Autoconf @substitutions@ will be skipped,
+i.e., C<&fun_item> will never be called for them.
+
+C<&fun_item> may return a list of items, they will be passed to
+C<&fun_store> later on.  Define C<&fun_item> or @<&fun_store> as
+C<undef> when they serve no purpose.
+
+Once all items of a variable have been processed, the result (of the
+calls to C<&fun_items>, or of recursive traversals of subvariables)
+are passed to C<&fun_collect>.  C<&fun_collect> receives three
+arguments:
+
+  ($var,         -- the variable being traversed
+   $parent_cond, -- the Condition inherited from parent
+                    variables during recursion
+   @condlist)    -- a list of [$cond, @results] pairs
+                    where each $cond appear only once, and @result
+                    are all the results for this condition.
+
+Typically you should do C<$cond->merge ($parent_cond)> to recompute
+the C<$full_cond> associated to C<@result>.  C<&fun_collect> may
+return a list of items, that will be used as the result of
+C<Automake::Variable::traverse_recursively> (the top-level, or its
+recursive calls).
+
+=cut
+
+# Contains a stack of 'from' and 'to' parts of variable
+# substitutions currently in force.
+my @_substfroms;
+my @_substtos;
+sub traverse_recursively ($&&;%)
+{
+  ++$_traversal;
+  @_substfroms = ();
+  @_substtos = ();
+  my ($var, $fun_item, $fun_collect, %options) = @_;
+  my $cond_filter = $options{'cond_filter'};
+  my $inner_expand = $options{'inner_expand'};
+  my $skip_ac_subst = $options{'skip_ac_subst'};
+  return $var->_do_recursive_traversal ($var,
+					$fun_item, $fun_collect,
+					$cond_filter, TRUE, $inner_expand,
+					$skip_ac_subst)
+}
+
+# The guts of Automake::Variable::traverse_recursively.
+sub _do_recursive_traversal ($$&&$$$$)
+{
+  my ($var, $parent, $fun_item, $fun_collect, $cond_filter, $parent_cond,
+      $inner_expand, $skip_ac_subst) = @_;
+
+  $var->set_seen;
+
+  if ($var->{'scanned'} == $_traversal)
+    {
+      err_var $var, "variable '" . $var->name() . "' recursively defined";
+      return ();
+    }
+  $var->{'scanned'} = $_traversal;
+
+  my @allresults = ();
+  my $cond_once = 0;
+  foreach my $cond ($var->conditions->conds)
+    {
+      if (ref $cond_filter)
+	{
+	  # Ignore conditions that don't match $cond_filter.
+	  next if ! $cond->true_when ($cond_filter);
+	  # If we found out several definitions of $var
+	  # match $cond_filter then we are in trouble.
+	  # Tell the user we don't support this.
+	  $var->check_defined_unconditionally ($parent, $parent_cond)
+	    if $cond_once;
+	  $cond_once = 1;
+	}
+      my @result = ();
+      my $full_cond = $cond->merge ($parent_cond);
+
+      my @to_process = $var->value_as_list ($cond, $parent, $parent_cond);
+      while (@to_process)
+	{
+	  my $val = shift @to_process;
+	  # If $val is a variable (i.e. ${foo} or $(bar), not a filename),
+	  # handle the sub variable recursively.
+	  # (Backslashes before '}' and ')' within brackets are here to
+	  # please Emacs's indentation.)
+	  if ($val =~ /^\$\{([^\}]*)\}$/ || $val =~ /^\$\(([^\)]*)\)$/)
+	    {
+	      my $subvarname = $1;
+
+	      # If the user uses a losing variable name, just ignore it.
+	      # This isn't ideal, but people have requested it.
+	      next if ($subvarname =~ /\@.*\@/);
+
+	      # See if the variable is actually a substitution reference
+	      my ($from, $to);
+              # This handles substitution references like ${foo:.a=.b}.
+	      if ($subvarname =~ /^([^:]*):([^=]*)=(.*)$/o)
+		{
+		  $subvarname = $1;
+		  $to = $3;
+		  $from = quotemeta $2;
+		}
+
+	      my $subvar = var ($subvarname);
+	      # Don't recurse into undefined variables.
+	      next unless $subvar;
+
+	      push @_substfroms, $from;
+	      push @_substtos, $to;
+
+	      my @res = $subvar->_do_recursive_traversal ($parent,
+							  $fun_item,
+							  $fun_collect,
+							  $cond_filter,
+							  $full_cond,
+							  $inner_expand,
+							  $skip_ac_subst);
+	      push (@result, @res);
+
+	      pop @_substfroms;
+	      pop @_substtos;
+
+	      next;
+	    }
+	  # Try to expand variable references inside filenames such as
+	  # '$(NAME).txt'.  We do not handle ':.foo=.bar'
+	  # substitutions, but it would make little sense to use this
+	  # here anyway.
+	  elsif ($inner_expand
+		 && ($val =~ /\$\{([^\}]*)\}/ || $val =~ /\$\(([^\)]*)\)/))
+	    {
+	      my $subvarname = $1;
+	      my $subvar = var $subvarname;
+	      if ($subvar)
+		{
+		  # Replace the reference by its value, and reschedule
+		  # for expansion.
+		  foreach my $c ($subvar->conditions->conds)
+		    {
+		      if (ref $cond_filter)
+			{
+			  # Ignore conditions that don't match $cond_filter.
+			  next if ! $c->true_when ($cond_filter);
+			  # If we found out several definitions of $var
+			  # match $cond_filter then we are in trouble.
+			  # Tell the user we don't support this.
+			  $subvar->check_defined_unconditionally ($var,
+								  $full_cond)
+			    if $cond_once;
+			  $cond_once = 1;
+			}
+		      my $subval = $subvar->rdef ($c)->value;
+		      $val =~ s/\$\{$subvarname\}/$subval/g;
+		      $val =~ s/\$\($subvarname\)/$subval/g;
+		      unshift @to_process, split (' ', $val);
+		    }
+		  next;
+		}
+	      # We do not know any variable with this name.  Fall through
+	      # to filename processing.
+	    }
+	  elsif ($skip_ac_subst && $val =~ /^\@.+\@$/)
+	    {
+	      next;
+	    }
+
+	  if ($fun_item) # $var is a filename we must process
+	    {
+	      my $substnum=$#_substfroms;
+	      while ($substnum >= 0)
+		{
+		  $val =~ s/$_substfroms[$substnum]$/$_substtos[$substnum]/
+		    if defined $_substfroms[$substnum];
+		  $substnum -= 1;
+		}
+
+	      # Make sure you update the doc of
+	      # Automake::Variable::traverse_recursively
+	      # if you change the prototype of &fun_item.
+	      my @transformed = &$fun_item ($var, $val, $cond, $full_cond);
+	      push (@result, @transformed);
+	    }
+	}
+      push (@allresults, [$cond, @result]) if @result;
+    }
+
+  # We only care about _recursive_ variable definitions.  The user
+  # is free to use the same variable several times in the same definition.
+  $var->{'scanned'} = -1;
+
+  return ()
+    unless $fun_collect;
+  # Make sure you update the doc of Automake::Variable::traverse_recursively
+  # if you change the prototype of &fun_collect.
+  return &$fun_collect ($var, $parent_cond, @allresults);
+}
+
+# _hash_varname ($VAR)
+# --------------------
+# Compute the key associated $VAR in %_gen_varname.
+# See _gen_varname() below.
+sub _hash_varname ($)
+{
+  my ($var) = @_;
+  my $key = '';
+  foreach my $cond ($var->conditions->conds)
+    {
+      my @values = $var->value_as_list ($cond);
+      $key .= "($cond)@values";
+    }
+  return $key;
+}
+
+# _hash_values (@VALUES)
+# ----------------------
+# Hash @VALUES for %_gen_varname.  @VALUES should be a list
+# of pairs: ([$cond, @values], [$cond, @values], ...).
+# See _gen_varname() below.
+sub _hash_values (@)
+{
+  my $key = '';
+  foreach my $pair (@_)
+    {
+      my ($cond, @values) = @$pair;
+      $key .= "($cond)@values";
+    }
+  return $key;
+}
+# ($VARNAME, $GENERATED)
+# _gen_varname ($BASE, @DEFINITIONS)
+# ----------------------------------
+# Return a variable name starting with $BASE, that will be
+# used to store definitions @DEFINITIONS.
+# @DEFINITIONS is a list of pair [$COND, @OBJECTS].
+#
+# If we already have a $BASE-variable containing @DEFINITIONS, reuse
+# it and set $GENERATED to 0.  Otherwise construct a new name and set
+# $GENERATED to 1.
+#
+# This way, we avoid combinatorial explosion of the generated
+# variables.  Especially, in a Makefile such as:
+#
+# | if FOO1
+# | A1=1
+# | endif
+# |
+# | if FOO2
+# | A2=2
+# | endif
+# |
+# | ...
+# |
+# | if FOON
+# | AN=N
+# | endif
+# |
+# | B=$(A1) $(A2) ... $(AN)
+# |
+# | c_SOURCES=$(B)
+# | d_SOURCES=$(B)
+#
+# The generated c_OBJECTS and d_OBJECTS will share the same variable
+# definitions.
+#
+# This setup can be the case of a testsuite containing lots (>100) of
+# small C programs, all testing the same set of source files.
+sub _gen_varname ($@)
+{
+  my $base = shift;
+  my $key = _hash_values @_;
+
+  return ($_gen_varname{$base}{$key}, 0)
+    if exists $_gen_varname{$base}{$key};
+
+  my $num = 1 + ($_gen_varname_n{$base} || 0);
+  $_gen_varname_n{$base} = $num;
+  my $name = "${base}_${num}";
+  $_gen_varname{$base}{$key} = $name;
+
+  return ($name, 1);
+}
+
+=item C<$resvar = transform_variable_recursively ($var, $resvar, $base, $nodefine, $where, &fun_item, [%options])>
+
+=item C<$resvar = $var-E<gt>transform_variable_recursively ($resvar, $base, $nodefine, $where, &fun_item, [%options])>
+
+Traverse C<$var> recursively, and create a C<$resvar> variable in
+which each filename in C<$var> have been transformed using
+C<&fun_item>.  (C<$var> may be a variable name in the first syntax.
+It must be an C<Automake::Variable> otherwise.)
+
+Helper variables (corresponding to sub-variables of C<$var>) are
+created as needed, using C<$base> as prefix.
+
+Arguments are:
+  $var       source variable to traverse
+  $resvar    resulting variable to define
+  $base      prefix to use when naming subvariables of $resvar
+  $nodefine  if true, traverse $var but do not define any variable
+             (this assumes &fun_item has some useful side-effect)
+  $where     context into which variable definitions are done
+  &fun_item  a transformation function -- see the documentation
+             of &fun_item in Automake::Variable::traverse_recursively.
+
+This returns the string C<"\$($RESVAR)">.
+
+C<%options> is a list of options to pass to
+C<Variable::traverse_recursively> (see this method).
+
+=cut
+
+sub transform_variable_recursively ($$$$$&;%)
+{
+  my ($var, $resvar, $base, $nodefine, $where, $fun_item, %options) = @_;
+
+  $var = ref $var ? $var : rvar $var;
+
+  my $res = $var->traverse_recursively
+    ($fun_item,
+     # The code that defines the variable holding the result
+     # of the recursive transformation of a subvariable.
+     sub {
+       my ($subvar, $parent_cond, @allresults) = @_;
+       # If no definition is required, return anything: the result is
+       # not expected to be used, only the side effect of $fun_item
+       # should matter.
+       return 'report-me' if $nodefine;
+       # Cache $subvar, so that we reuse it if @allresults is the same.
+       my $key = _hash_varname $subvar;
+       $_gen_varname{$base}{$key} = $subvar->name;
+
+       # Find a name for the variable, unless this is the top-variable
+       # for which we want to use $resvar.
+       my ($varname, $generated) =
+	 ($var != $subvar) ? _gen_varname ($base, @allresults) : ($resvar, 1);
+
+       # Define the variable if we are not reusing a previously
+       # defined variable.  At the top-level, we can also avoid redefining
+       # the variable if it already contains the same values.
+       if ($generated
+	   && !($varname eq $var->name && $key eq _hash_values @allresults))
+	 {
+	   # If the new variable is the source variable, we assume
+	   # we are trying to override a user variable.  Delete
+	   # the old variable first.
+	   variable_delete ($varname) if $varname eq $var->name;
+	   # Define an empty variable in condition TRUE if there is no
+	   # result.
+	   @allresults = ([TRUE, '']) unless @allresults;
+	   # Define the rewritten variable in all conditions not
+	   # already covered by user definitions.
+	   foreach my $pair (@allresults)
+	     {
+	       my ($cond, @result) = @$pair;
+	       my $var = var $varname;
+	       my @conds = ($var
+			    ? $var->not_always_defined_in_cond ($cond)->conds
+			    : $cond);
+
+	       foreach (@conds)
+		 {
+		   define ($varname, VAR_AUTOMAKE, '', $_, "@result",
+			   '', $where, VAR_PRETTY);
+		 }
+	     }
+	 }
+       set_seen $varname;
+       return "\$($varname)";
+     },
+     %options);
+  return $res;
+}
+
+
+=back
+
+=head1 SEE ALSO
+
+L<Automake::VarDef>, L<Automake::Condition>,
+L<Automake::DisjConditions>, L<Automake::Location>.
+
+=cut
+
+1;
+                                                                                                                           usr/share/automake-1.16/Automake/Version.pm                                                         0000644 0000000 0000000 00000007475 14215102164 017112  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        # Copyright (C) 2001-2021 Free Software Foundation, Inc.
+
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 2, or (at your option)
+# any later version.
+
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+package Automake::Version;
+
+use 5.006;
+use strict;
+use warnings FATAL => 'all';
+
+use Automake::ChannelDefs;
+
+=head1 NAME
+
+Automake::Version - version comparison
+
+=head1 SYNOPSIS
+
+  use Automake::Version;
+
+  print "Version $version is older than required version $required\n"
+    if Automake::Version::check ($version, $required);
+
+=head1 DESCRIPTION
+
+This module provides support for comparing versions string
+as they are used in Automake.
+
+A version is a string that looks like
+C<MAJOR.MINOR[.MICRO][ALPHA][-FORK]> where C<MAJOR>, C<MINOR>, and
+C<MICRO> are digits, C<ALPHA> is a character, and C<FORK> any
+alphanumeric word.
+
+Usually, C<ALPHA> is used to label alpha releases or intermediate
+snapshots, C<FORK> is used for git branches or patched releases, and
+C<MICRO> is used for bug fixes releases on the C<MAJOR.MINOR> branch.
+
+For the purpose of ordering, C<1.4> is the same as C<1.4.0>, but
+C<1.4g> is the same as C<1.4.99g>.  The C<FORK> identifier is ignored
+in the ordering, except when it looks like C<-pMINOR[ALPHA]>: some
+versions were labeled like C<1.4-p3a>, this is the same as an alpha
+release labeled C<1.4.3a>.  Yes, it's horrible, but Automake did not
+support two-dot versions in the past.
+
+=head2 FUNCTIONS
+
+=over 4
+
+=item C<split ($version)>
+
+Split the string C<$version> into the corresponding C<(MAJOR, MINOR,
+MICRO, ALPHA, FORK)> tuple.  For instance C<'1.4g'> would be split
+into C<(1, 4, 99, 'g', '')>.  Return C<()> on error.
+
+=cut
+
+sub split ($)
+{
+  my ($ver) = @_;
+
+  # Special case for versions like 1.4-p2a.
+  if ($ver =~ /^(\d+)\.(\d+)(?:-p(\d+)([a-z]+)?)$/)
+  {
+    return ($1, $2, $3, $4 || '', '');
+  }
+  # Common case.
+  elsif ($ver =~ /^(\d+)\.(\d+)(?:\.(\d+))?([a-z])?(?:-([A-Za-z0-9]+))?$/)
+  {
+    return ($1, $2, $3 || (defined $4 ? 99 : 0), $4 || '', $5 || '');
+  }
+  return ();
+}
+
+=item C<compare (\@LVERSION, \@RVERSION)>
+
+Compare two version tuples, as returned by C<split>.
+
+Return 1, 0, or -1, if C<LVERSION> is found to be respectively
+greater than, equal to, or less than C<RVERSION>.
+
+=cut
+
+sub compare (\@\@)
+{
+  my @l = @{$_[0]};
+  my @r = @{$_[1]};
+
+  for my $i (0, 1, 2)
+  {
+    return 1  if ($l[$i] > $r[$i]);
+    return -1 if ($l[$i] < $r[$i]);
+  }
+  for my $i (3, 4)
+  {
+    return 1  if ($l[$i] gt $r[$i]);
+    return -1 if ($l[$i] lt $r[$i]);
+  }
+  return 0;
+}
+
+=item C<check($VERSION, $REQUIRED)>
+
+Handles the logic of requiring a version number in Automake.
+C<$VERSION> should be Automake's version, while C<$REQUIRED>
+is the version required by the user input.
+
+Return 0 if the required version is satisfied, 1 otherwise.
+
+=cut
+
+sub check ($$)
+{
+  my ($version, $required) = @_;
+  my @version = Automake::Version::split ($version);
+  my @required = Automake::Version::split ($required);
+
+  prog_error "version is incorrect: $version"
+    if $#version == -1;
+
+  # This should not happen, because process_option_list and split_version
+  # use similar regexes.
+  prog_error "required version is incorrect: $required"
+    if $#required == -1;
+
+  # If we require 3.4n-foo then we require something
+  # >= 3.4n, with the 'foo' fork identifier.
+  return 1
+    if ($required[4] ne '' && $required[4] ne $version[4]);
+
+  return 0 > compare (@version, @required);
+}
+
+1;
+                                                                                                                                                                                                   usr/share/automake-1.16/Automake/Wrap.pm                                                            0000644 0000000 0000000 00000007232 14215102164 016365  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        # Copyright (C) 2003-2021 Free Software Foundation, Inc.
+
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 2, or (at your option)
+# any later version.
+
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+package Automake::Wrap;
+
+use 5.006;
+use strict;
+use warnings FATAL => 'all';
+
+use Exporter;
+
+our @ISA = qw (Exporter);
+our @EXPORT_OK = qw (wrap makefile_wrap);
+
+=head1 NAME
+
+Automake::Wrap - a paragraph formatter
+
+=head1 SYNOPSIS
+
+  use Automake::Wrap 'wrap', 'makefile_wrap';
+
+  print wrap ($first_ident, $next_ident, $end_of_line, $max_length,
+              @values);
+
+  print makefile_wrap ("VARIABLE = ", "    ", @values);
+
+=head1 DESCRIPTION
+
+This modules provide facility to format list of strings.  It is
+comparable to Perl's L<Text::Wrap>, however we can't use L<Text::Wrap>
+because some versions will abort when some word to print exceeds the
+maximum length allowed.  (Ticket #17141, fixed in Perl 5.8.0.)
+
+=head2 Functions
+
+=over 4
+
+=cut
+
+# _tab_length ($TXT)
+# ------------------
+# Compute the length of TXT, counting tab characters as 8 characters.
+sub _tab_length($)
+{
+  my ($txt) = @_;
+  my $len = length ($txt);
+  $len += 7 * ($txt =~ tr/\t/\t/);
+  return $len;
+}
+
+=item C<wrap ($head, $fill, $eol, $max_len, @values)>
+
+Format C<@values> as a block of text that starts with C<$head>,
+followed by the strings in C<@values> separated by spaces or by
+C<"$eol\n$fill"> so that the length of each line never exceeds
+C<$max_len>.
+
+The C<$max_len> constraint is ignored for C<@values> items which
+are too big to fit alone one a line.
+
+The constructed paragraph is C<"\n">-terminated.
+
+=cut
+
+sub wrap($$$$@)
+{
+  my ($head, $fill, $eol, $max_len, @values) = @_;
+
+  my $result = $head;
+  my $column = _tab_length ($head);
+
+  my $fill_len = _tab_length ($fill);
+  my $eol_len = _tab_length ($eol);
+
+  my $not_first_word = 0;
+
+  foreach (@values)
+    {
+      my $len = _tab_length ($_);
+
+      # See if the new variable fits on this line.
+      # (The + 1 is for the space we add in front of the value.).
+      if ($column + $len + $eol_len + 1 > $max_len
+	  # Do not break before the first word if it does not fit on
+	  # the next line anyway.
+	  && ($not_first_word || $fill_len + $len + $eol_len + 1 <= $max_len))
+	{
+	  # Start a new line.
+	  $result .= "$eol\n" . $fill;
+	  $column = $fill_len;
+	}
+      elsif ($not_first_word)
+	{
+	  # Add a space only if result does not already end
+	  # with a space.
+	  $_ = " $_" if $result =~ /\S\z/;
+	  ++$len;
+	}
+      $result .= $_;
+      $column += $len;
+      $not_first_word = 1;
+    }
+
+  $result .= "\n";
+  return $result;
+}
+
+
+=item C<makefile_wrap ($head, $fill, @values)>
+
+Format C<@values> in a way which is suitable for F<Makefile>s.
+This is comparable to C<wrap>, except C<$eol> is known to
+be C<" \\">, and the maximum length has been hardcoded to C<72>.
+
+A space is appended to C<$head> when this is not already
+the case.
+
+This can be used to format variable definitions or dependency lines.
+
+  makefile_wrap ('VARIABLE =', "\t", @values);
+  makefile_wrap ('rule:', "\t", @dependencies);
+
+=cut
+
+sub makefile_wrap ($$@)
+{
+  my ($head, $fill, @values) = @_;
+  if (@values)
+    {
+      $head .= ' ' if $head =~ /\S\z/;
+      return wrap $head, $fill, " \\", 72, @values;
+    }
+  return "$head\n";
+}
+
+
+1;
+                                                                                                                                                                                                                                                                                                                                                                      usr/share/automake-1.16/Automake/XFile.pm                                                           0000644 0000000 0000000 00000016445 14215102164 016471  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        # Copyright (C) 2001-2021 Free Software Foundation, Inc.
+
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 2, or (at your option)
+# any later version.
+
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+# Written by Akim Demaille <akim@freefriends.org>.
+
+###############################################################
+# The main copy of this file is in Automake's git repository. #
+# Updates should be sent to automake-patches@gnu.org.         #
+###############################################################
+
+package Automake::XFile;
+
+=head1 NAME
+
+Automake::XFile - supply object methods for filehandles with error handling
+
+=head1 SYNOPSIS
+
+    use Automake::XFile;
+
+    $fh = new Automake::XFile;
+    $fh->open ("file", "<");
+    # No need to check $FH: we died if open failed.
+    print <$fh>;
+    $fh->close;
+    # No need to check the return value of close: we died if it failed.
+
+    $fh = new Automake::XFile "file", ">";
+    # No need to check $FH: we died if new failed.
+    print $fh "bar\n";
+    $fh->close;
+
+    $fh = new Automake::XFile "file", "r";
+    # No need to check $FH: we died if new failed.
+    defined $fh
+    print <$fh>;
+    undef $fh;   # automatically closes the file and checks for errors.
+
+    $fh = new Automake::XFile "file", O_WRONLY | O_APPEND;
+    # No need to check $FH: we died if new failed.
+    print $fh "corge\n";
+
+    $pos = $fh->getpos;
+    $fh->setpos ($pos);
+
+    undef $fh;   # automatically closes the file and checks for errors.
+
+    autoflush STDOUT 1;
+
+=head1 DESCRIPTION
+
+C<Automake::XFile> inherits from C<IO::File>.  It provides the method
+C<name> returning the file name.  It provides dying versions of the
+methods C<close>, C<lock> (corresponding to C<flock>), C<new>,
+C<open>, C<seek>, and C<truncate>.  It also overrides the C<getline>
+and C<getlines> methods to translate C<\r\n> to C<\n>.
+
+=cut
+
+use 5.006;
+use strict;
+use warnings FATAL => 'all';
+
+use Errno;
+use Exporter;
+use IO::File;
+
+use Automake::ChannelDefs;
+use Automake::Channels qw (msg);
+use Automake::FileUtils;
+
+our @ISA = qw(Exporter IO::File);
+our @EXPORT = @IO::File::EXPORT;
+our $VERSION = "1.2";
+
+eval {
+  # Make all Fcntl O_XXX and LOCK_XXX constants available for importing
+  require Fcntl;
+  my @O = grep /^(LOCK|O)_/, @Fcntl::EXPORT, @Fcntl::EXPORT_OK;
+  Fcntl->import (@O);  # first we import what we want to export
+  push (@EXPORT, @O);
+};
+
+=head2 Methods
+
+=over
+
+=item C<$fh = new Automake::XFile ([$expr, ...]>
+
+Constructor a new XFile object.  Additional arguments
+are passed to C<open>, if any.
+
+=cut
+
+sub new
+{
+  my $type = shift;
+  my $class = ref $type || $type || "Automake::XFile";
+  my $fh = $class->SUPER::new ();
+  if (@_)
+    {
+      $fh->open (@_);
+    }
+  $fh;
+}
+
+=item C<$fh-E<gt>open ([$file, ...])>
+
+Open a file, passing C<$file> and further arguments to C<IO::File::open>.
+Die if opening fails.  Store the name of the file.  Use binmode for writing.
+
+=cut
+
+sub open
+{
+  my $fh = shift;
+  my ($file, $mode) = @_;
+
+  # WARNING: Gross hack: $FH is a typeglob: use its hash slot to store
+  # the 'name' of the file we are opening.  See the example with
+  # io_socket_timeout in IO::Socket for more, and read Graham's
+  # comment in IO::Handle.
+  ${*$fh}{'autom4te_xfile_file'} = "$file";
+
+  if (!$fh->SUPER::open (@_))
+    {
+      fatal "cannot open $file: $!";
+    }
+
+  # In case we're running under MSWindows, don't write with CRLF.
+  # (This circumvents a bug in at least Cygwin bash where the shell
+  # parsing fails on lines ending with the continuation character '\'
+  # and CRLF).
+  # Correctly recognize usages like:
+  #  - open ($file, "w")
+  #  - open ($file, "+<")
+  #  - open (" >$file")
+  binmode $fh
+    if (defined $mode && $mode =~ /^[+>wa]/ or $file =~ /^\s*>/);
+}
+
+=item C<$fh-E<gt>close>
+
+Close the file, handling errors.
+
+=cut
+
+sub close
+{
+  my $fh = shift;
+  if (!$fh->SUPER::close (@_))
+    {
+      my $file = $fh->name;
+      Automake::FileUtils::handle_exec_errors $file
+	unless $!;
+      fatal "cannot close $file: $!";
+    }
+}
+
+=item C<$line = $fh-E<gt>getline>
+
+Read and return a line from the file.  Ensure C<\r\n> is translated to
+C<\n> on input files.
+
+=cut
+
+# Some native Windows/perl installations fail to translate \r\n to \n on
+# input so we do that here.
+sub getline
+{
+  local $_ = $_[0]->SUPER::getline;
+  # Perform a _global_ replacement: $_ may can contains many lines
+  # in slurp mode ($/ = undef).
+  s/\015\012/\n/gs if defined $_;
+  return $_;
+}
+
+=item C<@lines = $fh-E<gt>getlines>
+
+Slurp lines from the files.
+
+=cut
+
+sub getlines
+{
+  my @res = ();
+  my $line;
+  push @res, $line while $line = $_[0]->getline;
+  return @res;
+}
+
+=item C<$name = $fh-E<gt>name>
+
+Return the name of the file.
+
+=cut
+
+sub name
+{
+  my $fh = shift;
+  return ${*$fh}{'autom4te_xfile_file'};
+}
+
+=item C<$fh-E<gt>lock>

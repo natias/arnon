@@ -1,0 +1,1000 @@
+def makecommands(rules):
+    """Returns a list of commands consumable by histedit --commands based on
+    our list of rules"""
+    commands = []
+    for rules in rules:
+        commands.append(b'%s %s\n' % (rules.action, rules.ctx))
+    return commands
+
+
+def addln(win, y, x, line, color=None):
+    """Add a line to the given window left padding but 100% filled with
+    whitespace characters, so that the color appears on the whole line"""
+    maxy, maxx = win.getmaxyx()
+    length = maxx - 1 - x
+    line = bytes(line).ljust(length)[:length]
+    if y < 0:
+        y = maxy + y
+    if x < 0:
+        x = maxx + x
+    if color:
+        win.addstr(y, x, line, color)
+    else:
+        win.addstr(y, x, line)
+
+
+def _trunc_head(line, n):
+    if len(line) <= n:
+        return line
+    return b'> ' + line[-(n - 2) :]
+
+
+def _trunc_tail(line, n):
+    if len(line) <= n:
+        return line
+    return line[: n - 2] + b' >'
+
+
+class _chistedit_state:
+    def __init__(
+        self,
+        repo,
+        rules,
+        stdscr,
+    ):
+        self.repo = repo
+        self.rules = rules
+        self.stdscr = stdscr
+        self.later_on_top = repo.ui.configbool(
+            b'histedit', b'later-commits-first'
+        )
+        # The current item in display order, initialized to point to the top
+        # of the screen.
+        self.pos = 0
+        self.selected = None
+        self.mode = (MODE_INIT, MODE_INIT)
+        self.page_height = None
+        self.modes = {
+            MODE_RULES: {
+                b'line_offset': 0,
+            },
+            MODE_PATCH: {
+                b'line_offset': 0,
+            },
+        }
+
+    def render_commit(self, win):
+        """Renders the commit window that shows the log of the current selected
+        commit"""
+        rule = self.rules[self.display_pos_to_rule_pos(self.pos)]
+
+        ctx = rule.ctx
+        win.box()
+
+        maxy, maxx = win.getmaxyx()
+        length = maxx - 3
+
+        line = b"changeset: %d:%s" % (ctx.rev(), ctx.hex()[:12])
+        win.addstr(1, 1, line[:length])
+
+        line = b"user:      %s" % ctx.user()
+        win.addstr(2, 1, line[:length])
+
+        bms = self.repo.nodebookmarks(ctx.node())
+        line = b"bookmark:  %s" % b' '.join(bms)
+        win.addstr(3, 1, line[:length])
+
+        line = b"summary:   %s" % stringutil.firstline(ctx.description())
+        win.addstr(4, 1, line[:length])
+
+        line = b"files:     "
+        win.addstr(5, 1, line)
+        fnx = 1 + len(line)
+        fnmaxx = length - fnx + 1
+        y = 5
+        fnmaxn = maxy - (1 + y) - 1
+        files = ctx.files()
+        for i, line1 in enumerate(files):
+            if len(files) > fnmaxn and i == fnmaxn - 1:
+                win.addstr(y, fnx, _trunc_tail(b','.join(files[i:]), fnmaxx))
+                y = y + 1
+                break
+            win.addstr(y, fnx, _trunc_head(line1, fnmaxx))
+            y = y + 1
+
+        conflicts = rule.conflicts
+        if len(conflicts) > 0:
+            conflictstr = b','.join(map(lambda r: r.ctx.hex()[:12], conflicts))
+            conflictstr = b"changed files overlap with %s" % conflictstr
+        else:
+            conflictstr = b'no overlap'
+
+        win.addstr(y, 1, conflictstr[:length])
+        win.noutrefresh()
+
+    def helplines(self):
+        if self.mode[0] == MODE_PATCH:
+            help = b"""\
+?: help, k/up: line up, j/down: line down, v: stop viewing patch
+pgup: prev page, space/pgdn: next page, c: commit, q: abort
+"""
+        else:
+            help = b"""\
+?: help, k/up: move up, j/down: move down, space: select, v: view patch
+d: drop, e: edit, f: fold, m: mess, p: pick, r: roll
+pgup/K: move patch up, pgdn/J: move patch down, c: commit, q: abort
+"""
+            if self.later_on_top:
+                help += b"Newer commits are shown above older commits.\n"
+            else:
+                help += b"Older commits are shown above newer commits.\n"
+        return help.splitlines()
+
+    def render_help(self, win):
+        maxy, maxx = win.getmaxyx()
+        for y, line in enumerate(self.helplines()):
+            if y >= maxy:
+                break
+            addln(win, y, 0, line, curses.color_pair(COLOR_HELP))
+        win.noutrefresh()
+
+    def layout(self):
+        maxy, maxx = self.stdscr.getmaxyx()
+        helplen = len(self.helplines())
+        mainlen = maxy - helplen - 12
+        if mainlen < 1:
+            raise error.Abort(
+                _(b"terminal dimensions %d by %d too small for curses histedit")
+                % (maxy, maxx),
+                hint=_(
+                    b"enlarge your terminal or use --config ui.interface=text"
+                ),
+            )
+        return {
+            b'commit': (12, maxx),
+            b'help': (helplen, maxx),
+            b'main': (mainlen, maxx),
+        }
+
+    def display_pos_to_rule_pos(self, display_pos):
+        """Converts a position in display order to rule order.
+
+        The `display_pos` is the order from the top in display order, not
+        considering which items are currently visible on the screen. Thus,
+        `display_pos=0` is the item at the top (possibly after scrolling to
+        the top)
+        """
+        if self.later_on_top:
+            return len(self.rules) - 1 - display_pos
+        else:
+            return display_pos
+
+    def render_rules(self, rulesscr):
+        start = self.modes[MODE_RULES][b'line_offset']
+
+        conflicts = [r.ctx for r in self.rules if r.conflicts]
+        if len(conflicts) > 0:
+            line = b"potential conflict in %s" % b','.join(
+                map(pycompat.bytestr, conflicts)
+            )
+            addln(rulesscr, -1, 0, line, curses.color_pair(COLOR_WARN))
+
+        for display_pos in range(start, len(self.rules)):
+            y = display_pos - start
+            if y < 0 or y >= self.page_height:
+                continue
+            rule_pos = self.display_pos_to_rule_pos(display_pos)
+            rule = self.rules[rule_pos]
+            if len(rule.conflicts) > 0:
+                rulesscr.addstr(y, 0, b" ", curses.color_pair(COLOR_WARN))
+            else:
+                rulesscr.addstr(y, 0, b" ", curses.COLOR_BLACK)
+
+            if display_pos == self.selected:
+                rollcolor = COLOR_ROLL_SELECTED
+                addln(rulesscr, y, 2, rule, curses.color_pair(COLOR_SELECTED))
+            elif display_pos == self.pos:
+                rollcolor = COLOR_ROLL_CURRENT
+                addln(
+                    rulesscr,
+                    y,
+                    2,
+                    rule,
+                    curses.color_pair(COLOR_CURRENT) | curses.A_BOLD,
+                )
+            else:
+                rollcolor = COLOR_ROLL
+                addln(rulesscr, y, 2, rule)
+
+            if rule.action == b'roll':
+                rulesscr.addstr(
+                    y,
+                    2 + len(rule.prefix),
+                    rule.desc,
+                    curses.color_pair(rollcolor),
+                )
+
+        rulesscr.noutrefresh()
+
+    def render_string(self, win, output, diffcolors=False):
+        maxy, maxx = win.getmaxyx()
+        length = min(maxy - 1, len(output))
+        for y in range(0, length):
+            line = output[y]
+            if diffcolors:
+                if line and line[0] == b'+':
+                    win.addstr(
+                        y, 0, line, curses.color_pair(COLOR_DIFF_ADD_LINE)
+                    )
+                elif line and line[0] == b'-':
+                    win.addstr(
+                        y, 0, line, curses.color_pair(COLOR_DIFF_DEL_LINE)
+                    )
+                elif line.startswith(b'@@ '):
+                    win.addstr(y, 0, line, curses.color_pair(COLOR_DIFF_OFFSET))
+                else:
+                    win.addstr(y, 0, line)
+            else:
+                win.addstr(y, 0, line)
+        win.noutrefresh()
+
+    def render_patch(self, win):
+        start = self.modes[MODE_PATCH][b'line_offset']
+        content = self.modes[MODE_PATCH][b'patchcontents']
+        self.render_string(win, content[start:], diffcolors=True)
+
+    def event(self, ch):
+        """Change state based on the current character input
+
+        This takes the current state and based on the current character input from
+        the user we change the state.
+        """
+        oldpos = self.pos
+
+        if ch in (curses.KEY_RESIZE, b"KEY_RESIZE"):
+            return E_RESIZE
+
+        lookup_ch = ch
+        if ch is not None and b'0' <= ch <= b'9':
+            lookup_ch = b'0'
+
+        curmode, prevmode = self.mode
+        action = KEYTABLE[curmode].get(
+            lookup_ch, KEYTABLE[b'global'].get(lookup_ch)
+        )
+        if action is None:
+            return
+        if action in (b'down', b'move-down'):
+            newpos = min(oldpos + 1, len(self.rules) - 1)
+            self.move_cursor(oldpos, newpos)
+            if self.selected is not None or action == b'move-down':
+                self.swap(oldpos, newpos)
+        elif action in (b'up', b'move-up'):
+            newpos = max(0, oldpos - 1)
+            self.move_cursor(oldpos, newpos)
+            if self.selected is not None or action == b'move-up':
+                self.swap(oldpos, newpos)
+        elif action == b'next-action':
+            self.cycle_action(oldpos, next=True)
+        elif action == b'prev-action':
+            self.cycle_action(oldpos, next=False)
+        elif action == b'select':
+            self.selected = oldpos if self.selected is None else None
+            self.make_selection(self.selected)
+        elif action == b'goto' and int(ch) < len(self.rules) <= 10:
+            newrule = next((r for r in self.rules if r.origpos == int(ch)))
+            self.move_cursor(oldpos, newrule.pos)
+            if self.selected is not None:
+                self.swap(oldpos, newrule.pos)
+        elif action.startswith(b'action-'):
+            self.change_action(oldpos, action[7:])
+        elif action == b'showpatch':
+            self.change_mode(MODE_PATCH if curmode != MODE_PATCH else prevmode)
+        elif action == b'help':
+            self.change_mode(MODE_HELP if curmode != MODE_HELP else prevmode)
+        elif action == b'quit':
+            return E_QUIT
+        elif action == b'histedit':
+            return E_HISTEDIT
+        elif action == b'page-down':
+            return E_PAGEDOWN
+        elif action == b'page-up':
+            return E_PAGEUP
+        elif action == b'line-down':
+            return E_LINEDOWN
+        elif action == b'line-up':
+            return E_LINEUP
+
+    def patch_contents(self):
+        repo = self.repo
+        rule = self.rules[self.display_pos_to_rule_pos(self.pos)]
+        displayer = logcmdutil.changesetdisplayer(
+            repo.ui,
+            repo,
+            {b"patch": True, b"template": b"status"},
+            buffered=True,
+        )
+        overrides = {(b'ui', b'verbose'): True}
+        with repo.ui.configoverride(overrides, source=b'histedit'):
+            displayer.show(rule.ctx)
+            displayer.close()
+        return displayer.hunk[rule.ctx.rev()].splitlines()
+
+    def move_cursor(self, oldpos, newpos):
+        """Change the rule/changeset that the cursor is pointing to, regardless of
+        current mode (you can switch between patches from the view patch window)."""
+        self.pos = newpos
+
+        mode, _ = self.mode
+        if mode == MODE_RULES:
+            # Scroll through the list by updating the view for MODE_RULES, so that
+            # even if we are not currently viewing the rules, switching back will
+            # result in the cursor's rule being visible.
+            modestate = self.modes[MODE_RULES]
+            if newpos < modestate[b'line_offset']:
+                modestate[b'line_offset'] = newpos
+            elif newpos > modestate[b'line_offset'] + self.page_height - 1:
+                modestate[b'line_offset'] = newpos - self.page_height + 1
+
+        # Reset the patch view region to the top of the new patch.
+        self.modes[MODE_PATCH][b'line_offset'] = 0
+
+    def change_mode(self, mode):
+        curmode, _ = self.mode
+        self.mode = (mode, curmode)
+        if mode == MODE_PATCH:
+            self.modes[MODE_PATCH][b'patchcontents'] = self.patch_contents()
+
+    def make_selection(self, pos):
+        self.selected = pos
+
+    def swap(self, oldpos, newpos):
+        """Swap two positions and calculate necessary conflicts in
+        O(|newpos-oldpos|) time"""
+        old_rule_pos = self.display_pos_to_rule_pos(oldpos)
+        new_rule_pos = self.display_pos_to_rule_pos(newpos)
+
+        rules = self.rules
+        assert 0 <= old_rule_pos < len(rules) and 0 <= new_rule_pos < len(rules)
+
+        rules[old_rule_pos], rules[new_rule_pos] = (
+            rules[new_rule_pos],
+            rules[old_rule_pos],
+        )
+
+        # TODO: swap should not know about histeditrule's internals
+        rules[new_rule_pos].pos = new_rule_pos
+        rules[old_rule_pos].pos = old_rule_pos
+
+        start = min(old_rule_pos, new_rule_pos)
+        end = max(old_rule_pos, new_rule_pos)
+        for r in range(start, end + 1):
+            rules[new_rule_pos].checkconflicts(rules[r])
+            rules[old_rule_pos].checkconflicts(rules[r])
+
+        if self.selected:
+            self.make_selection(newpos)
+
+    def change_action(self, pos, action):
+        """Change the action state on the given position to the new action"""
+        assert 0 <= pos < len(self.rules)
+        self.rules[pos].action = action
+
+    def cycle_action(self, pos, next=False):
+        """Changes the action state the next or the previous action from
+        the action list"""
+        assert 0 <= pos < len(self.rules)
+        current = self.rules[pos].action
+
+        assert current in KEY_LIST
+
+        index = KEY_LIST.index(current)
+        if next:
+            index += 1
+        else:
+            index -= 1
+        self.change_action(pos, KEY_LIST[index % len(KEY_LIST)])
+
+    def change_view(self, delta, unit):
+        """Change the region of whatever is being viewed (a patch or the list of
+        changesets). 'delta' is an amount (+/- 1) and 'unit' is 'page' or 'line'."""
+        mode, _ = self.mode
+        if mode != MODE_PATCH:
+            return
+        mode_state = self.modes[mode]
+        num_lines = len(mode_state[b'patchcontents'])
+        page_height = self.page_height
+        unit = page_height if unit == b'page' else 1
+        num_pages = 1 + (num_lines - 1) // page_height
+        max_offset = (num_pages - 1) * page_height
+        newline = mode_state[b'line_offset'] + delta * unit
+        mode_state[b'line_offset'] = max(0, min(max_offset, newline))
+
+
+def _chisteditmain(repo, rules, stdscr):
+    try:
+        curses.use_default_colors()
+    except curses.error:
+        pass
+
+    # initialize color pattern
+    curses.init_pair(COLOR_HELP, curses.COLOR_WHITE, curses.COLOR_BLUE)
+    curses.init_pair(COLOR_SELECTED, curses.COLOR_BLACK, curses.COLOR_WHITE)
+    curses.init_pair(COLOR_WARN, curses.COLOR_BLACK, curses.COLOR_YELLOW)
+    curses.init_pair(COLOR_OK, curses.COLOR_BLACK, curses.COLOR_GREEN)
+    curses.init_pair(COLOR_CURRENT, curses.COLOR_WHITE, curses.COLOR_MAGENTA)
+    curses.init_pair(COLOR_DIFF_ADD_LINE, curses.COLOR_GREEN, -1)
+    curses.init_pair(COLOR_DIFF_DEL_LINE, curses.COLOR_RED, -1)
+    curses.init_pair(COLOR_DIFF_OFFSET, curses.COLOR_MAGENTA, -1)
+    curses.init_pair(COLOR_ROLL, curses.COLOR_RED, -1)
+    curses.init_pair(
+        COLOR_ROLL_CURRENT, curses.COLOR_BLACK, curses.COLOR_MAGENTA
+    )
+    curses.init_pair(COLOR_ROLL_SELECTED, curses.COLOR_RED, curses.COLOR_WHITE)
+
+    # don't display the cursor
+    try:
+        curses.curs_set(0)
+    except curses.error:
+        pass
+
+    def drawvertwin(size, y, x):
+        win = curses.newwin(size[0], size[1], y, x)
+        y += size[0]
+        return win, y, x
+
+    state = _chistedit_state(repo, rules, stdscr)
+
+    # eventloop
+    ch = None
+    stdscr.clear()
+    stdscr.refresh()
+    while True:
+        oldmode, unused = state.mode
+        if oldmode == MODE_INIT:
+            state.change_mode(MODE_RULES)
+        e = state.event(ch)
+
+        if e == E_QUIT:
+            return False
+        if e == E_HISTEDIT:
+            return state.rules
+        else:
+            if e == E_RESIZE:
+                size = screen_size()
+                if size != stdscr.getmaxyx():
+                    curses.resizeterm(*size)
+
+            sizes = state.layout()
+            curmode, unused = state.mode
+            if curmode != oldmode:
+                state.page_height = sizes[b'main'][0]
+                # Adjust the view to fit the current screen size.
+                state.move_cursor(state.pos, state.pos)
+
+            # Pack the windows against the top, each pane spread across the
+            # full width of the screen.
+            y, x = (0, 0)
+            helpwin, y, x = drawvertwin(sizes[b'help'], y, x)
+            mainwin, y, x = drawvertwin(sizes[b'main'], y, x)
+            commitwin, y, x = drawvertwin(sizes[b'commit'], y, x)
+
+            if e in (E_PAGEDOWN, E_PAGEUP, E_LINEDOWN, E_LINEUP):
+                if e == E_PAGEDOWN:
+                    state.change_view(+1, b'page')
+                elif e == E_PAGEUP:
+                    state.change_view(-1, b'page')
+                elif e == E_LINEDOWN:
+                    state.change_view(+1, b'line')
+                elif e == E_LINEUP:
+                    state.change_view(-1, b'line')
+
+            # start rendering
+            commitwin.erase()
+            helpwin.erase()
+            mainwin.erase()
+            if curmode == MODE_PATCH:
+                state.render_patch(mainwin)
+            elif curmode == MODE_HELP:
+                state.render_string(mainwin, __doc__.strip().splitlines())
+            else:
+                state.render_rules(mainwin)
+                state.render_commit(commitwin)
+            state.render_help(helpwin)
+            curses.doupdate()
+            # done rendering
+            ch = encoding.strtolocal(stdscr.getkey())
+
+
+def _chistedit(ui, repo, freeargs, opts):
+    """interactively edit changeset history via a curses interface
+
+    Provides a ncurses interface to histedit. Press ? in chistedit mode
+    to see an extensive help. Requires python-curses to be installed."""
+
+    if curses is None:
+        raise error.Abort(_(b"Python curses library required"))
+
+    # disable color
+    ui._colormode = None
+
+    try:
+        keep = opts.get(b'keep')
+        revs = opts.get(b'rev', [])[:]
+        cmdutil.checkunfinished(repo)
+        cmdutil.bailifchanged(repo)
+
+        revs.extend(freeargs)
+        if not revs:
+            defaultrev = destutil.desthistedit(ui, repo)
+            if defaultrev is not None:
+                revs.append(defaultrev)
+        if len(revs) != 1:
+            raise error.InputError(
+                _(b'histedit requires exactly one ancestor revision')
+            )
+
+        rr = list(repo.set(b'roots(%ld)', logcmdutil.revrange(repo, revs)))
+        if len(rr) != 1:
+            raise error.InputError(
+                _(
+                    b'The specified revisions must have '
+                    b'exactly one common root'
+                )
+            )
+        root = rr[0].node()
+
+        topmost = repo.dirstate.p1()
+        revs = between(repo, root, topmost, keep)
+        if not revs:
+            raise error.InputError(
+                _(b'%s is not an ancestor of working directory') % short(root)
+            )
+
+        rules = []
+        for i, r in enumerate(revs):
+            rules.append(histeditrule(ui, repo[r], i))
+        with util.with_lc_ctype():
+            rc = curses.wrapper(functools.partial(_chisteditmain, repo, rules))
+        curses.echo()
+        curses.endwin()
+        if rc is False:
+            ui.write(_(b"histedit aborted\n"))
+            return 0
+        if type(rc) is list:
+            ui.status(_(b"performing changes\n"))
+            rules = makecommands(rc)
+            with repo.vfs(b'chistedit', b'w+') as fp:
+                for r in rules:
+                    fp.write(r)
+                opts[b'commands'] = fp.name
+            return _texthistedit(ui, repo, freeargs, opts)
+    except KeyboardInterrupt:
+        pass
+    return -1
+
+
+@command(
+    b'histedit',
+    [
+        (
+            b'',
+            b'commands',
+            b'',
+            _(b'read history edits from the specified file'),
+            _(b'FILE'),
+        ),
+        (b'c', b'continue', False, _(b'continue an edit already in progress')),
+        (b'', b'edit-plan', False, _(b'edit remaining actions list')),
+        (
+            b'k',
+            b'keep',
+            False,
+            _(b"don't strip old nodes after edit is complete"),
+        ),
+        (b'', b'abort', False, _(b'abort an edit in progress')),
+        (b'o', b'outgoing', False, _(b'changesets not found in destination')),
+        (
+            b'f',
+            b'force',
+            False,
+            _(b'force outgoing even for unrelated repositories'),
+        ),
+        (b'r', b'rev', [], _(b'first revision to be edited'), _(b'REV')),
+    ]
+    + cmdutil.formatteropts,
+    _(b"[OPTIONS] ([ANCESTOR] | --outgoing [URL])"),
+    helpcategory=command.CATEGORY_CHANGE_MANAGEMENT,
+)
+def histedit(ui, repo, *freeargs, **opts):
+    """interactively edit changeset history
+
+    This command lets you edit a linear series of changesets (up to
+    and including the working directory, which should be clean).
+    You can:
+
+    - `pick` to [re]order a changeset
+
+    - `drop` to omit changeset
+
+    - `mess` to reword the changeset commit message
+
+    - `fold` to combine it with the preceding changeset (using the later date)
+
+    - `roll` like fold, but discarding this commit's description and date
+
+    - `edit` to edit this changeset (preserving date)
+
+    - `base` to checkout changeset and apply further changesets from there
+
+    There are a number of ways to select the root changeset:
+
+    - Specify ANCESTOR directly
+
+    - Use --outgoing -- it will be the first linear changeset not
+      included in destination. (See :hg:`help config.paths.default-push`)
+
+    - Otherwise, the value from the "histedit.defaultrev" config option
+      is used as a revset to select the base revision when ANCESTOR is not
+      specified. The first revision returned by the revset is used. By
+      default, this selects the editable history that is unique to the
+      ancestry of the working directory.
+
+    .. container:: verbose
+
+       If you use --outgoing, this command will abort if there are ambiguous
+       outgoing revisions. For example, if there are multiple branches
+       containing outgoing revisions.
+
+       Use "min(outgoing() and ::.)" or similar revset specification
+       instead of --outgoing to specify edit target revision exactly in
+       such ambiguous situation. See :hg:`help revsets` for detail about
+       selecting revisions.
+
+    .. container:: verbose
+
+       Examples:
+
+         - A number of changes have been made.
+           Revision 3 is no longer needed.
+
+           Start history editing from revision 3::
+
+             hg histedit -r 3
+
+           An editor opens, containing the list of revisions,
+           with specific actions specified::
+
+             pick 5339bf82f0ca 3 Zworgle the foobar
+             pick 8ef592ce7cc4 4 Bedazzle the zerlog
+             pick 0a9639fcda9d 5 Morgify the cromulancy
+
+           Additional information about the possible actions
+           to take appears below the list of revisions.
+
+           To remove revision 3 from the history,
+           its action (at the beginning of the relevant line)
+           is changed to 'drop'::
+
+             drop 5339bf82f0ca 3 Zworgle the foobar
+             pick 8ef592ce7cc4 4 Bedazzle the zerlog
+             pick 0a9639fcda9d 5 Morgify the cromulancy
+
+         - A number of changes have been made.
+           Revision 2 and 4 need to be swapped.
+
+           Start history editing from revision 2::
+
+             hg histedit -r 2
+
+           An editor opens, containing the list of revisions,
+           with specific actions specified::
+
+             pick 252a1af424ad 2 Blorb a morgwazzle
+             pick 5339bf82f0ca 3 Zworgle the foobar
+             pick 8ef592ce7cc4 4 Bedazzle the zerlog
+
+           To swap revision 2 and 4, its lines are swapped
+           in the editor::
+
+             pick 8ef592ce7cc4 4 Bedazzle the zerlog
+             pick 5339bf82f0ca 3 Zworgle the foobar
+             pick 252a1af424ad 2 Blorb a morgwazzle
+
+    Returns 0 on success, 1 if user intervention is required (not only
+    for intentional "edit" command, but also for resolving unexpected
+    conflicts).
+    """
+    opts = pycompat.byteskwargs(opts)
+
+    # kludge: _chistedit only works for starting an edit, not aborting
+    # or continuing, so fall back to regular _texthistedit for those
+    # operations.
+    if ui.interface(b'histedit') == b'curses' and _getgoal(opts) == goalnew:
+        return _chistedit(ui, repo, freeargs, opts)
+    return _texthistedit(ui, repo, freeargs, opts)
+
+
+def _texthistedit(ui, repo, freeargs, opts):
+    state = histeditstate(repo)
+    with repo.wlock() as wlock, repo.lock() as lock:
+        state.wlock = wlock
+        state.lock = lock
+        _histedit(ui, repo, state, freeargs, opts)
+
+
+goalcontinue = b'continue'
+goalabort = b'abort'
+goaleditplan = b'edit-plan'
+goalnew = b'new'
+
+
+def _getgoal(opts):
+    if opts.get(b'continue'):
+        return goalcontinue
+    if opts.get(b'abort'):
+        return goalabort
+    if opts.get(b'edit_plan'):
+        return goaleditplan
+    return goalnew
+
+
+def _readfile(ui, path):
+    if path == b'-':
+        with ui.timeblockedsection(b'histedit'):
+            return ui.fin.read()
+    else:
+        with open(path, b'rb') as f:
+            return f.read()
+
+
+def _validateargs(ui, repo, freeargs, opts, goal, rules, revs):
+    # TODO only abort if we try to histedit mq patches, not just
+    # blanket if mq patches are applied somewhere
+    mq = getattr(repo, 'mq', None)
+    if mq and mq.applied:
+        raise error.StateError(_(b'source has mq patches applied'))
+
+    # basic argument incompatibility processing
+    outg = opts.get(b'outgoing')
+    editplan = opts.get(b'edit_plan')
+    abort = opts.get(b'abort')
+    force = opts.get(b'force')
+    if force and not outg:
+        raise error.InputError(_(b'--force only allowed with --outgoing'))
+    if goal == b'continue':
+        if any((outg, abort, revs, freeargs, rules, editplan)):
+            raise error.InputError(_(b'no arguments allowed with --continue'))
+    elif goal == b'abort':
+        if any((outg, revs, freeargs, rules, editplan)):
+            raise error.InputError(_(b'no arguments allowed with --abort'))
+    elif goal == b'edit-plan':
+        if any((outg, revs, freeargs)):
+            raise error.InputError(
+                _(b'only --commands argument allowed with --edit-plan')
+            )
+    else:
+        if outg:
+            if revs:
+                raise error.InputError(
+                    _(b'no revisions allowed with --outgoing')
+                )
+            if len(freeargs) > 1:
+                raise error.InputError(
+                    _(b'only one repo argument allowed with --outgoing')
+                )
+        else:
+            revs.extend(freeargs)
+            if len(revs) == 0:
+                defaultrev = destutil.desthistedit(ui, repo)
+                if defaultrev is not None:
+                    revs.append(defaultrev)
+
+            if len(revs) != 1:
+                raise error.InputError(
+                    _(b'histedit requires exactly one ancestor revision')
+                )
+
+
+def _histedit(ui, repo, state, freeargs, opts):
+    fm = ui.formatter(b'histedit', opts)
+    fm.startitem()
+    goal = _getgoal(opts)
+    revs = opts.get(b'rev', [])
+    nobackup = not ui.configbool(b'rewrite', b'backup-bundle')
+    rules = opts.get(b'commands', b'')
+    state.keep = opts.get(b'keep', False)
+
+    _validateargs(ui, repo, freeargs, opts, goal, rules, revs)
+
+    hastags = False
+    if revs:
+        revs = logcmdutil.revrange(repo, revs)
+        ctxs = [repo[rev] for rev in revs]
+        for ctx in ctxs:
+            tags = [tag for tag in ctx.tags() if tag != b'tip']
+            if not hastags:
+                hastags = len(tags)
+    if hastags:
+        if ui.promptchoice(
+            _(
+                b'warning: tags associated with the given'
+                b' changeset will be lost after histedit.\n'
+                b'do you want to continue (yN)? $$ &Yes $$ &No'
+            ),
+            default=1,
+        ):
+            raise error.CanceledError(_(b'histedit cancelled\n'))
+    # rebuild state
+    if goal == goalcontinue:
+        state.read()
+        state = bootstrapcontinue(ui, state, opts)
+    elif goal == goaleditplan:
+        _edithisteditplan(ui, repo, state, rules)
+        return
+    elif goal == goalabort:
+        _aborthistedit(ui, repo, state, nobackup=nobackup)
+        return
+    else:
+        # goal == goalnew
+        _newhistedit(ui, repo, state, revs, freeargs, opts)
+
+    _continuehistedit(ui, repo, state)
+    _finishhistedit(ui, repo, state, fm)
+    fm.end()
+
+
+def _continuehistedit(ui, repo, state):
+    """This function runs after either:
+    - bootstrapcontinue (if the goal is 'continue')
+    - _newhistedit (if the goal is 'new')
+    """
+    # preprocess rules so that we can hide inner folds from the user
+    # and only show one editor
+    actions = state.actions[:]
+    for idx, (action, nextact) in enumerate(zip(actions, actions[1:] + [None])):
+        if action.verb == b'fold' and nextact and nextact.verb == b'fold':
+            state.actions[idx].__class__ = _multifold
+
+    # Force an initial state file write, so the user can run --abort/continue
+    # even if there's an exception before the first transaction serialize.
+    state.write()
+
+    tr = None
+    # Don't use singletransaction by default since it rolls the entire
+    # transaction back if an unexpected exception happens (like a
+    # pretxncommit hook throws, or the user aborts the commit msg editor).
+    if ui.configbool(b"histedit", b"singletransaction"):
+        # Don't use a 'with' for the transaction, since actions may close
+        # and reopen a transaction. For example, if the action executes an
+        # external process it may choose to commit the transaction first.
+        tr = repo.transaction(b'histedit')
+    progress = ui.makeprogress(
+        _(b"editing"), unit=_(b'changes'), total=len(state.actions)
+    )
+    with progress, util.acceptintervention(tr):
+        while state.actions:
+            state.write(tr=tr)
+            actobj = state.actions[0]
+            progress.increment(item=actobj.torule())
+            ui.debug(
+                b'histedit: processing %s %s\n' % (actobj.verb, actobj.torule())
+            )
+            parentctx, replacement_ = actobj.run()
+            state.parentctxnode = parentctx.node()
+            state.replacements.extend(replacement_)
+            state.actions.pop(0)
+
+    state.write()
+
+
+def _finishhistedit(ui, repo, state, fm):
+    """This action runs when histedit is finishing its session"""
+    mergemod.update(repo[state.parentctxnode])
+
+    mapping, tmpnodes, created, ntm = processreplacement(state)
+    if mapping:
+        for prec, succs in mapping.items():
+            if not succs:
+                ui.debug(b'histedit: %s is dropped\n' % short(prec))
+            else:
+                ui.debug(
+                    b'histedit: %s is replaced by %s\n'
+                    % (short(prec), short(succs[0]))
+                )
+                if len(succs) > 1:
+                    m = b'histedit:                            %s'
+                    for n in succs[1:]:
+                        ui.debug(m % short(n))
+
+    if not state.keep:
+        if mapping:
+            movetopmostbookmarks(repo, state.topmost, ntm)
+            # TODO update mq state
+    else:
+        mapping = {}
+
+    for n in tmpnodes:
+        if n in repo:
+            mapping[n] = ()
+
+    # remove entries about unknown nodes
+    has_node = repo.unfiltered().changelog.index.has_node
+    mapping = {
+        k: v
+        for k, v in mapping.items()
+        if has_node(k) and all(has_node(n) for n in v)
+    }
+    scmutil.cleanupnodes(repo, mapping, b'histedit')
+    hf = fm.hexfunc
+    fl = fm.formatlist
+    fd = fm.formatdict
+    nodechanges = fd(
+        {
+            hf(oldn): fl([hf(n) for n in newn], name=b'node')
+            for oldn, newn in mapping.items()
+        },
+        key=b"oldnode",
+        value=b"newnodes",
+    )
+    fm.data(nodechanges=nodechanges)
+
+    state.clear()
+    if os.path.exists(repo.sjoin(b'undo')):
+        os.unlink(repo.sjoin(b'undo'))
+    if repo.vfs.exists(b'histedit-last-edit.txt'):
+        repo.vfs.unlink(b'histedit-last-edit.txt')
+
+
+def _aborthistedit(ui, repo, state, nobackup=False):
+    try:
+        state.read()
+        __, leafs, tmpnodes, __ = processreplacement(state)
+        ui.debug(b'restore wc to old parent %s\n' % short(state.topmost))
+
+        # Recover our old commits if necessary
+        if not state.topmost in repo and state.backupfile:
+            backupfile = repo.vfs.join(state.backupfile)
+            f = hg.openpath(ui, backupfile)
+            gen = exchange.readbundle(ui, f, backupfile)
+            with repo.transaction(b'histedit.abort') as tr:
+                bundle2.applybundle(
+                    repo,
+                    gen,
+                    tr,
+                    source=b'histedit',
+                    url=b'bundle:' + backupfile,
+                )
+
+            os.remove(backupfile)
+
+        # check whether we should update away
+        if repo.unfiltered().revs(
+            b'parents() and (%n  or %ln::)',
+            state.parentctxnode,
+            leafs | tmpnodes,
+        ):
+            hg.clean(repo, state.topmost, show_stats=True, quietempty=True)
+        cleanupnode(ui, repo, tmpnodes, nobackup=nobackup)
+        cleanupnode(ui, repo, leafs, nobackup=nobackup)
+    except Exception:
+        if state.inprogress():
+            ui.warn(
+                _(
+                    b'warning: encountered an exception during histedit '
+                    b'--abort; the repository may not have been completely '
+                    b'cleaned up\n'
+                )
+            )
+        raise
+    finally:
+        state.clear()
+
+
+def hgaborthistedit(ui, repo):
+    state = histeditstate(repo)
+    nobackup = not ui.configbool(b'rewrite', b'backup-bundle')
+    with repo.wlock() as wlock, repo.lock() as lock:
+        state.wlock = wlock
+        state.lock = lock
+        _aborthistedit(ui, repo, state, nobackup=nobackup)

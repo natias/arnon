@@ -1,0 +1,1000 @@
+  
+  # Workaround for Module::Install 1.04 creating a bogus (higher) MakeMaker requirement that it needs in build_requires
+  # Assuming MakeMaker requirement is already satisfied in configure_requires, there's no need to have higher version of
+  # MakeMaker in build/test anyway. https://github.com/miyagawa/cpanminus/issues/463
+  sub soften_makemaker_prereqs {
+      my($self, $prereqs) = @_;
+  
+      return $prereqs unless -e "inc/Module/Install.pm";
+  
+      for my $phase (qw( build test runtime )) {
+          my $reqs = $prereqs->requirements_for($phase, 'requires');
+          if ($reqs->requirements_for_module('ExtUtils::MakeMaker')) {
+              $reqs->clear_requirement('ExtUtils::MakeMaker');
+              $reqs->add_minimum('ExtUtils::MakeMaker' => 0);
+          }
+      }
+  
+      $prereqs;
+  }
+  
+  sub cleanup_workdirs {
+      my $self = shift;
+  
+      my $expire = time - 24 * 60 * 60 * $self->{auto_cleanup};
+      my @targets;
+  
+      opendir my $dh, "$self->{home}/work";
+      while (my $e = readdir $dh) {
+          next if $e !~ /^(\d+)\.\d+$/; # {UNIX time}.{PID}
+          my $time = $1;
+          if ($time < $expire) {
+              push @targets, "$self->{home}/work/$e";
+          }
+      }
+  
+      if (@targets) {
+          if (@targets >= 64) {
+              $self->diag("Expiring " . scalar(@targets) . " work directories. This might take a while...\n");
+          } else {
+              $self->chat("Expiring " . scalar(@targets) . " work directories.\n");
+          }
+          File::Path::rmtree(\@targets, 0, 0); # safe = 0, since blib usually doesn't have write bits
+      }
+  }
+  
+  sub scandeps_append_child {
+      my($self, $dist) = @_;
+  
+      my $new_node = [ $dist, [] ];
+  
+      my $curr_node = $self->{scandeps_current} || [ undef, $self->{scandeps_tree} ];
+      push @{$curr_node->[1]}, $new_node;
+  
+      $self->{scandeps_current} = $new_node;
+  
+      return sub { $self->{scandeps_current} = $curr_node };
+  }
+  
+  sub dump_scandeps {
+      my $self = shift;
+  
+      if ($self->{format} eq 'tree') {
+          $self->walk_down(sub {
+              my($dist, $depth) = @_;
+              if ($depth == 0) {
+                  print "$dist->{distvname}\n";
+              } else {
+                  print " " x ($depth - 1);
+                  print "\\_ $dist->{distvname}\n";
+              }
+          }, 1);
+      } elsif ($self->{format} =~ /^dists?$/) {
+          $self->walk_down(sub {
+              my($dist, $depth) = @_;
+              print $self->format_dist($dist), "\n";
+          }, 0);
+      } elsif ($self->{format} eq 'json') {
+          require JSON::PP;
+          print JSON::PP::encode_json($self->{scandeps_tree});
+      } elsif ($self->{format} eq 'yaml') {
+          require YAML; # no fatpack
+          print YAML::Dump($self->{scandeps_tree});
+      } else {
+          $self->diag("Unknown format: $self->{format}\n");
+      }
+  }
+  
+  sub walk_down {
+      my($self, $cb, $pre) = @_;
+      $self->_do_walk_down($self->{scandeps_tree}, $cb, 0, $pre);
+  }
+  
+  sub _do_walk_down {
+      my($self, $children, $cb, $depth, $pre) = @_;
+  
+      # DFS - $pre determines when we call the callback
+      for my $node (@$children) {
+          $cb->($node->[0], $depth) if $pre;
+          $self->_do_walk_down($node->[1], $cb, $depth + 1, $pre);
+          $cb->($node->[0], $depth) unless $pre;
+      }
+  }
+  
+  sub DESTROY {
+      my $self = shift;
+      $self->{at_exit}->($self) if $self->{at_exit};
+  }
+  
+  # Utils
+  
+  sub shell_quote {
+      my($self, @stuff) = @_;
+      if (WIN32) {
+          join ' ', map { /^${quote}.+${quote}$/ ? $_ : ($quote . $_ . $quote) } @stuff;
+      } else {
+          String::ShellQuote::shell_quote_best_effort(@stuff);
+      }
+  }
+  
+  sub which {
+      my($self, $name) = @_;
+      if (File::Spec->file_name_is_absolute($name)) {
+          if (-x $name && !-d _) {
+              return $name;
+          }
+      }
+      my $exe_ext = $Config{_exe};
+      for my $dir (File::Spec->path) {
+          my $fullpath = File::Spec->catfile($dir, $name);
+          if ((-x $fullpath || -x ($fullpath .= $exe_ext)) && !-d _) {
+              if ($fullpath =~ /\s/) {
+                  $fullpath = $self->shell_quote($fullpath);
+              }
+              return $fullpath;
+          }
+      }
+      return;
+  }
+  
+  sub get {
+      my($self, $uri) = @_;
+      if ($uri =~ /^file:/) {
+          $self->file_get($uri);
+      } else {
+          $self->{_backends}{get}->(@_);
+      }
+  }
+  
+  sub mirror {
+      my($self, $uri, $local) = @_;
+      if ($uri =~ /^file:/) {
+          $self->file_mirror($uri, $local);
+      } else {
+          $self->{_backends}{mirror}->(@_);
+      }
+  }
+  
+  sub untar    { $_[0]->{_backends}{untar}->(@_) };
+  sub unzip    { $_[0]->{_backends}{unzip}->(@_) };
+  
+  sub uri_to_file {
+      my($self, $uri) = @_;
+  
+      # file:///path/to/file -> /path/to/file
+      # file://C:/path       -> C:/path
+      if ($uri =~ s!file:/+!!) {
+          $uri = "/$uri" unless $uri =~ m![a-zA-Z]:!;
+      }
+  
+      return $uri;
+  }
+  
+  sub file_get {
+      my($self, $uri) = @_;
+      my $file = $self->uri_to_file($uri);
+      open my $fh, "<$file" or return;
+      join '', <$fh>;
+  }
+  
+  sub file_mirror {
+      my($self, $uri, $path) = @_;
+      my $file = $self->uri_to_file($uri);
+  
+      my $source_mtime = (stat $file)[9];
+  
+      # Don't mirror a file that's already there (like the index)
+      return 1 if -e $path && (stat $path)[9] >= $source_mtime;
+  
+      File::Copy::copy($file, $path);
+  
+      utime $source_mtime, $source_mtime, $path;
+  }
+  
+  sub has_working_lwp {
+      my($self, $mirrors) = @_;
+      my $https = grep /^https:/, @$mirrors;
+      eval {
+          require LWP::UserAgent; # no fatpack
+          LWP::UserAgent->VERSION(5.802);
+          require LWP::Protocol::https if $https; # no fatpack
+          1;
+      };
+  }
+  
+  sub init_tools {
+      my $self = shift;
+  
+      return if $self->{initialized}++;
+  
+      if ($self->{make} = $self->which($Config{make})) {
+          $self->chat("You have make $self->{make}\n");
+      }
+  
+      # use --no-lwp if they have a broken LWP, to upgrade LWP
+      if ($self->{try_lwp} && $self->has_working_lwp($self->{mirrors})) {
+          $self->chat("You have LWP $LWP::VERSION\n");
+          my $ua = sub {
+              LWP::UserAgent->new(
+                  parse_head => 0,
+                  env_proxy => 1,
+                  agent => $self->agent,
+                  timeout => 30,
+                  @_,
+              );
+          };
+          $self->{_backends}{get} = sub {
+              my $self = shift;
+              my $res = $ua->()->request(HTTP::Request->new(GET => $_[0]));
+              return unless $res->is_success;
+              return $res->decoded_content;
+          };
+          $self->{_backends}{mirror} = sub {
+              my $self = shift;
+              my $res = $ua->()->mirror(@_);
+              die $res->content if $res->code == 501;
+              $res->code;
+          };
+      } elsif ($self->{try_wget} and my $wget = $self->which('wget')) {
+          $self->chat("You have $wget\n");
+          my @common = (
+              '--user-agent', $self->agent,
+              '--retry-connrefused',
+              ($self->{verbose} ? () : ('-q')),
+          );
+          $self->{_backends}{get} = sub {
+              my($self, $uri) = @_;
+              $self->safeexec( my $fh, $wget, $uri, @common, '-O', '-' ) or die "wget $uri: $!";
+              local $/;
+              <$fh>;
+          };
+          $self->{_backends}{mirror} = sub {
+              my($self, $uri, $path) = @_;
+              $self->safeexec( my $fh, $wget, $uri, @common, '-O', $path ) or die "wget $uri: $!";
+              local $/;
+              <$fh>;
+          };
+      } elsif ($self->{try_curl} and my $curl = $self->which('curl')) {
+          $self->chat("You have $curl\n");
+          my @common = (
+              '--location',
+              '--user-agent', $self->agent,
+              ($self->{verbose} ? () : '-s'),
+          );
+          $self->{_backends}{get} = sub {
+              my($self, $uri) = @_;
+              $self->safeexec( my $fh, $curl, @common, $uri ) or die "curl $uri: $!";
+              local $/;
+              <$fh>;
+          };
+          $self->{_backends}{mirror} = sub {
+              my($self, $uri, $path) = @_;
+              $self->safeexec( my $fh, $curl, @common, $uri, '-#', '-o', $path ) or die "curl $uri: $!";
+              local $/;
+              <$fh>;
+          };
+      } else {
+          require HTTP::Tiny;
+          $self->chat("Falling back to HTTP::Tiny $HTTP::Tiny::VERSION\n");
+          my %common = (
+              agent => $self->agent,
+          );
+          $self->{_backends}{get} = sub {
+              my $self = shift;
+              my $res = HTTP::Tiny->new(%common)->get($_[0]);
+              return unless $res->{success};
+              return $res->{content};
+          };
+          $self->{_backends}{mirror} = sub {
+              my $self = shift;
+              my $res = HTTP::Tiny->new(%common)->mirror(@_);
+              return $res->{status};
+          };
+      }
+  
+      my $tar = $self->which('tar');
+      my $tar_ver;
+      my $maybe_bad_tar = sub { WIN32 || BAD_TAR || (($tar_ver = `$tar --version 2>/dev/null`) =~ /GNU.*1\.13/i) };
+  
+      if ($tar && !$maybe_bad_tar->()) {
+          chomp $tar_ver;
+          $self->chat("You have $tar: $tar_ver\n");
+          $self->{_backends}{untar} = sub {
+              my($self, $tarfile) = @_;
+  
+              my $xf = ($self->{verbose} ? 'v' : '')."xf";
+              my $ar = $tarfile =~ /bz2$/ ? 'j' : 'z';
+  
+              my($root, @others) = `$tar ${ar}tf $tarfile`
+                  or return undef;
+  
+              FILE: {
+                  chomp $root;
+                  $root =~ s!^\./!!;
+                  $root =~ s{^(.+?)/.*$}{$1};
+  
+                  if (!length($root)) {
+                      # archive had ./ as the first entry, so try again
+                      $root = shift(@others);
+                      redo FILE if $root;
+                  }
+              }
+  
+              system "$tar $ar$xf $tarfile";
+              return $root if -d $root;
+  
+              $self->diag_fail("Bad archive: $tarfile");
+              return undef;
+          }
+      } elsif (    $tar
+               and my $gzip = $self->which('gzip')
+               and my $bzip2 = $self->which('bzip2')) {
+          $self->chat("You have $tar, $gzip and $bzip2\n");
+          $self->{_backends}{untar} = sub {
+              my($self, $tarfile) = @_;
+  
+              my $x  = "x" . ($self->{verbose} ? 'v' : '') . "f -";
+              my $ar = $tarfile =~ /bz2$/ ? $bzip2 : $gzip;
+  
+              my($root, @others) = `$ar -dc $tarfile | $tar tf -`
+                  or return undef;
+  
+              FILE: {
+                  chomp $root;
+                  $root =~ s!^\./!!;
+                  $root =~ s{^(.+?)/.*$}{$1};
+  
+                  if (!length($root)) {
+                      # archive had ./ as the first entry, so try again
+                      $root = shift(@others);
+                      redo FILE if $root;
+                  }
+              }
+  
+              system "$ar -dc $tarfile | $tar $x";
+              return $root if -d $root;
+  
+              $self->diag_fail("Bad archive: $tarfile");
+              return undef;
+          }
+      } elsif (eval { require Archive::Tar }) { # uses too much memory!
+          $self->chat("Falling back to Archive::Tar $Archive::Tar::VERSION\n");
+          $self->{_backends}{untar} = sub {
+              my $self = shift;
+              my $t = Archive::Tar->new($_[0]);
+              my($root, @others) = $t->list_files;
+              FILE: {
+                  $root =~ s!^\./!!;
+                  $root =~ s{^(.+?)/.*$}{$1};
+  
+                  if (!length($root)) {
+                      # archive had ./ as the first entry, so try again
+                      $root = shift(@others);
+                      redo FILE if $root;
+                  }
+              }
+              $t->extract;
+              return -d $root ? $root : undef;
+          };
+      } else {
+          $self->{_backends}{untar} = sub {
+              die "Failed to extract $_[1] - You need to have tar or Archive::Tar installed.\n";
+          };
+      }
+  
+      if (my $unzip = $self->which('unzip')) {
+          $self->chat("You have $unzip\n");
+          $self->{_backends}{unzip} = sub {
+              my($self, $zipfile) = @_;
+  
+              my $opt = $self->{verbose} ? '' : '-q';
+              my(undef, $root, @others) = `$unzip -t $zipfile`
+                  or return undef;
+              FILE: {
+                  chomp $root;
+                  if ($root !~ s{^\s+testing:\s+([^/]+)/.*?\s+OK$}{$1}) {
+                      $root = shift(@others);
+                      redo FILE if $root;
+                  }
+              }
+  
+              system "$unzip $opt $zipfile";
+              return $root if -d $root;
+  
+              $self->diag_fail("Bad archive: [$root] $zipfile");
+              return undef;
+          }
+      } else {
+          $self->{_backends}{unzip} = sub {
+              eval { require Archive::Zip }
+                  or  die "Failed to extract $_[1] - You need to have unzip or Archive::Zip installed.\n";
+              my($self, $file) = @_;
+              my $zip = Archive::Zip->new();
+              my $status;
+              $status = $zip->read($file);
+              $self->diag_fail("Read of file[$file] failed")
+                  if $status != Archive::Zip::AZ_OK();
+              my @members = $zip->members();
+              for my $member ( @members ) {
+                  my $af = $member->fileName();
+                  next if ($af =~ m!^(/|\.\./)!);
+                  $status = $member->extractToFileNamed( $af );
+                  $self->diag_fail("Extracting of file[$af] from zipfile[$file failed")
+                      if $status != Archive::Zip::AZ_OK();
+              }
+  
+              my ($root) = $zip->membersMatching( qr<^[^/]+/$> );
+              $root &&= $root->fileName;
+              return -d $root ? $root : undef;
+          };
+      }
+  }
+  
+  sub safeexec {
+      my $self = shift;
+      my $rdr = $_[0] ||= Symbol::gensym();
+  
+      if (WIN32) {
+          my $cmd = $self->shell_quote(@_[1..$#_]);
+          return open( $rdr, "$cmd |" );
+      }
+  
+      if ( my $pid = open( $rdr, '-|' ) ) {
+          return $pid;
+      }
+      elsif ( defined $pid ) {
+          exec( @_[ 1 .. $#_ ] );
+          exit 1;
+      }
+      else {
+          return;
+      }
+  }
+  
+  sub mask_uri_passwords {
+      my($self, @strings) = @_;
+      s{ (https?://) ([^:/]+) : [^@/]+ @ }{$1$2:********@}gx for @strings;
+      return @strings;
+  }
+  
+  1;
+APP_CPANMINUS_SCRIPT
+
+$fatpacked{"CPAN/DistnameInfo.pm"} = '#line '.(1+__LINE__).' "'.__FILE__."\"\n".<<'CPAN_DISTNAMEINFO';
+  
+  package CPAN::DistnameInfo;
+  
+  $VERSION = "0.12";
+  use strict;
+  
+  sub distname_info {
+    my $file = shift or return;
+  
+    my ($dist, $version) = $file =~ /^
+      ((?:[-+.]*(?:[A-Za-z0-9]+|(?<=\D)_|_(?=\D))*
+       (?:
+  	[A-Za-z](?=[^A-Za-z]|$)
+  	|
+  	\d(?=-)
+       )(?<![._-][vV])
+      )+)(.*)
+    $/xs or return ($file,undef,undef);
+  
+    if ($dist =~ /-undef\z/ and ! length $version) {
+      $dist =~ s/-undef\z//;
+    }
+  
+    # Remove potential -withoutworldwriteables suffix
+    $version =~ s/-withoutworldwriteables$//;
+  
+    if ($version =~ /^(-[Vv].*)-(\d.*)/) {
+     
+      # Catch names like Unicode-Collate-Standard-V3_1_1-0.1
+      # where the V3_1_1 is part of the distname
+      $dist .= $1;
+      $version = $2;
+    }
+  
+    if ($version =~ /(.+_.*)-(\d.*)/) {
+        # Catch names like Task-Deprecations5_14-1.00.tar.gz where the 5_14 is
+        # part of the distname. However, names like libao-perl_0.03-1.tar.gz
+        # should still have 0.03-1 as their version.
+        $dist .= $1;
+        $version = $2;
+    }
+  
+    # Normalize the Dist.pm-1.23 convention which CGI.pm and
+    # a few others use.
+    $dist =~ s{\.pm$}{};
+  
+    $version = $1
+      if !length $version and $dist =~ s/-(\d+\w)$//;
+  
+    $version = $1 . $version
+      if $version =~ /^\d+$/ and $dist =~ s/-(\w+)$//;
+  
+    if ($version =~ /\d\.\d/) {
+      $version =~ s/^[-_.]+//;
+    }
+    else {
+      $version =~ s/^[-_]+//;
+    }
+  
+    my $dev;
+    if (length $version) {
+      if ($file =~ /^perl-?\d+\.(\d+)(?:\D(\d+))?(-(?:TRIAL|RC)\d+)?$/) {
+        $dev = 1 if (($1 > 6 and $1 & 1) or ($2 and $2 >= 50)) or $3;
+      }
+      elsif ($version =~ /\d\D\d+_\d/ or $version =~ /-TRIAL/) {
+        $dev = 1;
+      }
+    }
+    else {
+      $version = undef;
+    }
+  
+    ($dist, $version, $dev);
+  }
+  
+  sub new {
+    my $class = shift;
+    my $distfile = shift;
+  
+    $distfile =~ s,//+,/,g;
+  
+    my %info = ( pathname => $distfile );
+  
+    ($info{filename} = $distfile) =~ s,^(((.*?/)?authors/)?id/)?([A-Z])/(\4[A-Z])/(\5[-A-Z0-9]*)/,,
+      and $info{cpanid} = $6;
+  
+    if ($distfile =~ m,([^/]+)\.(tar\.(?:g?z|bz2)|zip|tgz)$,i) { # support more ?
+      $info{distvname} = $1;
+      $info{extension} = $2;
+    }
+  
+    @info{qw(dist version beta)} = distname_info($info{distvname});
+    $info{maturity} = delete $info{beta} ? 'developer' : 'released';
+  
+    return bless \%info, $class;
+  }
+  
+  sub dist      { shift->{dist} }
+  sub version   { shift->{version} }
+  sub maturity  { shift->{maturity} }
+  sub filename  { shift->{filename} }
+  sub cpanid    { shift->{cpanid} }
+  sub distvname { shift->{distvname} }
+  sub extension { shift->{extension} }
+  sub pathname  { shift->{pathname} }
+  
+  sub properties { %{ $_[0] } }
+  
+  1;
+  
+  __END__
+  
+  =head1 NAME
+  
+  CPAN::DistnameInfo - Extract distribution name and version from a distribution filename
+  
+  =head1 SYNOPSIS
+  
+    my $pathname = "authors/id/G/GB/GBARR/CPAN-DistnameInfo-0.02.tar.gz";
+  
+    my $d = CPAN::DistnameInfo->new($pathname);
+  
+    my $dist      = $d->dist;      # "CPAN-DistnameInfo"
+    my $version   = $d->version;   # "0.02"
+    my $maturity  = $d->maturity;  # "released"
+    my $filename  = $d->filename;  # "CPAN-DistnameInfo-0.02.tar.gz"
+    my $cpanid    = $d->cpanid;    # "GBARR"
+    my $distvname = $d->distvname; # "CPAN-DistnameInfo-0.02"
+    my $extension = $d->extension; # "tar.gz"
+    my $pathname  = $d->pathname;  # "authors/id/G/GB/GBARR/..."
+  
+    my %prop = $d->properties;
+  
+  =head1 DESCRIPTION
+  
+  Many online services that are centered around CPAN attempt to
+  associate multiple uploads by extracting a distribution name from
+  the filename of the upload. For most distributions this is easy as
+  they have used ExtUtils::MakeMaker or Module::Build to create the
+  distribution, which results in a uniform name. But sadly not all
+  uploads are created in this way.
+  
+  C<CPAN::DistnameInfo> uses heuristics that have been learnt by
+  L<http://search.cpan.org/> to extract the distribution name and
+  version from filenames and also report if the version is to be
+  treated as a developer release
+  
+  The constructor takes a single pathname, returning an object with the following methods
+  
+  =over
+  
+  =item cpanid
+  
+  If the path given looked like a CPAN authors directory path, then this will be the
+  the CPAN id of the author.
+  
+  =item dist
+  
+  The name of the distribution
+  
+  =item distvname
+  
+  The file name with any suffix and leading directory names removed
+  
+  =item filename
+  
+  If the path given looked like a CPAN authors directory path, then this will be the
+  path to the file relative to the detected CPAN author directory. Otherwise it is the path
+  that was passed in.
+  
+  =item maturity
+  
+  The maturity of the distribution. This will be either C<released> or C<developer>
+  
+  =item extension
+  
+  The extension of the distribution, often used to denote the archive type (e.g. 'tar.gz')
+  
+  =item pathname
+  
+  The pathname that was passed to the constructor when creating the object.
+  
+  =item properties
+  
+  This will return a list of key-value pairs, suitable for assigning to a hash,
+  for the known properties.
+  
+  =item version
+  
+  The extracted version
+  
+  =back
+  
+  =head1 AUTHOR
+  
+  Graham Barr <gbarr@pobox.com>
+  
+  =head1 COPYRIGHT 
+  
+  Copyright (c) 2003 Graham Barr. All rights reserved. This program is
+  free software; you can redistribute it and/or modify it under the same
+  terms as Perl itself.
+  
+  =cut
+  
+CPAN_DISTNAMEINFO
+
+$fatpacked{"CPAN/Meta.pm"} = '#line '.(1+__LINE__).' "'.__FILE__."\"\n".<<'CPAN_META';
+  use 5.006;
+  use strict;
+  use warnings;
+  package CPAN::Meta;
+  
+  our $VERSION = '2.150005';
+  
+  #pod =head1 SYNOPSIS
+  #pod
+  #pod     use v5.10;
+  #pod     use strict;
+  #pod     use warnings;
+  #pod     use CPAN::Meta;
+  #pod     use Module::Load;
+  #pod
+  #pod     my $meta = CPAN::Meta->load_file('META.json');
+  #pod
+  #pod     printf "testing requirements for %s version %s\n",
+  #pod     $meta->name,
+  #pod     $meta->version;
+  #pod
+  #pod     my $prereqs = $meta->effective_prereqs;
+  #pod
+  #pod     for my $phase ( qw/configure runtime build test/ ) {
+  #pod         say "Requirements for $phase:";
+  #pod         my $reqs = $prereqs->requirements_for($phase, "requires");
+  #pod         for my $module ( sort $reqs->required_modules ) {
+  #pod             my $status;
+  #pod             if ( eval { load $module unless $module eq 'perl'; 1 } ) {
+  #pod                 my $version = $module eq 'perl' ? $] : $module->VERSION;
+  #pod                 $status = $reqs->accepts_module($module, $version)
+  #pod                         ? "$version ok" : "$version not ok";
+  #pod             } else {
+  #pod                 $status = "missing"
+  #pod             };
+  #pod             say "  $module ($status)";
+  #pod         }
+  #pod     }
+  #pod
+  #pod =head1 DESCRIPTION
+  #pod
+  #pod Software distributions released to the CPAN include a F<META.json> or, for
+  #pod older distributions, F<META.yml>, which describes the distribution, its
+  #pod contents, and the requirements for building and installing the distribution.
+  #pod The data structure stored in the F<META.json> file is described in
+  #pod L<CPAN::Meta::Spec>.
+  #pod
+  #pod CPAN::Meta provides a simple class to represent this distribution metadata (or
+  #pod I<distmeta>), along with some helpful methods for interrogating that data.
+  #pod
+  #pod The documentation below is only for the methods of the CPAN::Meta object.  For
+  #pod information on the meaning of individual fields, consult the spec.
+  #pod
+  #pod =cut
+  
+  use Carp qw(carp croak);
+  use CPAN::Meta::Feature;
+  use CPAN::Meta::Prereqs;
+  use CPAN::Meta::Converter;
+  use CPAN::Meta::Validator;
+  use Parse::CPAN::Meta 1.4414 ();
+  
+  BEGIN { *_dclone = \&CPAN::Meta::Converter::_dclone }
+  
+  #pod =head1 STRING DATA
+  #pod
+  #pod The following methods return a single value, which is the value for the
+  #pod corresponding entry in the distmeta structure.  Values should be either undef
+  #pod or strings.
+  #pod
+  #pod =for :list
+  #pod * abstract
+  #pod * description
+  #pod * dynamic_config
+  #pod * generated_by
+  #pod * name
+  #pod * release_status
+  #pod * version
+  #pod
+  #pod =cut
+  
+  BEGIN {
+    my @STRING_READERS = qw(
+      abstract
+      description
+      dynamic_config
+      generated_by
+      name
+      release_status
+      version
+    );
+  
+    no strict 'refs';
+    for my $attr (@STRING_READERS) {
+      *$attr = sub { $_[0]{ $attr } };
+    }
+  }
+  
+  #pod =head1 LIST DATA
+  #pod
+  #pod These methods return lists of string values, which might be represented in the
+  #pod distmeta structure as arrayrefs or scalars:
+  #pod
+  #pod =for :list
+  #pod * authors
+  #pod * keywords
+  #pod * licenses
+  #pod
+  #pod The C<authors> and C<licenses> methods may also be called as C<author> and
+  #pod C<license>, respectively, to match the field name in the distmeta structure.
+  #pod
+  #pod =cut
+  
+  BEGIN {
+    my @LIST_READERS = qw(
+      author
+      keywords
+      license
+    );
+  
+    no strict 'refs';
+    for my $attr (@LIST_READERS) {
+      *$attr = sub {
+        my $value = $_[0]{ $attr };
+        croak "$attr must be called in list context"
+          unless wantarray;
+        return @{ _dclone($value) } if ref $value;
+        return $value;
+      };
+    }
+  }
+  
+  sub authors  { $_[0]->author }
+  sub licenses { $_[0]->license }
+  
+  #pod =head1 MAP DATA
+  #pod
+  #pod These readers return hashrefs of arbitrary unblessed data structures, each
+  #pod described more fully in the specification:
+  #pod
+  #pod =for :list
+  #pod * meta_spec
+  #pod * resources
+  #pod * provides
+  #pod * no_index
+  #pod * prereqs
+  #pod * optional_features
+  #pod
+  #pod =cut
+  
+  BEGIN {
+    my @MAP_READERS = qw(
+      meta-spec
+      resources
+      provides
+      no_index
+  
+      prereqs
+      optional_features
+    );
+  
+    no strict 'refs';
+    for my $attr (@MAP_READERS) {
+      (my $subname = $attr) =~ s/-/_/;
+      *$subname = sub {
+        my $value = $_[0]{ $attr };
+        return _dclone($value) if $value;
+        return {};
+      };
+    }
+  }
+  
+  #pod =head1 CUSTOM DATA
+  #pod
+  #pod A list of custom keys are available from the C<custom_keys> method and
+  #pod particular keys may be retrieved with the C<custom> method.
+  #pod
+  #pod   say $meta->custom($_) for $meta->custom_keys;
+  #pod
+  #pod If a custom key refers to a data structure, a deep clone is returned.
+  #pod
+  #pod =cut
+  
+  sub custom_keys {
+    return grep { /^x_/i } keys %{$_[0]};
+  }
+  
+  sub custom {
+    my ($self, $attr) = @_;
+    my $value = $self->{$attr};
+    return _dclone($value) if ref $value;
+    return $value;
+  }
+  
+  #pod =method new
+  #pod
+  #pod   my $meta = CPAN::Meta->new($distmeta_struct, \%options);
+  #pod
+  #pod Returns a valid CPAN::Meta object or dies if the supplied metadata hash
+  #pod reference fails to validate.  Older-format metadata will be up-converted to
+  #pod version 2 if they validate against the original stated specification.
+  #pod
+  #pod It takes an optional hashref of options. Valid options include:
+  #pod
+  #pod =over
+  #pod
+  #pod =item *
+  #pod
+  #pod lazy_validation -- if true, new will attempt to convert the given metadata
+  #pod to version 2 before attempting to validate it.  This means than any
+  #pod fixable errors will be handled by CPAN::Meta::Converter before validation.
+  #pod (Note that this might result in invalid optional data being silently
+  #pod dropped.)  The default is false.
+  #pod
+  #pod =back
+  #pod
+  #pod =cut
+  
+  sub _new {
+    my ($class, $struct, $options) = @_;
+    my $self;
+  
+    if ( $options->{lazy_validation} ) {
+      # try to convert to a valid structure; if succeeds, then return it
+      my $cmc = CPAN::Meta::Converter->new( $struct );
+      $self = $cmc->convert( version => 2 ); # valid or dies
+      return bless $self, $class;
+    }
+    else {
+      # validate original struct
+      my $cmv = CPAN::Meta::Validator->new( $struct );
+      unless ( $cmv->is_valid) {
+        die "Invalid metadata structure. Errors: "
+          . join(", ", $cmv->errors) . "\n";
+      }
+    }
+  
+    # up-convert older spec versions
+    my $version = $struct->{'meta-spec'}{version} || '1.0';
+    if ( $version == 2 ) {
+      $self = $struct;
+    }
+    else {
+      my $cmc = CPAN::Meta::Converter->new( $struct );
+      $self = $cmc->convert( version => 2 );
+    }
+  
+    return bless $self, $class;
+  }
+  
+  sub new {
+    my ($class, $struct, $options) = @_;
+    my $self = eval { $class->_new($struct, $options) };
+    croak($@) if $@;
+    return $self;
+  }
+  
+  #pod =method create
+  #pod
+  #pod   my $meta = CPAN::Meta->create($distmeta_struct, \%options);
+  #pod
+  #pod This is same as C<new()>, except that C<generated_by> and C<meta-spec> fields
+  #pod will be generated if not provided.  This means the metadata structure is
+  #pod assumed to otherwise follow the latest L<CPAN::Meta::Spec>.
+  #pod
+  #pod =cut
+  
+  sub create {
+    my ($class, $struct, $options) = @_;
+    my $version = __PACKAGE__->VERSION || 2;
+    $struct->{generated_by} ||= __PACKAGE__ . " version $version" ;
+    $struct->{'meta-spec'}{version} ||= int($version);
+    my $self = eval { $class->_new($struct, $options) };
+    croak ($@) if $@;
+    return $self;
+  }
+  
+  #pod =method load_file
+  #pod
+  #pod   my $meta = CPAN::Meta->load_file($distmeta_file, \%options);
+  #pod
+  #pod Given a pathname to a file containing metadata, this deserializes the file
+  #pod according to its file suffix and constructs a new C<CPAN::Meta> object, just
+  #pod like C<new()>.  It will die if the deserialized version fails to validate
+  #pod against its stated specification version.
+  #pod
+  #pod It takes the same options as C<new()> but C<lazy_validation> defaults to
+  #pod true.
+  #pod
+  #pod =cut
+  
+  sub load_file {
+    my ($class, $file, $options) = @_;
+    $options->{lazy_validation} = 1 unless exists $options->{lazy_validation};
+  
+    croak "load_file() requires a valid, readable filename"
+      unless -r $file;
+  
+    my $self;
+    eval {
+      my $struct = Parse::CPAN::Meta->load_file( $file );
+      $self = $class->_new($struct, $options);
+    };
+    croak($@) if $@;
+    return $self;
+  }
+  
+  #pod =method load_yaml_string
+  #pod
+  #pod   my $meta = CPAN::Meta->load_yaml_string($yaml, \%options);
+  #pod
+  #pod This method returns a new CPAN::Meta object using the first document in the
+  #pod given YAML string.  In other respects it is identical to C<load_file()>.
+  #pod
+  #pod =cut
+  
+  sub load_yaml_string {
+    my ($class, $yaml, $options) = @_;
+    $options->{lazy_validation} = 1 unless exists $options->{lazy_validation};
+  
+    my $self;
+    eval {
+      my ($struct) = Parse::CPAN::Meta->load_yaml_string( $yaml );
+      $self = $class->_new($struct, $options);
+    };
+    croak($@) if $@;
+    return $self;
+  }
+  

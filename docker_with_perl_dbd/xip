@@ -1,0 +1,1000 @@
+        if not self._get_overlapped_result_ex(
+            self.pipe, olap, nread, 0 if immediate else self.timeout, True
+        ):
+            err = GetLastError()
+            CancelIoEx(self.pipe, olap)
+
+            if err == WAIT_TIMEOUT:
+                log("GetOverlappedResultEx timedout")
+                raise SocketTimeout(
+                    "timed out after waiting %dms for read" % self.timeout
+                )
+
+            log("GetOverlappedResultEx reports error %d", err)
+            self._raise_win_err("error while waiting for read", err)
+
+        nread = nread.value
+        if nread == 0:
+            # Docs say that named pipes return 0 byte when the other end did
+            # a zero byte write.  Since we don't ever do that, the only
+            # other way this shows up is if the client has gotten in a weird
+            # state, so let's bail out
+            CancelIoEx(self.pipe, olap)
+            raise IOError("Async read yielded 0 bytes; unpossible!")
+
+        # Holds precisely the bytes that we read from the prior request
+        buf = buf[:nread]
+
+        returned_size = min(nread, size)
+        if returned_size == nread:
+            return buf
+
+        # keep any left-overs around for a later read to consume
+        self._iobuf = buf[returned_size:]
+        return buf[:returned_size]
+
+    def write(self, data):
+        olap = OVERLAPPED()
+        olap.hEvent = self._waitable
+
+        immediate = WriteFile(
+            self.pipe, ctypes.c_char_p(data), len(data), None, olap
+        )
+
+        if not immediate:
+            err = GetLastError()
+            if err != ERROR_IO_PENDING:
+                self._raise_win_err(
+                    "failed to write %d bytes to handle %r"
+                    % (len(data), self.pipe),
+                    err,
+                )
+
+        # Obtain results, waiting if needed
+        nwrote = wintypes.DWORD()
+        if self._get_overlapped_result_ex(
+            self.pipe, olap, nwrote, 0 if immediate else self.timeout, True
+        ):
+            log("made write of %d bytes", nwrote.value)
+            return nwrote.value
+
+        err = GetLastError()
+
+        # It's potentially unsafe to allow the write to continue after
+        # we unwind, so let's make a best effort to avoid that happening
+        CancelIoEx(self.pipe, olap)
+
+        if err == WAIT_TIMEOUT:
+            raise SocketTimeout(
+                "timed out after waiting %dms for write" % self.timeout
+            )
+        self._raise_win_err(
+            "error while waiting for write of %d bytes" % len(data), err
+        )
+
+
+def _default_binpath(binpath=None):
+    if binpath:
+        return binpath
+    # The test harness sets WATCHMAN_BINARY to the binary under test,
+    # so we use that by default, otherwise, allow resolving watchman
+    # from the users PATH.
+    return os.environ.get("WATCHMAN_BINARY", "watchman")
+
+
+class CLIProcessTransport(Transport):
+    """open a pipe to the cli to talk to the service
+    This intended to be used only in the test harness!
+
+    The CLI is an oddball because we only support JSON input
+    and cannot send multiple commands through the same instance,
+    so we spawn a new process for each command.
+
+    We disable server spawning for this implementation, again, because
+    it is intended to be used only in our test harness.  You really
+    should not need to use the CLI transport for anything real.
+
+    While the CLI can output in BSER, our Transport interface doesn't
+    support telling this instance that it should do so.  That effectively
+    limits this implementation to JSON input and output only at this time.
+
+    It is the responsibility of the caller to set the send and
+    receive codecs appropriately.
+    """
+
+    proc = None
+    closed = True
+
+    def __init__(self, sockpath, timeout, binpath=None):
+        self.sockpath = sockpath
+        self.timeout = timeout
+        self.binpath = _default_binpath(binpath)
+
+    def close(self):
+        if self.proc:
+            if self.proc.pid is not None:
+                self.proc.kill()
+            self.proc.stdin.close()
+            self.proc.stdout.close()
+            self.proc.wait()
+            self.proc = None
+
+    def _connect(self):
+        if self.proc:
+            return self.proc
+        args = [
+            self.binpath,
+            "--sockname={0}".format(self.sockpath),
+            "--logfile=/BOGUS",
+            "--statefile=/BOGUS",
+            "--no-spawn",
+            "--no-local",
+            "--no-pretty",
+            "-j",
+        ]
+        self.proc = subprocess.Popen(
+            args, stdin=subprocess.PIPE, stdout=subprocess.PIPE
+        )
+        return self.proc
+
+    def readBytes(self, size):
+        self._connect()
+        res = self.proc.stdout.read(size)
+        if not res:
+            raise WatchmanError("EOF on CLI process transport")
+        return res
+
+    def write(self, data):
+        if self.closed:
+            self.close()
+            self.closed = False
+        self._connect()
+        res = self.proc.stdin.write(data)
+        self.proc.stdin.close()
+        self.closed = True
+        return res
+
+
+class BserCodec(Codec):
+    """use the BSER encoding.  This is the default, preferred codec"""
+
+    def __init__(self, transport, value_encoding, value_errors):
+        super(BserCodec, self).__init__(transport)
+        self._value_encoding = value_encoding
+        self._value_errors = value_errors
+
+    def _loads(self, response):
+        return bser.loads(
+            response,
+            value_encoding=self._value_encoding,
+            value_errors=self._value_errors,
+        )
+
+    def receive(self):
+        buf = [self.transport.readBytes(sniff_len)]
+        if not buf[0]:
+            raise WatchmanError("empty watchman response")
+
+        _1, _2, elen = bser.pdu_info(buf[0])
+
+        rlen = len(buf[0])
+        while elen > rlen:
+            buf.append(self.transport.readBytes(elen - rlen))
+            rlen += len(buf[-1])
+
+        response = b"".join(buf)
+        try:
+            res = self._loads(response)
+            return res
+        except ValueError as e:
+            raise WatchmanError("watchman response decode error: %s" % e)
+
+    def send(self, *args):
+        cmd = bser.dumps(*args)  # Defaults to BSER v1
+        self.transport.write(cmd)
+
+
+class ImmutableBserCodec(BserCodec):
+    """use the BSER encoding, decoding values using the newer
+    immutable object support"""
+
+    def _loads(self, response):
+        return bser.loads(
+            response,
+            False,
+            value_encoding=self._value_encoding,
+            value_errors=self._value_errors,
+        )
+
+
+class Bser2WithFallbackCodec(BserCodec):
+    """use BSER v2 encoding"""
+
+    def __init__(self, transport, value_encoding, value_errors):
+        super(Bser2WithFallbackCodec, self).__init__(
+            transport, value_encoding, value_errors
+        )
+        if compat.PYTHON3:
+            bserv2_key = "required"
+        else:
+            bserv2_key = "optional"
+
+        self.send(["version", {bserv2_key: ["bser-v2"]}])
+
+        capabilities = self.receive()
+
+        if "error" in capabilities:
+            raise BSERv1Unsupported(
+                "The watchman server version does not support Python 3. Please "
+                "upgrade your watchman server."
+            )
+
+        if capabilities["capabilities"]["bser-v2"]:
+            self.bser_version = 2
+            self.bser_capabilities = 0
+        else:
+            self.bser_version = 1
+            self.bser_capabilities = 0
+
+    def receive(self):
+        buf = [self.transport.readBytes(sniff_len)]
+        if not buf[0]:
+            raise WatchmanError("empty watchman response")
+
+        recv_bser_version, recv_bser_capabilities, elen = bser.pdu_info(buf[0])
+
+        if hasattr(self, "bser_version"):
+            # Readjust BSER version and capabilities if necessary
+            self.bser_version = max(self.bser_version, recv_bser_version)
+            self.capabilities = self.bser_capabilities & recv_bser_capabilities
+
+        rlen = len(buf[0])
+        while elen > rlen:
+            buf.append(self.transport.readBytes(elen - rlen))
+            rlen += len(buf[-1])
+
+        response = b"".join(buf)
+        try:
+            res = self._loads(response)
+            return res
+        except ValueError as e:
+            raise WatchmanError("watchman response decode error: %s" % e)
+
+    def send(self, *args):
+        if hasattr(self, "bser_version"):
+            cmd = bser.dumps(
+                *args,
+                version=self.bser_version,
+                capabilities=self.bser_capabilities
+            )
+        else:
+            cmd = bser.dumps(*args)
+        self.transport.write(cmd)
+
+
+class ImmutableBser2Codec(Bser2WithFallbackCodec, ImmutableBserCodec):
+    """use the BSER encoding, decoding values using the newer
+    immutable object support"""
+
+    pass
+
+
+class JsonCodec(Codec):
+    """Use json codec.  This is here primarily for testing purposes"""
+
+    json = None
+
+    def __init__(self, transport):
+        super(JsonCodec, self).__init__(transport)
+        # optional dep on json, only if JsonCodec is used
+        import json
+
+        self.json = json
+
+    def receive(self):
+        line = self.transport.readLine()
+        try:
+            # In Python 3, json.loads is a transformation from Unicode string to
+            # objects possibly containing Unicode strings. We typically expect
+            # the JSON blob to be ASCII-only with non-ASCII characters escaped,
+            # but it's possible we might get non-ASCII bytes that are valid
+            # UTF-8.
+            if compat.PYTHON3:
+                line = line.decode("utf-8")
+            return self.json.loads(line)
+        except Exception as e:
+            print(e, line)
+            raise
+
+    def send(self, *args):
+        cmd = self.json.dumps(*args)
+        # In Python 3, json.dumps is a transformation from objects possibly
+        # containing Unicode strings to Unicode string. Even with (the default)
+        # ensure_ascii=True, dumps returns a Unicode string.
+        if compat.PYTHON3:
+            cmd = cmd.encode("ascii")
+        self.transport.write(cmd + b"\n")
+
+
+class client:
+    """Handles the communication with the watchman service"""
+
+    sockpath = None
+    transport = None
+    sendCodec = None
+    recvCodec = None
+    sendConn = None
+    recvConn = None
+    subs = {}  # Keyed by subscription name
+    sub_by_root = {}  # Keyed by root, then by subscription name
+    logs = []  # When log level is raised
+    unilateral = ["log", "subscription"]
+    tport = None
+    useImmutableBser = None
+    pid = None
+
+    def __init__(
+        self,
+        sockpath=None,
+        timeout=1.0,
+        transport=None,
+        sendEncoding=None,
+        recvEncoding=None,
+        useImmutableBser=False,
+        # use False for these two because None has a special
+        # meaning
+        valueEncoding=False,
+        valueErrors=False,
+        binpath=None,
+    ):
+        self.sockpath = sockpath
+        self.timeout = timeout
+        self.useImmutableBser = useImmutableBser
+        self.binpath = _default_binpath(binpath)
+
+        if inspect.isclass(transport) and issubclass(transport, Transport):
+            self.transport = transport
+        else:
+            transport = transport or os.getenv("WATCHMAN_TRANSPORT") or "local"
+            if transport == "local" and os.name == "nt":
+                self.transport = WindowsNamedPipeTransport
+            elif transport == "local":
+                self.transport = UnixSocketTransport
+            elif transport == "cli":
+                self.transport = CLIProcessTransport
+                if sendEncoding is None:
+                    sendEncoding = "json"
+                if recvEncoding is None:
+                    recvEncoding = sendEncoding
+            else:
+                raise WatchmanError("invalid transport %s" % transport)
+
+        sendEncoding = str(
+            sendEncoding or os.getenv("WATCHMAN_ENCODING") or "bser"
+        )
+        recvEncoding = str(
+            recvEncoding or os.getenv("WATCHMAN_ENCODING") or "bser"
+        )
+
+        self.recvCodec = self._parseEncoding(recvEncoding)
+        self.sendCodec = self._parseEncoding(sendEncoding)
+
+        # We want to act like the native OS methods as much as possible. This
+        # means returning bytestrings on Python 2 by default and Unicode
+        # strings on Python 3. However we take an optional argument that lets
+        # users override this.
+        if valueEncoding is False:
+            if compat.PYTHON3:
+                self.valueEncoding = encoding.get_local_encoding()
+                self.valueErrors = encoding.default_local_errors
+            else:
+                self.valueEncoding = None
+                self.valueErrors = None
+        else:
+            self.valueEncoding = valueEncoding
+            if valueErrors is False:
+                self.valueErrors = encoding.default_local_errors
+            else:
+                self.valueErrors = valueErrors
+
+    def _makeBSERCodec(self, codec):
+        def make_codec(transport):
+            return codec(transport, self.valueEncoding, self.valueErrors)
+
+        return make_codec
+
+    def _parseEncoding(self, enc):
+        if enc == "bser":
+            if self.useImmutableBser:
+                return self._makeBSERCodec(ImmutableBser2Codec)
+            return self._makeBSERCodec(Bser2WithFallbackCodec)
+        elif enc == "bser-v1":
+            if compat.PYTHON3:
+                raise BSERv1Unsupported(
+                    "Python 3 does not support the BSER v1 encoding: specify "
+                    '"bser" or omit the sendEncoding and recvEncoding '
+                    "arguments"
+                )
+            if self.useImmutableBser:
+                return self._makeBSERCodec(ImmutableBserCodec)
+            return self._makeBSERCodec(BserCodec)
+        elif enc == "json":
+            return JsonCodec
+        else:
+            raise WatchmanError("invalid encoding %s" % enc)
+
+    def _hasprop(self, result, name):
+        if self.useImmutableBser:
+            return hasattr(result, name)
+        return name in result
+
+    def _resolvesockname(self):
+        # if invoked via a trigger, watchman will set this env var; we
+        # should use it unless explicitly set otherwise
+        path = os.getenv("WATCHMAN_SOCK")
+        if path:
+            return path
+
+        cmd = [self.binpath, "--output-encoding=bser", "get-sockname"]
+        try:
+            args = dict(
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE
+            )  # noqa: C408
+
+            if os.name == "nt":
+                # if invoked via an application with graphical user interface,
+                # this call will cause a brief command window pop-up.
+                # Using the flag STARTF_USESHOWWINDOW to avoid this behavior.
+                startupinfo = subprocess.STARTUPINFO()
+                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                args["startupinfo"] = startupinfo
+
+            p = subprocess.Popen(cmd, **args)
+
+        except OSError as e:
+            raise WatchmanError('"watchman" executable not in PATH (%s)' % e)
+
+        stdout, stderr = p.communicate()
+        exitcode = p.poll()
+
+        if exitcode:
+            raise WatchmanError("watchman exited with code %d" % exitcode)
+
+        result = bser.loads(stdout)
+        if "error" in result:
+            raise WatchmanError("get-sockname error: %s" % result["error"])
+
+        return result["sockname"]
+
+    def _connect(self):
+        """establish transport connection"""
+
+        if self.recvConn:
+            if self.pid != os.getpid():
+                raise UseAfterFork(
+                    "do not re-use a connection after fork; open a new client instead"
+                )
+            return
+
+        if self.sockpath is None:
+            self.sockpath = self._resolvesockname()
+
+        kwargs = {}
+        if self.transport == CLIProcessTransport:
+            kwargs["binpath"] = self.binpath
+
+        self.tport = self.transport(self.sockpath, self.timeout, **kwargs)
+        self.sendConn = self.sendCodec(self.tport)
+        self.recvConn = self.recvCodec(self.tport)
+        self.pid = os.getpid()
+
+    def __del__(self):
+        self.close()
+
+    def __enter__(self):
+        self._connect()
+        return self
+
+    def __exit__(self, exc_type, exc_value, exc_traceback):
+        self.close()
+
+    def close(self):
+        if self.tport:
+            self.tport.close()
+            self.tport = None
+            self.recvConn = None
+            self.sendConn = None
+
+    def receive(self):
+        """receive the next PDU from the watchman service
+
+        If the client has activated subscriptions or logs then
+        this PDU may be a unilateral PDU sent by the service to
+        inform the client of a log event or subscription change.
+
+        It may also simply be the response portion of a request
+        initiated by query.
+
+        There are clients in production that subscribe and call
+        this in a loop to retrieve all subscription responses,
+        so care should be taken when making changes here.
+        """
+
+        self._connect()
+        result = self.recvConn.receive()
+        if self._hasprop(result, "error"):
+            raise CommandError(result["error"])
+
+        if self._hasprop(result, "log"):
+            self.logs.append(result["log"])
+
+        if self._hasprop(result, "subscription"):
+            sub = result["subscription"]
+            if not (sub in self.subs):
+                self.subs[sub] = []
+            self.subs[sub].append(result)
+
+            # also accumulate in {root,sub} keyed store
+            root = os.path.normpath(os.path.normcase(result["root"]))
+            if not root in self.sub_by_root:
+                self.sub_by_root[root] = {}
+            if not sub in self.sub_by_root[root]:
+                self.sub_by_root[root][sub] = []
+            self.sub_by_root[root][sub].append(result)
+
+        return result
+
+    def isUnilateralResponse(self, res):
+        if "unilateral" in res and res["unilateral"]:
+            return True
+        # Fall back to checking for known unilateral responses
+        for k in self.unilateral:
+            if k in res:
+                return True
+        return False
+
+    def getLog(self, remove=True):
+        """Retrieve buffered log data
+
+        If remove is true the data will be removed from the buffer.
+        Otherwise it will be left in the buffer
+        """
+        res = self.logs
+        if remove:
+            self.logs = []
+        return res
+
+    def getSubscription(self, name, remove=True, root=None):
+        """Retrieve the data associated with a named subscription
+
+        If remove is True (the default), the subscription data is removed
+        from the buffer.  Otherwise the data is returned but left in
+        the buffer.
+
+        Returns None if there is no data associated with `name`
+
+        If root is not None, then only return the subscription
+        data that matches both root and name.  When used in this way,
+        remove processing impacts both the unscoped and scoped stores
+        for the subscription data.
+        """
+        if root is not None:
+            root = os.path.normpath(os.path.normcase(root))
+            if root not in self.sub_by_root:
+                return None
+            if name not in self.sub_by_root[root]:
+                return None
+            sub = self.sub_by_root[root][name]
+            if remove:
+                del self.sub_by_root[root][name]
+                # don't let this grow unbounded
+                if name in self.subs:
+                    del self.subs[name]
+            return sub
+
+        if name not in self.subs:
+            return None
+        sub = self.subs[name]
+        if remove:
+            del self.subs[name]
+        return sub
+
+    def query(self, *args):
+        """Send a query to the watchman service and return the response
+
+        This call will block until the response is returned.
+        If any unilateral responses are sent by the service in between
+        the request-response they will be buffered up in the client object
+        and NOT returned via this method.
+        """
+
+        log("calling client.query")
+        self._connect()
+        try:
+            self.sendConn.send(args)
+
+            res = self.receive()
+            while self.isUnilateralResponse(res):
+                res = self.receive()
+
+            return res
+        except EnvironmentError as ee:
+            # When we can depend on Python 3, we can use PEP 3134
+            # exception chaining here.
+            raise WatchmanEnvironmentError(
+                "I/O error communicating with watchman daemon",
+                ee.errno,
+                ee.strerror,
+                args,
+            )
+        except WatchmanError as ex:
+            ex.setCommand(args)
+            raise
+
+    def capabilityCheck(self, optional=None, required=None):
+        """Perform a server capability check"""
+        res = self.query(
+            "version", {"optional": optional or [], "required": required or []}
+        )
+
+        if not self._hasprop(res, "capabilities"):
+            # Server doesn't support capabilities, so we need to
+            # synthesize the results based on the version
+            capabilities.synthesize(res, optional)
+            if "error" in res:
+                raise CommandError(res["error"])
+
+        return res
+
+    def setTimeout(self, value):
+        self.recvConn.setTimeout(value)
+        self.sendConn.setTimeout(value)
+                                                                                                                                                                                                                                          usr/lib/python3/dist-packages/hgext/fsmonitor/pywatchman/__pycache__/                               0000755 0000000 0000000 00000000000 14714551121 024471  5                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        usr/lib/python3/dist-packages/hgext/fsmonitor/pywatchman/__pycache__/__init__.cpython-311.pyc       0000644 0000000 0000000 00000137045 14714551121 030744  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        §
+    	^µc•  ã                   óˆ	  — d dl Z d dlZd dlZd dlZd dlZd dlZddlmZmZm	Z	m
+Z
+ 	 ddlmZ ej         n# e$ r	 ddlmZ Y nw xY wej        dk    r`d dlZd dlZej        ZdZdZdZd	Z ej        d
+¦  «        j        ZdZdZdZdZdZd ZdZ dZ!dZ"ej        j#        Z$ G d„ dej%        ¦  «        Z& ej'        ej(        ¦  «        Z)ej*        j+        j,        Z-ej.        ej(        ej(        ej/        ej(        ej(        ej0        ge-_1        ej0        e-_2        ej*        j+        j3        Z3ej0        ge3_1        ej4        e3_2        ej*        j+        j5        Z5ej0        ej/        ej(        e) ej'        e&¦  «        ge5_1        ej4        e5_2        ej*        j+        j6        Z6ej0        ej/        ej(        e) ej'        e&¦  «        ge6_1        ej4        e6_2        ej*        j+        j7        Z7g e7_1        ej(        e7_2        ej*        j+        j8        Z8ej(        ge8_1        de8_2        ej*        j+        j9        Z:ej(        ej/        ej(        ej(         ej'        ej.        ¦  «        ej(        ej/        ge:_1        ej(        e:_2        ej*        j+        j;        Z;ej*        j+        j<        Z<ej0         ej'        e&¦  «        e)ej4        ge<_1        ej4        e<_2         e=ej*        j+        dd¦  «        Z>e>5ej0         ej'        e&¦  «        e)ej(        ej4        ge>_1        ej4        e>_2        ej*        j+        j?        Z?ej0        ej(        ej4        ge?_1        ej(        e?_2        ej*        j+        j@        ZAe)ej4        ej4        ej.        geA_1        ej0        eA_2        ej*        j+        jB        ZBej0         ej'        e&¦  «        geB_1        ej4        eB_2        dZCdZDeDrd„ ZEnd„ ZEd„ ZF G d„ deG¦  «        ZH G d„ deH¦  «        ZI G d„ deH¦  «        ZJ G d „ d!eH¦  «        ZK G d"„ d#eH¦  «        ZL G d$„ d%eH¦  «        ZM G d&„ d'eH¦  «        ZN G d(„ d)¦  «        ZO G d*„ d+¦  «        ZP G d,„ d-eO¦  «        ZQd.„ ZR G d/„ d0eO¦  «        ZSd@d1„ZT G d2„ d3eO¦  «        ZU G d4„ d5eP¦  «        ZV G d6„ d7eV¦  «        ZW G d8„ d9eV¦  «        ZX G d:„ d;eXeW¦  «        ZY G d<„ d=eP¦  «        ZZ G d>„ d?¦  «        Z[dS )Aé    Né   )ÚcapabilitiesÚcompatÚencodingÚload)Úbser)ÚpybserÚntl        i   @é   éÿÿÿÿé   é   i   l   ÿÿ i  éÀ   iå  c                   óT   — e Zd Zdefdefdej        fdej        fdej        fgZd„ ZdS )Ú
+OVERLAPPEDÚInternalÚInternalHighÚOffsetÚ
+OffsetHighÚhEventc                 óL   — d| _         d| _        d| _        d| _        d| _        d S ©Nr   )r   r   r   r   r   ©Úselfs    úE/usr/lib/python3/dist-packages/hgext/fsmonitor/pywatchman/__init__.pyÚ__init__zOVERLAPPED.__init__X   s*   € ØˆDŒMØ !ˆDÔØˆDŒKØˆDŒOØˆDŒKˆKˆKó    N)	Ú__name__Ú
+__module__Ú__qualname__Ú	ULONG_PTRÚwintypesÚDWORDÚHANDLEÚ_fields_r   © r   r   r   r   O   sX   € € € € € à˜Ğ#Ø˜YĞ'Øx”~Ğ&Ø˜8œ>Ğ*Øx”Ğ'ğ
+ˆğ	ğ 	ğ 	ğ 	ğ 	r   r   ÚGetOverlappedResultExé   Fc           	      ó   — t          dt          j        dt          j        ¦   «         ¦  «        ›d| |d d …         z  ›¦  «         d S )Nú[z%a, %d %b %Y %H:%M:%Sz] )ÚprintÚtimeÚstrftimeÚgmtime©ÚfmtÚargss     r   Úlogr2   Î   sT   € İˆõ ”Ğ5µt´{±}´}ÑEÔEĞEĞEØd˜1˜1˜1”g‘ğñ	
+ô 	
+ğ 	
+ğ 	
+ğ 	
+r   c                 ó   — d S ©Nr&   r/   s     r   r2   r2   Ú   ó   € Øˆr   c           	      óÒ   — t          j        ¦   «         }t          t          t          z  t
+          z  d| d|dd¦  «         	 |j        t          |¦  «         S # t          |¦  «         w xY w)z7expand a win32 error code into a human readable messageNr   )ÚctypesÚc_char_pÚFormatMessageÚFORMAT_MESSAGE_FROM_SYSTEMÚFORMAT_MESSAGE_ALLOCATE_BUFFERÚFORMAT_MESSAGE_IGNORE_INSERTSÚvalueÚ	LocalFree)ÚerrÚbufs     r   Ú_win32_strerrorrA   Ş   sq   € õ Œ/Ñ
+Ô
+€Cİİ"İ
+(ñ	)å
+'ñ	(ğ 	ØØ	ØØ	Øñ
+ô 
+ğ 
+ğØŒyå#‰Œˆˆø	#‰Œˆˆøøøs   ¿A ÁA&c                   ó"   — e Zd Zdd„Zd„ Zd„ ZdS )ÚWatchmanErrorNc                 ó"   — || _         || _        d S r4   )ÚmsgÚcmd)r   rE   rF   s      r   r   zWatchmanError.__init__õ   s   € ØˆŒØˆŒˆˆr   c                 ó   — || _         d S r4   )rF   )r   rF   s     r   Ú
+setCommandzWatchmanError.setCommandù   s   € ØˆŒˆˆr   c                 ó@   — | j         r| j        ›d| j         ›S | j        S )Nz, while executing )rF   rE   r   s    r   Ú__str__zWatchmanError.__str__ü   s)   € ØŒ8ğ 	CØ/3¬x¨x¨x¸¼¸ĞBĞBØŒxˆr   ©NN)r   r   r    r   rH   rJ   r&   r   r   rC   rC   ô   sF   € € € € € ğğ ğ ğ ğğ ğ ğğ ğ ğ ğ r   rC   c                   ó   — e Zd ZdS )ÚBSERv1UnsupportedN©r   r   r    r&   r   r   rM   rM     ó   € € € € € Ø€Dr   rM   c                   ó   — e Zd ZdS )ÚUseAfterForkNrN   r&   r   r   rQ   rQ     rO   r   rQ   c                   ó    ‡ — e Zd Zdˆ fd„	Zˆ xZS )ÚWatchmanEnvironmentErrorNc                 ó„   •— t          t          | ¦  «                             d                     |||¦  «        |¦  «         d S )Nz{0}: errno={1} errmsg={2})ÚsuperrS   r   Úformat)r   rE   ÚerrnoÚerrmsgrF   Ú	__class__s        €r   r   z!WatchmanEnvironmentError.__init__  sG   ø€ İÕ&¨Ñ-Ô-×6Ò6Ø'×.Ò.¨s°E¸6ÑBÔBÀCñ	
+ô 	
+ğ 	
+ğ 	
+ğ 	
+r   r4   ©r   r   r    r   Ú__classcell__©rY   s   @r   rS   rS   
+  s=   ø€ € € € € ğ
+ğ 
+ğ 
+ğ 
+ğ 
+ğ 
+ğ 
+ğ 
+ğ 
+ğ 
+r   rS   c                   ó   ‡ — e Zd Zˆ fd„Zˆ xZS )ÚSocketConnectErrorc                 ó€   •— t          t          | ¦  «                             d|›d|›¦  «         || _        || _        d S )Nzunable to connect to z: )rU   r^   r   ÚsockpathÚexc)r   r`   ra   rY   s      €r   r   zSocketConnectError.__init__  sK   ø€ İÕ  $Ñ'Ô'×0Ò0Ğ0Ø-5¨X¨X°s°sĞ;ñ	
+ô 	
+ğ 	
+ğ !ˆŒØˆŒˆˆr   rZ   r\   s   @r   r^   r^     s8   ø€ € € € € ğğ ğ ğ ğ ğ ğ ğ ğ r   r^   c                   ó   — e Zd ZdZdS )ÚSocketTimeoutaŒ  A specialized exception raised for socket timeouts during communication to/from watchman.
+    This makes it easier to implement non-blocking loops as callers can easily distinguish
+    between a routine timeout and an actual error condition.
+
+    Note that catching WatchmanError will also catch this as it is a super-class, so backwards
+    compatibility in exception handling is preserved.
+    N©r   r   r    Ú__doc__r&   r   r   rc   rc     s   € € € € € ğğ ğ ğ r   rc   c                   ó$   ‡ — e Zd ZdZdˆ fd„	Zˆ xZS )ÚCommandErrorzRerror returned by watchman
+
+    self.msg is the message returned by watchman.
+    Nc                 ó`   •— t          t          | ¦  «                             d|›|¦  «         d S )Nzwatchman command error: )rU   rg   r   )r   rE   rF   rY   s      €r   r   zCommandError.__init__*  s<   ø€ İl˜DÑ!Ô!×*Ò*Ğ*Ø,/¨CĞ1°3ñ	
+ô 	
+ğ 	
+ğ 	
+ğ 	
+r   r4   )r   r   r    re   r   r[   r\   s   @r   rg   rg   $  sG   ø€ € € € € ğğ ğ
+
+ğ 
+ğ 
+ğ 
+ğ 
+ğ 
+ğ 
+ğ 
+ğ 
+ğ 
+r   rg   c                   ó4   — e Zd ZdZdZd„ Zd„ Zd„ Zd„ Zd„ Z	dS )Ú	Transportz.communication transport to the watchman serverNc                 ó   — t          ¦   «         ‚)ztear it down©ÚNotImplementedErrorr   s    r   ÚclosezTransport.close5  ó   € å!Ñ#Ô#Ğ#r   c                 ó   — t          ¦   «         ‚)zread size bytesrl   )r   Úsizes     r   Ú	readByteszTransport.readBytes9  ro   r   c                 ó   — t          ¦   «         ‚)zwrite some datarl   )r   r@   s     r   ÚwritezTransport.write=  ro   r   c                 ó   — d S r4   r&   ©r   r=   s     r   Ú
+setTimeoutzTransport.setTimeoutA  r5   r   c                 ó²  — | j         €g | _         t          | j         ¦  «        dk    r=d| j         d         v r.| j         d                              dd¦  «        \  }}|g| _         |S 	 |                      d¦  «        }d|v r@d                     | j         ¦  «        }|                     dd¦  «        \  }}|g| _         ||z   S | j                              |¦  «         Œt)z‡read a line
+        Maintains its own buffer, callers of the transport should not mix
+        calls to readBytes and readLine.
+        Nr   ó   
+r   Tr   r   )r@   ÚlenÚsplitrr   ÚjoinÚappend)r   ÚlineÚbÚresults       r   ÚreadLinezTransport.readLineD  sÚ   € ğ
+ Œ8ĞØˆDŒHõ ˆtŒx‰=Œ=˜AÒĞ %¨4¬8°A¬;Ğ"6Ğ"6Øœ œ×)Ò)¨%°Ñ3Ô3‰IˆT1ØsˆDŒHØˆKğ	Ø—’˜tÑ$Ô$ˆAØ˜ˆzˆzØŸš $¤(Ñ+Ô+ØŸGšG E¨1Ñ-Ô-‘	qØ˜3”Ø ‘}Ğ$ØŒHOŠO˜AÑÔĞğ	r   )
+r   r   r    re   r@   rn   rr   rt   rw   r   r&   r   r   rj   rj   0  sj   € € € € € Ø8Ğ8à
+€Cğ$ğ $ğ $ğ$ğ $ğ $ğ$ğ $ğ $ğğ ğ ğğ ğ ğ ğ r   rj   c                   ó.   — e Zd ZdZdZd„ Zd„ Zd„ Zd„ ZdS )ÚCodecz.communication encoding for the watchman serverNc                 ó   — || _         d S r4   )Ú	transport)r   r…   s     r   r   zCodec.__init__b  s   € Ø"ˆŒˆˆr   c                 ó   — t          ¦   «         ‚r4   rl   r   s    r   ÚreceivezCodec.receivee  ó   € İ!Ñ#Ô#Ğ#r   c                 ó   — t          ¦   «         ‚r4   rl   ©r   r1   s     r   Úsendz
+Codec.sendh  rˆ   r   c                 ó:   — | j                              |¦  «         d S r4   )r…   rw   rv   s     r   rw   zCodec.setTimeoutk  s   € ØŒ×!Ò! %Ñ(Ô(Ğ(Ğ(Ğ(r   )	r   r   r    re   r…   r   r‡   r‹   rw   r&   r   r   rƒ   rƒ   ]  s[   € € € € € Ø8Ğ8à€Iğ#ğ #ğ #ğ$ğ $ğ $ğ$ğ $ğ $ğ)ğ )ğ )ğ )ğ )r   rƒ   c                   ó4   — e Zd ZdZdZd„ Zd„ Zd„ Zd„ Zd„ Z	dS )ÚUnixSocketTransportz"local unix domain socket transportNc                 ól  — || _         || _        t          j        t          j        t          j        ¦  «        }	 |                     | j        ¦  «         |                     | j         ¦  «         || _        d S # t          j        $ r.}| 	                    ¦   «          t          | j         |¦  «        ‚d }~ww xY wr4   )r`   ÚtimeoutÚsocketÚAF_UNIXÚSOCK_STREAMÚ
+settimeoutÚconnectÚsockÚerrorrn   r^   )r   r`   r   r–   Úes        r   r   zUnixSocketTransport.__init__t  s   € Ø ˆŒØˆŒåŒ}Vœ^­VÔ-?Ñ@Ô@ˆğ	7ØOŠO˜DœLÑ)Ô)Ğ)ØLŠL˜œÑ'Ô'Ğ'ØˆDŒIˆIˆIøİŒ|ğ 	7ğ 	7ğ 	7ØJŠJ‰LŒLˆLİ$ T¤]°AÑ6Ô6Ğ6øøøøğ	7øøøs   ¹;A6 Á6B3Â)B.Â.B3c                 óX   — | j         r"| j                              ¦   «          d | _         d S d S r4   )r–   rn   r   s    r   rn   zUnixSocketTransport.close  s3   € ØŒ9ğ 	ØŒIOŠOÑÔĞØˆDŒIˆIˆIğ	ğ 	r   c                 óR   — || _         | j                             | j         ¦  «         d S r4   )r   r–   r”   rv   s     r   rw   zUnixSocketTransport.setTimeout†  s'   € ØˆŒØŒ	×Ò˜Tœ\Ñ*Ô*Ğ*Ğ*Ğ*r   c                 ó¼   — 	 | j                              |¦  «        g}|d         st          d¦  «        ‚|d         S # t          j        $ r t          d¦  «        ‚w xY w)Nr   úempty watchman responseztimed out waiting for response)r–   ÚrecvrC   r‘   r   rc   )r   rq   r@   s      r   rr   zUnixSocketTransport.readBytesŠ  sr   € ğ	BØ”9—>’> $Ñ'Ô'Ğ(ˆCØq”6ğ ?İ#Ğ$=Ñ>Ô>Ğ>Øq”6ˆMøİŒ~ğ 	Bğ 	Bğ 	BİĞ @ÑAÔAĞAğ	Bøøøs	   ‚9< ¼Ac                 ó€   — 	 | j                              |¦  «         d S # t          j        $ r t	          d¦  «        ‚w xY w)Nztimed out sending query command)r–   Úsendallr‘   r   rc   )r   Údatas     r   rt   zUnixSocketTransport.write“  sT   € ğ	CØŒI×Ò˜dÑ#Ô#Ğ#Ğ#Ğ#øİŒ~ğ 	Cğ 	Cğ 	CİĞ AÑBÔBĞBğ	Cøøøs   ‚ =)
+r   r   r    re   r–   r   rn   rw   rr   rt   r&   r   r   r   r   o  sr   € € € € € Ø,Ğ,à€Dğ7ğ 7ğ 7ğğ ğ ğ
++ğ +ğ +ğBğ Bğ BğCğ Cğ Cğ Cğ Cr   r   c                 óâ  — t          d|¦  «         |dk    rÈt          |j        ||¦  «        }|t          k    rn¦|t          k    rt          t          ¦  «         n†|t          k    rt          t          ¦  «         dS |t          k    r-t          ¦   «         }t          dt          |¦  «        ¦  «         dS t          ¦   «         }t          dt          |¦  «        ¦  «         dS t          | ||d¦  «        S )a  Windows 7 and earlier does not support GetOverlappedResultEx. The
+    alternative is to use GetOverlappedResult and wait for read or write
+    operation to complete. This is done be using CreateEvent and
+    WaitForSingleObjectEx. CreateEvent, WaitForSingleObjectEx
+    and GetOverlappedResult are all part of Windows API since WindowsXP.
+    This is the exact same implementation that can be found in the watchman
+    source code (see get_overlapped_result_ex_impl in stream_win.c). This
+    way, maintenance should be simplified.
+    z"Preparing to wait for maximum %dmsr   Fz WaitForSingleObjectEx failed: %szUnexpected error: %s)r2   ÚWaitForSingleObjectExr   ÚWAIT_OBJECT_0ÚWAIT_IO_COMPLETIONÚSetLastErrorÚWAIT_TIMEOUTÚWAIT_FAILEDÚGetLastErrorrA   ÚGetOverlappedResult)ÚpipeÚolapÚnbytesÚmillisÚ	alertableÚwaitReturnCoder?   s          r   Ú_get_overlapped_result_ex_implr°   š  sî   € õ Ğ,¨fÑ5Ô5Ğ5Ø‚{€{İ.¨t¬{¸FÀIÑNÔNˆØ]Ò*Ğ*àØÕ1Ò1Ğ1õ Õ+Ñ,Ô,Ğ,ØØ|Ò+Ğ+õ Ñ&Ô&Ğ&Ø5Ø{Ò*Ğ*å‘.”.ˆCİĞ2µOÀCÑ4HÔ4HÑIÔIĞIØ5õ ‘.”.ˆCİĞ&­¸Ñ(<Ô(<Ñ=Ô=Ğ=Ø5å˜t T¨6°5Ñ9Ô9Ğ9r   c                   ó<   — e Zd ZdZd„ Zd„ Zd„ Zd„ Zd„ Zd„ Z	d„ Z
+d	S )
+ÚWindowsNamedPipeTransportzconnect to a named pipec           	      ó¾  — || _         t          t          j        |dz  ¦  «        ¦  «        | _        d | _        t          j        rt          j	        |¦  «        }t          |t          t          z  dd t          t          d ¦  «        | _        t!          ¦   «         }| j        t"          k    s| j        dk    r0d | _        t%          | j         |                      d|¦  «        ¦  «        ‚t)          d ddd ¦  «        | _        t!          ¦   «         }| j        €|                      d|¦  «         t.          | _        t          j        d¦  «        dk    s| j        €t4          | _        d S d S )	Néè  r   Ú TFzCreateEvent failedÚWATCHMAN_WIN7_COMPATÚ1)r`   ÚintÚmathÚceilr   Ú_iobufr   ÚPYTHON3ÚosÚfsencodeÚ
+CreateFileÚGENERIC_READÚGENERIC_WRITEÚOPEN_EXISTINGÚFILE_FLAG_OVERLAPPEDrª   r¨   ÚINVALID_HANDLE_VALUEr^   Ú_make_win_errÚCreateEventÚ	_waitableÚ_raise_win_errr'   Ú_get_overlapped_result_exÚgetenvr°   )r   r`   r   r?   s       r   r   z"WindowsNamedPipeTransport.__init__Å  s9  € Ø ˆŒİ4œ9 W¨t¡^Ñ4Ô4Ñ5Ô5ˆŒØˆŒåŒ>ğ 	-İ”{ 8Ñ,Ô,ˆHİØİ=Ñ(ØØİİ Øñ
+ô 
+ˆŒ	õ ‰nŒnˆØŒ9Õ,Ò,Ğ,°´	¸Q²°ØˆDŒIİ$ T¤]°D×4FÒ4FÀrÈ3Ñ4OÔ4OÑPÔPĞPõ % T¨4°¸Ñ=Ô=ˆŒİ‰nŒnˆØŒ>Ğ!Ø×ÒĞ 4°cÑ:Ô:Ğ:å)>ˆÔ&åŒIĞ,Ñ-Ô-°Ò4Ğ4ØÔ-Ğ5å-KˆDÔ*Ğ*Ğ*ğ 6Ğ5r   c                 ó.   — |                       ||¦  «        ‚r4   )rÅ   ©r   rE   r?   s      r   rÈ   z(WindowsNamedPipeTransport._raise_win_errè  s   € Ø× Ò   cÑ*Ô*Ğ*r   c                 óF   — t          d||t          |¦  «        fz  ¦  «        S )Nz%s win32 error code: %d %s)ÚIOErrorrA   rÌ   s      r   rÅ   z'WindowsNamedPipeTransport._make_win_errë  s+   € İØ(¨C°µoÀcÑ6JÔ6JĞ+KÑKñ
+ô 
+ğ 	
+r   c                 ó¬   — | j         r#t          d¦  «         t          | j         ¦  «         d | _         | j        t          | j        ¦  «         d | _        d S )NzClosing pipe)rª   r2   ÚCloseHandlerÇ   r   s    r   rn   zWindowsNamedPipeTransport.closeğ  sT   € ØŒ9ğ 	#İÑÔĞİ˜œ	Ñ"Ô"Ğ"ØˆŒ	àŒ>Ğ%å˜œÑ'Ô'Ğ'ØˆŒˆˆr   c                 ó4   — t          |dz  ¦  «        | _        d S )Nr´   )r¸   r   rv   s     r   rw   z$WindowsNamedPipeTransport.setTimeoutû  s   € å˜5 4™<Ñ(Ô(ˆŒˆˆr   c                 ó
+  — | j         rM|t          | j         ¦  «        k    r| j         }d| _        |S | j         d|…         }| j         |d…         | _         |S t          j        |¦  «        }t          ¦   «         }| j        |_        t          d|¦  «         t          | j
+        ||d|¦  «        }|s2t          ¦   «         }|t          k    r|                      d|z  |¦  «         t                               ¦   «         }|                      | j
+        |||rdn| j        d¦  «        szt          ¦   «         }t%          | j
+        |¦  «         |t&          k    r&t          d¦  «         t)          d| j        z  ¦  «        ‚t          d|¦  «         |                      d	|¦  «         |j        }|dk    r$t%          | j
+        |¦  «         t-          d
+¦  «        ‚|d|…         }t/          ||¦  «        }||k    r|S ||d…         | _         |d|…         S )z¾A read can block for an unbounded amount of time, even if the
+        kernel reports that the pipe handle is signalled, so we need to
+        always perform our reads asynchronously
+        Nzmade read buff of size %dzfailed to read %d bytesr   TzGetOverlappedResultEx timedoutz%timed out after waiting %dms for readz&GetOverlappedResultEx reports error %dzerror while waiting for readz'Async read yielded 0 bytes; unpossible!)r»   rz   r@   r7   Úcreate_string_bufferr   rÇ   r   r2   ÚReadFilerª   r¨   ÚERROR_IO_PENDINGrÈ   r"   r#   rÉ   r   Ú
+CancelIoExr¦   rc   r=   rÎ   Úmin)	r   rq   Úresr@   r«   Ú	immediater?   ÚnreadÚreturned_sizes	            r   rr   z#WindowsNamedPipeTransport.readBytesÿ  s$  € ğ Œ;ğ 	Ø•s˜4œ;Ñ'Ô'Ò'Ğ'Ø”kØ”Ø
+Ø”+˜e˜t˜eÔ$ˆCØœ+ d e eÔ,ˆDŒKØˆJõ Ô)¨$Ñ/Ô/ˆİ‰|Œ|ˆØ”nˆŒåĞ'¨Ñ.Ô.Ğ.õ ˜TœY¨¨T°4¸Ñ>Ô>ˆ	àğ 	Kİ‘.”.ˆCØÕ&Ò&Ğ&Ø×#Ò#Ğ$=ÀÑ$DÀcÑJÔJĞJå—’Ñ Ô ˆØ×-Ò-ØŒIt˜U¨Ğ$D A A¸¼Àdñ
+ô 
+ğ 	Eõ ‘.”.ˆCİt”y $Ñ'Ô'Ğ'à•lÒ"Ğ"İĞ4Ñ5Ô5Ğ5İ#Ø;¸d¼lÑJñô ğ õ Ğ8¸#Ñ>Ô>Ğ>Ø×ÒĞ >ÀÑDÔDĞDà”ˆØAŠ:ˆ:õ
+ t”y $Ñ'Ô'Ğ'İĞCÑDÔDĞDğ &5&Œkˆå˜E 4Ñ(Ô(ˆØ˜EÒ!Ğ!ØˆJğ ˜-˜.˜.Ô)ˆŒØ>M>Ô"Ğ"r   c                 óÆ  — t          ¦   «         }| j        |_        t          | j        t          j        |¦  «        t          |¦  «        d |¦  «        }|sFt          ¦   «         }|t          k    r-|  
+                    dt          |¦  «        | j        fz  |¦  «         t                               ¦   «         }|                      | j        |||rdn| j        d¦  «        rt          d|j        ¦  «         |j        S t          ¦   «         }t#          | j        |¦  «         |t$          k    rt'          d| j        z  ¦  «        ‚|  
+                    dt          |¦  «        z  |¦  «         d S )Nz%failed to write %d bytes to handle %rr   Tzmade write of %d bytesz&timed out after waiting %dms for writez)error while waiting for write of %d bytes)r   rÇ   r   Ú	WriteFilerª   r7   r8   rz   r¨   rÕ   rÈ   r"   r#   rÉ   r   r2   r=   rÖ   r¦   rc   )r   r    r«   rÙ   r?   Únwrotes         r   rt   zWindowsNamedPipeTransport.writeC  sh  € İ‰|Œ|ˆØ”nˆŒåØŒI•v” tÑ,Ô,­c°$©i¬i¸¸tñ
+ô 
+ˆ	ğ ğ 	İ‘.”.ˆCØÕ&Ò&Ğ&Ø×#Ò#Ø;İ˜4‘y”y $¤)Ğ,ñ-àñô ğ õ —’Ñ!Ô!ˆØ×)Ò)ØŒIt˜V¨)Ğ%E Q Q¸¼Àtñ
+ô 
+ğ 	 õ Ğ(¨&¬,Ñ7Ô7Ğ7Ø”<Ğå‰nŒnˆõ 	4”9˜dÑ#Ô#Ğ#à•,ÒĞİØ8¸4¼<ÑGñô ğ ğ 	×ÒØ7½#¸d¹)¼)ÑCÀSñ	
+ô 	
+ğ 	
+ğ 	
+ğ 	
+r   N)r   r   r    re   r   rÈ   rÅ   rn   rw   rr   rt   r&   r   r   r²   r²   Â  s‹   € € € € € Ø!Ğ!ğ!Lğ !Lğ !LğF+ğ +ğ +ğ
+ğ 
+ğ 
+ğ
+	ğ 	ğ 	ğ)ğ )ğ )ğB#ğ B#ğ B#ğH%
+ğ %
+ğ %
+ğ %
+ğ %
+r   r²   c                 óJ   — | r| S t           j                             dd¦  «        S )NÚWATCHMAN_BINARYÚwatchman)r½   ÚenvironÚget)Úbinpaths    r   Ú_default_binpathrå   k  s(   € Øğ Øˆõ Œ:>Š>Ğ+¨ZÑ8Ô8Ğ8r   c                   ó:   — e Zd ZdZdZdZd	d„Zd„ Zd„ Zd„ Z	d„ Z
+dS )
+ÚCLIProcessTransporta"  open a pipe to the cli to talk to the service
+    This intended to be used only in the test harness!
+
+    The CLI is an oddball because we only support JSON input
+    and cannot send multiple commands through the same instance,
+    so we spawn a new process for each command.
+
+    We disable server spawning for this implementation, again, because
+    it is intended to be used only in our test harness.  You really
+    should not need to use the CLI transport for anything real.
+
+    While the CLI can output in BSER, our Transport interface doesn't
+    support telling this instance that it should do so.  That effectively
+    limits this implementation to JSON input and output only at this time.
+
+    It is the responsibility of the caller to set the send and
+    receive codecs appropriately.
+    NTc                 óJ   — || _         || _        t          |¦  «        | _        d S r4   )r`   r   rå   rä   )r   r`   r   rä   s       r   r   zCLIProcessTransport.__init__‹  s#   € Ø ˆŒØˆŒİ'¨Ñ0Ô0ˆŒˆˆr   c                 ó  — | j         rƒ| j         j        | j                              ¦   «          | j         j                             ¦   «          | j         j                             ¦   «          | j                              ¦   «          d | _         d S d S r4   )ÚprocÚpidÚkillÚstdinrn   ÚstdoutÚwaitr   s    r   rn   zCLIProcessTransport.close  s|   € ØŒ9ğ 	ØŒyŒ}Ğ(Ø”	—’Ñ Ô Ğ ØŒIŒO×!Ò!Ñ#Ô#Ğ#ØŒIÔ×"Ò"Ñ$Ô$Ğ$ØŒINŠNÑÔĞØˆDŒIˆIˆIğ	ğ 	r   c                 óÚ   — | j         r| j         S | j        d                     | j        ¦  «        ddddddg}t	          j        |t          j        t          j        ¬¦  «        | _         | j         S )	Nz--sockname={0}z--logfile=/BOGUSz--statefile=/BOGUSz
+--no-spawnz
+--no-localz--no-prettyz-j)rí   rî   )rê   rä   rV   r`   Ú
+subprocessÚPopenÚPIPErŠ   s     r   Ú_connectzCLIProcessTransport._connect™  su   € ØŒ9ğ 	Ø”9ĞàŒLØ×#Ò# D¤MÑ2Ô2ØØ ØØØØğ	
+ˆõ Ô$Ø
+œµ
+´ğ
+ñ 
+ô 
+ˆŒ	ğ ŒyĞr   c                 ó   — |                       ¦   «          | j        j                             |¦  «        }|st	          d¦  «        ‚|S )NzEOF on CLI process transport)rô   rê   rî   ÚreadrC   )r   rq   rØ   s      r   rr   zCLIProcessTransport.readBytes«  sD   € ØŠ‰ŒˆØŒiÔ×#Ò# DÑ)Ô)ˆØğ 	@İĞ >Ñ?Ô?Ğ?Øˆ
+r   c                 óú   — | j         r|                      ¦   «          d| _         |                      ¦   «          | j        j                             |¦  «        }| j        j                             ¦   «          d| _         |S )NFT)Úclosedrn   rô   rê   rí   rt   )r   r    rØ   s      r   rt   zCLIProcessTransport.write²  sf   € ØŒ;ğ 	 ØJŠJ‰LŒLˆLØˆDŒKØŠ‰ŒˆØŒiŒo×#Ò# DÑ)Ô)ˆØŒ	Œ×ÒÑÔĞØˆŒØˆ
+r   r4   )r   r   r    re   rê   rø   r   rn   rô   rr   rt   r&   r   r   rç   rç   t  sz   € € € € € ğğ ğ& €DØ€Fğ1ğ 1ğ 1ğ 1ğ
+ğ ğ ğğ ğ ğ$ğ ğ ğğ ğ ğ ğ r   rç   c                   ó4   ‡ — e Zd ZdZˆ fd„Zd„ Zd„ Zd„ Zˆ xZS )Ú	BserCodecz<use the BSER encoding.  This is the default, preferred codecc                 ót   •— t          t          | ¦  «                             |¦  «         || _        || _        d S r4   )rU   rú   r   Ú_value_encodingÚ_value_errors)r   r…   Úvalue_encodingÚvalue_errorsrY   s       €r   r   zBserCodec.__init__À  s7   ø€ İi˜ÑÔ×'Ò'¨	Ñ2Ô2Ğ2Ø-ˆÔØ)ˆÔĞĞr   c                 óD   — t          j        || j        | j        ¬¦  «        S )N©rş   rÿ   ©r   Úloadsrü   rı   ©r   Úresponses     r   Ú_loadszBserCodec._loadsÅ  s*   € İŒzØØÔ/ØÔ+ğ
+ñ 
+ô 
+ğ 	
+r   c                 ó   — | j                              t          ¦  «        g}|d         st          d¦  «        ‚t	          j        |d         ¦  «        \  }}}t          |d         ¦  «        }||k    rN|                     | j                              ||z
+  ¦  «        ¦  «         |t          |d         ¦  «        z  }||k    °Nd                     |¦  «        }	 |  	                    |¦  «        }|S # t          $ r}t          d|z  ¦  «        ‚d }~ww xY w)Nr   rœ   r   r   ú"watchman response decode error: %s)r…   rr   Ú	sniff_lenrC   r   Úpdu_inforz   r}   r|   r  Ú
+ValueError)	r   r@   Ú_1Ú_2ÚelenÚrlenr  rØ   r˜   s	            r   r‡   zBserCodec.receiveÌ  s  € ØŒ~×'Ò'­	Ñ2Ô2Ğ3ˆØ1Œvğ 	;İĞ 9Ñ:Ô:Ğ:å”} S¨¤VÑ,Ô,‰ˆˆBå3q”6‰{Œ{ˆØTŠkˆkØJŠJt”~×/Ò/°°t±Ñ<Ô<Ñ=Ô=Ğ=Ø•C˜˜Bœ‘L”LÑ ˆDğ TŠkˆkğ —8’8˜C‘=”=ˆğ	JØ—+’+˜hÑ'Ô'ˆCØˆJøİğ 	Jğ 	Jğ 	JİĞ DÀqÑ HÑIÔIĞIøøøøğ	Jøøøs   ÃC, Ã,
+DÃ6DÄDc                 óV   — t          j        | }| j                             |¦  «         d S r4   )r   Údumpsr…   rt   ©r   r1   rF   s      r   r‹   zBserCodec.sendß  s*   € İŒj˜$ĞˆØŒ×Ò˜SÑ!Ô!Ğ!Ğ!Ğ!r   )	r   r   r    re   r   r  r‡   r‹   r[   r\   s   @r   rú   rú   ½  sn   ø€ € € € € ØFĞFğ*ğ *ğ *ğ *ğ *ğ
+
+ğ 
+ğ 
+ğJğ Jğ Jğ&"ğ "ğ "ğ "ğ "ğ "ğ "r   rú   c                   ó   — e Zd ZdZd„ ZdS )ÚImmutableBserCodecúSuse the BSER encoding, decoding values using the newer
+    immutable object supportc                 óF   — t          j        |d| j        | j        ¬¦  «        S )NFr  r  r  s     r   r  zImmutableBserCodec._loadsè  s-   € İŒzØØØÔ/ØÔ+ğ	
+ñ 
+ô 
+ğ 	
+r   N)r   r   r    re   r  r&   r   r   r  r  ä  s-   € € € € € ğ ğ  ğ
+ğ 
+ğ 
+ğ 
+ğ 
+r   r  c                   ó.   ‡ — e Zd ZdZˆ fd„Zd„ Zd„ Zˆ xZS )ÚBser2WithFallbackCodeczuse BSER v2 encodingc                 óX  •— t          t          | ¦  «                             |||¦  «         t          j        rd}nd}|                      d|dgig¦  «         |                      ¦   «         }d|v rt          d¦  «        ‚|d         d         rd| _        d	| _	        d S d
+| _        d	| _	        d S )NÚrequiredÚoptionalÚversionzbser-v2r—   z[The watchman server version does not support Python 3. Please upgrade your watchman server.r   é   r   r   )
+rU   r  r   r   r¼   r‹   r‡   rM   Úbser_versionÚbser_capabilities)r   r…   rş   rÿ   Ú
+bserv2_keyr   rY   s         €r   r   zBser2WithFallbackCodec.__init__ô  sÒ   ø€ İÕ$ dÑ+Ô+×4Ò4Ø~ |ñ	
+ô 	
+ğ 	
+õ Œ>ğ 	$Ø#ˆJˆJà#ˆJà	Š	9˜z¨I¨;Ğ7Ğ8Ñ9Ô9Ğ9à—|’|‘~”~ˆàlĞ"Ğ"İ#ğ0ñô ğ ğ
+ ˜Ô'¨	Ô2ğ 	'Ø !ˆDÔØ%&ˆDÔ"Ğ"Ğ"à !ˆDÔØ%&ˆDÔ"Ğ"Ğ"r   c                 ó’  — | j                              t          ¦  «        g}|d         st          d¦  «        ‚t	          j        |d         ¦  «        \  }}}t          | d¦  «        r)t          | j        |¦  «        | _        | j	        |z  | _
+        t          |d         ¦  «        }||k    rN|                     | j                              ||z
+  ¦  «        ¦  «         |t          |d         ¦  «        z  }||k    °Nd                     |¦  «        }	 |                      |¦  «        }|S # t          $ r}t          d|z  ¦  «        ‚d }~ww xY w)Nr   rœ   r  r   r   r  )r…   rr   r	  rC   r   r
+  ÚhasattrÚmaxr  r  r   rz   r}   r|   r  r  )	r   r@   Úrecv_bser_versionÚrecv_bser_capabilitiesr  r  r  rØ   r˜   s	            r   r‡   zBser2WithFallbackCodec.receive  sL  € ØŒ~×'Ò'­	Ñ2Ô2Ğ3ˆØ1Œvğ 	;İĞ 9Ñ:Ô:Ğ:å:>¼-ÈÈAÌÑ:OÔ:OÑ7ĞĞ1°4å4˜Ñ(Ô(ğ 	På # DÔ$5Ğ7HÑ IÔ IˆDÔØ $Ô 6Ğ9OÑ OˆDÔå3q”6‰{Œ{ˆØTŠkˆkØJŠJt”~×/Ò/°°t±Ñ<Ô<Ñ=Ô=Ğ=Ø•C˜˜Bœ‘L”LÑ ˆDğ TŠkˆkğ —8’8˜C‘=”=ˆğ	JØ—+’+˜hÑ'Ô'ˆCØˆJøİğ 	Jğ 	Jğ 	JİĞ DÀqÑ HÑIÔIĞIøøøøğ	Jøøøs   ÄD% Ä%
+EÄ/EÅEc                 ó°   — t          | d¦  «        rt          j        || j        | j        dœ}nt          j        | }| j                             |¦  «         d S )Nr  )r  r   )r"  r   r  r  r  r…   rt   r  s      r   r‹   zBser2WithFallbackCodec.send&  se   € İ4˜Ñ(Ô(ğ 	$İ”*ØØÔ)Ø!Ô3ğğ ğ ˆCˆCõ ”*˜dĞ#ˆCØŒ×Ò˜SÑ!Ô!Ğ!Ğ!Ğ!r   )r   r   r    re   r   r‡   r‹   r[   r\   s   @r   r  r  ñ  s_   ø€ € € € € ØĞğ'ğ 'ğ 'ğ 'ğ 'ğ4Jğ Jğ Jğ0	"ğ 	"ğ 	"ğ 	"ğ 	"ğ 	"ğ 	"r   r  c                   ó   — e Zd ZdZdS )ÚImmutableBser2Codecr  Nrd   r&   r   r   r(  r(  2  s   € € € € € ğ ğ  ğ 	€Dr   r(  c                   ó2   ‡ — e Zd ZdZdZˆ fd„Zd„ Zd„ Zˆ xZS )Ú	JsonCodecz<Use json codec.  This is here primarily for testing purposesNc                 ón   •— t          t          | ¦  «                             |¦  «         dd l}|| _        d S r   )rU   r*  r   Újson)r   r…   r,  rY   s      €r   r   zJsonCodec.__init__>  s5   ø€ İi˜ÑÔ×'Ò'¨	Ñ2Ô2Ğ2àˆˆˆàˆŒ	ˆ	ˆ	r   c                 óò   — | j                              ¦   «         }	 t          j        r|                     d¦  «        }| j                             |¦  «        S # t          $ r}t          ||¦  «         ‚ d }~ww xY w)Nzutf-8)	r…   r   r   r¼   Údecoder,  r  Ú	Exceptionr+   )r   r~   r˜   s      r   r‡   zJsonCodec.receiveE  sz   € ØŒ~×&Ò&Ñ(Ô(ˆğ	õ Œ~ğ ,Ø—{’{ 7Ñ+Ô+Ø”9—?’? 4Ñ(Ô(Ğ(øİğ 	ğ 	ğ 	İ!T‰NŒNˆNØøøøøğ	øøøs   ›:A Á
+A6Á A1Á1A6c                 ó    —  | j         j        | }t          j        r|                     d¦  «        }| j                             |dz   ¦  «         d S )NÚasciiry   )r,  r  r   r¼   Úencoder…   rt   r  s      r   r‹   zJsonCodec.sendT  sO   € ØˆdŒiŒo˜tĞ$ˆõ Œ>ğ 	&Ø—*’*˜WÑ%Ô%ˆCØŒ×Ò˜S 5™[Ñ)Ô)Ğ)Ğ)Ğ)r   )	r   r   r    re   r,  r   r‡   r‹   r[   r\   s   @r   r*  r*  9  sa   ø€ € € € € ØFĞFà€Dğğ ğ ğ ğ ğğ ğ ğ*ğ *ğ *ğ *ğ *ğ *ğ *r   r*  c                   óÊ   — e Zd ZdZdZdZdZdZdZdZ	i Z
+i Zg ZddgZdZdZdZ	 	 	 	 	 	 	 	 	 dd„Zd„ Zd	„ Zd
+„ Zd„ Zd„ Zd„ Zd„ Zd„ Zd„ Zd„ Zd„ Zdd„Zdd„Zd„ Zdd„Z d„ Z!dS )Úclientz3Handles the communication with the watchman serviceNr2   Úsubscriptionç      ğ?Fc
+                 óŒ  — || _         || _        || _        t          |	¦  «        | _        t          j        |¦  «        rt          |t          ¦  «        r|| _	        n{|pt          j        d¦  «        pd}|dk    rt          j        dk    rt          | _	        n@|dk    rt          | _	        n-|dk    rt          | _	        |€d}|€|}nt!          d|z  ¦  «        ‚t#          |pt          j        d¦  «        pd¦  «        }t#          |pt          j        d¦  «        pd¦  «        }|                      |¦  «        | _        |                      |¦  «        | _        |d	u rGt*          j        r+t/          j        ¦   «         | _        t.          j        | _        d S d | _        d | _        d S || _        |d	u rt.          j        | _        d S || _        d S )
+NÚWATCHMAN_TRANSPORTÚlocalr
+   Úclir,  zinvalid transport %sÚWATCHMAN_ENCODINGr   F)r`   r   ÚuseImmutableBserrå   rä   ÚinspectÚisclassÚ
+issubclassrj   r…   r½   rÊ   Únamer²   r   rç   rC   ÚstrÚ_parseEncodingÚ	recvCodecÚ	sendCodecr   r¼   r   Úget_local_encodingÚvalueEncodingÚdefault_local_errorsÚvalueErrors)
+r   r`   r   r…   ÚsendEncodingÚrecvEncodingr<  rF  rH  rä   s
+             r   r   zclient.__init__o  sİ  € ğ !ˆŒØˆŒØ 0ˆÔİ'¨Ñ0Ô0ˆŒåŒ?˜9Ñ%Ô%ğ 	H­*°YÅ	Ñ*JÔ*Jğ 	HØ&ˆDŒNˆNà!ĞO¥R¤YĞ/CÑ%DÔ%DĞOÈˆIØ˜GÒ#Ğ#­¬°4ª¨İ!:”Ø˜gÒ%Ğ%İ!4”Ø˜eÒ#Ğ#İ!4”ØĞ'Ø#)LØĞ'Ø#/Løå#Ğ$:¸YÑ$FÑGÔGĞGåØĞDBœIĞ&9Ñ:Ô:ĞD¸fñ
+ô 
+ˆõ ØĞDBœIĞ&9Ñ:Ô:ĞD¸fñ
+ô 
+ˆğ ×,Ò,¨\Ñ:Ô:ˆŒØ×,Ò,¨\Ñ:Ô:ˆŒğ ˜EĞ!Ğ!İŒ~ğ (İ%-Ô%@Ñ%BÔ%BÔ"İ#+Ô#@Ô Ğ Ğ à%)Ô"Ø#'Ô Ğ Ğ à!.ˆDÔØ˜eĞ#Ğ#İ#+Ô#@Ô Ğ Ğ à#.Ô Ğ Ğ r   c                 ó   ‡ ‡— ˆˆ fd„}|S )Nc                 ó2   •—  ‰| ‰j         ‰j        ¦  «        S r4   )rF  rH  )r…   Úcodecr   s    €€r   Ú
+make_codecz)client._makeBSERCodec.<locals>.make_codec°  s   ø€ Ø5˜ DÔ$6¸Ô8HÑIÔIĞIr   r&   )r   rM  rN  s   `` r   Ú_makeBSERCodeczclient._makeBSERCodec¯  s0   øø€ ğ	Jğ 	Jğ 	Jğ 	Jğ 	Jğ 	Jğ Ğr   c                 óz  — |dk    r;| j         r|                      t          ¦  «        S |                      t          ¦  «        S |dk    rVt          j        rt          d¦  «        ‚| j         r|                      t          ¦  «        S |                      t          ¦  «        S |dk    rt          S t          d|z  ¦  «        ‚)Nr   zbser-v1zrPython 3 does not support the BSER v1 encoding: specify "bser" or omit the sendEncoding and recvEncoding argumentsr,  zinvalid encoding %s)r<  rO  r(  r  r   r¼   rM   r  rú   r*  rC   )r   Úencs     r   rB  zclient._parseEncodingµ  sÆ   € Ø&Š=ˆ=ØÔ$ğ @Ø×*Ò*Õ+>Ñ?Ô?Ğ?Ø×&Ò&Õ'=Ñ>Ô>Ğ>ØIÒĞİŒ~ğ İ'ğ ñô ğ ğ
+ Ô$ğ ?Ø×*Ò*Õ+=Ñ>Ô>Ğ>Ø×&Ò&¥yÑ1Ô1Ğ1ØFŠ]ˆ]İĞåĞ 5¸Ñ ;Ñ<Ô<Ğ<r   c                 ó8   — | j         rt          ||¦  «        S ||v S r4   )r<  r"  )r   r€   r@  s      r   Ú_haspropzclient._haspropÉ  s'   € ØÔ ğ 	)İ˜6 4Ñ(Ô(Ğ(Øvˆ~Ğr   c                 ór  — t          j        d¦  «        }|r|S | j        ddg}	 t          t          j        t          j        ¬¦  «        }t           j        dk    r2t	          j        ¦   «         }|xj        t          j	        z  c_        ||d<   t	          j
+        |fi |¤}n$# t          $ r}t          d|z  ¦  «        ‚d }~ww xY w|                     ¦   «         \  }}|                     ¦   «         }	|	rt          d|	z  ¦  «        ‚t          j        |¦  «        }
+d	|
+v rt          d
+|
+d	         z  ¦  «        ‚|
+d         S )NÚWATCHMAN_SOCKz--output-encoding=bserzget-sockname)rî   Ústderrr
+   Ústartupinfoz&"watchman" executable not in PATH (%s)zwatchman exited with code %dr—   zget-sockname error: %sÚsockname)r½   rÊ   rä   Údictrñ   ró   r@  ÚSTARTUPINFOÚdwFlagsÚSTARTF_USESHOWWINDOWrò   ÚOSErrorrC   ÚcommunicateÚpollr   r  )r   ÚpathrF   r1   rW  Úpr˜   rî   rV  Úexitcoder€   s              r   Ú_resolvesocknamezclient._resolvesocknameÎ  s[  € õ Œy˜Ñ)Ô)ˆØğ 	ØˆKàŒ|Ğ5°~ĞFˆğ	Nİİ!”­z¬ğñ ô ˆDõ Œw˜$Šˆõ )Ô4Ñ6Ô6ØĞ#Ô#¥zÔ'FÑFĞ#Ô#Ø&1]Ñ#åÔ  Ğ-Ğ-¨Ğ-Ğ-ˆAˆAøåğ 	Nğ 	Nğ 	NİĞ HÈ1Ñ LÑMÔMĞMøøøøğ	Nøøøğ Ÿš™œ‰ˆØ—6’6‘8”8ˆàğ 	KİĞ >ÀÑ IÑJÔJĞJå”˜FÑ#Ô#ˆØfĞĞİĞ 8¸6À'¼?Ñ JÑKÔKĞKàjÔ!Ğ!s   ¤A9B Â
+B?Â(B:Â:B?c                 óÎ  — | j         r-| j        t          j        ¦   «         k    rt	          d¦  «        ‚dS | j        €|                      ¦   «         | _        i }| j        t          k    r
+| j	        |d<    | j        | j        | j
+        fi |¤| _        |                      | j        ¦  «        | _        |                      | j        ¦  «        | _         t          j        ¦   «         | _        dS )zestablish transport connectionz@do not re-use a connection after fork; open a new client insteadNrä   )ÚrecvConnrë   r½   ÚgetpidrQ   r`   rc  r…   rç   rä   r   ÚtportrD  ÚsendConnrC  )r   Úkwargss     r   rô   zclient._connectô  sÓ   € ğ Œ=ğ 	ØŒx2œ9™;œ;Ò&Ğ&İ"ØVñô ğ ğ ˆFàŒ=Ğ Ø ×1Ò1Ñ3Ô3ˆDŒMàˆØŒ>Õ0Ò0Ğ0Ø $¤ˆF9Ñà#T”^ D¤M°4´<ĞJĞJÀ6ĞJĞJˆŒ
+ØŸš t¤zÑ2Ô2ˆŒØŸš t¤zÑ2Ô2ˆŒİ”9‘;”;ˆŒˆˆr   c                 ó.   — |                       ¦   «          d S r4   ©rn   r   s    r   Ú__del__zclient.__del__
+  ó   € Ø
+Š
+‰Œˆˆˆr   c                 ó.   — |                       ¦   «          | S r4   )rô   r   s    r   Ú	__enter__zclient.__enter__  s   € ØŠ‰ŒˆØˆr   c                 ó.   — |                       ¦   «          d S r4   rk  )r   Úexc_typeÚ	exc_valueÚexc_tracebacks       r   Ú__exit__zclient.__exit__  rm  r   c                 ót   — | j         r0| j                              ¦   «          d | _         d | _        d | _        d S d S r4   )rg  rn   re  rh  r   s    r   rn   zclient.close  sC   € ØŒ:ğ 	!ØŒJ×ÒÑÔĞØˆDŒJØ ˆDŒMØ ˆDŒMˆMˆMğ		!ğ 	!r   c                 óø  — |                       ¦   «          | j                             ¦   «         }|                      |d¦  «        rt	          |d         ¦  «        ‚|                      |d¦  «        r | j                             |d         ¦  «         |                      |d¦  «        rÕ|d         }|| j        vr
+g | j        |<   | j        |                              |¦  «         t          j	         
+                    t          j	                             |d         ¦  «        ¦  «        }|| j        vr
+i | j        |<   || j        |         vrg | j        |         |<   | j        |         |                              |¦  «         |S )a  receive the next PDU from the watchman service
+
+        If the client has activated subscriptions or logs then
+        this PDU may be a unilateral PDU sent by the service to
+        inform the client of a log event or subscription change.
+
+        It may also simply be the response portion of a request
+        initiated by query.
+
+        There are clients in production that subscribe and call
+        this in a loop to retrieve all subscription responses,
+        so care should be taken when making changes here.
+        r—   r2   r5  Úroot)rô   re  r‡   rS  rg   Úlogsr}   Úsubsr½   r`  ÚnormpathÚnormcaseÚsub_by_root)r   r€   Úsubrw  s       r   r‡   zclient.receive  s_  € ğ 	Š‰ŒˆØ”×&Ò&Ñ(Ô(ˆØ=Š=˜ Ñ)Ô)ğ 	0İ˜v gœÑ/Ô/Ğ/à=Š=˜ Ñ'Ô'ğ 	,ØŒI×Ò˜V Eœ]Ñ+Ô+Ğ+à=Š=˜ Ñ0Ô0ğ 	7Ø˜Ô(ˆCØ˜4œ9Ğ$Ğ$Ø!#”	˜#‘ØŒIcŒN×!Ò! &Ñ)Ô)Ğ)õ ”7×#Ò#¥B¤G×$4Ò$4°V¸F´^Ñ$DÔ$DÑEÔEˆDØ˜4Ô+Ğ+Ğ+Ø)+Ô  Ñ&Ø˜$Ô*¨4Ô0Ğ0Ğ0Ø.0Ô  Ô& sÑ+ØÔ˜TÔ" 3Ô'×.Ò.¨vÑ6Ô6Ğ6àˆr   c                 óD   — d|v r
+|d         rdS | j         D ]	}||v r dS Œ
+dS )NÚ
+unilateralTF)r  )r   rØ   Úks      r   ÚisUnilateralResponsezclient.isUnilateralResponseB  sG   € Ø˜3ĞĞ 3 |Ô#4ĞØ4à”ğ 	ğ 	ˆAØCˆxˆxØttğ àˆur   Tc                 ó&   — | j         }|rg | _         |S )z˜Retrieve buffered log data
+
+        If remove is true the data will be removed from the buffer.
+        Otherwise it will be left in the buffer
+        )rx  )r   ÚremoverØ   s      r   ÚgetLogzclient.getLogK  s   € ğ ŒiˆØğ 	ØˆDŒIØˆ
+r   c                 ój  — |t           j                             t           j                             |¦  «        ¦  «        }|| j        vrdS || j        |         vrdS | j        |         |         }|r| j        |         |= || j        v r| j        |= |S || j        vrdS | j        |         }|r| j        |= |S )a  Retrieve the data associated with a named subscription
+
+        If remove is True (the default), the subscription data is removed
+        from the buffer.  Otherwise the data is returned but left in
+        the buffer.
+
+        Returns None if there is no data associated with `name`
+
+        If root is not None, then only return the subscription
+        data that matches both root and name.  When used in this way,
+        remove processing impacts both the unscoped and scoped stores
+        for the subscription data.
+        N)r½   r`  rz  r{  r|  ry  )r   r@  rƒ  rw  r}  s        r   ÚgetSubscriptionzclient.getSubscriptionV  sÒ   € ğ Ğİ”7×#Ò#¥B¤G×$4Ò$4°TÑ$:Ô$:Ñ;Ô;ˆDØ˜4Ô+Ğ+Ğ+ØtØ˜4Ô+¨DÔ1Ğ1Ğ1ØtØÔ" 4Ô(¨Ô.ˆCØğ (ØÔ$ TÔ*¨4Ğ0à˜4œ9Ğ$Ğ$Øœ	 $˜ØˆJàt”yĞ Ğ Ø4ØŒi˜ŒoˆØğ 	 Ø”	˜$Øˆ
+r   c                 óÈ  — t          d¦  «         |                      ¦   «          	 | j                             |¦  «         |                      ¦   «         }|                      |¦  «        r)|                      ¦   «         }|                      |¦  «        °)|S # t          $ r!}t          d|j        |j	        |¦  «        ‚d}~wt          $ r}|                     |¦  «         ‚ d}~ww xY w)a?  Send a query to the watchman service and return the response
+
+        This call will block until the response is returned.
+        If any unilateral responses are sent by the service in between
+        the request-response they will be buffered up in the client object
+        and NOT returned via this method.
+        zcalling client.queryz,I/O error communicating with watchman daemonN)r2   rô   rh  r‹   r‡   r  ÚEnvironmentErrorrS   rW   ÚstrerrorrC   rH   )r   r1   rØ   ÚeeÚexs        r   Úqueryzclient.queryy  sú   € õ 	Ğ"Ñ#Ô#Ğ#ØŠ‰Œˆğ	ØŒM×Ò˜tÑ$Ô$Ğ$à—,’,‘.”.ˆCØ×+Ò+¨CÑ0Ô0ğ %Ø—l’l‘n”nğ ×+Ò+¨CÑ0Ô0ğ %ğ ˆJøİğ 	ğ 	ğ 	õ +Ø>Ø”Ø”Øñ	ô ğ øøøøõ ğ 	ğ 	ğ 	ØMŠM˜$ÑÔĞØøøøøğ	øøøs$   ¥A-B Â
+C!ÂB9Â9C!ÃCÃC!c                 óÈ   — |                       d|pg |pg dœ¦  «        }|                      |d¦  «        s.t          j        ||¦  «         d|v rt	          |d         ¦  «        ‚|S )z!Perform a server capability checkr  )r  r  r   r—   )rŒ  rS  r   Ú
+synthesizerg   )r   r  r  rØ   s       r   ÚcapabilityCheckzclient.capabilityCheck™  sw   € àjŠjØ H N°ÀÀÈBĞOĞOñ
+ô 
+ˆğ }Š}˜S .Ñ1Ô1ğ 	1õ Ô# C¨Ñ2Ô2Ğ2Ø˜#ˆ~ˆ~İ" 3 w¤<Ñ0Ô0Ğ0àˆ
+r   c                 ón   — | j                              |¦  «         | j                             |¦  «         d S r4   )re  rw   rh  rv   s     r   rw   zclient.setTimeout¨  s4   € ØŒ× Ò  Ñ'Ô'Ğ'ØŒ× Ò  Ñ'Ô'Ğ'Ğ'Ğ'r   )	Nr6  NNNFFFN)T)TNrK   )"r   r   r    re   r`   r…   rD  rC  rh  re  ry  r|  rx  r  rg  r<  rë   r   rO  rB  rS  rc  rô   rl  ro  rt  rn   r‡   r  r„  r†  rŒ  r  rw   r&   r   r   r4  r4  ^  s˜  € € € € € Ø=Ğ=à€HØ€IØ€IØ€IØ€HØ€HØ€DØ€KØ€DØ˜Ğ(€JØ€EØĞØ
+€Cğ ØØØØØğ ØØğ>/ğ >/ğ >/ğ >/ğ@ğ ğ ğ=ğ =ğ =ğ(ğ ğ ğ
+$"ğ $"ğ $"ğLğ ğ ğ,ğ ğ ğğ ğ ğğ ğ ğ!ğ !ğ !ğ%ğ %ğ %ğNğ ğ ğ	ğ 	ğ 	ğ 	ğ!ğ !ğ !ğ !ğFğ ğ ğ@ğ ğ ğ ğ(ğ (ğ (ğ (ğ (r   r4  r4   )\r=  r¹   r½   r‘   rñ   r,   rµ   r   r   r   r   r   r
+  ÚImportErrorr	   r@  r7   Úctypes.wintypesr"   rÀ   rÁ   rÃ   rÂ   Úc_void_pr=   rÄ   r:   r;   r<   r§   r¦   r£   r¤   ÚINFINITErÕ   ÚWPARAMr!   Ú	Structurer   ÚPOINTERr#   ÚLPDWORDÚwindllÚkernel32ÚCreateFileAr¿   ÚLPSTRÚLPVOIDr$   ÚargtypesÚrestyperĞ   ÚBOOLrÔ   rİ   r¨   r¥   ÚFormatMessageAr9   r>   r©   Úgetattrr'   r¢   ÚCreateEventArÆ   rÖ   r	  Ú
+_debuggingr2   rA   r/  rC   rM   rQ   rS   r^   rc   rg   rj   rƒ   r   r°   r²   rå   rç   rú   r  r  r(  r*  r4  r&   r   r   ú<module>r¥     sñ  ğğ> €€€Ø €€€Ø 	€	€	€	Ø €€€Ø Ğ Ğ Ğ Ø €€€à 2Ğ 2Ğ 2Ğ 2Ğ 2Ğ 2Ğ 2Ğ 2Ğ 2Ğ 2Ğ 2Ğ 2ğ
+!ØĞĞĞĞĞğ 	„M€M€MøØğ !ğ !ğ !Ø Ğ Ğ Ğ Ğ Ğ Ğ Ğ ğ!øøøğ „7ˆd‚??Ø€M€M€MØĞĞĞàŒ€HØ€LØ€MØ%ĞØ€MØ*˜6œ?¨2Ñ.Ô.Ô4ĞØ!+ĞØ%/Ğ"Ø$.Ğ!Ø€KØ€LØ€MØ#ĞØ€Hğ "Ğğ ”Ô&€Iğğ ğ ğ ğ VÔ%ñ ô ğ ğ  ˆfŒn˜Xœ^Ñ,Ô,€Gà”Ô'Ô3€JàŒØŒØŒØŒØŒØŒØŒğ€JÔğ "œ€JÔà”-Ô(Ô4€KØ$œOĞ,€KÔØ"œ-€KÔàŒ}Ô%Ô.€HàŒØŒØŒØØˆŒzÑ"Ô"ğ€HÔğ  ”}€HÔà”Ô&Ô0€IàŒØŒØŒØØˆŒzÑ"Ô"ğ€IÔğ !œ€IÔà”=Ô)Ô6€LØ€LÔØ#œ>€LÔà”=Ô)Ô6€LØ%œ^Ğ,€LÔØ€LÔà”MÔ*Ô9€MàŒØŒØŒØŒØˆŒx”~Ñ&Ô&ØŒØŒğ€MÔğ %œN€MÔà”Ô&Ô0€Ià œ-Ô0ÔDĞàŒØˆŒzÑ"Ô"ØØŒğ	$ĞÔ ğ #+¤-ĞÔà#˜GØŒÔĞ 7¸ñô Ğğ Ğ(àŒOØˆFŒN˜:Ñ&Ô&ØØŒNØŒMğ*
+ĞÔ&ğ )1¬ĞÔ%à"œMÔ2ÔHĞàŒØŒØŒğ&ĞÔ"ğ
+ %-¤NĞÔ!à”-Ô(Ô5€KàØŒØŒØŒğ	€KÔğ #œ/€KÔğ ”Ô'Ô2€JØ#œ?¨N¨F¬N¸:Ñ,FÔ,FĞG€JÔØ!œ€JÔğ €	ğ €
+Øğ ğ
+ğ 
+ğ 
+ğ 
+ğğ ğ ğğ ğ ğ,ğ ğ ğ ğ Iñ ô ğ ğ	ğ 	ğ 	ğ 	ğ 	˜ñ 	ô 	ğ 	ğ	ğ 	ğ 	ğ 	ğ 	=ñ 	ô 	ğ 	ğ
+ğ 
+ğ 
+ğ 
+ğ 
+˜}ñ 
+ô 
+ğ 
+ğğ ğ ğ ğ ˜ñ ô ğ ğğ ğ ğ ğ Mñ ô ğ ğ	
+ğ 	
+ğ 	
+ğ 	
+ğ 	
+=ñ 	
+ô 	
+ğ 	
+ğ*ğ *ğ *ğ *ğ *ñ *ô *ğ *ğZ)ğ )ğ )ğ )ğ )ñ )ô )ğ )ğ$(Cğ (Cğ (Cğ (Cğ (C˜)ñ (Cô (Cğ (CğV%:ğ %:ğ %:ğPf
+ğ f
+ğ f
+ğ f
+ğ f
+ 	ñ f
+ô f
+ğ f
+ğR9ğ 9ğ 9ğ 9ğFğ Fğ Fğ Fğ F˜)ñ Fô Fğ FğR$"ğ $"ğ $"ğ $"ğ $"ñ $"ô $"ğ $"ğN
+
+ğ 
+
+ğ 
+
+ğ 
+
+ğ 
+
+˜ñ 
+
+ô 
+
+ğ 
+
+ğ>"ğ >"ğ >"ğ >"ğ >"˜Yñ >"ô >"ğ >"ğB	ğ 	ğ 	ğ 	ğ 	Ğ0Ğ2Dñ 	ô 	ğ 	ğ"*ğ "*ğ "*ğ "*ğ "*ñ "*ô "*ğ "*ğJL(ğ L(ğ L(ğ L(ğ L(ñ L(ô L(ğ L(ğ L(ğ L(s   ¦4 ´AÁA                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           usr/lib/python3/dist-packages/hgext/fsmonitor/pywatchman/__pycache__/capabilities.cpython-311.pyc   0000644 0000000 0000000 00000003270 14714551121 031626  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        §
+    	^µc€
+  ã                   ó*   — d „ Z dddddddœZd„ Zd„ ZdS )	c                 óh   — d}|                       d¦  «        D ]}|dz  }|t          |¦  «        z   }Œ|S )Né    ú.iè  )ÚsplitÚint)ÚvstrÚresÚns      úI/usr/lib/python3/dist-packages/hgext/fsmonitor/pywatchman/capabilities.pyÚparse_versionr       s?   € Ø
+€CØZŠZ˜‰_Œ_ğ ğ ˆØD‰jˆØ•C˜‘F”F‰lˆˆØ€Jó    z3.1.1z3.1z3.3z3.7)zcmd-watch-del-allzcmd-watch-projectÚrelative_rootzterm-dirnamezterm-idirnameÚ	wildmatchc                 óT   — |t           v r| t          t           |         ¦  «        k    S dS )NF)Úcap_versionsr   )ÚversionÚnames     r
+   Úcheckr   2   s*   € Ø|ĞĞØ-­°TÔ(:Ñ;Ô;Ò;Ğ;Øˆ5r   c                 óè   — t          | d         ¦  «        }i | d<   |d         D ]}t          ||¦  «        | d         |<   Œ|d         D ]*}t          ||¦  «        }|| d         |<   |sd|z   dz   | d<   Œ+| S )z}Synthesize a capability enabled version response
+    This is a very limited emulation for relatively recent feature sets
+    r   ÚcapabilitiesÚoptionalÚrequiredzclient required capability `z!` is not supported by this serverÚerror)r   r   )ÚversÚoptsÚparsed_versionr   Úhaves        r
+   Ú
+synthesizer   8   s¯   € õ # 4¨	¤?Ñ3Ô3€NØ€DˆÑØZÔ ğ Ağ Aˆİ%*¨>¸4Ñ%@Ô%@ˆˆ^Ô˜TÑ"Ğ"àZÔ ğ ğ ˆİ^ TÑ*Ô*ˆØ%)ˆˆ^Ô˜TÑ"Øğ 	à.Øñà5ñ6ğ ‰Møğ
+ €Kr   N)r   r   r   r   © r   r
+   ú<module>r      s]   ğğ@ğ ğ ğ !ØØØØØğğ €ğğ ğ ğğ ğ ğ ğ r                                                                                                                                                                                                                                                                                                                                           usr/lib/python3/dist-packages/hgext/fsmonitor/pywatchman/__pycache__/compat.cpython-311.pyc         0000644 0000000 0000000 00000001715 14714551121 030462  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        §
+    	^µcS	  ã                   ó”   — d dl Z 	 e j        dk     Ze j        dk    Zerdd„Zn ed                     ¦   «         ¦  «         ereZdS e	ZdS )é    N)é   r   c                 ón   — 	 |€
+ | ¦   «         }|j         |ur|                     |¦  «        ‚|‚# d }d }w xY w©N)Ú__traceback__Úwith_traceback)ÚtpÚvalueÚtbs      úC/usr/lib/python3/dist-packages/hgext/fsmonitor/pywatchman/compat.pyÚreraiser   ,   sQ   € ğ	Øˆ}Ø˜™œØÔ"¨"Ğ,Ğ,Ø×*Ò*¨2Ñ.Ô.Ğ.ØˆKøàˆEØˆBˆIˆIˆIˆIs   ‚,. ®4zf
+def reraise(tp, value, tb=None):
+    try:
+        raise tp, value, tb
+    finally:
+        tb = None
+r   )
+ÚsysÚversion_infoÚPYTHON2ÚPYTHON3r   ÚexecÚstripÚstrÚUNICODEÚunicode© ó    r   ú<module>r      s–   ğğ> €
+€
+€
+ğ 2ğ Ô
+˜VÒ
+#€Ø
+Ô
+˜fÒ
+$€ğ ğ ğ	ğ 	ğ 	ğ 	ğ 	ğ 	€Dğ	÷ 
+‚EG„Gñô ğ ğ ğ Ø€G€G€Gà€G€G€Gr                                                      usr/lib/python3/dist-packages/hgext/fsmonitor/pywatchman/__pycache__/encoding.cpython-311.pyc       0000644 0000000 0000000 00000002536 14714551121 030767  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        §
+    	^µc  ã                   óL   — d dl Z ddlmZ 	 ej        rdZd„ ZndZd„ Zd„ Zd	„ ZdS )

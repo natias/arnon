@@ -1,0 +1,1000 @@
+}
+
+sub _ponder_Plain {
+  my ($self,$para) = @_;
+  DEBUG and print STDERR " giving plain treatment...\n";
+  unless( @$para == 2 or ( @$para == 3 and $para->[2] eq '' )
+    or $para->[1]{'~cooked'}
+  ) {
+    push @$para,
+    @{$self->_make_treelet(
+      join("\n", splice(@$para, 2)),
+      $para->[1]{'start_line'}
+    )};
+  }
+  # Empty paragraphs don't need a treelet for any reason I can see.
+  # And precooked paragraphs already have a treelet.
+  return;
+}
+
+sub _ponder_Verbatim {
+  my ($self,$para) = @_;
+  DEBUG and print STDERR " giving verbatim treatment...\n";
+
+  $para->[1]{'xml:space'} = 'preserve';
+
+  unless ($self->{'_output_is_for_JustPod'}) {
+    # Fix illegal settings for expand_verbatim_tabs()
+    # This is because this module doesn't do input error checking, but khw
+    # doesn't want to add yet another instance of that.
+    my $tab_width = $self->expand_verbatim_tabs;
+    $tab_width = $self->expand_verbatim_tabs(8)
+        if ! defined $tab_width
+        ||   $tab_width =~ /\D/;
+
+    my $indent = $self->strip_verbatim_indent;
+    if ($indent && ref $indent eq 'CODE') {
+        my @shifted = (shift @{$para}, shift @{$para});
+        $indent = $indent->($para);
+        unshift @{$para}, @shifted;
+    }
+
+    for(my $i = 2; $i < @$para; $i++) {
+      foreach my $line ($para->[$i]) { # just for aliasing
+        # Strip indentation.
+        $line =~ s/^\Q$indent// if $indent;
+        next unless $tab_width;
+
+            # This is commented out because of github issue #85, and the
+            # current maintainers don't know why it was there in the first
+            # place.
+            #&& !($self->{accept_codes} && $self->{accept_codes}{VerbatimFormatted});
+        while( $line =~
+          # Sort of adapted from Text::Tabs.
+          s/^([^\t]*)(\t+)/$1.(" " x ((length($2)
+                                       * $tab_width)
+                                       -(length($1) % $tab_width)))/e
+        ) {}
+
+        # TODO: whinge about (or otherwise treat) unindented or overlong lines
+
+      }
+    }
+  }
+
+  # Now the VerbatimFormatted hoodoo...
+  if( $self->{'accept_codes'} and
+      $self->{'accept_codes'}{'VerbatimFormatted'}
+  ) {
+    while(@$para > 3 and $para->[-1] !~ m/\S/) { pop @$para }
+     # Kill any number of terminal newlines
+    $self->_verbatim_format($para);
+  } elsif ($self->{'codes_in_verbatim'}) {
+    push @$para,
+    @{$self->_make_treelet(
+      join("\n", splice(@$para, 2)),
+      $para->[1]{'start_line'}, $para->[1]{'xml:space'}
+    )};
+    $para->[-1] =~ s/\n+$//s; # Kill any number of terminal newlines
+  } else {
+    push @$para, join "\n", splice(@$para, 2) if @$para > 3;
+    $para->[-1] =~ s/\n+$//s; # Kill any number of terminal newlines
+  }
+  return;
+}
+
+sub _ponder_Data {
+  my ($self,$para) = @_;
+  DEBUG and print STDERR " giving data treatment...\n";
+  $para->[1]{'xml:space'} = 'preserve';
+  push @$para, join "\n", splice(@$para, 2) if @$para > 3;
+  return;
+}
+
+
+
+
+###########################################################################
+
+sub _traverse_treelet_bit {  # for use only by the routine above
+  my($self, $name) = splice @_,0,2;
+
+  my $scratch;
+  $self->_handle_element_start(($scratch=$name), shift @_);
+
+  while (@_) {
+    my $x = shift;
+    if (ref($x)) {
+      &_traverse_treelet_bit($self, @$x);
+    } else {
+      $x .= shift while @_ && !ref($_[0]);
+      $self->_handle_text($x);
+    }
+  }
+
+  $self->_handle_element_end($scratch=$name);
+  return;
+}
+
+#@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+
+sub _closers_for_all_curr_open {
+  my $self = $_[0];
+  my @closers;
+  foreach my $still_open (@{  $self->{'curr_open'} || return  }) {
+    my @copy = @$still_open;
+    $copy[1] = {%{ $copy[1] }};
+    #$copy[1]{'start_line'} = -1;
+    if($copy[0] eq '=for') {
+      $copy[0] = '=end';
+    } elsif($copy[0] eq '=over') {
+      $self->whine(
+        $still_open->[1]{start_line} ,
+        "=over without closing =back"
+      );
+
+      $copy[0] = '=back';
+    } else {
+      die "I don't know how to auto-close an open $copy[0] region";
+    }
+
+    unless( @copy > 2 ) {
+      push @copy, $copy[1]{'target'};
+      $copy[-1] = '' unless defined $copy[-1];
+       # since =over's don't have targets
+    }
+
+    $copy[1]{'fake-closer'} = 1;
+
+    DEBUG and print STDERR "Queuing up fake-o event: ", pretty(\@copy), "\n";
+    unshift @closers, \@copy;
+  }
+  return @closers;
+}
+
+#--------------------------------------------------------------------------
+
+sub _verbatim_format {
+  my($it, $p) = @_;
+
+  my $formatting;
+
+  for(my $i = 2; $i < @$p; $i++) { # work backwards over the lines
+    DEBUG and print STDERR "_verbatim_format appends a newline to $i: $p->[$i]\n";
+    $p->[$i] .= "\n";
+     # Unlike with simple Verbatim blocks, we don't end up just doing
+     # a join("\n", ...) on the contents, so we have to append a
+     # newline to every line, and then nix the last one later.
+  }
+
+  if( DEBUG > 4 ) {
+    print STDERR "<<\n";
+    for(my $i = $#$p; $i >= 2; $i--) { # work backwards over the lines
+      print STDERR "_verbatim_format $i: $p->[$i]";
+    }
+    print STDERR ">>\n";
+  }
+
+  for(my $i = $#$p; $i > 2; $i--) {
+    # work backwards over the lines, except the first (#2)
+
+    #next unless $p->[$i]   =~ m{^#:([ \^\/\%]*)\n?$}s
+    #        and $p->[$i-1] !~ m{^#:[ \^\/\%]*\n?$}s;
+     # look at a formatty line preceding a nonformatty one
+    DEBUG > 5 and print STDERR "Scrutinizing line $i: $$p[$i]\n";
+    if($p->[$i]   =~ m{^#:([ \^\/\%]*)\n?$}s) {
+      DEBUG > 5 and print STDERR "  It's a formatty line.  ",
+       "Peeking at previous line ", $i-1, ": $$p[$i-1]: \n";
+
+      if( $p->[$i-1] =~ m{^#:[ \^\/\%]*\n?$}s ) {
+        DEBUG > 5 and print STDERR "  Previous line is formatty!  Skipping this one.\n";
+        next;
+      } else {
+        DEBUG > 5 and print STDERR "  Previous line is non-formatty!  Yay!\n";
+      }
+    } else {
+      DEBUG > 5 and print STDERR "  It's not a formatty line.  Ignoring\n";
+      next;
+    }
+
+    # A formatty line has to have #: in the first two columns, and uses
+    # "^" to mean bold, "/" to mean underline, and "%" to mean bold italic.
+    # Example:
+    #   What do you want?  i like pie. [or whatever]
+    # #:^^^^^^^^^^^^^^^^^              /////////////
+
+
+    DEBUG > 4 and print STDERR "_verbatim_format considers:\n<$p->[$i-1]>\n<$p->[$i]>\n";
+
+    $formatting = '  ' . $1;
+    $formatting =~ s/\s+$//s; # nix trailing whitespace
+    unless(length $formatting and $p->[$i-1] =~ m/\S/) { # no-op
+      splice @$p,$i,1; # remove this line
+      $i--; # don't consider next line
+      next;
+    }
+
+    if( length($formatting) >= length($p->[$i-1]) ) {
+      $formatting = substr($formatting, 0, length($p->[$i-1]) - 1) . ' ';
+    } else {
+      $formatting .= ' ' x (length($p->[$i-1]) - length($formatting));
+    }
+    # Make $formatting and the previous line be exactly the same length,
+    # with $formatting having a " " as the last character.
+
+    DEBUG > 4 and print STDERR "Formatting <$formatting>    on <", $p->[$i-1], ">\n";
+
+
+    my @new_line;
+    while( $formatting =~ m{\G(( +)|(\^+)|(\/+)|(\%+))}g ) {
+      #print STDERR "Format matches $1\n";
+
+      if($2) {
+        #print STDERR "SKIPPING <$2>\n";
+        push @new_line,
+          substr($p->[$i-1], pos($formatting)-length($1), length($1));
+      } else {
+        #print STDERR "SNARING $+\n";
+        push @new_line, [
+          (
+            $3 ? 'VerbatimB'  :
+            $4 ? 'VerbatimI'  :
+            $5 ? 'VerbatimBI' : die("Should never get called")
+          ), {},
+          substr($p->[$i-1], pos($formatting)-length($1), length($1))
+        ];
+        #print STDERR "Formatting <$new_line[-1][-1]> as $new_line[-1][0]\n";
+      }
+    }
+    my @nixed =
+      splice @$p, $i-1, 2, @new_line; # replace myself and the next line
+    DEBUG > 10 and print STDERR "Nixed count: ", scalar(@nixed), "\n";
+
+    DEBUG > 6 and print STDERR "New version of the above line is these tokens (",
+      scalar(@new_line), "):",
+      map( ref($_)?"<@$_> ":"<$_>", @new_line ), "\n";
+    $i--; # So the next line we scrutinize is the line before the one
+          #  that we just went and formatted
+  }
+
+  $p->[0] = 'VerbatimFormatted';
+
+  # Collapse adjacent text nodes, just for kicks.
+  for( my $i = 2; $i > $#$p; $i++ ) { # work forwards over the tokens except for the last
+    if( !ref($p->[$i]) and !ref($p->[$i + 1]) ) {
+      DEBUG > 5 and print STDERR "_verbatim_format merges {$p->[$i]} and {$p->[$i+1]}\n";
+      $p->[$i] .= splice @$p, $i+1, 1; # merge
+      --$i;  # and back up
+    }
+  }
+
+  # Now look for the last text token, and remove the terminal newline
+  for( my $i = $#$p; $i >= 2; $i-- ) {
+    # work backwards over the tokens, even the first
+    if( !ref($p->[$i]) ) {
+      if($p->[$i] =~ s/\n$//s) {
+        DEBUG > 5 and print STDERR "_verbatim_format killed the terminal newline on #$i: {$p->[$i]}, after {$p->[$i-1]}\n";
+      } else {
+        DEBUG > 5 and print STDERR
+         "No terminal newline on #$i: {$p->[$i]}, after {$p->[$i-1]} !?\n";
+      }
+      last; # we only want the next one
+    }
+  }
+
+  return;
+}
+
+
+#@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+
+
+sub _treelet_from_formatting_codes {
+  # Given a paragraph, returns a treelet.  Full of scary tokenizing code.
+  #  Like [ '~Top', {'start_line' => $start_line},
+  #            "I like ",
+  #            [ 'B', {}, "pie" ],
+  #            "!"
+  #       ]
+  # This illustrates the general format of a treelet.  It is an array:
+  #     [0]       is a scalar indicating its type.  In the example above, the
+  #               types are '~Top' and 'B'
+  #     [1]       is a hash of various flags about it, possibly empty
+  #     [2] - [N] are an ordered list of the subcomponents of the treelet.
+  #               Scalars are literal text, refs are sub-treelets, to
+  #               arbitrary levels.  Stringifying a treelet will recursively
+  #               stringify the sub-treelets, concatentating everything
+  #               together to form the exact text of the treelet.
+
+  my($self, $para, $start_line, $preserve_space) = @_;
+
+  my $treelet = ['~Top', {'start_line' => $start_line},];
+
+  unless ($preserve_space || $self->{'preserve_whitespace'}) {
+    $para =~ s/\s+/ /g; # collapse and trim all whitespace first.
+    $para =~ s/ $//;
+    $para =~ s/^ //;
+  }
+
+  # Only apparent problem the above code is that N<<  >> turns into
+  # N<< >>.  But then, word wrapping does that too!  So don't do that!
+
+
+  # As a Start-code is encountered, the number of opening bracket '<'
+  # characters minus 1 is pushed onto @stack (so 0 means a single bracket,
+  # etc).  When closing brackets are found in the text, at least this number
+  # (plus the 1) will be required to mean the Start-code is terminated.  When
+  # those are found, @stack is popped.
+  my @stack;
+
+  my @lineage = ($treelet);
+  my $raw = ''; # raw content of L<> fcode before splitting/processing
+    # XXX 'raw' is not 100% accurate: all surrounding whitespace is condensed
+    # into just 1 ' '. Is this the regex's doing or 'raw's?  Answer is it's
+    # the 'collapse and trim all whitespace first' lines just above.
+  my $inL = 0;
+
+  DEBUG > 4 and print STDERR "Paragraph:\n$para\n\n";
+
+  # Here begins our frightening tokenizer RE.  The following regex matches
+  # text in four main parts:
+  #
+  #  * Start-codes.  The first alternative matches C< or C<<, the latter
+  #    followed by some whitespace.  $1 will hold the entire start code
+  #    (including any space following a multiple-angle-bracket delimiter),
+  #    and $2 will hold only the additional brackets past the first in a
+  #    multiple-bracket delimiter.  length($2) + 1 will be the number of
+  #    closing brackets we have to find.
+  #
+  #  * Closing brackets.  Match some amount of whitespace followed by
+  #    multiple close brackets.  The logic to see if this closes anything
+  #    is down below.  Note that in order to parse C<<  >> correctly, we
+  #    have to use look-behind (?<=\s\s), since the match of the starting
+  #    code will have consumed the whitespace.
+  #
+  #  * A single closing bracket, to close a simple code like C<>.
+  #
+  #  * Something that isn't a start or end code.  We have to be careful
+  #    about accepting whitespace, since perlpodspec says that any whitespace
+  #    before a multiple-bracket closing delimiter should be ignored.
+  #
+  while($para =~
+    m/\G
+      (?:
+        # Match starting codes, including the whitespace following a
+        # multiple-delimiter start code.  $1 gets the whole start code and
+        # $2 gets all but one of the <s in the multiple-bracket case.
+        ([A-Z]<(?:(<+)\s+)?)
+        |
+        # Match multiple-bracket end codes.  $3 gets the whitespace that
+        # should be discarded before an end bracket but kept in other cases
+        # and $4 gets the end brackets themselves.  ($3 can be empty if the
+        # construct is empty, like C<<  >>, and all the white-space has been
+        # gobbled up already, considered to be space after the opening
+        # bracket.  In this case we use look-behind to verify that there are
+        # at least 2 spaces in a row before the ">".)
+        (\s+|(?<=\s\s))(>{2,})
+        |
+        (\s?>)          # $5: simple end-codes
+        |
+        (               # $6: stuff containing no start-codes or end-codes
+          (?:
+            [^A-Z\s>]
+            |
+            (?:
+              [A-Z](?!<)
+            )
+            |
+            # whitespace is ok, but we don't want to eat the whitespace before
+            # a multiple-bracket end code.
+            # NOTE: we may still have problems with e.g. S<<    >>
+            (?:
+              \s(?!\s*>{2,})
+            )
+          )+
+        )
+      )
+    /xgo
+  ) {
+    DEBUG > 4 and print STDERR "\nParagraphic tokenstack = (@stack)\n";
+    if(defined $1) {
+      my $bracket_count;    # How many '<<<' in a row this has.  Needed for
+                            # Pod::Simple::JustPod
+      if(defined $2) {
+        DEBUG > 3 and print STDERR "Found complex start-text code \"$1\"\n";
+        $bracket_count = length($2) + 1;
+        push @stack, $bracket_count; # length of the necessary complex
+                                     # end-code string
+      } else {
+        DEBUG > 3 and print STDERR "Found simple start-text code \"$1\"\n";
+        push @stack, 0;  # signal that we're looking for simple
+        $bracket_count = 1;
+      }
+      my $code = substr($1,0,1);
+      if ('L' eq $code) {
+        if ($inL) {
+            $raw .= $1;
+            $self->scream( $start_line,
+                           'Nested L<> are illegal.  Pretending inner one is '
+                         . 'X<...> so can continue looking for other errors.');
+            $code = "X";
+        }
+        else {
+            $raw = ""; # reset raw content accumulator
+            $inL = @stack;
+        }
+      } else {
+        $raw .= $1 if $inL;
+      }
+      push @lineage, [ $code, {}, ];  # new node object
+
+      # Tell Pod::Simple::JustPod how many brackets there were, but to save
+      # space, not in the most usual case of there was just 1.  It can be
+      # inferred by the absence of this element.  Similarly, if there is more
+      # than one bracket, extract the white space between the final bracket
+      # and the real beginning of the interior.  Save that if it isn't just a
+      # single space
+      if ($self->{'_output_is_for_JustPod'} && $bracket_count > 1) {
+        $lineage[-1][1]{'~bracket_count'} = $bracket_count;
+        my $lspacer = substr($1, 1 + $bracket_count);
+        $lineage[-1][1]{'~lspacer'} = $lspacer if $lspacer ne " ";
+      }
+      push @{ $lineage[-2] }, $lineage[-1];
+    } elsif(defined $4) {
+      DEBUG > 3 and print STDERR "Found apparent complex end-text code \"$3$4\"\n";
+      # This is where it gets messy...
+      if(! @stack) {
+        # We saw " >>>>" but needed nothing.  This is ALL just stuff then.
+        DEBUG > 4 and print STDERR " But it's really just stuff.\n";
+        push @{ $lineage[-1] }, $3, $4;
+        next;
+      } elsif(!$stack[-1]) {
+        # We saw " >>>>" but needed only ">".  Back pos up.
+        DEBUG > 4 and print STDERR " And that's more than we needed to close simple.\n";
+        push @{ $lineage[-1] }, $3; # That was a for-real space, too.
+        pos($para) = pos($para) - length($4) + 1;
+      } elsif($stack[-1] == length($4)) {
+        # We found " >>>>", and it was exactly what we needed.  Commonest case.
+        DEBUG > 4 and print STDERR " And that's exactly what we needed to close complex.\n";
+      } elsif($stack[-1] < length($4)) {
+        # We saw " >>>>" but needed only " >>".  Back pos up.
+        DEBUG > 4 and print STDERR " And that's more than we needed to close complex.\n";
+        pos($para) = pos($para) - length($4) + $stack[-1];
+      } else {
+        # We saw " >>>>" but needed " >>>>>>".  So this is all just stuff!
+        DEBUG > 4 and print STDERR " But it's really just stuff, because we needed more.\n";
+        push @{ $lineage[-1] }, $3, $4;
+        next;
+      }
+      #print STDERR "\nHOOBOY ", scalar(@{$lineage[-1]}), "!!!\n";
+
+      if ($3 ne " " && $self->{'_output_is_for_JustPod'}) {
+        if ($3 ne "") {
+          $lineage[-1][1]{'~rspacer'} = $3;
+        }
+        elsif ($lineage[-1][1]{'~lspacer'} eq "  ") {
+
+          # Here we had something like C<<  >> which was a false positive
+          delete $lineage[-1][1]{'~lspacer'};
+        }
+        else {
+          $lineage[-1][1]{'~rspacer'}
+                                = substr($lineage[-1][1]{'~lspacer'}, -1, 1);
+          chop $lineage[-1][1]{'~lspacer'};
+        }
+      }
+
+      push @{ $lineage[-1] }, '' if 2 == @{ $lineage[-1] };
+      # Keep the element from being childless
+
+      if ($inL == @stack) {
+        $lineage[-1][1]{'raw'} = $raw;
+        $inL = 0;
+      }
+
+      pop @stack;
+      pop @lineage;
+
+      $raw .= $3.$4 if $inL;
+
+    } elsif(defined $5) {
+      DEBUG > 3 and print STDERR "Found apparent simple end-text code \"$5\"\n";
+
+      if(@stack and ! $stack[-1]) {
+        # We're indeed expecting a simple end-code
+        DEBUG > 4 and print STDERR " It's indeed an end-code.\n";
+
+        if(length($5) == 2) { # There was a space there: " >"
+          push @{ $lineage[-1] }, ' ';
+        } elsif( 2 == @{ $lineage[-1] } ) { # Closing a childless element
+          push @{ $lineage[-1] }, ''; # keep it from being really childless
+        }
+
+        if ($inL == @stack) {
+          $lineage[-1][1]{'raw'} = $raw;
+          $inL = 0;
+        }
+
+        pop @stack;
+        pop @lineage;
+      } else {
+        DEBUG > 4 and print STDERR " It's just stuff.\n";
+        push @{ $lineage[-1] }, $5;
+      }
+
+      $raw .= $5 if $inL;
+
+    } elsif(defined $6) {
+      DEBUG > 3 and print STDERR "Found stuff \"$6\"\n";
+      push @{ $lineage[-1] }, $6;
+      $raw .= $6 if $inL;
+        # XXX does not capture multiplace whitespaces -- 'raw' ends up with
+        #     at most 1 leading/trailing whitespace, why not all of it?
+        #     Answer, because we deliberately trimmed it above
+
+    } else {
+      # should never ever ever ever happen
+      DEBUG and print STDERR "AYYAYAAAAA at line ", __LINE__, "\n";
+      die "SPORK 512512!";
+    }
+  }
+
+  if(@stack) { # Uhoh, some sequences weren't closed.
+    my $x= "...";
+    while(@stack) {
+      push @{ $lineage[-1] }, '' if 2 == @{ $lineage[-1] };
+      # Hmmmmm!
+
+      my $code         = (pop @lineage)->[0];
+      my $ender_length =  pop @stack;
+      if($ender_length) {
+        --$ender_length;
+        $x = $code . ("<" x $ender_length) . " $x " . (">" x $ender_length);
+      } else {
+        $x = $code . "<$x>";
+      }
+    }
+    DEBUG > 1 and print STDERR "Unterminated $x sequence\n";
+    $self->whine($start_line,
+      "Unterminated $x sequence",
+    );
+  }
+
+  return $treelet;
+}
+
+#@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+
+sub text_content_of_treelet {  # method: $parser->text_content_of_treelet($lol)
+  return stringify_lol($_[1]);
+}
+
+sub stringify_lol {  # function: stringify_lol($lol)
+  my $string_form = '';
+  _stringify_lol( $_[0] => \$string_form );
+  return $string_form;
+}
+
+sub _stringify_lol {  # the real recursor
+  my($lol, $to) = @_;
+  for(my $i = 2; $i < @$lol; ++$i) {
+    if( ref($lol->[$i] || '') and UNIVERSAL::isa($lol->[$i], 'ARRAY') ) {
+      _stringify_lol( $lol->[$i], $to);  # recurse!
+    } else {
+      $$to .= $lol->[$i];
+    }
+  }
+  return;
+}
+
+#@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+
+sub _dump_curr_open { # return a string representation of the stack
+  my $curr_open = $_[0]{'curr_open'};
+
+  return '[empty]' unless @$curr_open;
+  return join '; ',
+    map {;
+           ($_->[0] eq '=for')
+             ? ( ($_->[1]{'~really'} || '=over')
+               . ' ' . $_->[1]{'target'})
+             : $_->[0]
+        }
+    @$curr_open
+  ;
+}
+
+###########################################################################
+my %pretty_form = (
+  "\a" => '\a', # ding!
+  "\b" => '\b', # BS
+  "\e" => '\e', # ESC
+  "\f" => '\f', # FF
+  "\t" => '\t', # tab
+  "\cm" => '\cm',
+  "\cj" => '\cj',
+  "\n" => '\n', # probably overrides one of either \cm or \cj
+  '"' => '\"',
+  '\\' => '\\\\',
+  '$' => '\\$',
+  '@' => '\\@',
+  '%' => '\\%',
+  '#' => '\\#',
+);
+
+sub pretty { # adopted from Class::Classless
+  # Not the most brilliant routine, but passable.
+  # Don't give it a cyclic data structure!
+  my @stuff = @_; # copy
+  my $x;
+  my $out =
+    # join ",\n" .
+    join ", ",
+    map {;
+    if(!defined($_)) {
+      "undef";
+    } elsif(ref($_) eq 'ARRAY' or ref($_) eq 'Pod::Simple::LinkSection') {
+      $x = "[ " . pretty(@$_) . " ]" ;
+      $x;
+    } elsif(ref($_) eq 'SCALAR') {
+      $x = "\\" . pretty($$_) ;
+      $x;
+    } elsif(ref($_) eq 'HASH') {
+      my $hr = $_;
+      $x = "{" . join(", ",
+        map(pretty($_) . '=>' . pretty($hr->{$_}),
+            sort keys %$hr ) ) . "}" ;
+      $x;
+    } elsif(!length($_)) { q{''} # empty string
+    } elsif(
+      $_ eq '0' # very common case
+      or(
+         m/^-?(?:[123456789]\d*|0)(?:\.\d+)?$/s
+         and $_ ne '-0' # the strange case that RE lets thru
+      )
+    ) { $_;
+    } else {
+        # Yes, explicitly name every character desired. There are shorcuts one
+        # could make, but I (Karl Williamson) was afraid that some Perl
+        # releases would have bugs in some of them. For example [A-Z] works
+        # even on EBCDIC platforms to match exactly the 26 uppercase English
+        # letters, but I don't know if it has always worked without bugs. It
+        # seemed safest just to list the characters.
+        # s<([^\x20\x21\x23\x27-\x3F\x41-\x5B\x5D-\x7E])>
+        s<([^ !"#'()*+,\-./0123456789:;\<=\>?ABCDEFGHIJKLMNOPQRSTUVWXYZ\[\]^_`abcdefghijklmnopqrstuvwxyz{|}~])>
+         <$pretty_form{$1} || '\\x{'.sprintf("%x", ord($1)).'}'>eg;
+         #<$pretty_form{$1} || '\\x'.(unpack("H2",$1))>eg;
+      qq{"$_"};
+    }
+  } @stuff;
+  # $out =~ s/\n */ /g if length($out) < 75;
+  return $out;
+}
+
+#@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+
+# A rather unsubtle method of blowing away all the state information
+# from a parser object so it can be reused. Provided as a utility for
+# backward compatibility in Pod::Man, etc. but not recommended for
+# general use.
+
+sub reinit {
+  my $self = shift;
+  foreach (qw(source_dead source_filename doc_has_started
+start_of_pod_block content_seen last_was_blank paras curr_open
+line_count pod_para_count in_pod ~tried_gen_errata all_errata errata errors_seen
+Title)) {
+
+    delete $self->{$_};
+  }
+}
+
+#@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+1;
+
+                                                                                                                                                                                                                                                                                                                                                                                                             usr/local/lib/perl5/5.40.0/Pod/Simple/Checker.pm                                                    0000444 0000000 0000000 00000012450 14714567415 017363  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        
+# A quite dimwitted pod2plaintext that need only know how to format whatever
+# text comes out of Pod::BlackBox's _gen_errata
+
+package Pod::Simple::Checker;
+use strict;
+use warnings;
+use Carp ();
+use Pod::Simple::Methody ();
+use Pod::Simple ();
+our $VERSION = '3.45';
+our @ISA = ('Pod::Simple::Methody');
+BEGIN { *DEBUG = defined(&Pod::Simple::DEBUG)
+          ? \&Pod::Simple::DEBUG
+          : sub() {0}
+      }
+
+use Text::Wrap 98.112902 (); # was 2001.0131, but I don't think we need that
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+sub any_errata_seen {  # read-only accessor
+  return $_[1]->{'Errata_seen'};
+}
+
+sub new {
+  my $self = shift;
+  my $new = $self->SUPER::new(@_);
+  $new->{'output_fh'} ||= *STDOUT{IO};
+  $new->nix_X_codes(1);
+  $new->nbsp_for_S(1);
+  $new->{'Thispara'} = '';
+  $new->{'Indent'} = 0;
+  $new->{'Indentstring'} = '   ';
+  $new->{'Errata_seen'} = 0;
+  return $new;
+}
+
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+sub handle_text {  $_[0]{'Errata_seen'} and $_[0]{'Thispara'} .= $_[1] }
+
+sub start_Para  {  $_[0]{'Thispara'} = '' }
+
+sub start_head1 {
+  if($_[0]{'Errata_seen'}) {
+    $_[0]{'Thispara'} = '';
+  } else {
+    if($_[1]{'errata'}) { # start of errata!
+      $_[0]{'Errata_seen'} = 1;
+      $_[0]{'Thispara'} = $_[0]{'source_filename'} ?
+        "$_[0]{'source_filename'} -- " : ''
+    }
+  }
+}
+sub start_head2 {  $_[0]{'Thispara'} = '' }
+sub start_head3 {  $_[0]{'Thispara'} = '' }
+sub start_head4 {  $_[0]{'Thispara'} = '' }
+
+sub start_Verbatim    { $_[0]{'Thispara'} = ''   }
+sub start_item_bullet { $_[0]{'Thispara'} = '* ' }
+sub start_item_number { $_[0]{'Thispara'} = "$_[1]{'number'}. "  }
+sub start_item_text   { $_[0]{'Thispara'} = ''   }
+
+sub start_over_bullet  { ++$_[0]{'Indent'} }
+sub start_over_number  { ++$_[0]{'Indent'} }
+sub start_over_text    { ++$_[0]{'Indent'} }
+sub start_over_block   { ++$_[0]{'Indent'} }
+
+sub   end_over_bullet  { --$_[0]{'Indent'} }
+sub   end_over_number  { --$_[0]{'Indent'} }
+sub   end_over_text    { --$_[0]{'Indent'} }
+sub   end_over_block   { --$_[0]{'Indent'} }
+
+
+# . . . . . Now the actual formatters:
+
+sub end_head1       { $_[0]->emit_par(-4) }
+sub end_head2       { $_[0]->emit_par(-3) }
+sub end_head3       { $_[0]->emit_par(-2) }
+sub end_head4       { $_[0]->emit_par(-1) }
+sub end_Para        { $_[0]->emit_par( 0) }
+sub end_item_bullet { $_[0]->emit_par( 0) }
+sub end_item_number { $_[0]->emit_par( 0) }
+sub end_item_text   { $_[0]->emit_par(-2) }
+
+sub emit_par {
+  return unless $_[0]{'Errata_seen'};
+  my($self, $tweak_indent) = splice(@_,0,2);
+  my $length = 2 * $self->{'Indent'} + ($tweak_indent||0);
+  my $indent = ' ' x ($length > 0 ? $length : 0);
+   # Yes, 'STRING' x NEGATIVE gives '', same as 'STRING' x 0
+   # 'Negative repeat count does nothing' since 5.22
+
+  $self->{'Thispara'} =~ s/$Pod::Simple::shy//g;
+  local $Text::Wrap::wrap = 'overflow';
+  my $out = Text::Wrap::wrap($indent, $indent, $self->{'Thispara'} .= "\n");
+  $out =~ s/$Pod::Simple::nbsp/ /g;
+  print {$self->{'output_fh'}} $out,
+    #"\n"
+  ;
+  $self->{'Thispara'} = '';
+
+  return;
+}
+
+# . . . . . . . . . . And then off by its lonesome:
+
+sub end_Verbatim  {
+  return unless $_[0]{'Errata_seen'};
+  my $self = shift;
+  $self->{'Thispara'} =~ s/$Pod::Simple::nbsp/ /g;
+  $self->{'Thispara'} =~ s/$Pod::Simple::shy//g;
+
+  my $i = ' ' x ( 2 * $self->{'Indent'} + 4);
+
+  $self->{'Thispara'} =~ s/^/$i/mg;
+
+  print { $self->{'output_fh'} }   '',
+    $self->{'Thispara'},
+    "\n\n"
+  ;
+  $self->{'Thispara'} = '';
+  return;
+}
+
+#@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+1;
+
+__END__
+
+=head1 NAME
+
+Pod::Simple::Checker -- check the Pod syntax of a document
+
+=head1 SYNOPSIS
+
+  perl -MPod::Simple::Checker -e \
+   "exit Pod::Simple::Checker->filter(shift)->any_errata_seen" \
+   thingy.pod
+
+=head1 DESCRIPTION
+
+This class is for checking the syntactic validity of Pod.
+It works by basically acting like a simple-minded version of
+L<Pod::Simple::Text> that formats only the "Pod Errors" section
+(if Pod::Simple even generates one for the given document).
+
+This is a subclass of L<Pod::Simple> and inherits all its methods.
+
+=head1 SEE ALSO
+
+L<Pod::Simple>, L<Pod::Simple::Text>, L<Pod::Checker>
+
+=head1 SUPPORT
+
+Questions or discussion about POD and Pod::Simple should be sent to the
+pod-people@perl.org mail list. Send an empty email to
+pod-people-subscribe@perl.org to subscribe.
+
+This module is managed in an open GitHub repository,
+L<https://github.com/perl-pod/pod-simple/>. Feel free to fork and contribute, or
+to clone L<https://github.com/perl-pod/pod-simple.git> and send patches!
+
+Patches against Pod::Simple are welcome. Please send bug reports to
+<bug-pod-simple@rt.cpan.org>.
+
+=head1 COPYRIGHT AND DISCLAIMERS
+
+Copyright (c) 2002 Sean M. Burke.
+
+This library is free software; you can redistribute it and/or modify it
+under the same terms as Perl itself.
+
+This program is distributed in the hope that it will be useful, but
+without any warranty; without even the implied warranty of
+merchantability or fitness for a particular purpose.
+
+=head1 AUTHOR
+
+Pod::Simple was created by Sean M. Burke <sburke@cpan.org>.
+But don't bother him, he's retired.
+
+Pod::Simple is maintained by:
+
+=over
+
+=item * Allison Randal C<allison@perl.org>
+
+=item * Hans Dieter Pearcey C<hdp@cpan.org>
+
+=item * David E. Wheeler C<dwheeler@cpan.org>
+
+=back
+
+=cut
+                                                                                                                                                                                                                        usr/local/lib/perl5/5.40.0/Pod/Simple/Debug.pm                                                      0000444 0000000 0000000 00000010764 14714567415 017053  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        package Pod::Simple::Debug;
+use strict;
+our $VERSION = '3.45';
+
+sub import {
+  my($value,$variable);
+
+  if(@_ == 2) {
+    $value = $_[1];
+  } elsif(@_ == 3) {
+    ($variable, $value) = @_[1,2];
+
+    ($variable, $value) = ($value, $variable)
+       if     defined $value    and ref($value)    eq 'SCALAR'
+      and not(defined $variable and ref($variable) eq 'SCALAR')
+    ; # tolerate getting it backwards
+
+    unless( defined $variable and ref($variable) eq 'SCALAR') {
+      require Carp;
+      Carp::croak("Usage:\n use Pod::Simple::Debug (NUMVAL)\nor"
+                . "\n use Pod::Simple::Debug (\\\$var, STARTNUMVAL)\nAborting");
+    }
+  } else {
+    require Carp;
+    Carp::croak("Usage:\n use Pod::Simple::Debug (NUMVAL)\nor"
+                    . "\n use Pod::Simple::Debug (\\\$var, STARTNUMVAL)\nAborting");
+  }
+
+  if( defined &Pod::Simple::DEBUG ) {
+    require Carp;
+    Carp::croak("It's too late to call Pod::Simple::Debug -- "
+              . "Pod::Simple has already loaded\nAborting");
+  }
+
+  $value = 0 unless defined $value;
+
+  unless($value =~ m/^-?\d+$/) {
+    require Carp;
+    Carp::croak( "$value isn't a numeric value."
+            . "\nUsage:\n use Pod::Simple::Debug (NUMVAL)\nor"
+                    . "\n use Pod::Simple::Debug (\\\$var, STARTNUMVAL)\nAborting");
+  }
+
+  if( defined $variable ) {
+    # make a not-really-constant
+    *Pod::Simple::DEBUG = sub () { $$variable } ;
+    $$variable = $value;
+    print STDERR "# Starting Pod::Simple::DEBUG = non-constant $variable with val $value\n";
+  } else {
+    *Pod::Simple::DEBUG = eval " sub () { $value } ";
+    print STDERR "# Starting Pod::Simple::DEBUG = $value\n";
+  }
+
+  require Pod::Simple;
+  return;
+}
+
+1;
+
+
+__END__
+
+=head1 NAME
+
+Pod::Simple::Debug -- put Pod::Simple into trace/debug mode
+
+=head1 SYNOPSIS
+
+ use Pod::Simple::Debug (5);  # or some integer
+
+Or:
+
+ my $debuglevel;
+ use Pod::Simple::Debug (\$debuglevel, 0);
+ ...some stuff that uses Pod::Simple to do stuff, but which
+  you don't want debug output from...
+
+ $debug_level = 4;
+ ...some stuff that uses Pod::Simple to do stuff, but which
+  you DO want debug output from...
+
+ $debug_level = 0;
+
+=head1 DESCRIPTION
+
+This is an internal module for controlling the debug level (a.k.a. trace
+level) of Pod::Simple.  This is of interest only to Pod::Simple
+developers.
+
+
+=head1 CAVEATS
+
+Note that you should load this module I<before> loading Pod::Simple (or
+any Pod::Simple-based class).  If you try loading Pod::Simple::Debug
+after &Pod::Simple::DEBUG is already defined, Pod::Simple::Debug will
+throw a fatal error to the effect that
+"It's too late to call Pod::Simple::Debug".
+
+Note that the C<use Pod::Simple::Debug (\$x, I<somenum>)> mode will make
+Pod::Simple (et al) run rather slower, since &Pod::Simple::DEBUG won't
+be a constant sub anymore, and so Pod::Simple (et al) won't compile with
+constant-folding.
+
+
+=head1 GUTS
+
+Doing this:
+
+  use Pod::Simple::Debug (5);  # or some integer
+
+is basically equivalent to:

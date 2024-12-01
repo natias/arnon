@@ -1,0 +1,1000 @@
+
+# True if a fast implementation for persistent-nodemap is available
+#
+# We also consider we have a "fast" implementation in "pure" python because
+# people using pure don't really have performance consideration (and a
+# wheelbarrow of other slowness source)
+HAS_FAST_PERSISTENT_NODEMAP = rustrevlog is not None or util.safehasattr(
+    parsers, 'BaseIndexObject'
+)
+
+
+@interfaceutil.implementer(repository.irevisiondelta)
+@attr.s(slots=True)
+class revlogrevisiondelta:
+    node = attr.ib()
+    p1node = attr.ib()
+    p2node = attr.ib()
+    basenode = attr.ib()
+    flags = attr.ib()
+    baserevisionsize = attr.ib()
+    revision = attr.ib()
+    delta = attr.ib()
+    sidedata = attr.ib()
+    protocol_flags = attr.ib()
+    linknode = attr.ib(default=None)
+
+
+@interfaceutil.implementer(repository.iverifyproblem)
+@attr.s(frozen=True)
+class revlogproblem:
+    warning = attr.ib(default=None)
+    error = attr.ib(default=None)
+    node = attr.ib(default=None)
+
+
+def parse_index_v1(data, inline):
+    # call the C implementation to parse the index data
+    index, cache = parsers.parse_index2(data, inline)
+    return index, cache
+
+
+def parse_index_v2(data, inline):
+    # call the C implementation to parse the index data
+    index, cache = parsers.parse_index2(data, inline, format=REVLOGV2)
+    return index, cache
+
+
+def parse_index_cl_v2(data, inline):
+    # call the C implementation to parse the index data
+    index, cache = parsers.parse_index2(data, inline, format=CHANGELOGV2)
+    return index, cache
+
+
+if util.safehasattr(parsers, 'parse_index_devel_nodemap'):
+
+    def parse_index_v1_nodemap(data, inline):
+        index, cache = parsers.parse_index_devel_nodemap(data, inline)
+        return index, cache
+
+
+else:
+    parse_index_v1_nodemap = None
+
+
+def parse_index_v1_mixed(data, inline):
+    index, cache = parse_index_v1(data, inline)
+    return rustrevlog.MixedIndex(index), cache
+
+
+# corresponds to uncompressed length of indexformatng (2 gigs, 4-byte
+# signed integer)
+_maxentrysize = 0x7FFFFFFF
+
+FILE_TOO_SHORT_MSG = _(
+    b'cannot read from revlog %s;'
+    b'  expected %d bytes from offset %d, data size is %d'
+)
+
+hexdigits = b'0123456789abcdefABCDEF'
+
+
+class revlog:
+    """
+    the underlying revision storage object
+
+    A revlog consists of two parts, an index and the revision data.
+
+    The index is a file with a fixed record size containing
+    information on each revision, including its nodeid (hash), the
+    nodeids of its parents, the position and offset of its data within
+    the data file, and the revision it's based on. Finally, each entry
+    contains a linkrev entry that can serve as a pointer to external
+    data.
+
+    The revision data itself is a linear collection of data chunks.
+    Each chunk represents a revision and is usually represented as a
+    delta against the previous chunk. To bound lookup time, runs of
+    deltas are limited to about 2 times the length of the original
+    version data. This makes retrieval of a version proportional to
+    its size, or O(1) relative to the number of revisions.
+
+    Both pieces of the revlog are written to in an append-only
+    fashion, which means we never need to rewrite a file to insert or
+    remove data, and can use some simple techniques to avoid the need
+    for locking while reading.
+
+    If checkambig, indexfile is opened with checkambig=True at
+    writing, to avoid file stat ambiguity.
+
+    If mmaplargeindex is True, and an mmapindexthreshold is set, the
+    index will be mmapped rather than read if it is larger than the
+    configured threshold.
+
+    If censorable is True, the revlog can have censored revisions.
+
+    If `upperboundcomp` is not None, this is the expected maximal gain from
+    compression for the data content.
+
+    `concurrencychecker` is an optional function that receives 3 arguments: a
+    file handle, a filename, and an expected position. It should check whether
+    the current position in the file handle is valid, and log/warn/fail (by
+    raising).
+
+    See mercurial/revlogutils/contants.py for details about the content of an
+    index entry.
+    """
+
+    _flagserrorclass = error.RevlogError
+
+    def __init__(
+        self,
+        opener,
+        target,
+        radix,
+        postfix=None,  # only exist for `tmpcensored` now
+        checkambig=False,
+        mmaplargeindex=False,
+        censorable=False,
+        upperboundcomp=None,
+        persistentnodemap=False,
+        concurrencychecker=None,
+        trypending=False,
+        canonical_parent_order=True,
+    ):
+        """
+        create a revlog object
+
+        opener is a function that abstracts the file opening operation
+        and can be used to implement COW semantics or the like.
+
+        `target`: a (KIND, ID) tuple that identify the content stored in
+        this revlog. It help the rest of the code to understand what the revlog
+        is about without having to resort to heuristic and index filename
+        analysis. Note: that this must be reliably be set by normal code, but
+        that test, debug, or performance measurement code might not set this to
+        accurate value.
+        """
+        self.upperboundcomp = upperboundcomp
+
+        self.radix = radix
+
+        self._docket_file = None
+        self._indexfile = None
+        self._datafile = None
+        self._sidedatafile = None
+        self._nodemap_file = None
+        self.postfix = postfix
+        self._trypending = trypending
+        self.opener = opener
+        if persistentnodemap:
+            self._nodemap_file = nodemaputil.get_nodemap_file(self)
+
+        assert target[0] in ALL_KINDS
+        assert len(target) == 2
+        self.target = target
+        #  When True, indexfile is opened with checkambig=True at writing, to
+        #  avoid file stat ambiguity.
+        self._checkambig = checkambig
+        self._mmaplargeindex = mmaplargeindex
+        self._censorable = censorable
+        # 3-tuple of (node, rev, text) for a raw revision.
+        self._revisioncache = None
+        # Maps rev to chain base rev.
+        self._chainbasecache = util.lrucachedict(100)
+        # 2-tuple of (offset, data) of raw data from the revlog at an offset.
+        self._chunkcache = (0, b'')
+        # How much data to read and cache into the raw revlog data cache.
+        self._chunkcachesize = 65536
+        self._maxchainlen = None
+        self._deltabothparents = True
+        self._debug_delta = False
+        self.index = None
+        self._docket = None
+        self._nodemap_docket = None
+        # Mapping of partial identifiers to full nodes.
+        self._pcache = {}
+        # Mapping of revision integer to full node.
+        self._compengine = b'zlib'
+        self._compengineopts = {}
+        self._maxdeltachainspan = -1
+        self._withsparseread = False
+        self._sparserevlog = False
+        self.hassidedata = False
+        self._srdensitythreshold = 0.50
+        self._srmingapsize = 262144
+
+        # Make copy of flag processors so each revlog instance can support
+        # custom flags.
+        self._flagprocessors = dict(flagutil.flagprocessors)
+
+        # 3-tuple of file handles being used for active writing.
+        self._writinghandles = None
+        # prevent nesting of addgroup
+        self._adding_group = None
+
+        self._loadindex()
+
+        self._concurrencychecker = concurrencychecker
+
+        # parent order is supposed to be semantically irrelevant, so we
+        # normally resort parents to ensure that the first parent is non-null,
+        # if there is a non-null parent at all.
+        # filelog abuses the parent order as flag to mark some instances of
+        # meta-encoded files, so allow it to disable this behavior.
+        self.canonical_parent_order = canonical_parent_order
+
+    def _init_opts(self):
+        """process options (from above/config) to setup associated default revlog mode
+
+        These values might be affected when actually reading on disk information.
+
+        The relevant values are returned for use in _loadindex().
+
+        * newversionflags:
+            version header to use if we need to create a new revlog
+
+        * mmapindexthreshold:
+            minimal index size for start to use mmap
+
+        * force_nodemap:
+            force the usage of a "development" version of the nodemap code
+        """
+        mmapindexthreshold = None
+        opts = self.opener.options
+
+        if b'changelogv2' in opts and self.revlog_kind == KIND_CHANGELOG:
+            new_header = CHANGELOGV2
+        elif b'revlogv2' in opts:
+            new_header = REVLOGV2
+        elif b'revlogv1' in opts:
+            new_header = REVLOGV1 | FLAG_INLINE_DATA
+            if b'generaldelta' in opts:
+                new_header |= FLAG_GENERALDELTA
+        elif b'revlogv0' in self.opener.options:
+            new_header = REVLOGV0
+        else:
+            new_header = REVLOG_DEFAULT_VERSION
+
+        if b'chunkcachesize' in opts:
+            self._chunkcachesize = opts[b'chunkcachesize']
+        if b'maxchainlen' in opts:
+            self._maxchainlen = opts[b'maxchainlen']
+        if b'deltabothparents' in opts:
+            self._deltabothparents = opts[b'deltabothparents']
+        self._lazydelta = bool(opts.get(b'lazydelta', True))
+        self._lazydeltabase = False
+        if self._lazydelta:
+            self._lazydeltabase = bool(opts.get(b'lazydeltabase', False))
+        if b'debug-delta' in opts:
+            self._debug_delta = opts[b'debug-delta']
+        if b'compengine' in opts:
+            self._compengine = opts[b'compengine']
+        if b'zlib.level' in opts:
+            self._compengineopts[b'zlib.level'] = opts[b'zlib.level']
+        if b'zstd.level' in opts:
+            self._compengineopts[b'zstd.level'] = opts[b'zstd.level']
+        if b'maxdeltachainspan' in opts:
+            self._maxdeltachainspan = opts[b'maxdeltachainspan']
+        if self._mmaplargeindex and b'mmapindexthreshold' in opts:
+            mmapindexthreshold = opts[b'mmapindexthreshold']
+        self._sparserevlog = bool(opts.get(b'sparse-revlog', False))
+        withsparseread = bool(opts.get(b'with-sparse-read', False))
+        # sparse-revlog forces sparse-read
+        self._withsparseread = self._sparserevlog or withsparseread
+        if b'sparse-read-density-threshold' in opts:
+            self._srdensitythreshold = opts[b'sparse-read-density-threshold']
+        if b'sparse-read-min-gap-size' in opts:
+            self._srmingapsize = opts[b'sparse-read-min-gap-size']
+        if opts.get(b'enableellipsis'):
+            self._flagprocessors[REVIDX_ELLIPSIS] = ellipsisprocessor
+
+        # revlog v0 doesn't have flag processors
+        for flag, processor in opts.get(b'flagprocessors', {}).items():
+            flagutil.insertflagprocessor(flag, processor, self._flagprocessors)
+
+        if self._chunkcachesize <= 0:
+            raise error.RevlogError(
+                _(b'revlog chunk cache size %r is not greater than 0')
+                % self._chunkcachesize
+            )
+        elif self._chunkcachesize & (self._chunkcachesize - 1):
+            raise error.RevlogError(
+                _(b'revlog chunk cache size %r is not a power of 2')
+                % self._chunkcachesize
+            )
+        force_nodemap = opts.get(b'devel-force-nodemap', False)
+        return new_header, mmapindexthreshold, force_nodemap
+
+    def _get_data(self, filepath, mmap_threshold, size=None):
+        """return a file content with or without mmap
+
+        If the file is missing return the empty string"""
+        try:
+            with self.opener(filepath) as fp:
+                if mmap_threshold is not None:
+                    file_size = self.opener.fstat(fp).st_size
+                    if file_size >= mmap_threshold:
+                        if size is not None:
+                            # avoid potentiel mmap crash
+                            size = min(file_size, size)
+                        # TODO: should .close() to release resources without
+                        # relying on Python GC
+                        if size is None:
+                            return util.buffer(util.mmapread(fp))
+                        else:
+                            return util.buffer(util.mmapread(fp, size))
+                if size is None:
+                    return fp.read()
+                else:
+                    return fp.read(size)
+        except FileNotFoundError:
+            return b''
+
+    def _loadindex(self, docket=None):
+
+        new_header, mmapindexthreshold, force_nodemap = self._init_opts()
+
+        if self.postfix is not None:
+            entry_point = b'%s.i.%s' % (self.radix, self.postfix)
+        elif self._trypending and self.opener.exists(b'%s.i.a' % self.radix):
+            entry_point = b'%s.i.a' % self.radix
+        else:
+            entry_point = b'%s.i' % self.radix
+
+        if docket is not None:
+            self._docket = docket
+            self._docket_file = entry_point
+        else:
+            entry_data = b''
+            self._initempty = True
+            entry_data = self._get_data(entry_point, mmapindexthreshold)
+            if len(entry_data) > 0:
+                header = INDEX_HEADER.unpack(entry_data[:4])[0]
+                self._initempty = False
+            else:
+                header = new_header
+
+            self._format_flags = header & ~0xFFFF
+            self._format_version = header & 0xFFFF
+
+            supported_flags = SUPPORTED_FLAGS.get(self._format_version)
+            if supported_flags is None:
+                msg = _(b'unknown version (%d) in revlog %s')
+                msg %= (self._format_version, self.display_id)
+                raise error.RevlogError(msg)
+            elif self._format_flags & ~supported_flags:
+                msg = _(b'unknown flags (%#04x) in version %d revlog %s')
+                display_flag = self._format_flags >> 16
+                msg %= (display_flag, self._format_version, self.display_id)
+                raise error.RevlogError(msg)
+
+            features = FEATURES_BY_VERSION[self._format_version]
+            self._inline = features[b'inline'](self._format_flags)
+            self._generaldelta = features[b'generaldelta'](self._format_flags)
+            self.hassidedata = features[b'sidedata']
+
+            if not features[b'docket']:
+                self._indexfile = entry_point
+                index_data = entry_data
+            else:
+                self._docket_file = entry_point
+                if self._initempty:
+                    self._docket = docketutil.default_docket(self, header)
+                else:
+                    self._docket = docketutil.parse_docket(
+                        self, entry_data, use_pending=self._trypending
+                    )
+
+        if self._docket is not None:
+            self._indexfile = self._docket.index_filepath()
+            index_data = b''
+            index_size = self._docket.index_end
+            if index_size > 0:
+                index_data = self._get_data(
+                    self._indexfile, mmapindexthreshold, size=index_size
+                )
+                if len(index_data) < index_size:
+                    msg = _(b'too few index data for %s: got %d, expected %d')
+                    msg %= (self.display_id, len(index_data), index_size)
+                    raise error.RevlogError(msg)
+
+            self._inline = False
+            # generaldelta implied by version 2 revlogs.
+            self._generaldelta = True
+            # the logic for persistent nodemap will be dealt with within the
+            # main docket, so disable it for now.
+            self._nodemap_file = None
+
+        if self._docket is not None:
+            self._datafile = self._docket.data_filepath()
+            self._sidedatafile = self._docket.sidedata_filepath()
+        elif self.postfix is None:
+            self._datafile = b'%s.d' % self.radix
+        else:
+            self._datafile = b'%s.d.%s' % (self.radix, self.postfix)
+
+        self.nodeconstants = sha1nodeconstants
+        self.nullid = self.nodeconstants.nullid
+
+        # sparse-revlog can't be on without general-delta (issue6056)
+        if not self._generaldelta:
+            self._sparserevlog = False
+
+        self._storedeltachains = True
+
+        devel_nodemap = (
+            self._nodemap_file
+            and force_nodemap
+            and parse_index_v1_nodemap is not None
+        )
+
+        use_rust_index = False
+        if rustrevlog is not None:
+            if self._nodemap_file is not None:
+                use_rust_index = True
+            else:
+                use_rust_index = self.opener.options.get(b'rust.index')
+
+        self._parse_index = parse_index_v1
+        if self._format_version == REVLOGV0:
+            self._parse_index = revlogv0.parse_index_v0
+        elif self._format_version == REVLOGV2:
+            self._parse_index = parse_index_v2
+        elif self._format_version == CHANGELOGV2:
+            self._parse_index = parse_index_cl_v2
+        elif devel_nodemap:
+            self._parse_index = parse_index_v1_nodemap
+        elif use_rust_index:
+            self._parse_index = parse_index_v1_mixed
+        try:
+            d = self._parse_index(index_data, self._inline)
+            index, chunkcache = d
+            use_nodemap = (
+                not self._inline
+                and self._nodemap_file is not None
+                and util.safehasattr(index, 'update_nodemap_data')
+            )
+            if use_nodemap:
+                nodemap_data = nodemaputil.persisted_data(self)
+                if nodemap_data is not None:
+                    docket = nodemap_data[0]
+                    if (
+                        len(d[0]) > docket.tip_rev
+                        and d[0][docket.tip_rev][7] == docket.tip_node
+                    ):
+                        # no changelog tampering
+                        self._nodemap_docket = docket
+                        index.update_nodemap_data(*nodemap_data)
+        except (ValueError, IndexError):
+            raise error.RevlogError(
+                _(b"index %s is corrupted") % self.display_id
+            )
+        self.index = index
+        self._segmentfile = randomaccessfile.randomaccessfile(
+            self.opener,
+            (self._indexfile if self._inline else self._datafile),
+            self._chunkcachesize,
+            chunkcache,
+        )
+        self._segmentfile_sidedata = randomaccessfile.randomaccessfile(
+            self.opener,
+            self._sidedatafile,
+            self._chunkcachesize,
+        )
+        # revnum -> (chain-length, sum-delta-length)
+        self._chaininfocache = util.lrucachedict(500)
+        # revlog header -> revlog compressor
+        self._decompressors = {}
+
+    @util.propertycache
+    def revlog_kind(self):
+        return self.target[0]
+
+    @util.propertycache
+    def display_id(self):
+        """The public facing "ID" of the revlog that we use in message"""
+        # Maybe we should build a user facing representation of
+        # revlog.target instead of using `self.radix`
+        return self.radix
+
+    def _get_decompressor(self, t):
+        try:
+            compressor = self._decompressors[t]
+        except KeyError:
+            try:
+                engine = util.compengines.forrevlogheader(t)
+                compressor = engine.revlogcompressor(self._compengineopts)
+                self._decompressors[t] = compressor
+            except KeyError:
+                raise error.RevlogError(
+                    _(b'unknown compression type %s') % binascii.hexlify(t)
+                )
+        return compressor
+
+    @util.propertycache
+    def _compressor(self):
+        engine = util.compengines[self._compengine]
+        return engine.revlogcompressor(self._compengineopts)
+
+    @util.propertycache
+    def _decompressor(self):
+        """the default decompressor"""
+        if self._docket is None:
+            return None
+        t = self._docket.default_compression_header
+        c = self._get_decompressor(t)
+        return c.decompress
+
+    def _indexfp(self):
+        """file object for the revlog's index file"""
+        return self.opener(self._indexfile, mode=b"r")
+
+    def __index_write_fp(self):
+        # You should not use this directly and use `_writing` instead
+        try:
+            f = self.opener(
+                self._indexfile, mode=b"r+", checkambig=self._checkambig
+            )
+            if self._docket is None:
+                f.seek(0, os.SEEK_END)
+            else:
+                f.seek(self._docket.index_end, os.SEEK_SET)
+            return f
+        except FileNotFoundError:
+            return self.opener(
+                self._indexfile, mode=b"w+", checkambig=self._checkambig
+            )
+
+    def __index_new_fp(self):
+        # You should not use this unless you are upgrading from inline revlog
+        return self.opener(
+            self._indexfile,
+            mode=b"w",
+            checkambig=self._checkambig,
+            atomictemp=True,
+        )
+
+    def _datafp(self, mode=b'r'):
+        """file object for the revlog's data file"""
+        return self.opener(self._datafile, mode=mode)
+
+    @contextlib.contextmanager
+    def _sidedatareadfp(self):
+        """file object suitable to read sidedata"""
+        if self._writinghandles:
+            yield self._writinghandles[2]
+        else:
+            with self.opener(self._sidedatafile) as fp:
+                yield fp
+
+    def tiprev(self):
+        return len(self.index) - 1
+
+    def tip(self):
+        return self.node(self.tiprev())
+
+    def __contains__(self, rev):
+        return 0 <= rev < len(self)
+
+    def __len__(self):
+        return len(self.index)
+
+    def __iter__(self):
+        return iter(range(len(self)))
+
+    def revs(self, start=0, stop=None):
+        """iterate over all rev in this revlog (from start to stop)"""
+        return storageutil.iterrevs(len(self), start=start, stop=stop)
+
+    def hasnode(self, node):
+        try:
+            self.rev(node)
+            return True
+        except KeyError:
+            return False
+
+    def candelta(self, baserev, rev):
+        """whether two revisions (baserev, rev) can be delta-ed or not"""
+        # Disable delta if either rev requires a content-changing flag
+        # processor (ex. LFS). This is because such flag processor can alter
+        # the rawtext content that the delta will be based on, and two clients
+        # could have a same revlog node with different flags (i.e. different
+        # rawtext contents) and the delta could be incompatible.
+        if (self.flags(baserev) & REVIDX_RAWTEXT_CHANGING_FLAGS) or (
+            self.flags(rev) & REVIDX_RAWTEXT_CHANGING_FLAGS
+        ):
+            return False
+        return True
+
+    def update_caches(self, transaction):
+        if self._nodemap_file is not None:
+            if transaction is None:
+                nodemaputil.update_persistent_nodemap(self)
+            else:
+                nodemaputil.setup_persistent_nodemap(transaction, self)
+
+    def clearcaches(self):
+        self._revisioncache = None
+        self._chainbasecache.clear()
+        self._segmentfile.clear_cache()
+        self._segmentfile_sidedata.clear_cache()
+        self._pcache = {}
+        self._nodemap_docket = None
+        self.index.clearcaches()
+        # The python code is the one responsible for validating the docket, we
+        # end up having to refresh it here.
+        use_nodemap = (
+            not self._inline
+            and self._nodemap_file is not None
+            and util.safehasattr(self.index, 'update_nodemap_data')
+        )
+        if use_nodemap:
+            nodemap_data = nodemaputil.persisted_data(self)
+            if nodemap_data is not None:
+                self._nodemap_docket = nodemap_data[0]
+                self.index.update_nodemap_data(*nodemap_data)
+
+    def rev(self, node):
+        try:
+            return self.index.rev(node)
+        except TypeError:
+            raise
+        except error.RevlogError:
+            # parsers.c radix tree lookup failed
+            if (
+                node == self.nodeconstants.wdirid
+                or node in self.nodeconstants.wdirfilenodeids
+            ):
+                raise error.WdirUnsupported
+            raise error.LookupError(node, self.display_id, _(b'no node'))
+
+    # Accessors for index entries.
+
+    # First tuple entry is 8 bytes. First 6 bytes are offset. Last 2 bytes
+    # are flags.
+    def start(self, rev):
+        return int(self.index[rev][0] >> 16)
+
+    def sidedata_cut_off(self, rev):
+        sd_cut_off = self.index[rev][8]
+        if sd_cut_off != 0:
+            return sd_cut_off
+        # This is some annoying dance, because entries without sidedata
+        # currently use 0 as their ofsset. (instead of previous-offset +
+        # previous-size)
+        #
+        # We should reconsider this sidedata → 0 sidata_offset policy.
+        # In the meantime, we need this.
+        while 0 <= rev:
+            e = self.index[rev]
+            if e[9] != 0:
+                return e[8] + e[9]
+            rev -= 1
+        return 0
+
+    def flags(self, rev):
+        return self.index[rev][0] & 0xFFFF
+
+    def length(self, rev):
+        return self.index[rev][1]
+
+    def sidedata_length(self, rev):
+        if not self.hassidedata:
+            return 0
+        return self.index[rev][9]
+
+    def rawsize(self, rev):
+        """return the length of the uncompressed text for a given revision"""
+        l = self.index[rev][2]
+        if l >= 0:
+            return l
+
+        t = self.rawdata(rev)
+        return len(t)
+
+    def size(self, rev):
+        """length of non-raw text (processed by a "read" flag processor)"""
+        # fast path: if no "read" flag processor could change the content,
+        # size is rawsize. note: ELLIPSIS is known to not change the content.
+        flags = self.flags(rev)
+        if flags & (flagutil.REVIDX_KNOWN_FLAGS ^ REVIDX_ELLIPSIS) == 0:
+            return self.rawsize(rev)
+
+        return len(self.revision(rev))
+
+    def fast_rank(self, rev):
+        """Return the rank of a revision if already known, or None otherwise.
+
+        The rank of a revision is the size of the sub-graph it defines as a
+        head. Equivalently, the rank of a revision `r` is the size of the set
+        `ancestors(r)`, `r` included.
+
+        This method returns the rank retrieved from the revlog in constant
+        time. It makes no attempt at computing unknown values for versions of
+        the revlog which do not persist the rank.
+        """
+        rank = self.index[rev][ENTRY_RANK]
+        if self._format_version != CHANGELOGV2 or rank == RANK_UNKNOWN:
+            return None
+        if rev == nullrev:
+            return 0  # convention
+        return rank
+
+    def chainbase(self, rev):
+        base = self._chainbasecache.get(rev)
+        if base is not None:
+            return base
+
+        index = self.index
+        iterrev = rev
+        base = index[iterrev][3]
+        while base != iterrev:
+            iterrev = base
+            base = index[iterrev][3]
+
+        self._chainbasecache[rev] = base
+        return base
+
+    def linkrev(self, rev):
+        return self.index[rev][4]
+
+    def parentrevs(self, rev):
+        try:
+            entry = self.index[rev]
+        except IndexError:
+            if rev == wdirrev:
+                raise error.WdirUnsupported
+            raise
+
+        if self.canonical_parent_order and entry[5] == nullrev:
+            return entry[6], entry[5]
+        else:
+            return entry[5], entry[6]
+
+    # fast parentrevs(rev) where rev isn't filtered
+    _uncheckedparentrevs = parentrevs
+
+    def node(self, rev):
+        try:
+            return self.index[rev][7]
+        except IndexError:
+            if rev == wdirrev:
+                raise error.WdirUnsupported
+            raise
+
+    # Derived from index values.
+
+    def end(self, rev):
+        return self.start(rev) + self.length(rev)
+
+    def parents(self, node):
+        i = self.index
+        d = i[self.rev(node)]
+        # inline node() to avoid function call overhead
+        if self.canonical_parent_order and d[5] == self.nullid:
+            return i[d[6]][7], i[d[5]][7]
+        else:
+            return i[d[5]][7], i[d[6]][7]
+
+    def chainlen(self, rev):
+        return self._chaininfo(rev)[0]
+
+    def _chaininfo(self, rev):
+        chaininfocache = self._chaininfocache
+        if rev in chaininfocache:
+            return chaininfocache[rev]
+        index = self.index
+        generaldelta = self._generaldelta
+        iterrev = rev
+        e = index[iterrev]
+        clen = 0
+        compresseddeltalen = 0
+        while iterrev != e[3]:
+            clen += 1
+            compresseddeltalen += e[1]
+            if generaldelta:
+                iterrev = e[3]
+            else:
+                iterrev -= 1
+            if iterrev in chaininfocache:
+                t = chaininfocache[iterrev]
+                clen += t[0]
+                compresseddeltalen += t[1]
+                break
+            e = index[iterrev]
+        else:
+            # Add text length of base since decompressing that also takes
+            # work. For cache hits the length is already included.
+            compresseddeltalen += e[1]
+        r = (clen, compresseddeltalen)
+        chaininfocache[rev] = r
+        return r
+
+    def _deltachain(self, rev, stoprev=None):
+        """Obtain the delta chain for a revision.
+
+        ``stoprev`` specifies a revision to stop at. If not specified, we
+        stop at the base of the chain.
+
+        Returns a 2-tuple of (chain, stopped) where ``chain`` is a list of
+        revs in ascending order and ``stopped`` is a bool indicating whether
+        ``stoprev`` was hit.
+        """
+        # Try C implementation.
+        try:
+            return self.index.deltachain(rev, stoprev, self._generaldelta)
+        except AttributeError:
+            pass
+
+        chain = []
+
+        # Alias to prevent attribute lookup in tight loop.
+        index = self.index
+        generaldelta = self._generaldelta
+
+        iterrev = rev
+        e = index[iterrev]
+        while iterrev != e[3] and iterrev != stoprev:
+            chain.append(iterrev)
+            if generaldelta:
+                iterrev = e[3]
+            else:
+                iterrev -= 1
+            e = index[iterrev]
+
+        if iterrev == stoprev:
+            stopped = True
+        else:
+            chain.append(iterrev)
+            stopped = False
+
+        chain.reverse()
+        return chain, stopped
+
+    def ancestors(self, revs, stoprev=0, inclusive=False):
+        """Generate the ancestors of 'revs' in reverse revision order.
+        Does not generate revs lower than stoprev.
+
+        See the documentation for ancestor.lazyancestors for more details."""
+
+        # first, make sure start revisions aren't filtered
+        revs = list(revs)
+        checkrev = self.node
+        for r in revs:
+            checkrev(r)
+        # and we're sure ancestors aren't filtered as well
+
+        if rustancestor is not None and self.index.rust_ext_compat:
+            lazyancestors = rustancestor.LazyAncestors
+            arg = self.index
+        else:
+            lazyancestors = ancestor.lazyancestors
+            arg = self._uncheckedparentrevs
+        return lazyancestors(arg, revs, stoprev=stoprev, inclusive=inclusive)
+
+    def descendants(self, revs):
+        return dagop.descendantrevs(revs, self.revs, self.parentrevs)
+
+    def findcommonmissing(self, common=None, heads=None):
+        """Return a tuple of the ancestors of common and the ancestors of heads
+        that are not ancestors of common. In revset terminology, we return the
+        tuple:
+
+          ::common, (::heads) - (::common)
+
+        The list is sorted by revision number, meaning it is
+        topologically sorted.
+
+        'heads' and 'common' are both lists of node IDs.  If heads is
+        not supplied, uses all of the revlog's heads.  If common is not
+        supplied, uses nullid."""
+        if common is None:
+            common = [self.nullid]
+        if heads is None:
+            heads = self.heads()
+
+        common = [self.rev(n) for n in common]
+        heads = [self.rev(n) for n in heads]
+
+        # we want the ancestors, but inclusive
+        class lazyset:
+            def __init__(self, lazyvalues):
+                self.addedvalues = set()
+                self.lazyvalues = lazyvalues
+
+            def __contains__(self, value):
+                return value in self.addedvalues or value in self.lazyvalues
+
+            def __iter__(self):
+                added = self.addedvalues
+                for r in added:
+                    yield r
+                for r in self.lazyvalues:
+                    if not r in added:
+                        yield r
+
+            def add(self, value):
+                self.addedvalues.add(value)
+
+            def update(self, values):
+                self.addedvalues.update(values)
+
+        has = lazyset(self.ancestors(common))
+        has.add(nullrev)
+        has.update(common)
+
+        # take all ancestors from heads that aren't in has
+        missing = set()
+        visit = collections.deque(r for r in heads if r not in has)
+        while visit:
+            r = visit.popleft()
+            if r in missing:
+                continue
+            else:
+                missing.add(r)
+                for p in self.parentrevs(r):
+                    if p not in has:
+                        visit.append(p)
+        missing = list(missing)
+        missing.sort()
+        return has, [self.node(miss) for miss in missing]
+
+    def incrementalmissingrevs(self, common=None):
+        """Return an object that can be used to incrementally compute the
+        revision numbers of the ancestors of arbitrary sets that are not
+        ancestors of common. This is an ancestor.incrementalmissingancestors
+        object.
+
+        'common' is a list of revision numbers. If common is not supplied, uses
+        nullrev.
+        """
+        if common is None:
+            common = [nullrev]
+
+        if rustancestor is not None and self.index.rust_ext_compat:
+            return rustancestor.MissingAncestors(self.index, common)
+        return ancestor.incrementalmissingancestors(self.parentrevs, common)
+
+    def findmissingrevs(self, common=None, heads=None):
+        """Return the revision numbers of the ancestors of heads that
+        are not ancestors of common.
+
+        More specifically, return a list of revision numbers corresponding to
+        nodes N such that every N satisfies the following constraints:
+
+          1. N is an ancestor of some node in 'heads'
+          2. N is not an ancestor of any node in 'common'
+
+        The list is sorted by revision number, meaning it is
+        topologically sorted.
+
+        'heads' and 'common' are both lists of revision numbers.  If heads is
+        not supplied, uses all of the revlog's heads.  If common is not
+        supplied, uses nullid."""
+        if common is None:
+            common = [nullrev]
+        if heads is None:
+            heads = self.headrevs()
+
+        inc = self.incrementalmissingrevs(common=common)
+        return inc.missingancestors(heads)
+
+    def findmissing(self, common=None, heads=None):
+        """Return the ancestors of heads that are not ancestors of common.
+
+        More specifically, return a list of nodes N such that every N
+        satisfies the following constraints:
+
+          1. N is an ancestor of some node in 'heads'
+          2. N is not an ancestor of any node in 'common'
+
+        The list is sorted by revision number, meaning it is
+        topologically sorted.
+
+        'heads' and 'common' are both lists of node IDs.  If heads is
+        not supplied, uses all of the revlog's heads.  If common is not
+        supplied, uses nullid."""
+        if common is None:
+            common = [self.nullid]
+        if heads is None:

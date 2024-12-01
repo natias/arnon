@@ -1,0 +1,1000 @@
+=item C<todo>
+
+Run the tests ordered by number of todos.
+
+=item C<slow>
+
+Run the tests in slowest to fastest order.
+
+=item C<fast>
+
+Run test tests in fastest to slowest order.
+
+=item C<new>
+
+Run the tests in newest to oldest order.
+
+=item C<old>
+
+Run the tests in oldest to newest order.
+
+=item C<save>
+
+Save the state on exit.
+
+=back
+
+=cut
+
+sub apply_switch {
+    my $self = shift;
+    my @opts = @_;
+
+    my $last_gen      = $self->results->generation - 1;
+    my $last_run_time = $self->results->last_run_time;
+    my $now           = $self->get_time;
+
+    my @switches = map { split /,/ } @opts;
+
+    my %handler = (
+        last => sub {
+            $self->_select(
+                limit => shift,
+                where => sub { $_->generation >= $last_gen },
+                order => sub { $_->sequence }
+            );
+        },
+        failed => sub {
+            $self->_select(
+                limit => shift,
+                where => sub { $_->result != 0 },
+                order => sub { -$_->result }
+            );
+        },
+        passed => sub {
+            $self->_select(
+                limit => shift,
+                where => sub { $_->result == 0 }
+            );
+        },
+        all => sub {
+            $self->_select( limit => shift );
+        },
+        todo => sub {
+            $self->_select(
+                limit => shift,
+                where => sub { $_->num_todo != 0 },
+                order => sub { -$_->num_todo; }
+            );
+        },
+        hot => sub {
+            $self->_select(
+                limit => shift,
+                where => sub { defined $_->last_fail_time },
+                order => sub { $now - $_->last_fail_time }
+            );
+        },
+        slow => sub {
+            $self->_select(
+                limit => shift,
+                order => sub { -$_->elapsed }
+            );
+        },
+        fast => sub {
+            $self->_select(
+                limit => shift,
+                order => sub { $_->elapsed }
+            );
+        },
+        new => sub {
+            $self->_select(
+                limit => shift,
+                order => sub { -$_->mtime }
+            );
+        },
+        old => sub {
+            $self->_select(
+                limit => shift,
+                order => sub { $_->mtime }
+            );
+        },
+        fresh => sub {
+            $self->_select(
+                limit => shift,
+                where => sub { $_->mtime >= $last_run_time }
+            );
+        },
+        save => sub {
+            $self->{should_save}++;
+        },
+        adrian => sub {
+            unshift @switches, qw( hot all save );
+        },
+    );
+
+    while ( defined( my $ele = shift @switches ) ) {
+        my ( $opt, $arg )
+          = ( $ele =~ /^([^:]+):(.*)/ )
+          ? ( $1, $2 )
+          : ( $ele, undef );
+        my $code = $handler{$opt}
+          || croak "Illegal state option: $opt";
+        $code->($arg);
+    }
+    return;
+}
+
+sub _select {
+    my ( $self, %spec ) = @_;
+    push @{ $self->{select} }, \%spec;
+}
+
+=head3 C<get_tests>
+
+Given a list of args get the names of tests that should run
+
+=cut
+
+sub get_tests {
+    my $self    = shift;
+    my $recurse = shift;
+    my @argv    = @_;
+    my %seen;
+
+    my @selected = $self->_query;
+
+    unless ( @argv || @{ $self->{select} } ) {
+        @argv = $recurse ? '.' : 't';
+        croak qq{No tests named and '@argv' directory not found}
+          unless -d $argv[0];
+    }
+
+    push @selected, $self->_get_raw_tests( $recurse, @argv ) if @argv;
+    return grep { !$seen{$_}++ } @selected;
+}
+
+sub _query {
+    my $self = shift;
+    if ( my @sel = @{ $self->{select} } ) {
+        warn "No saved state, selection will be empty\n"
+          unless $self->results->num_tests;
+        return map { $self->_query_clause($_) } @sel;
+    }
+    return;
+}
+
+sub _query_clause {
+    my ( $self, $clause ) = @_;
+    my @got;
+    my $results = $self->results;
+    my $where = $clause->{where} || sub {1};
+
+    # Select
+    for my $name ( $results->test_names ) {
+        next unless -f $name;
+        local $_ = $results->test($name);
+        push @got, $name if $where->();
+    }
+
+    # Sort
+    if ( my $order = $clause->{order} ) {
+        @got = map { $_->[0] }
+          sort {
+                 ( defined $b->[1] <=> defined $a->[1] )
+              || ( ( $a->[1] || 0 ) <=> ( $b->[1] || 0 ) )
+          } map {
+            [   $_,
+                do { local $_ = $results->test($_); $order->() }
+            ]
+          } @got;
+    }
+
+    if ( my $limit = $clause->{limit} ) {
+        @got = splice @got, 0, $limit if @got > $limit;
+    }
+
+    return @got;
+}
+
+sub _get_raw_tests {
+    my $self    = shift;
+    my $recurse = shift;
+    my @argv    = @_;
+    my @tests;
+
+    # Do globbing on Win32.
+    if (NEED_GLOB) {
+        eval "use File::Glob::Windows";    # [49732]
+        @argv = map { glob "$_" } @argv;
+    }
+    my $extensions = $self->{extensions};
+
+    for my $arg (@argv) {
+        if ( '-' eq $arg ) {
+            push @argv => <STDIN>;
+            chomp(@argv);
+            next;
+        }
+
+        push @tests,
+            sort -d $arg
+          ? $recurse
+              ? $self->_expand_dir_recursive( $arg, $extensions )
+              : map { glob( File::Spec->catfile( $arg, "*$_" ) ) }
+              @{$extensions}
+          : $arg;
+    }
+    return @tests;
+}
+
+sub _expand_dir_recursive {
+    my ( $self, $dir, $extensions ) = @_;
+
+    my @tests;
+    my $ext_string = join( '|', map {quotemeta} @{$extensions} );
+
+    find(
+        {   follow      => 1,      #21938
+            follow_skip => 2,
+            wanted      => sub {
+                -f 
+                  && /(?:$ext_string)$/
+                  && push @tests => $File::Find::name;
+              }
+        },
+        $dir
+    );
+    return @tests;
+}
+
+=head3 C<observe_test>
+
+Store the results of a test.
+
+=cut
+
+# Store:
+#     last fail time
+#     last pass time
+#     last run time
+#     most recent result
+#     most recent todos
+#     total failures
+#     total passes
+#     state generation
+#     parser
+
+sub observe_test {
+
+    my ( $self, $test_info, $parser ) = @_;
+    my $name = $test_info->[0];
+    my $fail = scalar( $parser->failed ) + ( $parser->has_problems ? 1 : 0 );
+    my $todo = scalar( $parser->todo );
+    my $start_time = $parser->start_time;
+    my $end_time   = $parser->end_time,
+
+      my $test = $self->results->test($name);
+
+    $test->sequence( $self->{seq}++ );
+    $test->generation( $self->results->generation );
+
+    $test->run_time($end_time);
+    $test->result($fail);
+    $test->num_todo($todo);
+    $test->elapsed( $end_time - $start_time );
+
+    $test->parser($parser);
+
+    if ($fail) {
+        $test->total_failures( $test->total_failures + 1 );
+        $test->last_fail_time($end_time);
+    }
+    else {
+        $test->total_passes( $test->total_passes + 1 );
+        $test->last_pass_time($end_time);
+    }
+}
+
+=head3 C<save>
+
+Write the state to a file.
+
+=cut
+
+sub save {
+    my ($self) = @_;
+
+    my $store = $self->{store} or return;
+    $self->results->last_run_time( $self->get_time );
+
+    my $writer = TAP::Parser::YAMLish::Writer->new;
+    local *FH;
+    open FH, ">$store" or croak "Can't write $store ($!)";
+    $writer->write( $self->results->raw, \*FH );
+    close FH;
+}
+
+=head3 C<load>
+
+Load the state from a file
+
+=cut
+
+sub load {
+    my ( $self, $name ) = @_;
+    my $reader = TAP::Parser::YAMLish::Reader->new;
+    local *FH;
+    open FH, "<$name" or croak "Can't read $name ($!)";
+
+    # XXX this is temporary
+    $self->{_} = $self->result_class->new(
+        $reader->read(
+            sub {
+                my $line = <FH>;
+                defined $line && chomp $line;
+                return $line;
+            }
+        )
+    );
+
+    # $writer->write( $self->{tests} || {}, \*FH );
+    close FH;
+    $self->_regen_seq;
+    $self->_prune_and_stamp;
+    $self->results->generation( $self->results->generation + 1 );
+}
+
+sub _prune_and_stamp {
+    my $self = shift;
+
+    my $results = $self->results;
+    my @tests   = $self->results->tests;
+    for my $test (@tests) {
+        my $name = $test->name;
+        if ( my @stat = stat $name ) {
+            $test->mtime( $stat[9] );
+        }
+        else {
+            $results->remove($name);
+        }
+    }
+}
+
+sub _regen_seq {
+    my $self = shift;
+    for my $test ( $self->results->tests ) {
+        $self->{seq} = $test->sequence + 1
+          if defined $test->sequence && $test->sequence >= $self->{seq};
+    }
+}
+
+1;
+                                                                                       usr/local/lib/perl5/5.40.0/App/Prove.pm                                                             0000444 0000000 0000000 00000044357 14714567415 015672  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        package App::Prove;
+
+use strict;
+use warnings;
+
+use TAP::Harness::Env;
+use Text::ParseWords qw(shellwords);
+use File::Spec;
+use Getopt::Long;
+use App::Prove::State;
+use Carp;
+
+use base 'TAP::Object';
+
+=head1 NAME
+
+App::Prove - Implements the C<prove> command.
+
+=head1 VERSION
+
+Version 3.48
+
+=cut
+
+our $VERSION = '3.48';
+
+=head1 DESCRIPTION
+
+L<Test::Harness> provides a command, C<prove>, which runs a TAP based
+test suite and prints a report. The C<prove> command is a minimal
+wrapper around an instance of this module.
+
+=head1 SYNOPSIS
+
+    use App::Prove;
+
+    my $app = App::Prove->new;
+    $app->process_args(@ARGV);
+    $app->run;
+
+=cut
+
+use constant IS_WIN32 => ( $^O =~ /^(MS)?Win32$/ );
+use constant IS_VMS => $^O eq 'VMS';
+use constant IS_UNIXY => !( IS_VMS || IS_WIN32 );
+
+use constant STATE_FILE => IS_UNIXY ? '.prove'   : '_prove';
+use constant RC_FILE    => IS_UNIXY ? '.proverc' : '_proverc';
+
+use constant PLUGINS => 'App::Prove::Plugin';
+
+my @ATTR;
+
+BEGIN {
+    @ATTR = qw(
+      archive argv blib show_count color directives exec failures comments
+      formatter harness includes modules plugins jobs lib merge parse quiet
+      really_quiet recurse backwards shuffle taint_fail taint_warn timer
+      verbose warnings_fail warnings_warn show_help show_man show_version
+      state_class test_args state dry extensions ignore_exit rules state_manager
+      normalize sources tapversion trap
+      statefile
+    );
+    __PACKAGE__->mk_methods(@ATTR);
+}
+
+=head1 METHODS
+
+=head2 Class Methods
+
+=head3 C<new>
+
+Create a new C<App::Prove>. Optionally a hash ref of attribute
+initializers may be passed.
+
+=cut
+
+# new() implementation supplied by TAP::Object
+
+sub _initialize {
+    my $self = shift;
+    my $args = shift || {};
+
+    my @is_array = qw(
+      argv rc_opts includes modules state plugins rules sources
+    );
+
+    # setup defaults:
+    for my $key (@is_array) {
+        $self->{$key} = [];
+    }
+
+    for my $attr (@ATTR) {
+        if ( exists $args->{$attr} ) {
+
+            # TODO: Some validation here
+            $self->{$attr} = $args->{$attr};
+        }
+    }
+
+    $self->state_class('App::Prove::State');
+    return $self;
+}
+
+=head3 C<state_class>
+
+Getter/setter for the name of the class used for maintaining state.  This
+class should either subclass from C<App::Prove::State> or provide an identical
+interface.
+
+=head3 C<state_manager>
+
+Getter/setter for the instance of the C<state_class>.
+
+=cut
+
+=head3 C<add_rc_file>
+
+    $prove->add_rc_file('myproj/.proverc');
+
+Called before C<process_args> to prepend the contents of an rc file to
+the options.
+
+=cut
+
+sub add_rc_file {
+    my ( $self, $rc_file ) = @_;
+
+    local *RC;
+    open RC, "<$rc_file" or croak "Can't read $rc_file ($!)";
+    while ( defined( my $line = <RC> ) ) {
+        push @{ $self->{rc_opts} },
+          grep { defined and not /^#/ }
+          $line =~ m{ ' ([^']*) ' | " ([^"]*) " | (\#.*) | (\S+) }xg;
+    }
+    close RC;
+}
+
+=head3 C<process_args>
+
+    $prove->process_args(@args);
+
+Processes the command-line arguments. Attributes will be set
+appropriately. Any filenames may be found in the C<argv> attribute.
+
+Dies on invalid arguments.
+
+=cut
+
+sub process_args {
+    my $self = shift;
+
+    my @rc = RC_FILE;
+    unshift @rc, glob '~/' . RC_FILE if IS_UNIXY;
+
+    # Preprocess meta-args.
+    my @args;
+    while ( defined( my $arg = shift ) ) {
+        if ( $arg eq '--norc' ) {
+            @rc = ();
+        }
+        elsif ( $arg eq '--rc' ) {
+            defined( my $rc = shift )
+              or croak "Missing argument to --rc";
+            push @rc, $rc;
+        }
+        elsif ( $arg =~ m{^--rc=(.+)$} ) {
+            push @rc, $1;
+        }
+        else {
+            push @args, $arg;
+        }
+    }
+
+    # Everything after the arisdottle '::' gets passed as args to
+    # test programs.
+    if ( defined( my $stop_at = _first_pos( '::', @args ) ) ) {
+        my @test_args = splice @args, $stop_at;
+        shift @test_args;
+        $self->{test_args} = \@test_args;
+    }
+
+    # Grab options from RC files
+    $self->add_rc_file($_) for grep -f, @rc;
+    unshift @args, @{ $self->{rc_opts} };
+
+    if ( my @bad = map {"-$_"} grep {/^-(man|help)$/} @args ) {
+        die "Long options should be written with two dashes: ",
+          join( ', ', @bad ), "\n";
+    }
+
+    # And finally...
+
+    {
+        local @ARGV = @args;
+        Getopt::Long::Configure(qw(no_ignore_case bundling pass_through));
+
+        # Don't add coderefs to GetOptions
+        GetOptions(
+            'v|verbose'  => \$self->{verbose},
+            'f|failures' => \$self->{failures},
+            'o|comments' => \$self->{comments},
+            'l|lib'      => \$self->{lib},
+            'b|blib'     => \$self->{blib},
+            's|shuffle'  => \$self->{shuffle},
+            'color!'     => \$self->{color},
+            'colour!'    => \$self->{color},
+            'count!'     => \$self->{show_count},
+            'c'          => \$self->{color},
+            'D|dry'      => \$self->{dry},
+            'ext=s@'     => sub {
+                my ( $opt, $val ) = @_;
+
+                # Workaround for Getopt::Long 2.25 handling of
+                # multivalue options
+                push @{ $self->{extensions} ||= [] }, $val;
+            },
+            'harness=s'    => \$self->{harness},
+            'ignore-exit'  => \$self->{ignore_exit},
+            'source=s@'    => $self->{sources},
+            'formatter=s'  => \$self->{formatter},
+            'r|recurse'    => \$self->{recurse},
+            'reverse'      => \$self->{backwards},
+            'p|parse'      => \$self->{parse},
+            'q|quiet'      => \$self->{quiet},
+            'Q|QUIET'      => \$self->{really_quiet},
+            'e|exec=s'     => \$self->{exec},
+            'm|merge'      => \$self->{merge},
+            'I=s@'         => $self->{includes},
+            'M=s@'         => $self->{modules},
+            'P=s@'         => $self->{plugins},
+            'state=s@'     => $self->{state},
+            'statefile=s'  => \$self->{statefile},
+            'directives'   => \$self->{directives},
+            'h|help|?'     => \$self->{show_help},
+            'H|man'        => \$self->{show_man},
+            'V|version'    => \$self->{show_version},
+            'a|archive=s'  => \$self->{archive},
+            'j|jobs=i'     => \$self->{jobs},
+            'timer'        => \$self->{timer},
+            'T'            => \$self->{taint_fail},
+            't'            => \$self->{taint_warn},
+            'W'            => \$self->{warnings_fail},
+            'w'            => \$self->{warnings_warn},
+            'normalize'    => \$self->{normalize},
+            'rules=s@'     => $self->{rules},
+            'tapversion=s' => \$self->{tapversion},
+            'trap'         => \$self->{trap},
+        ) or croak('Unable to continue');
+
+        # Stash the remainder of argv for later
+        $self->{argv} = [@ARGV];
+    }
+
+    return;
+}
+
+sub _first_pos {
+    my $want = shift;
+    for ( 0 .. $#_ ) {
+        return $_ if $_[$_] eq $want;
+    }
+    return;
+}
+
+sub _help {
+    my ( $self, $verbosity ) = @_;
+
+    eval('use Pod::Usage 1.12 ()');
+    if ( my $err = $@ ) {
+        die 'Please install Pod::Usage for the --help option '
+          . '(or try `perldoc prove`.)'
+          . "\n ($@)";
+    }
+
+    Pod::Usage::pod2usage( { -verbose => $verbosity } );
+
+    return;
+}
+
+sub _color_default {
+    my $self = shift;
+
+    return -t STDOUT && !$ENV{HARNESS_NOTTY};
+}
+
+sub _get_args {
+    my $self = shift;
+
+    my %args;
+
+    $args{trap} = 1 if $self->trap;
+
+    if ( defined $self->color ? $self->color : $self->_color_default ) {
+        $args{color} = 1;
+    }
+    if ( !defined $self->show_count ) {
+        $args{show_count} = 1;
+    }
+    else {
+        $args{show_count} = $self->show_count;
+    }
+
+    if ( $self->archive ) {
+        $self->require_harness( archive => 'TAP::Harness::Archive' );
+        $args{archive} = $self->archive;
+    }
+
+    if ( my $jobs = $self->jobs ) {
+        $args{jobs} = $jobs;
+    }
+
+    if ( my $harness_opt = $self->harness ) {
+        $self->require_harness( harness => $harness_opt );
+    }
+
+    if ( my $formatter = $self->formatter ) {
+        $args{formatter_class} = $formatter;
+    }
+
+    for my $handler ( @{ $self->sources } ) {
+        my ( $name, $config ) = $self->_parse_source($handler);
+        $args{sources}->{$name} = $config;
+    }
+
+    if ( $self->ignore_exit ) {
+        $args{ignore_exit} = 1;
+    }
+
+    if ( $self->taint_fail && $self->taint_warn ) {
+        die '-t and -T are mutually exclusive';
+    }
+
+    if ( $self->warnings_fail && $self->warnings_warn ) {
+        die '-w and -W are mutually exclusive';
+    }
+
+    for my $a (qw( lib switches )) {
+        my $method = "_get_$a";
+        my $val    = $self->$method();
+        $args{$a} = $val if defined $val;
+    }
+
+    # Handle verbose, quiet, really_quiet flags
+    my %verb_map = ( verbose => 1, quiet => -1, really_quiet => -2, );
+
+    my @verb_adj = map { $self->$_() ? $verb_map{$_} : () }
+      keys %verb_map;
+
+    die "Only one of verbose, quiet or really_quiet should be specified\n"
+      if @verb_adj > 1;
+
+    $args{verbosity} = shift @verb_adj if @verb_adj;
+
+    for my $a (qw( merge failures comments timer directives normalize )) {
+        $args{$a} = 1 if $self->$a();
+    }
+
+    $args{errors} = 1 if $self->parse;
+
+    # defined but zero-length exec runs test files as binaries
+    $args{exec} = [ split( /\s+/, $self->exec ) ]
+      if ( defined( $self->exec ) );
+
+    $args{version} = $self->tapversion if defined( $self->tapversion );
+
+    if ( defined( my $test_args = $self->test_args ) ) {
+        $args{test_args} = $test_args;
+    }
+
+    if ( @{ $self->rules } ) {
+        my @rules;
+        for ( @{ $self->rules } ) {
+            if (/^par=(.*)/) {
+                push @rules, $1;
+            }
+            elsif (/^seq=(.*)/) {
+                push @rules, { seq => $1 };
+            }
+        }
+        $args{rules} = { par => [@rules] };
+    }
+    $args{harness_class} = $self->{harness_class} if $self->{harness_class};
+
+    return \%args;
+}
+
+sub _find_module {
+    my ( $self, $class, @search ) = @_;
+
+    croak "Bad module name $class"
+      unless $class =~ /^ \w+ (?: :: \w+ ) *$/x;
+
+    for my $pfx (@search) {
+        my $name = join( '::', $pfx, $class );
+        eval "require $name";
+        return $name unless $@;
+    }
+
+    eval "require $class";
+    return $class unless $@;
+    return;
+}
+
+sub _load_extension {
+    my ( $self, $name, @search ) = @_;
+
+    my @args = ();
+    if ( $name =~ /^(.*?)=(.*)/ ) {
+        $name = $1;
+        @args = split( /,/, $2 );
+    }
+
+    if ( my $class = $self->_find_module( $name, @search ) ) {
+        if ( $class->can('load') ) {
+            $class->load( { app_prove => $self, args => [@args] } );
+        }
+    }
+    else {
+        croak "Can't load module $name";
+    }
+}
+
+sub _load_extensions {
+    my ( $self, $ext, @search ) = @_;
+    $self->_load_extension( $_, @search ) for @$ext;
+}
+
+sub _parse_source {
+    my ( $self, $handler ) = @_;
+
+    # Load any options.
+    ( my $opt_name = lc $handler ) =~ s/::/-/g;
+    local @ARGV = @{ $self->{argv} };
+    my %config;
+    Getopt::Long::GetOptions(
+        "$opt_name-option=s%" => sub {
+            my ( $name, $k, $v ) = @_;
+            if ( $v =~ /(?<!\\)=/ ) {
+
+                # It's a hash option.
+                croak "Option $name must be consistently used as a hash"
+                  if exists $config{$k} && ref $config{$k} ne 'HASH';
+                $config{$k} ||= {};
+                my ( $hk, $hv ) = split /(?<!\\)=/, $v, 2;
+                $config{$k}{$hk} = $hv;
+            }
+            else {
+                $v =~ s/\\=/=/g;
+                if ( exists $config{$k} ) {
+                    $config{$k} = [ $config{$k} ]
+                      unless ref $config{$k} eq 'ARRAY';
+                    push @{ $config{$k} } => $v;
+                }
+                else {
+                    $config{$k} = $v;
+                }
+            }
+        }
+    );
+    $self->{argv} = \@ARGV;
+    return ( $handler, \%config );
+}
+
+=head3 C<run>
+
+Perform whatever actions the command line args specified. The C<prove>
+command line tool consists of the following code:
+
+    use App::Prove;
+
+    my $app = App::Prove->new;
+    $app->process_args(@ARGV);
+    exit( $app->run ? 0 : 1 );  # if you need the exit code
+
+=cut
+
+sub run {
+    my $self = shift;
+
+    unless ( $self->state_manager ) {
+        $self->state_manager(
+            $self->state_class->new( { store => $self->statefile || STATE_FILE } ) );
+    }
+
+    if ( $self->show_help ) {
+        $self->_help(1);
+    }
+    elsif ( $self->show_man ) {
+        $self->_help(2);
+    }
+    elsif ( $self->show_version ) {
+        $self->print_version;
+    }
+    elsif ( $self->dry ) {
+        print "$_\n" for $self->_get_tests;
+    }
+    else {
+
+        $self->_load_extensions( $self->modules );
+        $self->_load_extensions( $self->plugins, PLUGINS );
+
+        local $ENV{TEST_VERBOSE} = 1 if $self->verbose;
+
+        return $self->_runtests( $self->_get_args, $self->_get_tests );
+    }
+
+    return 1;
+}
+
+sub _get_tests {
+    my $self = shift;
+
+    my $state = $self->state_manager;
+    my $ext   = $self->extensions;
+    $state->extensions($ext) if defined $ext;
+    if ( defined( my $state_switch = $self->state ) ) {
+        $state->apply_switch(@$state_switch);
+    }
+
+    my @tests = $state->get_tests( $self->recurse, @{ $self->argv } );
+
+    $self->_shuffle(@tests) if $self->shuffle;
+    @tests = reverse @tests if $self->backwards;
+
+    return @tests;
+}
+
+sub _runtests {
+    my ( $self, $args, @tests ) = @_;
+    my $harness = TAP::Harness::Env->create($args);
+
+    my $state = $self->state_manager;
+
+    $harness->callback(
+        after_test => sub {
+            $state->observe_test(@_);
+        }
+    );
+
+    $harness->callback(
+        after_runtests => sub {
+            $state->commit(@_);
+        }
+    );
+
+    my $aggregator = $harness->runtests(@tests);
+
+    return !$aggregator->has_errors;
+}
+
+sub _get_switches {
+    my $self = shift;
+    my @switches;
+
+    # notes that -T or -t must be at the front of the switches!
+    if ( $self->taint_fail ) {
+        push @switches, '-T';
+    }
+    elsif ( $self->taint_warn ) {
+        push @switches, '-t';
+    }
+    if ( $self->warnings_fail ) {
+        push @switches, '-W';
+    }
+    elsif ( $self->warnings_warn ) {
+        push @switches, '-w';
+    }
+
+    return @switches ? \@switches : ();
+}
+
+sub _get_lib {
+    my $self = shift;
+    my @libs;
+    if ( $self->lib ) {
+        push @libs, 'lib';
+    }
+    if ( $self->blib ) {
+        push @libs, 'blib/lib', 'blib/arch';
+    }
+    if ( @{ $self->includes } ) {
+        push @libs, @{ $self->includes };
+    }
+
+    #24926
+    @libs = map { File::Spec->rel2abs($_) } @libs;
+
+    # Huh?
+    return @libs ? \@libs : ();
+}
+
+sub _shuffle {
+    my $self = shift;
+
+    # Fisher-Yates shuffle
+    my $i = @_;
+    while ($i) {
+        my $j = rand $i--;
+        @_[ $i, $j ] = @_[ $j, $i ];
+    }
+    return;
+}
+
+=head3 C<require_harness>
+
+Load a harness replacement class.
+
+  $prove->require_harness($for => $class_name);
+
+=cut
+
+sub require_harness {
+    my ( $self, $for, $class ) = @_;
+
+    my ($class_name) = $class =~ /^(\w+(?:::\w+)*)/;
+
+    # Emulate Perl's -MModule=arg1,arg2 behaviour
+    $class =~ s!^(\w+(?:::\w+)*)=(.*)$!$1 split(/,/,q{$2})!;
+
+    eval("use $class;");
+    die "$class_name is required to use the --$for feature: $@" if $@;
+
+    $self->{harness_class} = $class_name;
+
+    return;
+}
+
+=head3 C<print_version>

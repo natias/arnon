@@ -1,0 +1,1000 @@
+	  std::move(__w), memory_order_seq_cst, memory_order_seq_cst);
+    }
+
+  template<typename _Tp, _Lock_policy _Lp>
+    bool
+    atomic_compare_exchange_strong_explicit(__shared_ptr<_Tp, _Lp>* __p,
+					    __shared_ptr<_Tp, _Lp>* __v,
+					    __shared_ptr<_Tp, _Lp> __w,
+					    memory_order,
+					    memory_order)
+    {
+      __shared_ptr<_Tp, _Lp> __x; // goes out of scope after __lock
+      _Sp_locker __lock{__p, __v};
+      owner_less<__shared_ptr<_Tp, _Lp>> __less;
+      if (*__p == *__v && !__less(*__p, *__v) && !__less(*__v, *__p))
+	{
+	  __x = std::move(*__p);
+	  *__p = std::move(__w);
+	  return true;
+	}
+      __x = std::move(*__v);
+      *__v = *__p;
+      return false;
+    }
+
+  template<typename _Tp, _Lock_policy _Lp>
+    inline bool
+    atomic_compare_exchange_strong(__shared_ptr<_Tp, _Lp>* __p,
+				   __shared_ptr<_Tp, _Lp>* __v,
+				   __shared_ptr<_Tp, _Lp> __w)
+    {
+      return std::atomic_compare_exchange_strong_explicit(__p, __v,
+	  std::move(__w), memory_order_seq_cst, memory_order_seq_cst);
+    }
+
+  template<typename _Tp, _Lock_policy _Lp>
+    inline bool
+    atomic_compare_exchange_weak_explicit(__shared_ptr<_Tp, _Lp>* __p,
+					  __shared_ptr<_Tp, _Lp>* __v,
+					  __shared_ptr<_Tp, _Lp> __w,
+					  memory_order __success,
+					  memory_order __failure)
+    {
+      return std::atomic_compare_exchange_strong_explicit(__p, __v,
+	  std::move(__w), __success, __failure);
+    }
+
+  template<typename _Tp, _Lock_policy _Lp>
+    inline bool
+    atomic_compare_exchange_weak(__shared_ptr<_Tp, _Lp>* __p,
+				 __shared_ptr<_Tp, _Lp>* __v,
+				 __shared_ptr<_Tp, _Lp> __w)
+    {
+      return std::atomic_compare_exchange_weak_explicit(__p, __v,
+	  std::move(__w), memory_order_seq_cst, memory_order_seq_cst);
+    }
+  /// @}
+
+#if __cplusplus >= 202002L
+# define __cpp_lib_atomic_shared_ptr 201711L
+  template<typename _Tp>
+    class atomic;
+
+  template<typename _Up>
+    static constexpr bool __is_shared_ptr = false;
+  template<typename _Up>
+    static constexpr bool __is_shared_ptr<shared_ptr<_Up>> = true;
+
+  template<typename _Tp>
+    class _Sp_atomic
+    {
+      using value_type = _Tp;
+
+      friend class atomic<_Tp>;
+
+      // An atomic version of __shared_count<> and __weak_count<>.
+      // Stores a _Sp_counted_base<>* but uses the LSB as a lock.
+      struct _Atomic_count
+      {
+	// Either __shared_count<> or __weak_count<>
+	using __count_type = decltype(_Tp::_M_refcount);
+
+	// _Sp_counted_base<>*
+	using pointer = decltype(__count_type::_M_pi);
+
+	// Ensure we can use the LSB as the lock bit.
+	static_assert(alignof(remove_pointer_t<pointer>) > 1);
+
+	constexpr _Atomic_count() noexcept = default;
+
+	explicit
+	_Atomic_count(__count_type&& __c) noexcept
+	: _M_val(reinterpret_cast<uintptr_t>(__c._M_pi))
+	{
+	  __c._M_pi = nullptr;
+	}
+
+	~_Atomic_count()
+	{
+	  auto __val = _M_val.load(memory_order_relaxed);
+	  __glibcxx_assert(!(__val & _S_lock_bit));
+	  if (auto __pi = reinterpret_cast<pointer>(__val))
+	    {
+	      if constexpr (__is_shared_ptr<_Tp>)
+		__pi->_M_release();
+	      else
+		__pi->_M_weak_release();
+	    }
+	}
+
+	_Atomic_count(const _Atomic_count&) = delete;
+	_Atomic_count& operator=(const _Atomic_count&) = delete;
+
+	// Precondition: Caller does not hold lock!
+	// Returns the raw pointer value without the lock bit set.
+	pointer
+	lock(memory_order __o) const noexcept
+	{
+	  // To acquire the lock we flip the LSB from 0 to 1.
+
+	  auto __current = _M_val.load(memory_order_relaxed);
+	  while (__current & _S_lock_bit)
+	    {
+#if __cpp_lib_atomic_wait
+	      __detail::__thread_relax();
+#endif
+	      __current = _M_val.load(memory_order_relaxed);
+	    }
+
+	  while (!_M_val.compare_exchange_strong(__current,
+						 __current | _S_lock_bit,
+						 __o,
+						 memory_order_relaxed))
+	    {
+#if __cpp_lib_atomic_wait
+	      __detail::__thread_relax();
+#endif
+	      __current = __current & ~_S_lock_bit;
+	    }
+	  return reinterpret_cast<pointer>(__current);
+	}
+
+	// Precondition: caller holds lock!
+	void
+	unlock(memory_order __o) const noexcept
+	{
+	  _M_val.fetch_sub(1, __o);
+	}
+
+	// Swaps the values of *this and __c, and unlocks *this.
+	// Precondition: caller holds lock!
+	void
+	_M_swap_unlock(__count_type& __c, memory_order __o) noexcept
+	{
+	  if (__o != memory_order_seq_cst)
+	    __o = memory_order_release;
+	  auto __x = reinterpret_cast<uintptr_t>(__c._M_pi);
+	  __x = _M_val.exchange(__x, __o);
+	  __c._M_pi = reinterpret_cast<pointer>(__x & ~_S_lock_bit);
+	}
+
+#if __cpp_lib_atomic_wait
+	// Precondition: caller holds lock!
+	void
+	_M_wait_unlock(memory_order __o) const noexcept
+	{
+	  auto __v = _M_val.fetch_sub(1, memory_order_relaxed);
+	  _M_val.wait(__v & ~_S_lock_bit, __o);
+	}
+
+	void
+	notify_one() noexcept
+	{
+	  _M_val.notify_one();
+	}
+
+	void
+	notify_all() noexcept
+	{
+	  _M_val.notify_all();
+	}
+#endif
+
+      private:
+	mutable __atomic_base<uintptr_t> _M_val{0};
+	static constexpr uintptr_t _S_lock_bit{1};
+      };
+
+      typename _Tp::element_type* _M_ptr = nullptr;
+      _Atomic_count _M_refcount;
+
+      static typename _Atomic_count::pointer
+      _S_add_ref(typename _Atomic_count::pointer __p)
+      {
+	if (__p)
+	  {
+	    if constexpr (__is_shared_ptr<_Tp>)
+	      __p->_M_add_ref_copy();
+	    else
+	      __p->_M_weak_add_ref();
+	  }
+	return __p;
+      }
+
+      constexpr _Sp_atomic() noexcept = default;
+
+      explicit
+      _Sp_atomic(value_type __r) noexcept
+      : _M_ptr(__r._M_ptr), _M_refcount(std::move(__r._M_refcount))
+      { }
+
+      ~_Sp_atomic() = default;
+
+      _Sp_atomic(const _Sp_atomic&) = delete;
+      void operator=(const _Sp_atomic&) = delete;
+
+      value_type
+      load(memory_order __o) const noexcept
+      {
+	__glibcxx_assert(__o != memory_order_release
+			   && __o != memory_order_acq_rel);
+	// Ensure that the correct value of _M_ptr is visible after locking.,
+	// by upgrading relaxed or consume to acquire.
+	if (__o != memory_order_seq_cst)
+	  __o = memory_order_acquire;
+
+	value_type __ret;
+	auto __pi = _M_refcount.lock(__o);
+	__ret._M_ptr = _M_ptr;
+	__ret._M_refcount._M_pi = _S_add_ref(__pi);
+	_M_refcount.unlock(memory_order_relaxed);
+	return __ret;
+      }
+
+      void
+      swap(value_type& __r, memory_order __o) noexcept
+      {
+	_M_refcount.lock(memory_order_acquire);
+	std::swap(_M_ptr, __r._M_ptr);
+	_M_refcount._M_swap_unlock(__r._M_refcount, __o);
+      }
+
+      bool
+      compare_exchange_strong(value_type& __expected, value_type __desired,
+			      memory_order __o, memory_order __o2) noexcept
+      {
+	bool __result = true;
+	auto __pi = _M_refcount.lock(memory_order_acquire);
+	if (_M_ptr == __expected._M_ptr
+	      && __pi == __expected._M_refcount._M_pi)
+	  {
+	    _M_ptr = __desired._M_ptr;
+	    _M_refcount._M_swap_unlock(__desired._M_refcount, __o);
+	  }
+	else
+	  {
+	    _Tp __sink = std::move(__expected);
+	    __expected._M_ptr = _M_ptr;
+	    __expected._M_refcount._M_pi = _S_add_ref(__pi);
+	    _M_refcount.unlock(__o2);
+	    __result = false;
+	  }
+	return __result;
+      }
+
+#if __cpp_lib_atomic_wait
+      void
+      wait(value_type __old, memory_order __o) const noexcept
+      {
+	auto __pi = _M_refcount.lock(memory_order_acquire);
+	if (_M_ptr == __old._M_ptr && __pi == __old._M_refcount._M_pi)
+	  _M_refcount._M_wait_unlock(__o);
+	else
+	  _M_refcount.unlock(memory_order_relaxed);
+      }
+
+      void
+      notify_one() noexcept
+      {
+	_M_refcount.notify_one();
+      }
+
+      void
+      notify_all() noexcept
+      {
+	_M_refcount.notify_all();
+      }
+#endif
+    };
+
+  template<typename _Tp>
+    class atomic<shared_ptr<_Tp>>
+    {
+    public:
+      using value_type = shared_ptr<_Tp>;
+
+      static constexpr bool is_always_lock_free = false;
+
+      bool
+      is_lock_free() const noexcept
+      { return false; }
+
+      constexpr atomic() noexcept = default;
+
+      // _GLIBCXX_RESOLVE_LIB_DEFECTS
+      // 3661. constinit atomic<shared_ptr<T>> a(nullptr); should work
+      constexpr atomic(nullptr_t) noexcept : atomic() { }
+
+      atomic(shared_ptr<_Tp> __r) noexcept
+      : _M_impl(std::move(__r))
+      { }
+
+      atomic(const atomic&) = delete;
+      void operator=(const atomic&) = delete;
+
+      shared_ptr<_Tp>
+      load(memory_order __o = memory_order_seq_cst) const noexcept
+      { return _M_impl.load(__o); }
+
+      operator shared_ptr<_Tp>() const noexcept
+      { return _M_impl.load(memory_order_seq_cst); }
+
+      void
+      store(shared_ptr<_Tp> __desired,
+	    memory_order __o = memory_order_seq_cst) noexcept
+      { _M_impl.swap(__desired, __o); }
+
+      void
+      operator=(shared_ptr<_Tp> __desired) noexcept
+      { _M_impl.swap(__desired, memory_order_seq_cst); }
+
+      shared_ptr<_Tp>
+      exchange(shared_ptr<_Tp> __desired,
+	       memory_order __o = memory_order_seq_cst) noexcept
+      {
+	_M_impl.swap(__desired, __o);
+	return __desired;
+      }
+
+      bool
+      compare_exchange_strong(shared_ptr<_Tp>& __expected,
+			      shared_ptr<_Tp> __desired,
+			      memory_order __o, memory_order __o2) noexcept
+      {
+	return _M_impl.compare_exchange_strong(__expected, __desired, __o, __o2);
+      }
+
+      bool
+      compare_exchange_strong(value_type& __expected, value_type __desired,
+			      memory_order __o = memory_order_seq_cst) noexcept
+      {
+	memory_order __o2;
+	switch (__o)
+	{
+	case memory_order_acq_rel:
+	  __o2 = memory_order_acquire;
+	  break;
+	case memory_order_release:
+	  __o2 = memory_order_relaxed;
+	  break;
+	default:
+	  __o2 = __o;
+	}
+	return compare_exchange_strong(__expected, std::move(__desired),
+				       __o, __o2);
+      }
+
+      bool
+      compare_exchange_weak(value_type& __expected, value_type __desired,
+			    memory_order __o, memory_order __o2) noexcept
+      {
+	return compare_exchange_strong(__expected, std::move(__desired),
+				       __o, __o2);
+      }
+
+      bool
+      compare_exchange_weak(value_type& __expected, value_type __desired,
+			    memory_order __o = memory_order_seq_cst) noexcept
+      {
+	return compare_exchange_strong(__expected, std::move(__desired), __o);
+      }
+
+#if __cpp_lib_atomic_wait
+      void
+      wait(value_type __old,
+	   memory_order __o = memory_order_seq_cst) const noexcept
+      {
+	_M_impl.wait(std::move(__old), __o);
+      }
+
+      void
+      notify_one() noexcept
+      {
+	_M_impl.notify_one();
+      }
+
+      void
+      notify_all() noexcept
+      {
+	_M_impl.notify_all();
+      }
+#endif
+
+    private:
+      _Sp_atomic<shared_ptr<_Tp>> _M_impl;
+    };
+
+  template<typename _Tp>
+    class atomic<weak_ptr<_Tp>>
+    {
+    public:
+      using value_type = weak_ptr<_Tp>;
+
+      static constexpr bool is_always_lock_free = false;
+
+      bool
+      is_lock_free() const noexcept
+      { return false; }
+
+      constexpr atomic() noexcept = default;
+
+      atomic(weak_ptr<_Tp> __r) noexcept
+     : _M_impl(move(__r))
+      { }
+
+      atomic(const atomic&) = delete;
+      void operator=(const atomic&) = delete;
+
+      weak_ptr<_Tp>
+      load(memory_order __o = memory_order_seq_cst) const noexcept
+      { return _M_impl.load(__o); }
+
+      operator weak_ptr<_Tp>() const noexcept
+      { return _M_impl.load(memory_order_seq_cst); }
+
+      void
+      store(weak_ptr<_Tp> __desired,
+	    memory_order __o = memory_order_seq_cst) noexcept
+      { _M_impl.swap(__desired, __o); }
+
+      void
+      operator=(weak_ptr<_Tp> __desired) noexcept
+      { _M_impl.swap(__desired, memory_order_seq_cst); }
+
+      weak_ptr<_Tp>
+      exchange(weak_ptr<_Tp> __desired,
+	       memory_order __o = memory_order_seq_cst) noexcept
+      {
+	_M_impl.swap(__desired, __o);
+	return __desired;
+      }
+
+      bool
+      compare_exchange_strong(weak_ptr<_Tp>& __expected,
+			      weak_ptr<_Tp> __desired,
+			      memory_order __o, memory_order __o2) noexcept
+      {
+	return _M_impl.compare_exchange_strong(__expected, __desired, __o, __o2);
+      }
+
+      bool
+      compare_exchange_strong(value_type& __expected, value_type __desired,
+			      memory_order __o = memory_order_seq_cst) noexcept
+      {
+	memory_order __o2;
+	switch (__o)
+	{
+	case memory_order_acq_rel:
+	  __o2 = memory_order_acquire;
+	  break;
+	case memory_order_release:
+	  __o2 = memory_order_relaxed;
+	  break;
+	default:
+	  __o2 = __o;
+	}
+	return compare_exchange_strong(__expected, std::move(__desired),
+				       __o, __o2);
+      }
+
+      bool
+      compare_exchange_weak(value_type& __expected, value_type __desired,
+			    memory_order __o, memory_order __o2) noexcept
+      {
+	return compare_exchange_strong(__expected, std::move(__desired),
+				       __o, __o2);
+      }
+
+      bool
+      compare_exchange_weak(value_type& __expected, value_type __desired,
+			    memory_order __o = memory_order_seq_cst) noexcept
+      {
+	return compare_exchange_strong(__expected, std::move(__desired), __o);
+      }
+
+#if __cpp_lib_atomic_wait
+      void
+      wait(value_type __old,
+	   memory_order __o = memory_order_seq_cst) const noexcept
+      {
+	_M_impl.wait(std::move(__old), __o);
+      }
+
+      void
+      notify_one() noexcept
+      {
+	_M_impl.notify_one();
+      }
+
+      void
+      notify_all() noexcept
+      {
+	_M_impl.notify_all();
+      }
+#endif
+
+    private:
+      _Sp_atomic<weak_ptr<_Tp>> _M_impl;
+    };
+#endif // C++20
+
+  /// @} relates shared_ptr
+  /// @} group pointer_abstractions
+
+_GLIBCXX_END_NAMESPACE_VERSION
+} // namespace
+
+#endif // _SHARED_PTR_ATOMIC_H
+                                                                                                                                                                                                                                                                                                                 usr/include/c++/12/bits/shared_ptr_base.h                                                           0000644 0000000 0000000 00000202352 14356504412 016541  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        // shared_ptr and weak_ptr implementation details -*- C++ -*-
+
+// Copyright (C) 2007-2022 Free Software Foundation, Inc.
+//
+// This file is part of the GNU ISO C++ Library.  This library is free
+// software; you can redistribute it and/or modify it under the
+// terms of the GNU General Public License as published by the
+// Free Software Foundation; either version 3, or (at your option)
+// any later version.
+
+// This library is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+
+// Under Section 7 of GPL version 3, you are granted additional
+// permissions described in the GCC Runtime Library Exception, version
+// 3.1, as published by the Free Software Foundation.
+
+// You should have received a copy of the GNU General Public License and
+// a copy of the GCC Runtime Library Exception along with this program;
+// see the files COPYING3 and COPYING.RUNTIME respectively.  If not, see
+// <http://www.gnu.org/licenses/>.
+
+// GCC Note: Based on files from version 1.32.0 of the Boost library.
+
+//  shared_count.hpp
+//  Copyright (c) 2001, 2002, 2003 Peter Dimov and Multi Media Ltd.
+
+//  shared_ptr.hpp
+//  Copyright (C) 1998, 1999 Greg Colvin and Beman Dawes.
+//  Copyright (C) 2001, 2002, 2003 Peter Dimov
+
+//  weak_ptr.hpp
+//  Copyright (C) 2001, 2002, 2003 Peter Dimov
+
+//  enable_shared_from_this.hpp
+//  Copyright (C) 2002 Peter Dimov
+
+// Distributed under the Boost Software License, Version 1.0. (See
+// accompanying file LICENSE_1_0.txt or copy at
+// http://www.boost.org/LICENSE_1_0.txt)
+
+/** @file bits/shared_ptr_base.h
+ *  This is an internal header file, included by other library headers.
+ *  Do not attempt to use it directly. @headername{memory}
+ */
+
+#ifndef _SHARED_PTR_BASE_H
+#define _SHARED_PTR_BASE_H 1
+
+#include <typeinfo>
+#include <bits/allocated_ptr.h>
+#include <bits/allocator.h>
+#include <bits/exception_defines.h>
+#include <bits/functional_hash.h>
+#include <bits/refwrap.h>
+#include <bits/stl_function.h>  // std::less
+#include <bits/unique_ptr.h>
+#include <ext/aligned_buffer.h>
+#include <ext/atomicity.h>
+#include <ext/concurrence.h>
+#if __cplusplus >= 202002L
+# include <bit>          // __bit_floor
+# include <compare>
+# include <bits/align.h> // std::align
+# include <bits/stl_uninitialized.h>
+#endif
+
+namespace std _GLIBCXX_VISIBILITY(default)
+{
+_GLIBCXX_BEGIN_NAMESPACE_VERSION
+
+#if _GLIBCXX_USE_DEPRECATED
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+  template<typename> class auto_ptr;
+#pragma GCC diagnostic pop
+#endif
+
+ /**
+   *  @brief  Exception possibly thrown by @c shared_ptr.
+   *  @ingroup exceptions
+   */
+  class bad_weak_ptr : public std::exception
+  {
+  public:
+    virtual char const* what() const noexcept;
+
+    virtual ~bad_weak_ptr() noexcept;
+  };
+
+  // Substitute for bad_weak_ptr object in the case of -fno-exceptions.
+  inline void
+  __throw_bad_weak_ptr()
+  { _GLIBCXX_THROW_OR_ABORT(bad_weak_ptr()); }
+
+  using __gnu_cxx::_Lock_policy;
+  using __gnu_cxx::__default_lock_policy;
+  using __gnu_cxx::_S_single;
+  using __gnu_cxx::_S_mutex;
+  using __gnu_cxx::_S_atomic;
+
+  // Empty helper class except when the template argument is _S_mutex.
+  template<_Lock_policy _Lp>
+    class _Mutex_base
+    {
+    protected:
+      // The atomic policy uses fully-fenced builtins, single doesn't care.
+      enum { _S_need_barriers = 0 };
+    };
+
+  template<>
+    class _Mutex_base<_S_mutex>
+    : public __gnu_cxx::__mutex
+    {
+    protected:
+      // This policy is used when atomic builtins are not available.
+      // The replacement atomic operations might not have the necessary
+      // memory barriers.
+      enum { _S_need_barriers = 1 };
+    };
+
+  template<_Lock_policy _Lp = __default_lock_policy>
+    class _Sp_counted_base
+    : public _Mutex_base<_Lp>
+    {
+    public:
+      _Sp_counted_base() noexcept
+      : _M_use_count(1), _M_weak_count(1) { }
+
+      virtual
+      ~_Sp_counted_base() noexcept
+      { }
+
+      // Called when _M_use_count drops to zero, to release the resources
+      // managed by *this.
+      virtual void
+      _M_dispose() noexcept = 0;
+
+      // Called when _M_weak_count drops to zero.
+      virtual void
+      _M_destroy() noexcept
+      { delete this; }
+
+      virtual void*
+      _M_get_deleter(const std::type_info&) noexcept = 0;
+
+      // Increment the use count (used when the count is greater than zero).
+      void
+      _M_add_ref_copy()
+      { __gnu_cxx::__atomic_add_dispatch(&_M_use_count, 1); }
+
+      // Increment the use count if it is non-zero, throw otherwise.
+      void
+      _M_add_ref_lock()
+      {
+	if (!_M_add_ref_lock_nothrow())
+	  __throw_bad_weak_ptr();
+      }
+
+      // Increment the use count if it is non-zero.
+      bool
+      _M_add_ref_lock_nothrow() noexcept;
+
+      // Decrement the use count.
+      void
+      _M_release() noexcept;
+
+      // Called by _M_release() when the use count reaches zero.
+      void
+      _M_release_last_use() noexcept
+      {
+	_GLIBCXX_SYNCHRONIZATION_HAPPENS_AFTER(&_M_use_count);
+	_M_dispose();
+	// There must be a memory barrier between dispose() and destroy()
+	// to ensure that the effects of dispose() are observed in the
+	// thread that runs destroy().
+	// See http://gcc.gnu.org/ml/libstdc++/2005-11/msg00136.html
+	if (_Mutex_base<_Lp>::_S_need_barriers)
+	  {
+	    __atomic_thread_fence (__ATOMIC_ACQ_REL);
+	  }
+
+	// Be race-detector-friendly.  For more info see bits/c++config.
+	_GLIBCXX_SYNCHRONIZATION_HAPPENS_BEFORE(&_M_weak_count);
+	if (__gnu_cxx::__exchange_and_add_dispatch(&_M_weak_count,
+						   -1) == 1)
+	  {
+	    _GLIBCXX_SYNCHRONIZATION_HAPPENS_AFTER(&_M_weak_count);
+	    _M_destroy();
+	  }
+      }
+
+      // As above, but 'noinline' to reduce code size on the cold path.
+      __attribute__((__noinline__))
+      void
+      _M_release_last_use_cold() noexcept
+      { _M_release_last_use(); }
+
+      // Increment the weak count.
+      void
+      _M_weak_add_ref() noexcept
+      { __gnu_cxx::__atomic_add_dispatch(&_M_weak_count, 1); }
+
+      // Decrement the weak count.
+      void
+      _M_weak_release() noexcept
+      {
+        // Be race-detector-friendly. For more info see bits/c++config.
+        _GLIBCXX_SYNCHRONIZATION_HAPPENS_BEFORE(&_M_weak_count);
+	if (__gnu_cxx::__exchange_and_add_dispatch(&_M_weak_count, -1) == 1)
+	  {
+            _GLIBCXX_SYNCHRONIZATION_HAPPENS_AFTER(&_M_weak_count);
+	    if (_Mutex_base<_Lp>::_S_need_barriers)
+	      {
+	        // See _M_release(),
+	        // destroy() must observe results of dispose()
+		__atomic_thread_fence (__ATOMIC_ACQ_REL);
+	      }
+	    _M_destroy();
+	  }
+      }
+
+      long
+      _M_get_use_count() const noexcept
+      {
+        // No memory barrier is used here so there is no synchronization
+        // with other threads.
+        return __atomic_load_n(&_M_use_count, __ATOMIC_RELAXED);
+      }
+
+    private:
+      _Sp_counted_base(_Sp_counted_base const&) = delete;
+      _Sp_counted_base& operator=(_Sp_counted_base const&) = delete;
+
+      _Atomic_word  _M_use_count;     // #shared
+      _Atomic_word  _M_weak_count;    // #weak + (#shared != 0)
+    };
+
+  template<>
+    inline bool
+    _Sp_counted_base<_S_single>::
+    _M_add_ref_lock_nothrow() noexcept
+    {
+      if (_M_use_count == 0)
+	return false;
+      ++_M_use_count;
+      return true;
+    }
+
+  template<>
+    inline bool
+    _Sp_counted_base<_S_mutex>::
+    _M_add_ref_lock_nothrow() noexcept
+    {
+      __gnu_cxx::__scoped_lock sentry(*this);
+      if (__gnu_cxx::__exchange_and_add_dispatch(&_M_use_count, 1) == 0)
+	{
+	  _M_use_count = 0;
+	  return false;
+	}
+      return true;
+    }
+
+  template<>
+    inline bool
+    _Sp_counted_base<_S_atomic>::
+    _M_add_ref_lock_nothrow() noexcept
+    {
+      // Perform lock-free add-if-not-zero operation.
+      _Atomic_word __count = _M_get_use_count();
+      do
+	{
+	  if (__count == 0)
+	    return false;
+	  // Replace the current counter value with the old value + 1, as
+	  // long as it's not changed meanwhile.
+	}
+      while (!__atomic_compare_exchange_n(&_M_use_count, &__count, __count + 1,
+					  true, __ATOMIC_ACQ_REL,
+					  __ATOMIC_RELAXED));
+      return true;
+    }
+
+  template<>
+    inline void
+    _Sp_counted_base<_S_single>::_M_add_ref_copy()
+    { ++_M_use_count; }
+
+  template<>
+    inline void
+    _Sp_counted_base<_S_single>::_M_release() noexcept
+    {
+      if (--_M_use_count == 0)
+        {
+          _M_dispose();
+          if (--_M_weak_count == 0)
+            _M_destroy();
+        }
+    }
+
+  template<>
+    inline void
+    _Sp_counted_base<_S_mutex>::_M_release() noexcept
+    {
+      // Be race-detector-friendly.  For more info see bits/c++config.
+      _GLIBCXX_SYNCHRONIZATION_HAPPENS_BEFORE(&_M_use_count);
+      if (__gnu_cxx::__exchange_and_add_dispatch(&_M_use_count, -1) == 1)
+	{
+	  _M_release_last_use();
+	}
+    }
+
+  template<>
+    inline void
+    _Sp_counted_base<_S_atomic>::_M_release() noexcept
+    {
+      _GLIBCXX_SYNCHRONIZATION_HAPPENS_BEFORE(&_M_use_count);
+#if ! _GLIBCXX_TSAN
+      constexpr bool __lock_free
+	= __atomic_always_lock_free(sizeof(long long), 0)
+	&& __atomic_always_lock_free(sizeof(_Atomic_word), 0);
+      constexpr bool __double_word
+	= sizeof(long long) == 2 * sizeof(_Atomic_word);
+      // The ref-count members follow the vptr, so are aligned to
+      // alignof(void*).
+      constexpr bool __aligned = __alignof(long long) <= alignof(void*);
+      if _GLIBCXX17_CONSTEXPR (__lock_free && __double_word && __aligned)
+	{
+	  constexpr int __wordbits = __CHAR_BIT__ * sizeof(_Atomic_word);
+	  constexpr int __shiftbits = __double_word ? __wordbits : 0;
+	  constexpr long long __unique_ref = 1LL + (1LL << __shiftbits);
+	  auto __both_counts = reinterpret_cast<long long*>(&_M_use_count);
+
+	  _GLIBCXX_SYNCHRONIZATION_HAPPENS_BEFORE(&_M_weak_count);
+	  if (__atomic_load_n(__both_counts, __ATOMIC_ACQUIRE) == __unique_ref)
+	    {
+	      // Both counts are 1, so there are no weak references and
+	      // we are releasing the last strong reference. No other
+	      // threads can observe the effects of this _M_release()
+	      // call (e.g. calling use_count()) without a data race.
+	      _M_weak_count = _M_use_count = 0;
+	      _GLIBCXX_SYNCHRONIZATION_HAPPENS_AFTER(&_M_use_count);
+	      _GLIBCXX_SYNCHRONIZATION_HAPPENS_AFTER(&_M_weak_count);
+	      _M_dispose();
+	      _M_destroy();
+	      return;
+	    }
+	  if (__gnu_cxx::__exchange_and_add_dispatch(&_M_use_count, -1) == 1)
+	    [[__unlikely__]]
+	    {
+	      _M_release_last_use_cold();
+	      return;
+	    }
+	}
+      else
+#endif
+      if (__gnu_cxx::__exchange_and_add_dispatch(&_M_use_count, -1) == 1)
+	{
+	  _M_release_last_use();
+	}
+    }
+
+  template<>
+    inline void
+    _Sp_counted_base<_S_single>::_M_weak_add_ref() noexcept
+    { ++_M_weak_count; }
+
+  template<>
+    inline void
+    _Sp_counted_base<_S_single>::_M_weak_release() noexcept
+    {
+      if (--_M_weak_count == 0)
+        _M_destroy();
+    }
+
+  template<>
+    inline long
+    _Sp_counted_base<_S_single>::_M_get_use_count() const noexcept
+    { return _M_use_count; }
+
+
+  // Forward declarations.
+  template<typename _Tp, _Lock_policy _Lp = __default_lock_policy>
+    class __shared_ptr;
+
+  template<typename _Tp, _Lock_policy _Lp = __default_lock_policy>
+    class __weak_ptr;
+
+  template<typename _Tp, _Lock_policy _Lp = __default_lock_policy>
+    class __enable_shared_from_this;
+
+  template<typename _Tp>
+    class shared_ptr;
+
+  template<typename _Tp>
+    class weak_ptr;
+
+  template<typename _Tp>
+    struct owner_less;
+
+  template<typename _Tp>
+    class enable_shared_from_this;
+
+  template<_Lock_policy _Lp = __default_lock_policy>
+    class __weak_count;
+
+  template<_Lock_policy _Lp = __default_lock_policy>
+    class __shared_count;
+
+#if __cplusplus >= 202002L
+  template<typename>
+    class _Sp_atomic;
+#endif
+
+  // Counted ptr with no deleter or allocator support
+  template<typename _Ptr, _Lock_policy _Lp>
+    class _Sp_counted_ptr final : public _Sp_counted_base<_Lp>
+    {
+    public:
+      explicit
+      _Sp_counted_ptr(_Ptr __p) noexcept
+      : _M_ptr(__p) { }
+
+      virtual void
+      _M_dispose() noexcept
+      { delete _M_ptr; }
+
+      virtual void
+      _M_destroy() noexcept
+      { delete this; }
+
+      virtual void*
+      _M_get_deleter(const std::type_info&) noexcept
+      { return nullptr; }
+
+      _Sp_counted_ptr(const _Sp_counted_ptr&) = delete;
+      _Sp_counted_ptr& operator=(const _Sp_counted_ptr&) = delete;
+
+    private:
+      _Ptr             _M_ptr;
+    };
+
+  template<>
+    inline void
+    _Sp_counted_ptr<nullptr_t, _S_single>::_M_dispose() noexcept { }
+
+  template<>
+    inline void
+    _Sp_counted_ptr<nullptr_t, _S_mutex>::_M_dispose() noexcept { }
+
+  template<>
+    inline void
+    _Sp_counted_ptr<nullptr_t, _S_atomic>::_M_dispose() noexcept { }
+
+  // FIXME: once __has_cpp_attribute(__no_unique_address__)) is true for
+  // all supported compilers we can greatly simplify _Sp_ebo_helper.
+  // N.B. unconditionally applying the attribute could change layout for
+  // final types, which currently cannot use EBO so have a unique address.
+
+  template<int _Nm, typename _Tp,
+	   bool __use_ebo = !__is_final(_Tp) && __is_empty(_Tp)>
+    struct _Sp_ebo_helper;
+
+  /// Specialization using EBO.
+  template<int _Nm, typename _Tp>
+    struct _Sp_ebo_helper<_Nm, _Tp, true> : private _Tp
+    {
+      explicit _Sp_ebo_helper(const _Tp& __tp) : _Tp(__tp) { }
+      explicit _Sp_ebo_helper(_Tp&& __tp) : _Tp(std::move(__tp)) { }
+

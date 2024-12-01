@@ -1,0 +1,1000 @@
+    local(*DBI::DIR, $@);
+    my(%seen_dir, %seen_dbd);
+    my $haveFileSpec = eval { require File::Spec };
+    foreach $d (@INC){
+	chomp($d); # Perl 5 beta 3 bug in #!./perl -Ilib from Test::Harness
+	my $dbd_dir =
+	    ($haveFileSpec ? File::Spec->catdir($d, 'DBD') : "$d/DBD");
+	next unless -d $dbd_dir;
+	next if $seen_dir{$d};
+	$seen_dir{$d} = 1;
+	# XXX we have a problem here with case insensitive file systems
+	# XXX since we can't tell what case must be used when loading.
+	opendir(DBI::DIR, $dbd_dir) || Carp::carp "opendir $dbd_dir: $!\n";
+	foreach $f (readdir(DBI::DIR)){
+	    next unless $f =~ s/\.pm$//;
+	    next if $f eq 'NullP';
+	    if ($seen_dbd{$f}){
+		Carp::carp "DBD::$f in $d is hidden by DBD::$f in $seen_dbd{$f}\n"
+		    unless $quiet;
+            } else {
+		push(@drivers, $f);
+	    }
+	    $seen_dbd{$f} = $d;
+	}
+	closedir(DBI::DIR);
+    }
+
+    # "return sort @drivers" will not DWIM in scalar context.
+    return wantarray ? sort @drivers : @drivers;
+}
+
+sub installed_versions {
+    my ($class, $quiet) = @_;
+    my %error;
+    my %version;
+    for my $driver ($class->available_drivers($quiet)) {
+	next if $DBI::PurePerl && grep { -d "$_/auto/DBD/$driver" } @INC;
+	my $drh = eval {
+	    local $SIG{__WARN__} = sub {};
+	    $class->install_driver($driver);
+	};
+	($error{"DBD::$driver"}=$@),next if $@;
+	no strict 'refs';
+	my $vers = ${"DBD::$driver" . '::VERSION'};
+	$version{"DBD::$driver"} = $vers || '?';
+    }
+    if (wantarray) {
+       return map { m/^DBD::(\w+)/ ? ($1) : () } sort keys %version;
+    }
+    $version{"DBI"}           = $DBI::VERSION;
+    $version{"DBI::PurePerl"} = $DBI::PurePerl::VERSION if $DBI::PurePerl;
+    if (!defined wantarray) {	# void context
+	require Config;		# add more detail
+	$version{OS}   = "$^O\t($Config::Config{osvers})";
+	$version{Perl} = "$]\t($Config::Config{archname})";
+	$version{$_}   = (($error{$_} =~ s/ \(\@INC.*//s),$error{$_})
+	    for keys %error;
+	printf "  %-16s: %s\n",$_,$version{$_}
+	    for reverse sort keys %version;
+    }
+    return \%version;
+}
+
+
+sub data_sources {
+    my ($class, $driver, @other) = @_;
+    my $drh = $class->install_driver($driver);
+    my @ds = $drh->data_sources(@other);
+    return @ds;
+}
+
+
+sub neat_list {
+    my ($listref, $maxlen, $sep) = @_;
+    $maxlen = 0 unless defined $maxlen;	# 0 == use internal default
+    $sep = ", " unless defined $sep;
+    join($sep, map { neat($_,$maxlen) } @$listref);
+}
+
+
+sub dump_results {	# also aliased as a method in DBD::_::st
+    my ($sth, $maxlen, $lsep, $fsep, $fh) = @_;
+    return 0 unless $sth;
+    $maxlen ||= 35;
+    $lsep   ||= "\n";
+    $fh ||= \*STDOUT;
+    my $rows = 0;
+    my $ref;
+    while($ref = $sth->fetch) {
+	print $fh $lsep if $rows++ and $lsep;
+	my $str = neat_list($ref,$maxlen,$fsep);
+	print $fh $str;	# done on two lines to avoid 5.003 errors
+    }
+    print $fh "\n$rows rows".($DBI::err ? " ($DBI::err: $DBI::errstr)" : "")."\n";
+    $rows;
+}
+
+
+sub data_diff {
+    my ($a, $b, $logical) = @_;
+
+    my $diff   = data_string_diff($a, $b);
+    return "" if $logical and !$diff;
+
+    my $a_desc = data_string_desc($a);
+    my $b_desc = data_string_desc($b);
+    return "" if !$diff and $a_desc eq $b_desc;
+
+    $diff ||= "Strings contain the same sequence of characters"
+    	if length($a);
+    $diff .= "\n" if $diff;
+    return "a: $a_desc\nb: $b_desc\n$diff";
+}
+
+
+sub data_string_diff {
+    # Compares 'logical' characters, not bytes, so a latin1 string and an
+    # an equivalent Unicode string will compare as equal even though their
+    # byte encodings are different.
+    my ($a, $b) = @_;
+    unless (defined $a and defined $b) {             # one undef
+	return ""
+		if !defined $a and !defined $b;
+	return "String a is undef, string b has ".length($b)." characters"
+		if !defined $a;
+	return "String b is undef, string a has ".length($a)." characters"
+		if !defined $b;
+    }
+
+    my @a_chars = (utf8::is_utf8($a)) ? unpack("U*", $a) : unpack("C*", $a);
+    my @b_chars = (utf8::is_utf8($b)) ? unpack("U*", $b) : unpack("C*", $b);
+    my $i = 0;
+    while (@a_chars && @b_chars) {
+	++$i, shift(@a_chars), shift(@b_chars), next
+	    if $a_chars[0] == $b_chars[0];# compare ordinal values
+	my @desc = map {
+	    $_ > 255 ?                    # if wide character...
+	      sprintf("\\x{%04X}", $_) :  # \x{...}
+	      chr($_) =~ /[[:cntrl:]]/ ?  # else if control character ...
+	      sprintf("\\x%02X", $_) :    # \x..
+	      chr($_)                     # else as themselves
+	} ($a_chars[0], $b_chars[0]);
+	# highlight probable double-encoding?
+        foreach my $c ( @desc ) {
+	    next unless $c =~ m/\\x\{08(..)}/;
+	    $c .= "='" .chr(hex($1)) ."'"
+	}
+	return sprintf "Strings differ at index $i: a[$i]=$desc[0], b[$i]=$desc[1]";
+    }
+    return "String a truncated after $i characters" if @b_chars;
+    return "String b truncated after $i characters" if @a_chars;
+    return "";
+}
+
+
+sub data_string_desc {	# describe a data string
+    my ($a) = @_;
+    require bytes;
+
+    # Give sufficient info to help diagnose at least these kinds of situations:
+    # - valid UTF8 byte sequence but UTF8 flag not set
+    #   (might be ascii so also need to check for hibit to make it worthwhile)
+    # - UTF8 flag set but invalid UTF8 byte sequence
+    # could do better here, but this'll do for now
+    my $utf8 = sprintf "UTF8 %s%s",
+	utf8::is_utf8($a) ? "on" : "off",
+	utf8::valid($a||'') ? "" : " but INVALID encoding";
+    return "$utf8, undef" unless defined $a;
+    my $is_ascii = $a =~ m/^[\000-\177]*$/;
+    return sprintf "%s, %s, %d characters %d bytes",
+	$utf8, $is_ascii ? "ASCII" : "non-ASCII",
+	length($a), bytes::length($a);
+}
+
+
+sub connect_test_perf {
+    my($class, $dsn,$dbuser,$dbpass, $attr) = @_;
+	Carp::croak("connect_test_perf needs hash ref as fourth arg") unless ref $attr;
+    # these are non standard attributes just for this special method
+    my $loops ||= $attr->{dbi_loops} || 5;
+    my $par   ||= $attr->{dbi_par}   || 1;	# parallelism
+    my $verb  ||= $attr->{dbi_verb}  || 1;
+    my $meth  ||= $attr->{dbi_meth}  || 'connect';
+    print "$dsn: testing $loops sets of $par connections:\n";
+    require "FileHandle.pm";	# don't let toke.c create empty FileHandle package
+    local $| = 1;
+    my $drh = $class->install_driver($dsn) or Carp::croak("Can't install $dsn driver\n");
+    # test the connection and warm up caches etc
+    $drh->connect($dsn,$dbuser,$dbpass) or Carp::croak("connect failed: $DBI::errstr");
+    my $t1 = dbi_time();
+    my $loop;
+    for $loop (1..$loops) {
+	my @cons;
+	print "Connecting... " if $verb;
+	for (1..$par) {
+	    print "$_ ";
+	    push @cons, ($drh->connect($dsn,$dbuser,$dbpass)
+		    or Carp::croak("connect failed: $DBI::errstr\n"));
+	}
+	print "\nDisconnecting...\n" if $verb;
+	for (@cons) {
+	    $_->disconnect or warn "disconnect failed: $DBI::errstr"
+	}
+    }
+    my $t2 = dbi_time();
+    my $td = $t2 - $t1;
+    printf "$meth %d and disconnect them, %d times: %.4fs / %d = %.4fs\n",
+        $par, $loops, $td, $loops*$par, $td/($loops*$par);
+    return $td;
+}
+
+
+# Help people doing DBI->errstr, might even document it one day
+# XXX probably best moved to cheaper XS code if this gets documented
+sub err    { $DBI::err    }
+sub errstr { $DBI::errstr }
+
+
+# --- Private Internal Function for Creating New DBI Handles
+
+# XXX move to PurePerl?
+*DBI::dr::TIEHASH = \&DBI::st::TIEHASH;
+*DBI::db::TIEHASH = \&DBI::st::TIEHASH;
+
+
+# These three special constructors are called by the drivers
+# The way they are called is likely to change.
+
+our $shared_profile;
+
+sub _new_drh {	# called by DBD::<drivername>::driver()
+    my ($class, $initial_attr, $imp_data) = @_;
+    # Provide default storage for State,Err and Errstr.
+    # Note that these are shared by all child handles by default! XXX
+    # State must be undef to get automatic faking in DBI::var::FETCH
+    my ($h_state_store, $h_err_store, $h_errstr_store) = (undef, undef, '');
+    my $attr = {
+	# these attributes get copied down to child handles by default
+	'State'		=> \$h_state_store,  # Holder for DBI::state
+	'Err'		=> \$h_err_store,    # Holder for DBI::err
+	'Errstr'	=> \$h_errstr_store, # Holder for DBI::errstr
+	'TraceLevel' 	=> 0,
+	FetchHashKeyName=> 'NAME',
+	%$initial_attr,
+    };
+    my ($h, $i) = _new_handle('DBI::dr', '', $attr, $imp_data, $class);
+
+    # XXX DBI_PROFILE unless DBI::PurePerl because for some reason
+    # it kills the t/zz_*_pp.t tests (they silently exit early)
+    if (($ENV{DBI_PROFILE} && !$DBI::PurePerl) || $shared_profile) {
+	# The profile object created here when the first driver is loaded
+	# is shared by all drivers so we end up with just one set of profile
+	# data and thus the 'total time in DBI' is really the true total.
+	if (!$shared_profile) {	# first time
+	    $h->{Profile} = $ENV{DBI_PROFILE}; # write string
+	    $shared_profile = $h->{Profile};   # read and record object
+	}
+	else {
+	    $h->{Profile} = $shared_profile;
+	}
+    }
+    return $h unless wantarray;
+    ($h, $i);
+}
+
+sub _new_dbh {	# called by DBD::<drivername>::dr::connect()
+    my ($drh, $attr, $imp_data) = @_;
+    my $imp_class = $drh->{ImplementorClass}
+	or Carp::croak("DBI _new_dbh: $drh has no ImplementorClass");
+    substr($imp_class,-4,4) = '::db';
+    my $app_class = ref $drh;
+    substr($app_class,-4,4) = '::db';
+    $attr->{Err}    ||= \my $err;
+    $attr->{Errstr} ||= \my $errstr;
+    $attr->{State}  ||= \my $state;
+    _new_handle($app_class, $drh, $attr, $imp_data, $imp_class);
+}
+
+sub _new_sth {	# called by DBD::<drivername>::db::prepare)
+    my ($dbh, $attr, $imp_data) = @_;
+    my $imp_class = $dbh->{ImplementorClass}
+	or Carp::croak("DBI _new_sth: $dbh has no ImplementorClass");
+    substr($imp_class,-4,4) = '::st';
+    my $app_class = ref $dbh;
+    substr($app_class,-4,4) = '::st';
+    _new_handle($app_class, $dbh, $attr, $imp_data, $imp_class);
+}
+
+
+# end of DBI package
+
+
+
+# --------------------------------------------------------------------
+# === The internal DBI Switch pseudo 'driver' class ===
+
+{   package	# hide from PAUSE
+	DBD::Switch::dr;
+    DBI->setup_driver('DBD::Switch');	# sets up @ISA
+
+    $DBD::Switch::dr::imp_data_size = 0;
+    $DBD::Switch::dr::imp_data_size = 0;	# avoid typo warning
+    my $drh;
+
+    sub driver {
+	return $drh if $drh;	# a package global
+
+	my $inner;
+	($drh, $inner) = DBI::_new_drh('DBD::Switch::dr', {
+		'Name'    => 'Switch',
+		'Version' => $DBI::VERSION,
+		'Attribution' => "DBI $DBI::VERSION by Tim Bunce",
+	    });
+	Carp::croak("DBD::Switch init failed!") unless ($drh && $inner);
+	return $drh;
+    }
+    sub CLONE {
+	undef $drh;
+    }
+
+    sub FETCH {
+	my($drh, $key) = @_;
+	return DBI->trace if $key eq 'DebugDispatch';
+	return undef if $key eq 'DebugLog';	# not worth fetching, sorry
+	return $drh->DBD::_::dr::FETCH($key);
+	undef;
+    }
+    sub STORE {
+	my($drh, $key, $value) = @_;
+	if ($key eq 'DebugDispatch') {
+	    DBI->trace($value);
+	} elsif ($key eq 'DebugLog') {
+	    DBI->trace(-1, $value);
+	} else {
+	    $drh->DBD::_::dr::STORE($key, $value);
+	}
+    }
+}
+
+
+# --------------------------------------------------------------------
+# === OPTIONAL MINIMAL BASE CLASSES FOR DBI SUBCLASSES ===
+
+# We only define default methods for harmless functions.
+# We don't, for example, define a DBD::_::st::prepare()
+
+{   package		# hide from PAUSE
+	DBD::_::common; # ====== Common base class methods ======
+    use strict;
+
+    # methods common to all handle types:
+
+    # generic TIEHASH default methods:
+    sub FIRSTKEY { }
+    sub NEXTKEY  { }
+    sub EXISTS   { defined($_[0]->FETCH($_[1])) } # XXX undef?
+    sub CLEAR    { Carp::carp "Can't CLEAR $_[0] (DBI)" }
+
+    sub FETCH_many {    # XXX should move to C one day
+        my $h = shift;
+        # scalar is needed to workaround drivers that return an empty list
+        # for some attributes
+        return map { scalar $h->FETCH($_) } @_;
+    }
+
+    *dump_handle = \&DBI::dump_handle;
+
+    sub install_method {
+	# special class method called directly by apps and/or drivers
+	# to install new methods into the DBI dispatcher
+	# DBD::Foo::db->install_method("foo_mumble", { usage => [...], options => '...' });
+	my ($class, $method, $attr) = @_;
+	Carp::croak("Class '$class' must begin with DBD:: and end with ::db or ::st")
+	    unless $class =~ /^DBD::(\w+)::(dr|db|st)$/;
+	my ($driver, $subtype) = ($1, $2);
+	Carp::croak("invalid method name '$method'")
+	    unless $method =~ m/^([a-z][a-z0-9]*_)\w+$/;
+	my $prefix = $1;
+	my $reg_info = $dbd_prefix_registry->{$prefix};
+	Carp::carp("method name prefix '$prefix' is not associated with a registered driver") unless $reg_info;
+
+	my $full_method = "DBI::${subtype}::$method";
+	$DBI::installed_methods{$full_method} = $attr;
+
+	my (undef, $filename, $line) = caller;
+	# XXX reformat $attr as needed for _install_method
+	my %attr = %{$attr||{}}; # copy so we can edit
+	DBI->_install_method("DBI::${subtype}::$method", "$filename at line $line", \%attr);
+    }
+
+    sub parse_trace_flags {
+	my ($h, $spec) = @_;
+	my $level = 0;
+	my $flags = 0;
+	my @unknown;
+	for my $word (split /\s*[|&,]\s*/, $spec) {
+	    if (DBI::looks_like_number($word) && $word <= 0xF && $word >= 0) {
+		$level = $word;
+	    } elsif ($word eq 'ALL') {
+		$flags = 0x7FFFFFFF; # XXX last bit causes negative headaches
+		last;
+	    } elsif (my $flag = $h->parse_trace_flag($word)) {
+		$flags |= $flag;
+	    }
+	    else {
+		push @unknown, $word;
+	    }
+	}
+	if (@unknown && (ref $h ? $h->FETCH('Warn') : 1)) {
+	    Carp::carp("$h->parse_trace_flags($spec) ignored unknown trace flags: ".
+		join(" ", map { DBI::neat($_) } @unknown));
+	}
+	$flags |= $level;
+	return $flags;
+    }
+
+    sub parse_trace_flag {
+	my ($h, $name) = @_;
+	#      0xddDDDDrL (driver, DBI, reserved, Level)
+	return 0x00000100 if $name eq 'SQL';
+    return 0x00000200 if $name eq 'CON';
+    return 0x00000400 if $name eq 'ENC';
+    return 0x00000800 if $name eq 'DBD';
+    return 0x00001000 if $name eq 'TXN';
+	return;
+    }
+
+    sub private_attribute_info {
+        return undef;
+    }
+
+    sub visit_child_handles {
+	my ($h, $code, $info) = @_;
+	$info = {} if not defined $info;
+	for my $ch (@{ $h->{ChildHandles} || []}) {
+	    next unless $ch;
+	    my $child_info = $code->($ch, $info)
+		or next;
+	    $ch->visit_child_handles($code, $child_info);
+	}
+	return $info;
+    }
+}
+
+
+{   package		# hide from PAUSE
+	DBD::_::dr;	# ====== DRIVER ======
+    our @ISA = qw(DBD::_::common);
+    use strict;
+
+    sub default_user {
+	my ($drh, $user, $pass, $attr) = @_;
+	$user = $ENV{DBI_USER} unless defined $user;
+	$pass = $ENV{DBI_PASS} unless defined $pass;
+	return ($user, $pass);
+    }
+
+    sub connect { # normally overridden, but a handy default
+	my ($drh, $dsn, $user, $auth) = @_;
+	my ($this) = DBI::_new_dbh($drh, {
+	    'Name' => $dsn,
+	});
+	# XXX debatable as there's no "server side" here
+	# (and now many uses would trigger warnings on DESTROY)
+	# $this->STORE(Active => 1);
+        # so drivers should set it in their own connect
+	$this;
+    }
+
+
+    sub connect_cached {
+        my $drh = shift;
+	my ($dsn, $user, $auth, $attr) = @_;
+
+	my $cache = $drh->{CachedKids} ||= {};
+	my $key = do { no warnings;
+	    join "!\001", $dsn, $user, $auth, DBI::_concat_hash_sorted($attr, "=\001", ",\001", 0, 0)
+	};
+	my $dbh = $cache->{$key};
+        $drh->trace_msg(sprintf("    connect_cached: key '$key', cached dbh $dbh\n", DBI::neat($key), DBI::neat($dbh)))
+            if (($DBI::dbi_debug & 0xF) >= 4);
+
+        my $cb = $attr->{Callbacks}; # take care not to autovivify
+	if ($dbh && $dbh->FETCH('Active') && eval { $dbh->ping }) {
+            # If the caller has provided a callback then call it
+            if ($cb and $cb = $cb->{"connect_cached.reused"}) {
+		local $_ = "connect_cached.reused";
+		$cb->($dbh, $dsn, $user, $auth, $attr);
+            }
+	    return $dbh;
+	}
+
+	# If the caller has provided a callback then call it
+	if ($cb and (my $new_cb = $cb->{"connect_cached.new"})) {
+	    local $_ = "connect_cached.new";
+	    $new_cb->($dbh, $dsn, $user, $auth, $attr); # $dbh is dead or undef
+	}
+
+	$dbh = $drh->connect(@_);
+	$cache->{$key} = $dbh;	# replace prev entry, even if connect failed
+	if ($cb and (my $conn_cb = $cb->{"connect_cached.connected"})) {
+	    local $_ = "connect_cached.connected";
+	    $conn_cb->($dbh, $dsn, $user, $auth, $attr);
+	}
+	return $dbh;
+    }
+
+}
+
+
+{   package		# hide from PAUSE
+	DBD::_::db;	# ====== DATABASE ======
+    our @ISA = qw(DBD::_::common);
+    use strict;
+
+    sub clone {
+	my ($old_dbh, $attr) = @_;
+
+	my $closure = $old_dbh->{dbi_connect_closure}
+            or return $old_dbh->set_err($DBI::stderr, "Can't clone handle");
+
+	unless ($attr) { # XXX deprecated, caller should always pass a hash ref
+	    # copy attributes visible in the attribute cache
+	    keys %$old_dbh;	# reset iterator
+	    while ( my ($k, $v) = each %$old_dbh ) {
+		# ignore non-code refs, i.e., caches, handles, Err etc
+		next if ref $v && ref $v ne 'CODE'; # HandleError etc
+		$attr->{$k} = $v;
+	    }
+	    # explicitly set attributes which are unlikely to be in the
+	    # attribute cache, i.e., boolean's and some others
+	    $attr->{$_} = $old_dbh->FETCH($_) for (qw(
+		AutoCommit ChopBlanks InactiveDestroy AutoInactiveDestroy
+		LongTruncOk PrintError PrintWarn Profile RaiseError RaiseWarn
+		ShowErrorStatement TaintIn TaintOut
+	    ));
+	}
+
+	# use Data::Dumper; warn Dumper([$old_dbh, $attr]);
+	my $new_dbh = &$closure($old_dbh, $attr);
+	unless ($new_dbh) {
+	    # need to copy err/errstr from driver back into $old_dbh
+	    my $drh = $old_dbh->{Driver};
+	    return $old_dbh->set_err($drh->err, $drh->errstr, $drh->state);
+	}
+        $new_dbh->{dbi_connect_closure} = $closure;
+	return $new_dbh;
+    }
+
+    sub quote_identifier {
+	my ($dbh, @id) = @_;
+	my $attr = (@id > 3 && ref($id[-1])) ? pop @id : undef;
+
+	my $info = $dbh->{dbi_quote_identifier_cache} ||= [
+	    $dbh->get_info(29)  || '"',	# SQL_IDENTIFIER_QUOTE_CHAR
+	    $dbh->get_info(41)  || '.',	# SQL_CATALOG_NAME_SEPARATOR
+	    $dbh->get_info(114) ||   1,	# SQL_CATALOG_LOCATION
+	];
+
+	my $quote = $info->[0];
+	foreach (@id) {			# quote the elements
+	    next unless defined;
+	    s/$quote/$quote$quote/g;	# escape embedded quotes
+	    $_ = qq{$quote$_$quote};
+	}
+
+	# strip out catalog if present for special handling
+	my $catalog = (@id >= 3) ? shift @id : undef;
+
+	# join the dots, ignoring any null/undef elements (ie schema)
+	my $quoted_id = join '.', grep { defined } @id;
+
+	if ($catalog) {			# add catalog correctly
+        if ($quoted_id) {
+            $quoted_id = ($info->[2] == 2)	# SQL_CL_END
+                ? $quoted_id . $info->[1] . $catalog
+                    : $catalog   . $info->[1] . $quoted_id;
+        } else {
+            $quoted_id = $catalog;
+        }
+	}
+	return $quoted_id;
+    }
+
+    sub quote {
+	my ($dbh, $str, $data_type) = @_;
+
+	return "NULL" unless defined $str;
+	unless ($data_type) {
+	    $str =~ s/'/''/g;		# ISO SQL2
+	    return "'$str'";
+	}
+
+	my $dbi_literal_quote_cache = $dbh->{'dbi_literal_quote_cache'} ||= [ {} , {} ];
+	my ($prefixes, $suffixes) = @$dbi_literal_quote_cache;
+
+	my $lp = $prefixes->{$data_type};
+	my $ls = $suffixes->{$data_type};
+
+	if ( ! defined $lp || ! defined $ls ) {
+	    my $ti = $dbh->type_info($data_type);
+	    $lp = $prefixes->{$data_type} = $ti ? $ti->{LITERAL_PREFIX} || "" : "'";
+	    $ls = $suffixes->{$data_type} = $ti ? $ti->{LITERAL_SUFFIX} || "" : "'";
+	}
+	return $str unless $lp || $ls; # no quoting required
+
+	# XXX don't know what the standard says about escaping
+	# in the 'general case' (where $lp != "'").
+	# So we just do this and hope:
+	$str =~ s/$lp/$lp$lp/g
+		if $lp && $lp eq $ls && ($lp eq "'" || $lp eq '"');
+	return "$lp$str$ls";
+    }
+
+    sub rows { -1 }	# here so $DBI::rows 'works' after using $dbh
+
+    sub do {
+	my($dbh, $statement, $attr, @params) = @_;
+	my $sth = $dbh->prepare($statement, $attr) or return undef;
+	$sth->execute(@params) or return undef;
+	my $rows = $sth->rows;
+	($rows == 0) ? "0E0" : $rows;
+    }
+
+    sub _do_selectrow {
+	my ($method, $dbh, $stmt, $attr, @bind) = @_;
+	my $sth = ((ref $stmt) ? $stmt : $dbh->prepare($stmt, $attr))
+	    or return undef;
+	$sth->execute(@bind)
+	    or return undef;
+	my $row = $sth->$method()
+	    and $sth->finish;
+	return $row;
+    }
+
+    sub selectrow_hashref {  return _do_selectrow('fetchrow_hashref',  @_); }
+
+    # XXX selectrow_array/ref also have C implementations in Driver.xst
+    sub selectrow_arrayref { return _do_selectrow('fetchrow_arrayref', @_); }
+    sub selectrow_array {
+	my $row = _do_selectrow('fetchrow_arrayref', @_) or return;
+	return $row->[0] unless wantarray;
+	return @$row;
+    }
+
+    sub selectall_array {
+        return @{ shift->selectall_arrayref(@_) || [] };
+    }
+
+    # XXX selectall_arrayref also has C implementation in Driver.xst
+    # which fallsback to this if a slice is given
+    sub selectall_arrayref {
+	my ($dbh, $stmt, $attr, @bind) = @_;
+	my $sth = (ref $stmt) ? $stmt : $dbh->prepare($stmt, $attr)
+	    or return;
+	$sth->execute(@bind) || return;
+	my $slice = $attr->{Slice}; # typically undef, else hash or array ref
+	if (!$slice and $slice=$attr->{Columns}) {
+	    if (ref $slice eq 'ARRAY') { # map col idx to perl array idx
+		$slice = [ @{$attr->{Columns}} ];	# take a copy
+		for (@$slice) { $_-- }
+	    }
+	}
+	my $rows = $sth->fetchall_arrayref($slice, my $MaxRows = $attr->{MaxRows});
+	$sth->finish if defined $MaxRows;
+	return $rows;
+    }
+
+    sub selectall_hashref {
+	my ($dbh, $stmt, $key_field, $attr, @bind) = @_;
+	my $sth = (ref $stmt) ? $stmt : $dbh->prepare($stmt, $attr);
+	return unless $sth;
+	$sth->execute(@bind) || return;
+	return $sth->fetchall_hashref($key_field);
+    }
+
+    sub selectcol_arrayref {
+	my ($dbh, $stmt, $attr, @bind) = @_;
+	my $sth = (ref $stmt) ? $stmt : $dbh->prepare($stmt, $attr);
+	return unless $sth;
+	$sth->execute(@bind) || return;
+	my @columns = ($attr->{Columns}) ? @{$attr->{Columns}} : (1);
+	my @values  = (undef) x @columns;
+	my $idx = 0;
+	for (@columns) {
+	    $sth->bind_col($_, \$values[$idx++]) || return;
+	}
+	my @col;
+	if (my $max = $attr->{MaxRows}) {
+	    push @col, @values while 0 < $max-- && $sth->fetch;
+	}
+	else {
+	    push @col, @values while $sth->fetch;
+	}
+	return \@col;
+    }
+
+    sub prepare_cached {
+	my ($dbh, $statement, $attr, $if_active) = @_;
+
+	# Needs support at dbh level to clear cache before complaining about
+	# active children. The XS template code does this. Drivers not using
+	# the template must handle clearing the cache themselves.
+	my $cache = $dbh->{CachedKids} ||= {};
+	my $key = do { no warnings;
+	    join "!\001", $statement, DBI::_concat_hash_sorted($attr, "=\001", ",\001", 0, 0)
+	};
+	my $sth = $cache->{$key};
+
+	if ($sth) {
+	    return $sth unless $sth->FETCH('Active');
+	    Carp::carp("prepare_cached($statement) statement handle $sth still Active")
+		unless ($if_active ||= 0);
+	    $sth->finish if $if_active <= 1;
+	    return $sth  if $if_active <= 2;
+	}
+
+	$sth = $dbh->prepare($statement, $attr);
+	$cache->{$key} = $sth if $sth;
+
+	return $sth;
+    }
+
+    sub ping {
+	my $dbh = shift;
+	# "0 but true" is a special kind of true 0 that is used here so
+	# applications can check if the ping was a real ping or not
+	($dbh->FETCH('Active')) ?  "0 but true" : 0;
+    }
+
+    sub begin_work {
+	my $dbh = shift;
+	return $dbh->set_err($DBI::stderr, "Already in a transaction")
+		unless $dbh->FETCH('AutoCommit');
+	$dbh->STORE('AutoCommit', 0); # will croak if driver doesn't support it
+	$dbh->STORE('BegunWork',  1); # trigger post commit/rollback action
+	return 1;
+    }
+
+    sub primary_key {
+	my ($dbh, @args) = @_;
+	my $sth = $dbh->primary_key_info(@args) or return;
+	my ($row, @col);
+	push @col, $row->[3] while ($row = $sth->fetch);
+	Carp::croak("primary_key method not called in list context")
+		unless wantarray; # leave us some elbow room
+	return @col;
+    }
+
+    sub tables {
+	my ($dbh, @args) = @_;
+	my $sth    = $dbh->table_info(@args[0,1,2,3,4]) or return;
+	my $tables = $sth->fetchall_arrayref or return;
+	my @tables;
+	if (defined($args[3]) && $args[3] eq '%' # special case for tables('','','','%')
+	    && grep {defined($_) && $_ eq ''} @args[0,1,2]
+	) {
+	    @tables = map { $_->[3] } @$tables;
+	} elsif ($dbh->get_info(29)) { # SQL_IDENTIFIER_QUOTE_CHAR
+	    @tables = map { $dbh->quote_identifier( @{$_}[0,1,2] ) } @$tables;
+	}
+	else {		# temporary old style hack (yeach)
+	    @tables = map {
+		my $name = $_->[2];
+		if ($_->[1]) {
+		    my $schema = $_->[1];
+		    # a sad hack (mostly for Informix I recall)
+		    my $quote = ($schema eq uc($schema)) ? '' : '"';
+		    $name = "$quote$schema$quote.$name"
+		}
+		$name;
+	    } @$tables;
+	}
+	return @tables;
+    }
+
+    sub type_info {	# this should be sufficient for all drivers
+	my ($dbh, $data_type) = @_;
+	my $idx_hash;
+	my $tia = $dbh->{dbi_type_info_row_cache};
+	if ($tia) {
+	    $idx_hash = $dbh->{dbi_type_info_idx_cache};
+	}
+	else {
+	    my $temp = $dbh->type_info_all;
+	    return unless $temp && @$temp;
+	    # we cache here because type_info_all may be expensive to call
+	    # (and we take a copy so the following shift can't corrupt
+	    # the data that may be returned by future calls to type_info_all)
+	    $tia      = $dbh->{dbi_type_info_row_cache} = [ @$temp ];
+	    $idx_hash = $dbh->{dbi_type_info_idx_cache} = shift @$tia;
+	}
+
+	my $dt_idx   = $idx_hash->{DATA_TYPE} || $idx_hash->{data_type};
+	Carp::croak("type_info_all returned non-standard DATA_TYPE index value ($dt_idx != 1)")
+	    if $dt_idx && $dt_idx != 1;
+
+	# --- simple DATA_TYPE match filter
+	my @ti;
+	my @data_type_list = (ref $data_type) ? @$data_type : ($data_type);
+	foreach $data_type (@data_type_list) {
+	    if (defined($data_type) && $data_type != DBI::SQL_ALL_TYPES()) {
+		push @ti, grep { $_->[$dt_idx] == $data_type } @$tia;
+	    }
+	    else {	# SQL_ALL_TYPES
+		push @ti, @$tia;
+	    }
+	    last if @ti;	# found at least one match
+	}
+
+	# --- format results into list of hash refs
+	my $idx_fields = keys %$idx_hash;
+	my @idx_names  = map { uc($_) } keys %$idx_hash;
+	my @idx_values = values %$idx_hash;
+	Carp::croak "type_info_all result has $idx_fields keys but ".(@{$ti[0]})." fields"
+		if @ti && @{$ti[0]} != $idx_fields;
+	my @out = map {
+	    my %h; @h{@idx_names} = @{$_}[ @idx_values ]; \%h;
+	} @ti;
+	return $out[0] unless wantarray;
+	return @out;
+    }
+
+    sub data_sources {
+	my ($dbh, @other) = @_;
+	my $drh = $dbh->{Driver}; # XXX proxy issues?
+	return $drh->data_sources(@other);
+    }
+
+}
+
+
+{   package		# hide from PAUSE
+	DBD::_::st;	# ====== STATEMENT ======
+    our @ISA = qw(DBD::_::common);
+    use strict;
+
+    sub bind_param { Carp::croak("Can't bind_param, not implement by driver") }
+
+#
+# ********************************************************
+#
+#	BEGIN ARRAY BINDING
+#
+#	Array binding support for drivers which don't support
+#	array binding, but have sufficient interfaces to fake it.
+#	NOTE: mixing scalars and arrayrefs requires using bind_param_array
+#	for *all* params...unless we modify bind_param for the default
+#	case...
+#
+#	2002-Apr-10	D. Arnold
+
+    sub bind_param_array {
+	my $sth = shift;
+	my ($p_id, $value_array, $attr) = @_;
+
+	return $sth->set_err($DBI::stderr, "Value for parameter $p_id must be a scalar or an arrayref, not a ".ref($value_array))
+	    if defined $value_array and ref $value_array and ref $value_array ne 'ARRAY';
+
+	return $sth->set_err($DBI::stderr, "Can't use named placeholder '$p_id' for non-driver supported bind_param_array")
+	    unless DBI::looks_like_number($p_id); # because we rely on execute(@ary) here
+
+	return $sth->set_err($DBI::stderr, "Placeholder '$p_id' is out of range")
+	    if $p_id <= 0; # can't easily/reliably test for too big
+
+	# get/create arrayref to hold params
+	my $hash_of_arrays = $sth->{ParamArrays} ||= { };
+
+	# If the bind has attribs then we rely on the driver conforming to
+	# the DBI spec in that a single bind_param() call with those attribs
+	# makes them 'sticky' and apply to all later execute(@values) calls.
+	# Since we only call bind_param() if we're given attribs then
+	# applications using drivers that don't support bind_param can still
+	# use bind_param_array() so long as they don't pass any attribs.
+
+	$$hash_of_arrays{$p_id} = $value_array;
+	return $sth->bind_param($p_id, undef, $attr)
+		if $attr;
+	1;
+    }
+
+    sub bind_param_inout_array {
+	my $sth = shift;
+	# XXX not supported so we just call bind_param_array instead
+	# and then return an error
+	my ($p_num, $value_array, $attr) = @_;
+	$sth->bind_param_array($p_num, $value_array, $attr);
+	return $sth->set_err($DBI::stderr, "bind_param_inout_array not supported");
+    }
+
+    sub bind_columns {
+	my $sth = shift;
+	my $fields = $sth->FETCH('NUM_OF_FIELDS') || 0;
+	if ($fields <= 0 && !$sth->{Active}) {
+	    return $sth->set_err($DBI::stderr, "Statement has no result columns to bind"
+		    ." (perhaps you need to successfully call execute first, or again)");
+	}
+	# Backwards compatibility for old-style call with attribute hash
+	# ref as first arg. Skip arg if undef or a hash ref.
+	my $attr;
+	$attr = shift if !defined $_[0] or ref($_[0]) eq 'HASH';
+
+	my $idx = 0;
+	$sth->bind_col(++$idx, shift, $attr) or return
+	    while (@_ and $idx < $fields);
+
+	return $sth->set_err($DBI::stderr, "bind_columns called with ".($idx+@_)." values but $fields are needed")
+	    if @_ or $idx != $fields;
+
+	return 1;
+    }
+
+    sub execute_array {
+	my $sth = shift;
+	my ($attr, @array_of_arrays) = @_;
+	my $NUM_OF_PARAMS = $sth->FETCH('NUM_OF_PARAMS'); # may be undef at this point
+
+	# get tuple status array or hash attribute
+	my $tuple_sts = $attr->{ArrayTupleStatus};
+	return $sth->set_err($DBI::stderr, "ArrayTupleStatus attribute must be an arrayref")
+		if $tuple_sts and ref $tuple_sts ne 'ARRAY';
+
+	# bind all supplied arrays
+	if (@array_of_arrays) {
+	    $sth->{ParamArrays} = { };	# clear out old params
+	    return $sth->set_err($DBI::stderr,
+		    @array_of_arrays." bind values supplied but $NUM_OF_PARAMS expected")
+		if defined ($NUM_OF_PARAMS) && @array_of_arrays != $NUM_OF_PARAMS;
+	    $sth->bind_param_array($_, $array_of_arrays[$_-1]) or return
+		foreach (1..@array_of_arrays);
+	}
+
+	my $fetch_tuple_sub;
+
+	if ($fetch_tuple_sub = $attr->{ArrayTupleFetch}) {	# fetch on demand
+
+	    return $sth->set_err($DBI::stderr,
+		    "Can't use both ArrayTupleFetch and explicit bind values")
+		if @array_of_arrays; # previous bind_param_array calls will simply be ignored
+
+	    if (UNIVERSAL::isa($fetch_tuple_sub,'DBI::st')) {
+		my $fetch_sth = $fetch_tuple_sub;
+		return $sth->set_err($DBI::stderr,
+			"ArrayTupleFetch sth is not Active, need to execute() it first")
+		    unless $fetch_sth->{Active};
+		# check column count match to give more friendly message
+		my $NUM_OF_FIELDS = $fetch_sth->{NUM_OF_FIELDS};
+		return $sth->set_err($DBI::stderr,
+			"$NUM_OF_FIELDS columns from ArrayTupleFetch sth but $NUM_OF_PARAMS expected")
+		    if defined($NUM_OF_FIELDS) && defined($NUM_OF_PARAMS)
+		    && $NUM_OF_FIELDS != $NUM_OF_PARAMS;
+		$fetch_tuple_sub = sub { $fetch_sth->fetchrow_arrayref };
+	    }
+	    elsif (!UNIVERSAL::isa($fetch_tuple_sub,'CODE')) {
+		return $sth->set_err($DBI::stderr, "ArrayTupleFetch '$fetch_tuple_sub' is not a code ref or statement handle");
+	    }
+
+	}
+	else {
+	    my $NUM_OF_PARAMS_given = keys %{ $sth->{ParamArrays} || {} };
+	    return $sth->set_err($DBI::stderr,
+		    "$NUM_OF_PARAMS_given bind values supplied but $NUM_OF_PARAMS expected")
+		if defined($NUM_OF_PARAMS) && $NUM_OF_PARAMS != $NUM_OF_PARAMS_given;
+
+	    # get the length of a bound array
+	    my $maxlen;
+	    my %hash_of_arrays = %{$sth->{ParamArrays}};
+	    foreach (keys(%hash_of_arrays)) {
+		my $ary = $hash_of_arrays{$_};
+		next unless ref $ary eq 'ARRAY';
+		$maxlen = @$ary if !$maxlen || @$ary > $maxlen;
+	    }
+	    # if there are no arrays then execute scalars once
+	    $maxlen = 1 unless defined $maxlen;
+	    my @bind_ids = 1..keys(%hash_of_arrays);
+
+	    my $tuple_idx = 0;
+	    $fetch_tuple_sub = sub {
+		return if $tuple_idx >= $maxlen;
+		my @tuple = map {
+		    my $a = $hash_of_arrays{$_};
+		    ref($a) ? $a->[$tuple_idx] : $a
+		} @bind_ids;
+		++$tuple_idx;
+		return \@tuple;
+	    };
+	}
+	# pass thru the callers scalar or list context
+	return $sth->execute_for_fetch($fetch_tuple_sub, $tuple_sts);
+    }
+
+    sub execute_for_fetch {
+	my ($sth, $fetch_tuple_sub, $tuple_status) = @_;
+	# start with empty status array
+	($tuple_status) ? @$tuple_status = () : $tuple_status = [];
+
+        my $rc_total = 0;
+	my $err_count;
+	while ( my $tuple = &$fetch_tuple_sub() ) {
+	    if ( my $rc = $sth->execute(@$tuple) ) {

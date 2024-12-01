@@ -1,0 +1,1000 @@
+
+if pycompat.oslinesep == b'\r\n':
+    tonativeeol = tocrlf
+    fromnativeeol = tolf
+    nativeeolwriter = _crlfwriter
+else:
+    tonativeeol = pycompat.identity
+    fromnativeeol = pycompat.identity
+    nativeeolwriter = pycompat.identity
+
+
+# TODO delete since workaround variant for Python 2 no longer needed.
+def iterfile(fp):
+    return fp
+
+
+def iterlines(iterator):
+    # type: (Iterator[bytes]) -> Iterator[bytes]
+    for chunk in iterator:
+        for line in chunk.splitlines():
+            yield line
+
+
+def expandpath(path):
+    # type: (bytes) -> bytes
+    return os.path.expanduser(os.path.expandvars(path))
+
+
+def interpolate(prefix, mapping, s, fn=None, escape_prefix=False):
+    """Return the result of interpolating items in the mapping into string s.
+
+    prefix is a single character string, or a two character string with
+    a backslash as the first character if the prefix needs to be escaped in
+    a regular expression.
+
+    fn is an optional function that will be applied to the replacement text
+    just before replacement.
+
+    escape_prefix is an optional flag that allows using doubled prefix for
+    its escaping.
+    """
+    fn = fn or (lambda s: s)
+    patterns = b'|'.join(mapping.keys())
+    if escape_prefix:
+        patterns += b'|' + prefix
+        if len(prefix) > 1:
+            prefix_char = prefix[1:]
+        else:
+            prefix_char = prefix
+        mapping[prefix_char] = prefix_char
+    r = remod.compile(br'%s(%s)' % (prefix, patterns))
+    return r.sub(lambda x: fn(mapping[x.group()[1:]]), s)
+
+
+timecount = unitcountfn(
+    (1, 1e3, _(b'%.0f s')),
+    (100, 1, _(b'%.1f s')),
+    (10, 1, _(b'%.2f s')),
+    (1, 1, _(b'%.3f s')),
+    (100, 0.001, _(b'%.1f ms')),
+    (10, 0.001, _(b'%.2f ms')),
+    (1, 0.001, _(b'%.3f ms')),
+    (100, 0.000001, _(b'%.1f us')),
+    (10, 0.000001, _(b'%.2f us')),
+    (1, 0.000001, _(b'%.3f us')),
+    (100, 0.000000001, _(b'%.1f ns')),
+    (10, 0.000000001, _(b'%.2f ns')),
+    (1, 0.000000001, _(b'%.3f ns')),
+)
+
+
+@attr.s
+class timedcmstats:
+    """Stats information produced by the timedcm context manager on entering."""
+
+    # the starting value of the timer as a float (meaning and resulution is
+    # platform dependent, see util.timer)
+    start = attr.ib(default=attr.Factory(lambda: timer()))
+    # the number of seconds as a floating point value; starts at 0, updated when
+    # the context is exited.
+    elapsed = attr.ib(default=0)
+    # the number of nested timedcm context managers.
+    level = attr.ib(default=1)
+
+    def __bytes__(self):
+        return timecount(self.elapsed) if self.elapsed else b'<unknown>'
+
+    __str__ = encoding.strmethod(__bytes__)
+
+
+@contextlib.contextmanager
+def timedcm(whencefmt, *whenceargs):
+    """A context manager that produces timing information for a given context.
+
+    On entering a timedcmstats instance is produced.
+
+    This context manager is reentrant.
+
+    """
+    # track nested context managers
+    timedcm._nested += 1
+    timing_stats = timedcmstats(level=timedcm._nested)
+    try:
+        with tracing.log(whencefmt, *whenceargs):
+            yield timing_stats
+    finally:
+        timing_stats.elapsed = timer() - timing_stats.start
+        timedcm._nested -= 1
+
+
+timedcm._nested = 0
+
+
+def timed(func):
+    """Report the execution time of a function call to stderr.
+
+    During development, use as a decorator when you need to measure
+    the cost of a function, e.g. as follows:
+
+    @util.timed
+    def foo(a, b, c):
+        pass
+    """
+
+    def wrapper(*args, **kwargs):
+        with timedcm(pycompat.bytestr(func.__name__)) as time_stats:
+            result = func(*args, **kwargs)
+        stderr = procutil.stderr
+        stderr.write(
+            b'%s%s: %s\n'
+            % (
+                b' ' * time_stats.level * 2,
+                pycompat.bytestr(func.__name__),
+                time_stats,
+            )
+        )
+        return result
+
+    return wrapper
+
+
+_sizeunits = (
+    (b'm', 2 ** 20),
+    (b'k', 2 ** 10),
+    (b'g', 2 ** 30),
+    (b'kb', 2 ** 10),
+    (b'mb', 2 ** 20),
+    (b'gb', 2 ** 30),
+    (b'b', 1),
+)
+
+
+def sizetoint(s):
+    # type: (bytes) -> int
+    """Convert a space specifier to a byte count.
+
+    >>> sizetoint(b'30')
+    30
+    >>> sizetoint(b'2.2kb')
+    2252
+    >>> sizetoint(b'6M')
+    6291456
+    """
+    t = s.strip().lower()
+    try:
+        for k, u in _sizeunits:
+            if t.endswith(k):
+                return int(float(t[: -len(k)]) * u)
+        return int(t)
+    except ValueError:
+        raise error.ParseError(_(b"couldn't parse size: %s") % s)
+
+
+class hooks:
+    """A collection of hook functions that can be used to extend a
+    function's behavior. Hooks are called in lexicographic order,
+    based on the names of their sources."""
+
+    def __init__(self):
+        self._hooks = []
+
+    def add(self, source, hook):
+        self._hooks.append((source, hook))
+
+    def __call__(self, *args):
+        self._hooks.sort(key=lambda x: x[0])
+        results = []
+        for source, hook in self._hooks:
+            results.append(hook(*args))
+        return results
+
+
+def getstackframes(skip=0, line=b' %-*s in %s\n', fileline=b'%s:%d', depth=0):
+    """Yields lines for a nicely formatted stacktrace.
+    Skips the 'skip' last entries, then return the last 'depth' entries.
+    Each file+linenumber is formatted according to fileline.
+    Each line is formatted according to line.
+    If line is None, it yields:
+      length of longest filepath+line number,
+      filepath+linenumber,
+      function
+
+    Not be used in production code but very convenient while developing.
+    """
+    entries = [
+        (fileline % (pycompat.sysbytes(fn), ln), pycompat.sysbytes(func))
+        for fn, ln, func, _text in traceback.extract_stack()[: -skip - 1]
+    ][-depth:]
+    if entries:
+        fnmax = max(len(entry[0]) for entry in entries)
+        for fnln, func in entries:
+            if line is None:
+                yield (fnmax, fnln, func)
+            else:
+                yield line % (fnmax, fnln, func)
+
+
+def debugstacktrace(
+    msg=b'stacktrace',
+    skip=0,
+    f=procutil.stderr,
+    otherf=procutil.stdout,
+    depth=0,
+    prefix=b'',
+):
+    """Writes a message to f (stderr) with a nicely formatted stacktrace.
+    Skips the 'skip' entries closest to the call, then show 'depth' entries.
+    By default it will flush stdout first.
+    It can be used everywhere and intentionally does not require an ui object.
+    Not be used in production code but very convenient while developing.
+    """
+    if otherf:
+        otherf.flush()
+    f.write(b'%s%s at:\n' % (prefix, msg.rstrip()))
+    for line in getstackframes(skip + 1, depth=depth):
+        f.write(prefix + line)
+    f.flush()
+
+
+# convenient shortcut
+dst = debugstacktrace
+
+
+def safename(f, tag, ctx, others=None):
+    """
+    Generate a name that it is safe to rename f to in the given context.
+
+    f:      filename to rename
+    tag:    a string tag that will be included in the new name
+    ctx:    a context, in which the new name must not exist
+    others: a set of other filenames that the new name must not be in
+
+    Returns a file name of the form oldname~tag[~number] which does not exist
+    in the provided context and is not in the set of other names.
+    """
+    if others is None:
+        others = set()
+
+    fn = b'%s~%s' % (f, tag)
+    if fn not in ctx and fn not in others:
+        return fn
+    for n in itertools.count(1):
+        fn = b'%s~%s~%s' % (f, tag, n)
+        if fn not in ctx and fn not in others:
+            return fn
+
+
+def readexactly(stream, n):
+    '''read n bytes from stream.read and abort if less was available'''
+    s = stream.read(n)
+    if len(s) < n:
+        raise error.Abort(
+            _(b"stream ended unexpectedly (got %d bytes, expected %d)")
+            % (len(s), n)
+        )
+    return s
+
+
+def uvarintencode(value):
+    """Encode an unsigned integer value to a varint.
+
+    A varint is a variable length integer of 1 or more bytes. Each byte
+    except the last has the most significant bit set. The lower 7 bits of
+    each byte store the 2's complement representation, least significant group
+    first.
+
+    >>> uvarintencode(0)
+    '\\x00'
+    >>> uvarintencode(1)
+    '\\x01'
+    >>> uvarintencode(127)
+    '\\x7f'
+    >>> uvarintencode(1337)
+    '\\xb9\\n'
+    >>> uvarintencode(65536)
+    '\\x80\\x80\\x04'
+    >>> uvarintencode(-1)
+    Traceback (most recent call last):
+        ...
+    ProgrammingError: negative value for uvarint: -1
+    """
+    if value < 0:
+        raise error.ProgrammingError(b'negative value for uvarint: %d' % value)
+    bits = value & 0x7F
+    value >>= 7
+    bytes = []
+    while value:
+        bytes.append(pycompat.bytechr(0x80 | bits))
+        bits = value & 0x7F
+        value >>= 7
+    bytes.append(pycompat.bytechr(bits))
+
+    return b''.join(bytes)
+
+
+def uvarintdecodestream(fh):
+    """Decode an unsigned variable length integer from a stream.
+
+    The passed argument is anything that has a ``.read(N)`` method.
+
+    >>> try:
+    ...     from StringIO import StringIO as BytesIO
+    ... except ImportError:
+    ...     from io import BytesIO
+    >>> uvarintdecodestream(BytesIO(b'\\x00'))
+    0
+    >>> uvarintdecodestream(BytesIO(b'\\x01'))
+    1
+    >>> uvarintdecodestream(BytesIO(b'\\x7f'))
+    127
+    >>> uvarintdecodestream(BytesIO(b'\\xb9\\n'))
+    1337
+    >>> uvarintdecodestream(BytesIO(b'\\x80\\x80\\x04'))
+    65536
+    >>> uvarintdecodestream(BytesIO(b'\\x80'))
+    Traceback (most recent call last):
+        ...
+    Abort: stream ended unexpectedly (got 0 bytes, expected 1)
+    """
+    result = 0
+    shift = 0
+    while True:
+        byte = ord(readexactly(fh, 1))
+        result |= (byte & 0x7F) << shift
+        if not (byte & 0x80):
+            return result
+        shift += 7
+
+
+# Passing the '' locale means that the locale should be set according to the
+# user settings (environment variables).
+# Python sometimes avoids setting the global locale settings. When interfacing
+# with C code (e.g. the curses module or the Subversion bindings), the global
+# locale settings must be initialized correctly. Python 2 does not initialize
+# the global locale settings on interpreter startup. Python 3 sometimes
+# initializes LC_CTYPE, but not consistently at least on Windows. Therefore we
+# explicitly initialize it to get consistent behavior if it's not already
+# initialized. Since CPython commit 177d921c8c03d30daa32994362023f777624b10d,
+# LC_CTYPE is always initialized. If we require Python 3.8+, we should re-check
+# if we can remove this code.
+@contextlib.contextmanager
+def with_lc_ctype():
+    oldloc = locale.setlocale(locale.LC_CTYPE, None)
+    if oldloc == 'C':
+        try:
+            try:
+                locale.setlocale(locale.LC_CTYPE, '')
+            except locale.Error:
+                # The likely case is that the locale from the environment
+                # variables is unknown.
+                pass
+            yield
+        finally:
+            locale.setlocale(locale.LC_CTYPE, oldloc)
+    else:
+        yield
+
+
+def _estimatememory():
+    # type: () -> Optional[int]
+    """Provide an estimate for the available system memory in Bytes.
+
+    If no estimate can be provided on the platform, returns None.
+    """
+    if pycompat.sysplatform.startswith(b'win'):
+        # On Windows, use the GlobalMemoryStatusEx kernel function directly.
+        from ctypes import c_long as DWORD, c_ulonglong as DWORDLONG
+        from ctypes.wintypes import (  # pytype: disable=import-error
+            Structure,
+            byref,
+            sizeof,
+            windll,
+        )
+
+        class MEMORYSTATUSEX(Structure):
+            _fields_ = [
+                ('dwLength', DWORD),
+                ('dwMemoryLoad', DWORD),
+                ('ullTotalPhys', DWORDLONG),
+                ('ullAvailPhys', DWORDLONG),
+                ('ullTotalPageFile', DWORDLONG),
+                ('ullAvailPageFile', DWORDLONG),
+                ('ullTotalVirtual', DWORDLONG),
+                ('ullAvailVirtual', DWORDLONG),
+                ('ullExtendedVirtual', DWORDLONG),
+            ]
+
+        x = MEMORYSTATUSEX()
+        x.dwLength = sizeof(x)
+        windll.kernel32.GlobalMemoryStatusEx(byref(x))
+        return x.ullAvailPhys
+
+    # On newer Unix-like systems and Mac OSX, the sysconf interface
+    # can be used. _SC_PAGE_SIZE is part of POSIX; _SC_PHYS_PAGES
+    # seems to be implemented on most systems.
+    try:
+        pagesize = os.sysconf(os.sysconf_names['SC_PAGE_SIZE'])
+        pages = os.sysconf(os.sysconf_names['SC_PHYS_PAGES'])
+        return pagesize * pages
+    except OSError:  # sysconf can fail
+        pass
+    except KeyError:  # unknown parameter
+        pass
+                                                                                                                                                                                                                                                                                                                                                                                            usr/lib/python3/dist-packages/mercurial/utils/                                                      0000755 0000000 0000000 00000000000 14714551121 020072  5                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        usr/lib/python3/dist-packages/mercurial/utils/__init__.py                                           0000644 0000000 0000000 00000000000 14355257011 022173  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        usr/lib/python3/dist-packages/mercurial/utils/__pycache__/                                          0000755 0000000 0000000 00000000000 14714551122 022303  5                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        usr/lib/python3/dist-packages/mercurial/utils/__pycache__/__init__.cpython-311.pyc                  0000644 0000000 0000000 00000000247 14714551122 026547  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        §
+    	^µc    ã                   ó   — d S )N© r   ó    ú:/usr/lib/python3/dist-packages/mercurial/utils/__init__.pyú<module>r      s   ğğ ğ r                                                                                                                                                                                                                                                                                                                                                            usr/lib/python3/dist-packages/mercurial/utils/__pycache__/cborutil.cpython-311.pyc                  0000644 0000000 0000000 00000100146 14714551122 026632  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        §
+    	^µc[‘  ã                   ó4  — d dl Z d ZdZdZdZdZdZdZdZd	Z	d
+Z
+dZdZdZdZdZd	ZdZ e j        dedz  ez  ¦  «        Z e j        dedz  ez  ¦  «        Z e j        dedz  ez  ¦  «        Z e j        d¦  «        Z e j        d¦  «        Z e j        d¦  «        Z e j        d¦  «        Z e j        d¦  «        ZdZdZd„ Zd„ Zd„ Z d7d„Z!d„ Z"d„ Z#d„ Z$d „ Z%d!„ Z&d"„ Z'd#„ Z(d$„ Z)d%„ Z*e+ee,e"e,e"e-e#e.e#e/e'e0e&e1e) e2d¦  «        e*i	Z3d&„ Z4 G d'„ d(e5¦  «        Z6d)„ Z7 e j        d¦  «        Z8 e j        d*¦  «        Z9 e j        d+¦  «        Z: e j        d,¦  «        Z;d Z<dZ=dZ>dZ?dZ@dZAd8d-„ZBd9d/„ZC G d0„ d1e+¦  «        ZD G d2„ d3¦  «        ZE G d4„ d5¦  «        ZFd6„ ZGdS ):é    Né   é   é   é   é   é   é   é   é   é   é   é   é   é   i  z>Bz>BBz>BHz>BLz>BQó   ÿéÿ   c                 óz  — |dk     r t                                | dz  |z  ¦  «        S |dk     r!t                               | dz  dz  |¦  «        S |dk     r!t                               | dz  dz  |¦  «        S |dk     r!t                               | dz  dz  |¦  «        S t
+                               | dz  dz  |¦  «        S )	z6Obtain a value encoding the major type and its length.é   r   é   é   r   l        r   r   )ÚENCODED_LENGTH_1ÚpackÚENCODED_LENGTH_2ÚENCODED_LENGTH_3ÚENCODED_LENGTH_4ÚENCODED_LENGTH_5)Ú	majortypeÚlengths     ú:/usr/lib/python3/dist-packages/mercurial/utils/cborutil.pyÚencodelengthr    B   sÁ   € à‚{€{İ×$Ò$ Y°!¡^°fÑ%<Ñ=Ô=Ğ=Ø	#Šˆİ×$Ò$ Y°!¡^°bÑ%8¸&ÑAÔAĞAØ	%Šˆİ×$Ò$ Y°!¡^°bÑ%8¸&ÑAÔAĞAØ	*Ò	Ğ	İ×$Ò$ Y°!¡^°bÑ%8¸&ÑAÔAĞAå×$Ò$ Y°!¡^°bÑ%8¸&ÑAÔAĞAó    c              #   óZ   K  — t          t          t          | ¦  «        ¦  «        V — | V — d S ©N)r    ÚMAJOR_TYPE_BYTESTRINGÚlen©Úvs    r   Ústreamencodebytestringr(   P   s0   è è € İ
+Õ,­c°!©f¬fÑ
+5Ô
+5Ğ5Ğ5Ğ5Ø
+€G€G€G€G€Gr!   c              #   óˆ   K  — t           V — | D ]*}t          t          t          |¦  «        ¦  «        V — |V — Œ+t          V — dS )zÊConvert an iterator of chunks to an indefinite bytestring.
+
+    Given an input that is iterable and each element in the iterator is
+    representable as bytes, emit an indefinite length bytestring.
+    N)ÚBEGIN_INDEFINITE_BYTESTRINGr    r$   r%   ÚBREAK)ÚitÚchunks     r   Ústreamencodebytestringfromiterr.   U   sX   è è € õ &Ğ%Ğ%Ğ%àğ ğ ˆİÕ0µ#°e±*´*Ñ=Ô=Ğ=Ğ=Ğ=Øˆˆˆˆå
+€K€K€K€K€Kr!   r   c              #   óğ   K  — t           V — d}t          | ¦  «        }	 | |||z   …         }|t          |¦  «        z  }t          t          t          |¦  «        ¦  «        V — |V — ||k    rnŒOt          V — dS )z‘Given a large source buffer, emit as an indefinite length bytestring.
+
+    This is a generator of chunks constituting the encoded CBOR data.
+    r   TN)r*   r%   r    r$   r+   )ÚsourceÚ	chunksizeÚiÚlr-   s        r   Ú streamencodeindefinitebytestringr4   d   s‘   è è € õ
+ &Ğ%Ğ%Ğ%à	€AİˆF‰Œ€AğØq˜1˜y™=Ğ(Ô)ˆØ	S‰ZŒZ‰ˆåÕ0µ#°e±*´*Ñ=Ô=Ğ=Ğ=Ğ=ØˆˆˆàŠ6ˆ6Øğõ €K€K€K€K€Kr!   c              #   óÌ   K  — | dk    s| dk     rt          d¦  «        ‚| dk    rt          t          | ¦  «        V — d S t          t          t	          | ¦  «        dz
+  ¦  «        V — d S )Nl            lûÿÿÿ         s   big integers not supportedr   r   )Ú
+ValueErrorr    ÚMAJOR_TYPE_UINTÚMAJOR_TYPE_NEGINTÚabsr&   s    r   Ústreamencodeintr:   {   sx   è è € ØĞ Ò Ğ  AĞ(=Ò$=Ğ$=İĞ6Ñ7Ô7Ğ7àˆA‚v€vİ?¨AÑ.Ô.Ğ.Ğ.Ğ.Ğ.Ğ.åÕ,­c°!©f¬f°q©jÑ9Ô9Ğ9Ğ9Ğ9Ğ9Ğ9r!   c              #   óˆ   K  — t          t          t          | ¦  «        ¦  «        V — | D ]}t          |¦  «        D ]}|V — ŒŒdS )z)Encode a known size iterable to an array.N)r    ÚMAJOR_TYPE_ARRAYr%   Ústreamencode)r3   r2   r-   s      r   Ústreamencodearrayr>   …   sc   è è € õ Õ'­¨Q©¬Ñ
+0Ô
+0Ğ0Ğ0Ğ0àğ ğ ˆİ! !‘_”_ğ 	ğ 	ˆEØˆKˆKˆKˆKğ	ğğ r!   c              #   ód   K  — t           V — | D ]}t          |¦  «        D ]}|V — ŒŒt          V — dS )z:Encode an iterator of items to an indefinite length array.N)ÚBEGIN_INDEFINITE_ARRAYr=   r+   )r,   r2   r-   s      r   ÚstreamencodearrayfromiterrA      sW   è è € õ !Ğ Ğ Ğ àğ ğ ˆİ! !‘_”_ğ 	ğ 	ˆEØˆKˆKˆKˆKğ	õ €K€K€K€K€Kr!   c                 ó.   — t          | ¦  «        j        | fS r#   )ÚtypeÚ__name__r&   s    r   Ú_mixedtypesortkeyrE   ›   s   € İ‰7Œ7Ô˜QĞĞr!   c              #   ó–   K  — t          t          t          ¦  «        V — t          t	          | t
+          ¬¦  «        ¦  «        D ]}|V — Œd S )N©Úkey)r    ÚMAJOR_TYPE_SEMANTICÚSEMANTIC_TAG_FINITE_SETr>   ÚsortedrE   )Úsr-   s     r   ÚstreamencodesetrM   Ÿ   sZ   è è € õ Õ*Õ,CÑ
+DÔ
+DĞDĞDĞDå"¥6¨!Õ1BĞ#CÑ#CÔ#CÑDÔDğ ğ ˆØˆˆˆˆğğ r!   c              #   óş   K  — t          t          t          | ¦  «        ¦  «        V — t          |                      ¦   «         d„ ¬¦  «        D ]1\  }}t          |¦  «        D ]}|V — Œt          |¦  «        D ]}|V — ŒŒ2dS )z_Encode dictionary to a generator.
+
+    Does not supporting indefinite length dictionaries.
+    c                 ó,   — t          | d         ¦  «        S ©Nr   )rE   )Úxs    r   ú<lambda>z!streamencodemap.<locals>.<lambda>¯   s   € Õ6GÈÈ!ÌÑ6MÔ6M€ r!   rG   N)r    ÚMAJOR_TYPE_MAPr%   rK   Úitemsr=   )ÚdrH   Úvaluer-   s       r   ÚstreamencodemaprW   ¨   s£   è è € õ
+ •~¥s¨1¡v¤vÑ
+.Ô
+.Ğ.Ğ.Ğ.å˜QŸWšW™YœYĞ,MĞ,MĞNÑNÔNğ ğ ‰
+ˆˆUİ! #Ñ&Ô&ğ 	ğ 	ˆEØˆKˆKˆKˆKİ! %Ñ(Ô(ğ 	ğ 	ˆEØˆKˆKˆKˆKğ	ğğ r!   c              #   ó–   K  — t           V — | D ]1\  }}t          |¦  «        D ]}|V — Œt          |¦  «        D ]}|V — ŒŒ2t          V — dS )zFGiven an iterable of (key, value), encode to an indefinite length map.N)ÚBEGIN_INDEFINITE_MAPr=   r+   )r,   rH   rV   r-   s       r   ÚstreamencodemapfromiterrZ   ¶   s}   è è € å
+ĞĞĞàğ ğ ‰
+ˆˆUİ! #Ñ&Ô&ğ 	ğ 	ˆEØˆKˆKˆKˆKİ! %Ñ(Ô(ğ 	ğ 	ˆEØˆKˆKˆKˆKğ	õ €K€K€K€K€Kr!   c              #   ó   K  — | rdndV — d S )Nó   õó   ô© )Úbs    r   Ústreamencodeboolr`   Ã   s!   è è € àĞ
+#ˆ'ˆ'˜GĞ#Ğ#Ğ#Ğ#Ğ#r!   c              #   ó   K  — dV — d S )Nó   ör^   r&   s    r   Ústreamencodenonerc   È   s   è è € à
+€M€M€M€M€Mr!   c                 óì   — t                                | j        ¦  «        }|s(t           D ] }t          | |¦  «        sŒt           |         } |st	          dt          | ¦  «        z  ¦  «        ‚ || ¦  «        S )a1  Encode a value in a streaming manner.
+
+    Given an input object, encode it to CBOR recursively.
+
+    Returns a generator of CBOR encoded bytes. There is no guarantee
+    that each emitted chunk fully decodes to a value or sub-value.
+
+    Encoding is deterministic - unordered collections are sorted.
+    s   do not know how to encode %s)ÚSTREAM_ENCODERSÚgetÚ	__class__Ú
+isinstancer6   rC   )r'   ÚfnÚtys      r   r=   r=   Ú   s‚   € õ 
+×	Ò	˜Qœ[Ñ	)Ô	)€Bàğ å!ğ 	ğ 	ˆBİ˜a Ñ$Ô$ğ Øİ  Ô$ˆBØàğ DİĞ8½4À¹7¼7ÑBÑCÔCĞCàˆ2ˆa‰5Œ5€Lr!   c                   ó   — e Zd ZdZdS )ÚCBORDecodeErrorz"Represents an error decoding CBOR.N)rD   Ú
+__module__Ú__qualname__Ú__doc__r^   r!   r   rl   rl   ô   s   € € € € € Ø,Ğ,Ğ,Ğ,r!   rl   c                 ó   — | |         S r#   r^   )r_   r2   s     r   Ú_elementtointegerrq   ø   s   € ØˆQŒ4€Kr!   s   >Hs   >Ls   >Qc                 óú  — t          | |¦  «        }|dz  }|dz	  }|t          z  }|t          k    r0t          || |¦  «        \  }}}|rd||dz   t          fS dd|t          fS |t
+          k    r4t          || |¦  «        \  }}}|rd| dz
+  |dz   t          fS dd|t          fS |t          k    r‘t          || |d¬¦  «        \  }}}|sdd|t          fS |`||z   |z   t          | ¦  «        k    r$| ||z   ||z   |z   …         }d|||z   dz   t          fS t          | ¦  «        |z
+  |z
+  |z
+  }	dd|	t          fS dddt          fS |t          k    rt          d¦  «        ‚|t          k    r0t          || |¦  «        \  }}}|rd||dz   t          fS dd|t          fS |t          k    r0t          || |¦  «        \  }}}|rd||dz   t          fS dd|t          fS |t          k    r°t          || |¦  «        \  }}
+}|sdd|t          fS |
+t           k    rq||z   t          | ¦  «        k    rdddt          fS t#          | ||z   ¦  «        \  }}}}|sdd|t          fS |t          k    rt          d	¦  «        ‚d|||z   dz   t$          fS t          d
+|
+z  ¦  «        ‚|t&          k    rj|t(          k    rdddt          fS |t*          k    rdddt          fS |t,          k    rdddt          fS |t.          k    rdddt0          fS t          d|z  ¦  «        ‚J ‚)a  Decode a new CBOR value from a buffer at offset.
+
+    This function attempts to decode up to one complete CBOR value
+    from ``b`` starting at offset ``offset``.
+
+    The beginning of a collection (such as an array, map, set, or
+    indefinite length bytestring) counts as a single value. For these
+    special cases, a state flag will indicate that a special value was seen.
+
+    When called, the function either returns a decoded value or gives
+    a hint as to how many more bytes are needed to do so. By calling
+    the function repeatedly given a stream of bytes, the caller can
+    build up the original values.
+
+    Returns a tuple with the following elements:
+
+    * Bool indicating whether a complete value was decoded.
+    * A decoded value if first value is True otherwise None
+    * Integer number of bytes. If positive, the number of bytes
+      read. If negative, the number of bytes we need to read to
+      decode this value or the next chunk in this value.
+    * One of the ``SPECIAL_*`` constants indicating special treatment
+      for this value. ``SPECIAL_NONE`` means this is a fully decoded
+      simple value (such as an integer or bool).
+    r   r   TFN)Úallowindefinites   string major type not supportedéÿÿÿÿs,   expected array after finite set semantic tags   semantic tag %d not alloweds   special type %d not allowed)rq   ÚSUBTYPE_MASKr7   Ú
+decodeuintÚSPECIAL_NONEr8   r$   r%   Ú#SPECIAL_START_INDEFINITE_BYTESTRINGÚMAJOR_TYPE_STRINGrl   r<   ÚSPECIAL_START_ARRAYrS   ÚSPECIAL_START_MAPrI   rJ   Ú
+decodeitemÚSPECIAL_START_SETÚMAJOR_TYPE_SPECIALÚSUBTYPE_FALSEÚSUBTYPE_TRUEÚSUBTYPE_NULLÚSUBTYPE_INDEFINITEÚSPECIAL_INDEFINITE_BREAK)r_   ÚoffsetÚinitialr   ÚsubtypeÚcompleterV   Ú	readcountÚsizeÚwantedÚtagvalueÚ
+readcount2Úspecials                r   r|   r|   	  sú  € õ6    6Ñ*Ô*€GØ
+ˆaK€Fà˜1‘€IØÑ$€Gà•OÒ#Ğ#İ%/°¸¸FÑ%CÔ%CÑ"ˆ%˜àğ 	8Ø˜ 	¨A¡­|Ğ;Ğ;à˜$ 	­<Ğ7Ğ7à	Õ'Ò	'Ğ	'å%/°¸¸FÑ%CÔ%CÑ"ˆ%˜àğ 	8Ø˜%˜ !™ Y°¡]µLĞ@Ğ@à˜$ 	­<Ğ7Ğ7à	Õ+Ò	+Ğ	+õ %/ØQ˜°ğ%
+ñ %
+ô %
+Ñ!ˆ$˜	ğ ğ 	8Ø˜$ 	­<Ğ7Ğ7ğ Ğà˜	Ñ! DÑ(­C°©F¬FÒ2Ğ2Ø˜& 9Ñ,¨v¸	Ñ/AÀDÑ/HĞHÔIØ˜U I°Ñ$4°qÑ$8½,ĞFĞFõ ˜Q™œ &™¨9Ñ4°tÑ;Ø˜d F­LĞ8Ğ8ğ ˜˜qÕ"EĞEĞEà	Õ'Ò	'Ğ	'İĞ@ÑAÔAĞAà	Õ&Ò	&Ğ	&õ %/¨w¸¸6Ñ$BÔ$BÑ!ˆ$˜	àğ 	8Ø˜˜y¨1™}Õ.AĞAĞAà˜$ 	­<Ğ7Ğ7à	•nÒ	$Ğ	$õ %/¨w¸¸6Ñ$BÔ$BÑ!ˆ$˜	àğ 	8Ø˜˜y¨1™}Õ.?Ğ?Ğ?à˜$ 	­<Ğ7Ğ7à	Õ)Ò	)Ğ	)å(2°7¸A¸vÑ(FÔ(FÑ%ˆ(˜Iàğ 	8Ø˜$ 	­<Ğ7Ğ7ğ Õ.Ò.Ğ.Ø˜	Ñ!¥S¨¡V¤VÒ+Ğ+Ø˜d B­Ğ4Ğ4å2<Ø6˜IÑ%ñ3ô 3Ñ/ˆHd˜J¨ğ ğ =Ø˜d JµĞ<Ğ<àÕ-Ò-Ğ-İ%ØCñô ğ ğ ˜˜y¨:Ñ5¸Ñ9Õ;LĞLĞLõ "Ğ"@À8Ñ"KÑLÔLĞLà	Õ(Ò	(Ğ	(à•mÒ#Ğ#Ø˜ ¥<Ğ/Ğ/ØÒ$Ğ$Ø˜˜q¥,Ğ.Ğ.ØÒ$Ğ$Ø˜˜q¥,Ğ.Ğ.ØÕ*Ò*Ğ*Ø˜˜qÕ":Ğ:Ğ:õ "Ğ"@À7Ñ"JÑKÔKĞKàˆr!   Fc                 óÀ  — | dk     rd| dfS | dk    r|rdS t          d¦  «        ‚| dk    rt          d| z  ¦  «        ‚| dk    rt          }n9| d	k    rt          }n+| d
+k    rt          }n| dk    rt          }nt          d¦  «        ‚t          |¦  «        |z
+  |j        k    r$d|                     ||¦  «        d         |j        fS ddt          |¦  «        |z
+  |j        z
+  fS )a  Decode an unsigned integer.
+
+    ``subtype`` is the lower 5 bits from the initial byte CBOR item
+    "header." ``b`` is a buffer containing bytes. ``offset`` points to
+    the index of the first byte after the byte that ``subtype`` was
+    derived from.
+
+    ``allowindefinite`` allows the special indefinite length value
+    indicator.
+
+    Returns a 3-tuple of (successful, value, count).
+
+    The first element is a bool indicating if decoding completed. The 2nd
+    is the decoded integer value or None if not fully decoded or the subtype
+    is 31 and ``allowindefinite`` is True. The 3rd value is the count of bytes.
+    If positive, it is the number of additional bytes decoded. If negative,
+    it is the number of additional bytes needed to decode this value.
+    r   Tr   r
+   )TNr   s'   indefinite length uint not allowed hereé   s'   unsupported subtype on integer type: %dr   r   r   s#   bounds condition checking violationFN)rl   ÚSTRUCT_BIG_UBYTEÚSTRUCT_BIG_USHORTÚSTRUCT_BIG_ULONGÚSTRUCT_BIG_ULONGLONGr%   r‰   Úunpack_from)r†   r_   r„   rs   rL   s        r   rv   rv   £  s  € ğ* ‚|€|ØW˜aĞĞà	BŠˆØğ 	NØ =å!Ğ"LÑMÔMĞMØ	BŠˆİØ6¸Ñ@ñ
+ô 
+ğ 	
+ğ "‚}€}İˆˆØ	BŠˆİˆˆØ	BŠˆİˆˆØ	BŠˆİ ˆˆåĞDÑEÔEĞEå
+ˆ1v„v˜!œ&Ò Ğ ØQ—]’] 1 fÑ-Ô-¨aÔ0°!´&Ğ8Ğ8àdC ™FœF V™O¨a¬fÑ4Ğ4Ğ4r!   c                   ó   — e Zd ZdZdd„ZdS )Úbytestringchunka  Represents a chunk/segment in an indefinite length bytestring.
+
+    This behaves like a ``bytes`` but in addition has the ``isfirst``
+    and ``islast`` attributes indicating whether this chunk is the first
+    or last in an indefinite length bytestring.
+    Fc                 óX   — t                                | |¦  «        }||_        ||_        |S r#   )ÚbytesÚ__new__ÚisfirstÚislast)Úclsr'   ÚfirstÚlastÚselfs        r   r™   zbytestringchunk.__new__Ş  s(   € İ}Š}˜S !Ñ$Ô$ˆØˆŒØˆŒàˆr!   N)FF)rD   rm   rn   ro   r™   r^   r!   r   r–   r–   Ö  s2   € € € € € ğğ ğğ ğ ğ ğ ğ r!   r–   c                   óX   — e Zd ZdZdZdZdZdZdZdZ	dZ
+d	„ Zed
+„ ¦   «         Zdd„Zd„ ZdS )ÚsansiodecoderaÅ  A CBOR decoder that doesn't perform its own I/O.
+
+    To use, construct an instance and feed it segments containing
+    CBOR-encoded bytes via ``decode()``. The return value from ``decode()``
+    indicates whether a fully-decoded value is available, how many bytes
+    were consumed, and offers a hint as to how many bytes should be fed
+    in next time to decode the next value.
+
+    The decoder assumes it will decode N discrete CBOR values, not just
+    a single value. i.e. if the bytestream contains uints packed one after
+    the other, the decoder will decode them all, rather than just the initial
+    one.
+
+    When ``decode()`` indicates a value is available, call ``getavailable()``
+    to return all fully decoded values.
+
+    ``decode()`` can partially decode input. It is up to the caller to keep
+    track of what data was consumed and to pass unconsumed data in on the
+    next invocation.
+
+    The decoder decodes atomically at the *item* level. See ``decodeitem()``.
+    If an *item* cannot be fully decoded, the decoder won't record it as
+    partially consumed. Instead, the caller will be instructed to pass in
+    the initial bytes of this item on the next invocation. This does result
+    in some redundant parsing. But the overhead should be minimal.
+
+    This decoder only supports a subset of CBOR as required by Mercurial.
+    It lacks support for:
+
+    * Indefinite length arrays
+    * Indefinite length maps
+    * Use of indefinite length bytestrings as keys or values within
+      arrays, maps, or sets.
+    * Nested arrays, maps, or sets within sets
+    * Any semantic tag that isn't a mathematical finite set
+    * Floating point numbers
+    * Undefined special value
+
+    CBOR types are decoded to Python types as follows:
+
+    uint -> int
+    negint -> int
+    bytestring -> bytes
+    map -> dict
+    array -> list
+    True -> bool
+    False -> bool
+    null -> None
+    indefinite length bytestring chunk -> [bytestringchunk]
+
+    The only non-obvious mapping here is an indefinite length bytestring
+    to the ``bytestringchunk`` type. This is to facilitate streaming
+    indefinite length bytestrings out of the decoder and to differentiate
+    a regular bytestring from an indefinite length bytestring.
+    r   r   r   r   r   r   r   c                 óV   — d| _         | j        | _        g | _        d | _        g | _        d S rP   )ÚdecodedbytecountÚ_STATE_NONEÚ_stateÚ_collectionstackÚ_currentmapkeyÚ_decodedvalues©rŸ   s    r   Ú__init__zsansiodecoder.__init__'  s:   € ğ
+ !"ˆÔàÔ&ˆŒğ !#ˆÔğ #ˆÔğ !ˆÔĞĞr!   c                 ó"   — | j         | j        k    S )z2Whether the decoder has partially decoded a value.)r¥   r¤   r©   s    r   Ú
+inprogresszsansiodecoder.inprogress:  s   € ğ Œ{˜dÔ.Ò.Ğ.r!   c                 ón  — |st          | j        ¦  «        ddfS |}|t          |¦  «        k     rmt          ||¦  «        \  }}}}|dk    r| xj        |z  c_        |s#|dk     sJ ‚t          | j        ¦  «        ||z
+  | fS ||z  }| j        | j        k    r |t          k    r| j                             |¦  «         nü|t          k    r+| j
+                             |g dœ¦  «         | j        | _        nÆ|t          k    r+| j
+                             |i dœ¦  «         | j        | _        n|t          k    r7| j
+                             |t          ¦   «         dœ¦  «         | j        | _        nN|t"          k    r| j        | _        n5t'          d|z  ¦  «        ‚| j        | j        k    rÁ|t          k    r:| j
+        d         }|d                              |¦  «         |dxx         dz  cc<   nÍ|t          k    rY| j
+        d         }	g }
+|	d                              |
+¦  «         |	dxx         dz  cc<   | j
+                             ||
+dœ¦  «         ni|t          k    re| j
+        d         }	i }
+|	d                              |
+¦  «         |	dxx         dz  cc<   | j
+                             ||
+dœ¦  «         | j        | _        nù|t          k    rq| j
+        d         }	t          ¦   «         }
+|	d                              |
+¦  «         |	dxx         dz  cc<   | j
+                             ||
+dœ¦  «         | j        | _        n}|t"          k    rt'          d¦  «        ‚t'          d	|z  ¦  «        ‚| j        | j        k    rq|t          k    r|| _        | j        | _        n!|t"          k    rt'          d
+¦  «        ‚|t          t          t          fv rt'          d¦  «        ‚t'          d|z  ¦  «        ‚| j        | j        k    r´|t          k    r;| j
+        d         }	||	d         | j        <   |	dxx         dz  cc<   | j        | _        ne|t          k    rZ| j
+        d         }	g }
+|
+|	d         | j        <   |	dxx         dz  cc<   | j
+                             ||
+dœ¦  «         | j        | _        n |t          k    rY| j
+        d         }	i }
+|
+|	d         | j        <   |	dxx         dz  cc<   | j
+                             ||
+dœ¦  «         | j        | _        nœ|t          k    re| j
+        d         }	t          ¦   «         }
+|
+|	d         | j        <   |	dxx         dz  cc<   | j
+                             ||
+dœ¦  «         | j        | _        n,|t"          k    rt'          d¦  «        ‚t'          d|z  ¦  «        ‚d| _        n| j        | j        k    r–|t          k    r:| j
+        d         }	|	d                              |¦  «         |	dxx         dz  cc<   n¶|t"          k    rt'          d¦  «        ‚|t          t          t          fv rt'          d¦  «        ‚t'          d|z  ¦  «        ‚| j        | j        k    rŸ|t          k    r7| j                             t/          |d¬¦  «        ¦  «         | j        | _        n|t2          k    r@| j                             t/          ddd¬¦  «        ¦  «         | j
+        rJ ‚| j        | _        nÈt'          d|z  ¦  «        ‚| j        | j        k    r|t          k    r(| j                             t/          |¦  «        ¦  «         ns|t2          k    r?| j                             t/          dd¬¦  «        ¦  «         | j
+        rJ ‚| j        | _        n)t'          d|z  ¦  «        ‚t'          d| j        z  ¦  «        ‚	 | j        | j        | j        | j        fvrn³| j
+        d         }	|	d         rn| j
+                             ¦   «          | j
+        rPt6          | j        t8          | j        t          | j        it;          | j
+        d         d         ¦  «                 | _        n,| j                             |	d         ¦  «         | j        | _        ŒÏ|t          |¦  «        k     °mt          | j        ¦  «        ||z
+  dfS )a¥  Attempt to decode bytes from an input buffer.
+
+        ``b`` is a collection of bytes and ``offset`` is the byte
+        offset within that buffer from which to begin reading data.
+
+        ``b`` must support ``len()`` and accessing bytes slices via
+        ``__slice__``. Typically ``bytes`` instances are used.
+
+        Returns a tuple with the following fields:
+
+        * Bool indicating whether values are available for retrieval.
+        * Integer indicating the number of bytes that were fully consumed,
+          starting from ``offset``.
+        * Integer indicating the number of bytes that are desired for the
+          next call in order to decode an item.
+        r   )ó	   remainingó   vs   unhandled special state: %drt   r¯   r®   r   s9   indefinite length bytestrings not allowed as array valuess5   unhandled special item when expecting array value: %ds5   indefinite length bytestrings not allowed as map keyss%   collections not supported as map keyss1   unhandled special item when expecting map key: %ds7   indefinite length bytestrings not allowed as map valuess3   unhandled special item when expecting map value: %dNs7   indefinite length bytestrings not allowed as set valuess%   collections not allowed as set valuess3   unhandled special item when expecting set value: %dT)r   r!   )r   r   s<   unexpected special value when expecting bytestring chunk: %d)r   s   unhandled decoder state: %d)Úboolr¨   r%   r|   r£   r¥   r¤   rw   Úappendrz   r¦   Ú_STATE_WANT_ARRAY_VALUEr{   Ú_STATE_WANT_MAP_KEYr}   ÚsetÚ_STATE_WANT_SET_VALUErx   Ú"_STATE_WANT_BYTESTRING_CHUNK_FIRSTrl   r§   Ú_STATE_WANT_MAP_VALUEÚaddr–   Ú'_STATE_WANT_BYTESTRING_CHUNK_SUBSEQUENTrƒ   ÚpopÚlistÚdictrC   )rŸ   r_   r„   Úinitialoffsetr‡   rV   rˆ   r   ÚcÚlastcÚnewvalues              r   Údecodezsansiodecoder.decode?  s°
+  € ğ" ğ 	3İ˜Ô+Ñ,Ô,¨a°Ğ2Ğ2àˆğ •s˜1‘v”vŠo‰oõ 3=¸QÀÑ2GÔ2GÑ/ˆHe˜Y¨à˜1Š}ˆ}ØĞ%Ô%¨Ñ2Ğ%Ô%àğ Ø  1’}}}}å˜Ô,Ñ-Ô-Ø˜]Ñ*ØJğğ ğ iÑˆFğ Œ{˜dÔ.Ò.Ñ.àlÒ*Ğ*ØÔ'×.Ò.¨uÑ5Ô5Ğ5Ñ5àÕ 3Ò3Ğ3ØÔ)×0Ò0à*/Ø"$ğğ ñô ğ ğ #'Ô">D”K‘KàÕ 1Ò1Ğ1ØÔ)×0Ò0à*/Ø"$ğğ ñô ğ ğ #'Ô":D”K‘KàÕ 1Ò1Ğ1ØÔ)×0Ò0à*/İ"%¡%¤%ğğ ñô ğ ğ #'Ô"<D”K‘KàÕ CÒCĞCØ"&Ô"ID”K‘Kõ *Ø6¸Ñ@ñô ğ ğ
+ ” Ô <Ò<Ñ<àlÒ*Ğ*ØÔ-¨bÔ1AØd”G—N’N 5Ñ)Ô)Ğ)ØlOO”O qÑ(OO‘O‘Oğ
+ Õ 3Ò3Ğ3Ø Ô1°"Ô5EØ!Hà˜$”K×&Ò& xÑ0Ô0Ğ0Ø˜,Ğ'Ğ'Ô'¨1Ñ,Ğ'Ğ'Ñ'àÔ)×0Ò0à*/Ø"*ğğ ñô ğ ñ ğ Õ 1Ò1Ğ1Ø Ô1°"Ô5EØ!Hà˜$”K×&Ò& xÑ0Ô0Ğ0Ø˜,Ğ'Ğ'Ô'¨1Ñ,Ğ'Ğ'Ñ'àÔ)×0Ò0Ø',°HĞ=Ğ=ñô ğ ğ #'Ô":D”K‘KàÕ 1Ò1Ğ1Ø Ô1°"Ô5Eİ"™uœuHà˜$”K×&Ò& xÑ0Ô0Ğ0Ø˜,Ğ'Ğ'Ô'¨1Ñ,Ğ'Ğ'Ñ'àÔ)×0Ò0à*/Ø"*ğğ ñô ğ ğ #'Ô"<D”K‘KàÕ CÒCĞCİ)ğ7ñô ğ õ *ğ5Ø7>ñ?ñô ğ ğ ” Ô 8Ò8Ğ8ØlÒ*Ğ*Ø*/DÔ'Ø"&Ô"<D”K‘KàÕ CÒCĞCİ)ğ3ñô ğ ğ
+ İ'İ%İ%ğ!ğ ğ õ
+ *Ø@ñô ğ õ *ğ1Ø3:ñ;ñô ğ ğ ” Ô :Ò:Ñ:àlÒ*Ğ*Ø Ô1°"Ô5EØ7<E˜$”K Ô 3Ñ4Ø˜,Ğ'Ğ'Ô'¨1Ñ,Ğ'Ğ'Ñ'à"&Ô":D”K‘Kğ Õ 3Ò3Ğ3Ø Ô1°"Ô5EØ!Hà7?E˜$”K Ô 3Ñ4Ø˜,Ğ'Ğ'Ô'¨1Ñ,Ğ'Ğ'Ñ'àÔ)×0Ò0à*/Ø"*ğğ ñô ğ ğ #'Ô">D”K‘Kğ Õ 1Ò1Ğ1Ø Ô1°"Ô5EØ!Hà7?E˜$”K Ô 3Ñ4Ø˜,Ğ'Ğ'Ô'¨1Ñ,Ğ'Ğ'Ñ'àÔ)×0Ò0à*/Ø"*ğğ ñô ğ ğ #'Ô":D”KKğ Õ 1Ò1Ğ1Ø Ô1°"Ô5Eİ"™uœuHà7?E˜$”K Ô 3Ñ4Ø˜,Ğ'Ğ'Ô'¨1Ñ,Ğ'Ğ'Ñ'àÔ)×0Ò0à*/Ø"*ğğ ñô ğ ğ #'Ô"<D”KKàÕ CÒCĞCİ)ğ1ñô ğ õ *ğ3Ø5<ñ=ñô ğ ğ
+ '+Ô#Ñ#ğ ” Ô :Ò:Ğ:ØlÒ*Ğ*Ø Ô1°"Ô5EØ˜$”K—O’O EÑ*Ô*Ğ*Ø˜,Ğ'Ğ'Ô'¨1Ñ,Ğ'Ğ'Ñ'Ñ'àÕ CÒCĞCİ)ğ1ñô ğ ğ
+ İ'İ%İ%ğ!ğ ğ õ
+ *Ø@ñô ğ õ *ğ3Ø5<ñ=ñô ğ ğ ” Ô GÒGĞGàlÒ*Ğ*ØÔ'×.Ò.İ'¨°TĞ:Ñ:Ô:ñô ğ ğ #'Ô"ND”K‘Kğ Õ 8Ò8Ğ8ğ Ô'×.Ò.İ'¨°4¸dĞCÑCÔCñô ğ ğ  $Ô4Ğ4Ğ4Ğ4Ø"&Ô"2D”KKõ *ğ:Ø<CñDñô ğ ğ ” Ô LÒLĞLàlÒ*Ğ*ØÔ'×.Ò.­¸uÑ/EÔ/EÑFÔFĞFĞFğ Õ 8Ò8Ğ8ØÔ'×.Ò.­¸sÈĞ/NÑ/NÔ/NÑOÔOĞOğ  $Ô4Ğ4Ğ4Ğ4Ø"&Ô"2D”KKõ *ğ:Ø<CñDñô ğ õ &Ø2°T´[Ñ@ñô ğ ğ"3à”;ØÔ0ØÔ,ØÔ.ğ'ğ ğ ğ
+ ğ Ô-¨bÔ1à˜Ô&ğ Øğ
+ Ô%×)Ò)Ñ+Ô+Ğ+ğ Ô(ğ 
+3å˜dÔ:İ˜dÔ6İ˜TÔ7ğ#õ ˜4Ô0°Ô4°TÔ:Ñ;Ô;ô	#=D”KKğ Ô'×.Ò.¨u°T¬{Ñ;Ô;Ğ;Ø"&Ô"2D”KğE"3ğG
+ •s˜1‘v”vŠo‰oõP Ô$Ñ%Ô%Ø]Ñ"Øğ
+ğ 	
+r!   c                 ó<   — t          | j        ¦  «        }g | _        |S )z…Returns an iterator over fully decoded values.
+
+        Once values are retrieved, they won't be available on the next call.
+        )r»   r¨   )rŸ   r3   s     r   Úgetavailablezsansiodecoder.getavailableÈ  s!   € õ Ô$Ñ%Ô%ˆØ ˆÔØˆr!   N©r   )rD   rm   rn   ro   r¤   r³   r·   r²   rµ   r¶   r¹   rª   Úpropertyr¬   rÁ   rÃ   r^   r!   r   r¡   r¡   æ  sœ   € € € € € ğ6ğ 6ğp €KØĞØĞØĞØĞØ)*Ğ&Ø./Ğ+ğ!ğ !ğ !ğ& ğ/ğ /ñ „Xğ/ğG
+ğ G
+ğ G
+ğ G
+ğRğ ğ ğ ğ r!   r¡   c                   ó$   — e Zd ZdZd„ Zd„ Zd„ ZdS )Úbufferingdecoderah  A CBOR decoder that buffers undecoded input.
+
+    This is a glorified wrapper around ``sansiodecoder`` that adds a buffering
+    layer. All input that isn't consumed by ``sansiodecoder`` will be buffered
+    and concatenated with any new input that arrives later.
+
+    TODO consider adding limits as to the maximum amount of data that can
+    be buffered.
+    c                 óH   — t          ¦   «         | _        g | _        d| _        d S rP   )r¡   Ú_decoderÚ_chunksÚ_wantedr©   s    r   rª   zbufferingdecoder.__init__Ş  s   € İ%™œˆŒØˆŒØˆŒˆˆr!   c                 óŒ  — t          |t          ¦  «        rt          |¦  «        }| j        r¶t	          |¦  «        | j        k     rA| j                             |¦  «         | xj        t	          |¦  «        z  c_        dd| j        fS t	          |¦  «        }| j                             |¦  «         d                     | j        ¦  «        }g | _        t	          |¦  «        |z
+  }nd}| j         	                    |¦  «        \  }}}|| _        |t	          |¦  «        k     r"| j                             ||d…         ¦  «         |||z
+  |fS )a0  Attempt to decode bytes to CBOR values.
+
+        Returns a tuple with the following fields:
+
+        * Bool indicating whether new values are available for retrieval.
+        * Integer number of bytes decoded from the new input.
+        * Integer number of bytes wanted to decode the next value.
+        Fr   r!   N)
+rh   Ú	bytearrayr˜   rÊ   r%   rË   r±   ÚjoinrÉ   rÁ   )rŸ   r_   ÚnewlenÚoldlenÚ	availablerˆ   rŠ   s          r   rÁ   zbufferingdecoder.decodeã  s6  € õ aÑ#Ô#ğ 	İa‘”ˆAğ Œ<ğ 	õ 1‰vŒv˜œÒ$Ğ$Ø”×#Ò# AÑ&Ô&Ğ&Ø”¥ A¡¤Ñ&”Ø˜a ¤Ğ-Ğ-õ ˜‘V”VˆFØŒL×Ò Ñ"Ô"Ğ"Ø—’˜œÑ&Ô&ˆAØˆDŒLİ˜‘V”V˜f‘_ˆFˆFğ ˆFà'+¤}×';Ò';¸AÑ'>Ô'>Ñ$ˆ	9˜fØˆŒà•s˜1‘v”vÒĞØŒL×Ò  ) * *¤Ñ.Ô.Ğ.à˜) fÑ,¨fĞ4Ğ4r!   c                 ó4   — | j                              ¦   «         S r#   )rÉ   rÃ   r©   s    r   rÃ   zbufferingdecoder.getavailable  s   € ØŒ}×)Ò)Ñ+Ô+Ğ+r!   N)rD   rm   rn   ro   rª   rÁ   rÃ   r^   r!   r   rÇ   rÇ   Ó  sL   € € € € € ğğ ğğ ğ ğ
+15ğ 15ğ 15ğf,ğ ,ğ ,ğ ,ğ ,r!   rÇ   c                 óğ   — | sg S t          ¦   «         }|                     | ¦  «        \  }}}|t          | ¦  «        k    rt          d¦  «        ‚|j        rt          d¦  «        ‚|                     ¦   «         S )av  Decode all CBOR items present in an iterable of bytes.
+
+    In addition to regular decode errors, raises CBORDecodeError if the
+    entirety of the passed buffer does not fully decode to complete CBOR
+    values. This includes failure to decode any value, incomplete collection
+    types, incomplete indefinite length items, and extra data at the end of
+    the buffer.
+    s   input data not fully consumeds   input data not complete)r¡   rÁ   r%   rl   r¬   rÃ   )r_   ÚdecoderÚ
+havevaluesrˆ   Ú	wantbytess        r   Ú	decodeallr×     s~   € ğ ğ Øˆ	å‰oŒo€Gà'.§~¢~°aÑ'8Ô'8Ñ$€J	˜9à•C˜‘F”FÒĞİĞ>Ñ?Ô?Ğ?àÔğ :İĞ8Ñ9Ô9Ğ9à×ÒÑ!Ô!Ğ!r!   )r   rÄ   )r   F)HÚstructr7   r8   r$   ry   r<   rS   rI   r~   ru   r   r€   r   ÚSUBTYPE_HALF_FLOATÚSUBTYPE_SINGLE_FLOATÚSUBTYPE_DOUBLE_FLOATr‚   rJ   r   r*   r@   rY   ÚStructr   r   r   r   r   r+   Ú	BREAK_INTr    r(   r.   r4   r:   r>   rA   rE   rM   rW   rZ   r`   rc   r˜   Úintr»   Útupler¼   r´   r°   rC   re   r=   Ú	Exceptionrl   rq   r   r‘   r’   r“   rw   rx   rz   r{   r}   rƒ   r|   rv   r–   r¡   rÇ   r×   r^   r!   r   ú<module>rá      sä  ğğ €€€ğ €ØĞ ØĞ ØĞ ØĞ Ø€ØĞ ØĞ à€à€Ø€Ø€ØĞ ØĞ ØĞ ØĞ àĞ ğ *˜fœkØĞ
+ 1Ñ
+$Ğ'9Ñ
+9ñô Ğ ğ %˜œØĞ
+˜aÑ
+Ğ"4Ñ
+4ñô Ğ ğ #v”{Øˆ.˜AÑ
+Ğ 2Ñ
+2ñô Ğ ğ !6”= Ñ&Ô&Ğ Ø 6”= Ñ'Ô'Ğ Ø 6”= Ñ'Ô'Ğ Ø 6”= Ñ'Ô'Ğ Ø 6”= Ñ'Ô'Ğ ğ 	€Ø€	ğBğ Bğ Bğğ ğ ğ
+ğ ğ ğğ ğ ğ ğ.:ğ :ğ :ğğ ğ ğ	ğ 	ğ 	ğğ ğ ğğ ğ ğğ ğ ğ
+ğ 
+ğ 
+ğ$ğ $ğ $ğ
+ğ ğ ğ 
+Ğ!ØˆØˆØĞ
+Ø	ĞØˆ/ØˆØĞ
+Ø€DˆJ„JĞ ğ
+€ğğ ğ ğ4-ğ -ğ -ğ -ğ -iñ -ô -ğ -ğğ ğ ğ !6”= Ñ&Ô&Ğ Ø!F”M %Ñ(Ô(Ğ Ø 6”= Ñ'Ô'Ğ Ø$v”} UÑ+Ô+Ğ à€Ø&'Ğ #ØĞ ØĞ ØĞ ØĞ ğWğ Wğ Wğ Wğt05ğ 05ğ 05ğ 05ğfğ ğ ğ ğ eñ ô ğ ğ jğ jğ jğ jğ jñ jô jğ jğZD,ğ D,ğ D,ğ D,ğ D,ñ D,ô D,ğ D,ğN"ğ "ğ "ğ "ğ "r!                                                                                                                                                                                                                                                                                                                                                                                                                             usr/lib/python3/dist-packages/mercurial/utils/__pycache__/compression.cpython-311.pyc               0000644 0000000 0000000 00000114102 14714551122 027345  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        §
+    	^µcd  ã                   óh  — d dl Z d dlZd dlZddlmZ ddlmZmZmZ ddlmZ ej	        Z	ej
+        Z
+dZdZ ej        d	d
+¦  «        Z G d„ d¦  «        Z G d„ d¦  «        Z e¦   «         Z G d„ d¦  «        Z G d„ d¦  «        Z G d„ de¦  «        Z G d„ de¦  «        Z G d„ de¦  «        Z G d„ de¦  «        Z G d„ de¦  «        Ze                      e¦   «         ¦  «          G d„ de¦  «        Ze                      e¦   «         ¦  «          G d„ d e¦  «        Ze                      e¦   «         ¦  «          G d!„ d"e¦  «        Ze                      e¦   «         ¦  «          G d#„ d$e¦  «        Ze                      e¦   «         ¦  «         d%„ Z e¦   «                              ¦   «         Z dS )&é    Né   )Úgetattr)ÚerrorÚi18nÚpycompaté   )Ú
+stringutils   servers   clientÚcompenginewireprotosupport)ÚnameÚserverpriorityÚclientpriorityc                   ó"   — e Zd Zd„ Zdd„Zd„ ZdS )Úpropertycachec                 ó,   — || _         |j        | _        d S ©N)ÚfuncÚ__name__r   )Úselfr   s     ú=/usr/lib/python3/dist-packages/mercurial/utils/compression.pyÚ__init__zpropertycache.__init__$   s   € ØˆŒ	Ø”MˆŒ	ˆ	ˆ	ó    Nc                 ó\   — |                       |¦  «        }|                      ||¦  «         |S r   )r   Ú
+cachevalue)r   ÚobjÚtypeÚresults       r   Ú__get__zpropertycache.__get__(   s*   € Ø—’˜3‘”ˆØŠ˜˜VÑ$Ô$Ğ$Øˆr   c                 ó$   — ||j         | j        <   d S r   )Ú__dict__r   )r   r   Úvalues      r   r   zpropertycache.cachevalue-   s   € à"'ˆŒT”YÑĞĞr   r   )r   Ú
+__module__Ú__qualname__r   r   r   © r   r   r   r   #   sF   € € € € € ğ"ğ "ğ "ğğ ğ ğ ğ
+(ğ (ğ (ğ (ğ (r   r   c                   ó|   — e Zd ZdZd„ Zd„ Zd„ Zd„ Zd„ Ze	d„ ¦   «         Z
+e	d„ ¦   «         Zd	„ Zd
+„ Zdd„Zd„ Zd„ ZdS )ÚcompressormanageraG  Holds registrations of various compression engines.
+
+    This class essentially abstracts the differences between compression
+    engines to allow new compression formats to be added easily, possibly from
+    extensions.
+
+    Compressors are registered against the global instance by calling its
+    ``register()`` method.
+    c                 óL   — i | _         i | _        i | _        i | _        i | _        d S r   )Ú_enginesÚ_bundlenamesÚ_bundletypesÚ_revlogheadersÚ
+_wiretypes©r   s    r   r   zcompressormanager.__init__=   s,   € ØˆŒàˆÔàˆÔà ˆÔàˆŒˆˆr   c                 ó   — | j         |         S r   ©r'   ©r   Úkeys     r   Ú__getitem__zcompressormanager.__getitem__H   s   € ØŒ}˜SÔ!Ğ!r   c                 ó   — || j         v S r   r.   r/   s     r   Ú__contains__zcompressormanager.__contains__K   s   € Ød”mĞ#Ğ#r   c                 óN   — t          | j                             ¦   «         ¦  «        S r   )Úiterr'   Úkeysr,   s    r   Ú__iter__zcompressormanager.__iter__N   s   € İD”M×&Ò&Ñ(Ô(Ñ)Ô)Ğ)r   c                 ó¨  — t          |t          ¦  «        st          t          d¦  «        ¦  «        ‚|                     ¦   «         }|| j        v r$t          j        t          d¦  «        |z  ¦  «        ‚|                     ¦   «         }|r‚|\  }}|| j	        v r$t          j        t          d¦  «        |z  ¦  «        ‚|| j
+        v r1t          j        t          d¦  «        || j
+        |         fz  ¦  «        ‚|r
+|| j	        |<   || j
+        |<   |                     ¦   «         }|rK|j        }|| j        v r1t          j        t          d¦  «        || j        |         fz  ¦  «        ‚|| j        |<   |                     ¦   «         }|r:|| j        v r1t          j        t          d¦  «        || j        |         fz  ¦  «        ‚|r
+|| j        |<   || j        |<   dS )zxRegister a compression engine with the manager.
+
+        The argument must be a ``compressionengine`` instance.
+        s$   argument must be a compressionengines(   compression engine %s already registereds!   bundle name %s already registereds'   bundle type %s already registered by %ss5   wire protocol compression %s already registered by %ss)   revlog header %s already registered by %sN)Ú
+isinstanceÚcompressionengineÚ
+ValueErrorÚ_r   r'   r   ÚAbortÚ
+bundletyper(   r)   Úwireprotosupportr+   Úrevlogheaderr*   )	r   Úenginer   Ú
+bundleinfoÚ
+bundlenamer>   ÚwiresupportÚwiretyper@   s	            r   Úregisterzcompressormanager.registerQ   s-  € õ
+ ˜&Õ"3Ñ4Ô4ğ 	IİQĞFÑGÔGÑHÔHĞHà{Š{‰}Œ}ˆà4”=Ğ Ğ İ”+İĞ=Ñ>Ô>ÀÑEñô ğ ğ ×&Ò&Ñ(Ô(ˆ
+Øğ 	1Ø%/Ñ"ˆJ˜
+à˜TÔ.Ğ.Ğ.İ”kİĞ:Ñ;Ô;¸jÑHñô ğ ğ ˜TÔ.Ğ.Ğ.İ”kİĞ@ÑAÔAØ! 4Ô#4°ZÔ#@ĞAñBñô ğ ğ ğ 5Ø04Ô! *Ñ-à,0ˆDÔ˜jÑ)à×-Ò-Ñ/Ô/ˆØğ 	-Ø"Ô'ˆHØ˜4œ?Ğ*Ğ*İ”kİğ,ñô ğ   ¤°Ô!:Ğ;ñ	<ñô ğ ğ )-ˆDŒO˜HÑ%à×*Ò*Ñ,Ô,ˆØğ 	˜L¨DÔ,?Ğ?Ğ?İ”+İĞ>Ñ?Ô?Ø Ô!4°\Ô!BĞCñDñô ğ ğ
+ ğ 	5Ø04ˆDÔ Ñ-à$ˆŒdÑĞĞr   c                 óN   — t          | j                             ¦   «         ¦  «        S r   )Úsetr(   r6   r,   s    r   Úsupportedbundlenamesz&compressormanager.supportedbundlenames   ó   € å4Ô$×)Ò)Ñ+Ô+Ñ,Ô,Ğ,r   c                 óN   — t          | j                             ¦   «         ¦  «        S r   )rH   r)   r6   r,   s    r   Úsupportedbundletypesz&compressormanager.supportedbundletypes’   rJ   r   c                 óÊ   — | j         | j        |                  }|                     ¦   «         s6t          j        t          d¦  «        |                     ¦   «         z  ¦  «        ‚|S )zÁObtain a compression engine registered to a bundle name.
+
+        Will raise KeyError if the bundle type isn't registered.
+
+        Will abort if the engine is known but not available.
+        ó)   compression engine %s could not be loaded)r'   r(   Ú	availabler   r=   r<   r   )r   rC   rA   s      r   Úforbundlenamezcompressormanager.forbundlename–   ó`   € ğ ”˜tÔ0°Ô<Ô=ˆØ×ÒÑ!Ô!ğ 	İ”+İĞ>Ñ?Ô?À&Ç+Â+Á-Ä-ÑOñô ğ ğ ˆr   c                 óÊ   — | j         | j        |                  }|                     ¦   «         s6t          j        t          d¦  «        |                     ¦   «         z  ¦  «        ‚|S )zÁObtain a compression engine registered to a bundle type.
+
+        Will raise KeyError if the bundle type isn't registered.
+
+        Will abort if the engine is known but not available.
+        rN   )r'   r)   rO   r   r=   r<   r   )r   r>   rA   s      r   Úforbundletypezcompressormanager.forbundletype¤   rQ   r   Tc                 óô   ‡ ‡— |t           t          fv sJ ‚|t           k    rdndŠˆ fd„‰ j                             ¦   «         D ¦   «         }|rd„ |D ¦   «         }ˆfd„}t	          t          ||¬¦  «        ¦  «        S )zçObtain compression engines that support the wire protocol.
+
+        Returns a list of engines in prioritized order, most desired first.
+
+        If ``onlyavailable`` is set, filter out engines that can't be
+        loaded.
+        s   serverprioritys   clientpriorityc                 ó*   •— g | ]}‰j         |         ‘ŒS r#   r.   )Ú.0Úer   s     €r   ú
+<listcomp>z:compressormanager.supportedwireengines.<locals>.<listcomp>¾   s    ø€ ĞFĞFĞF¨4”= Ô#ĞFĞFĞFr   c                 ó:   — g | ]}|                      ¦   «         ¯|‘ŒS r#   )rO   )rV   rW   s     r   rX   z:compressormanager.supportedwireengines.<locals>.<listcomp>À   s%   € Ğ;Ğ;Ğ;˜Q¨Q¯[ª[©]¬]Ğ;qĞ;Ğ;Ğ;r   c                 ó`   •— |                       ¦   «         }dt          |‰¦  «        z  |j        fS )Néÿÿÿÿ)r?   r   r   )rW   ÚwÚattrs     €r   Úgetkeyz6compressormanager.supportedwireengines.<locals>.getkeyÂ   s2   ø€ ğ ×"Ò"Ñ$Ô$ˆAØ  4Ñ(Ô(Ñ(¨!¬&Ğ0Ğ0r   )r0   )Ú
+SERVERROLEÚ
+CLIENTROLEr+   ÚvaluesÚlistÚsorted)r   ÚroleÚonlyavailableÚenginesr^   r]   s   `    @r   Úsupportedwireenginesz&compressormanager.supportedwireengines²   sª   øø€ ğ 
+¥JĞ/Ğ/Ğ/Ğ/Ğ/à$(­JÒ$6Ğ$6Ğ Ğ Ğ<MˆàFĞFĞFĞF¨T¬_×-CÒ-CÑ-EÔ-EĞFÑFÔFˆØğ 	<Ø;Ğ; 'Ğ;Ñ;Ô;ˆGğ	1ğ 	1ğ 	1ğ 	1ğ 	1õ •F˜7¨Ğ/Ñ/Ô/Ñ0Ô0Ğ0r   c                 óÊ   — | j         | j        |                  }|                     ¦   «         s6t          j        t          d¦  «        |                     ¦   «         z  ¦  «        ‚|S )NrN   )r'   r+   rO   r   r=   r<   r   )r   rE   rA   s      r   Úforwiretypezcompressormanager.forwiretypeË   s]   € Ø”˜tœ¨xÔ8Ô9ˆØ×ÒÑ!Ô!ğ 	İ”+İĞ>Ñ?Ô?À&Ç+Â+Á-Ä-ÑOñô ğ ğ ˆr   c                 ó2   — | j         | j        |                  S )zObtain a compression engine registered to a revlog header.
+
+        Will raise KeyError if the revlog header value isn't registered.
+        )r'   r*   )r   Úheaders     r   Úforrevlogheaderz!compressormanager.forrevlogheaderÓ   s   € ğ
+ Œ}˜TÔ0°Ô8Ô9Ğ9r   N)T)r   r!   r"   Ú__doc__r   r1   r3   r7   rF   ÚpropertyrI   rL   rP   rS   rg   ri   rl   r#   r   r   r%   r%   2   sğ   € € € € € ğğ ğ	ğ 	ğ 	ğ"ğ "ğ "ğ$ğ $ğ $ğ*ğ *ğ *ğ;%ğ ;%ğ ;%ğz ğ-ğ -ñ „Xğ-ğ ğ-ğ -ñ „Xğ-ğğ ğ ğğ ğ ğ1ğ 1ğ 1ğ 1ğ2ğ ğ ğ:ğ :ğ :ğ :ğ :r   r%   c                   óF   — e Zd ZdZd„ Zd„ Zd„ Zd„ Zd„ Zdd„Z	d	„ Z
+dd
+„ZdS )r:   zuBase class for compression engines.
+
+    Compression engines must implement the interface defined by this class.
+    c                 ó   — t          ¦   «         ‚)z—Returns the name of the compression engine.
+
+        This is the key the engine is registered under.
+
+        This method must be implemented.
+        ©ÚNotImplementedErrorr,   s    r   r   zcompressionengine.nameä   ó   € õ "Ñ#Ô#Ğ#r   c                 ó   — dS )a  Whether the compression engine is available.
+
+        The intent of this method is to allow optional compression engines
+        that may not be available in all installations (such as engines relying
+        on C extensions that may not be present).
+        Tr#   r,   s    r   rO   zcompressionengine.availableí   s	   € ğ ˆtr   c                 ó   — dS )a¥  Describes bundle identifiers for this engine.
+
+        If this compression engine isn't supported for bundles, returns None.
+
+        If this engine can be used for bundles, returns a 2-tuple of strings of
+        the user-facing "bundle spec" compression name and an internal
+        identifier used to denote the compression format within bundles. To
+        exclude the name from external usage, set the first element to ``None``.
+
+        If bundle compression is supported, the class must also implement
+        ``compressstream`` and `decompressorreader``.
+
+        The docstring of this method is used in the help system to tell users
+        about this engine.
+        Nr#   r,   s    r   r>   zcompressionengine.bundletypeö   s	   € ğ  ˆtr   c                 ó   — dS )a‹  Declare support for this compression format on the wire protocol.
+
+        If this compression engine isn't supported for compressing wire
+        protocol payloads, returns None.
+
+        Otherwise, returns ``compenginewireprotosupport`` with the following
+        fields:
+
+        * String format identifier
+        * Integer priority for the server
+        * Integer priority for the client
+
+        The integer priorities are used to order the advertisement of format
+        support by server and client. The highest integer is advertised
+        first. Integers with non-positive values aren't advertised.
+
+        The priority values are somewhat arbitrary and only used for default
+        ordering. The relative order can be changed via config options.
+
+        If wire protocol compression is supported, the class must also implement
+        ``compressstream`` and ``decompressorreader``.
+        Nr#   r,   s    r   r?   z"compressionengine.wireprotosupport  s	   € ğ. ˆtr   c                 ó   — dS )aP  Header added to revlog chunks that identifies this engine.
+
+        If this engine can be used to compress revlogs, this method should
+        return the bytes used to identify chunks compressed with this engine.
+        Else, the method should return ``None`` to indicate it does not
+        participate in revlog compression.
+        Nr#   r,   s    r   r@   zcompressionengine.revlogheader!  s	   € ğ ˆtr   Nc                 ó   — t          ¦   «         ‚)aƒ  Compress an iterator of chunks.
+
+        The method receives an iterator (ideally a generator) of chunks of
+        bytes to be compressed. It returns an iterator (ideally a generator)
+        of bytes of chunks representing the compressed output.
+
+        Optionally accepts an argument defining how to perform compression.
+        Each engine treats this argument differently.
+        rq   ©r   ÚitÚoptss      r   Úcompressstreamz compressionengine.compressstream+  s   € õ "Ñ#Ô#Ğ#r   c                 ó   — t          ¦   «         ‚)zêPerform decompression on a file object.
+
+        Argument is an object with a ``read(size)`` method that returns
+        compressed data. Return value is an object with a ``read(size)`` that
+        returns uncompressed data.
+        rq   ©r   Úfhs     r   Údecompressorreaderz$compressionengine.decompressorreader7  rs   r   c                 ó   — t          ¦   «         ‚)aL  Obtain an object that can be used to compress revlog entries.
+
+        The object has a ``compress(data)`` method that compresses binary
+        data. This method returns compressed binary data or ``None`` if
+        the data could not be compressed (too small, not compressible, etc).
+        The returned data should have a header uniquely identifying this
+        compression format so decompression can be routed to this engine.
+        This header should be identified by the ``revlogheader()`` return
+        value.
+
+        The object has a ``decompress(data)`` method that decompresses
+        data. The method will only be called if ``data`` begins with
+        ``revlogheader()``. The method should return the raw, uncompressed
+        data or raise a ``StorageError``.
+
+        The object is reusable but is not thread safe.
+        rq   ©r   r{   s     r   Úrevlogcompressorz"compressionengine.revlogcompressor@  s   € õ$ "Ñ#Ô#Ğ#r   r   )r   r!   r"   rm   r   rO   r>   r?   r@   r|   r€   rƒ   r#   r   r   r:   r:   Ş   s    € € € € € ğğ ğ
+$ğ $ğ $ğğ ğ ğğ ğ ğ$ğ ğ ğ2ğ ğ ğ
+$ğ 
+$ğ 
+$ğ 
+$ğ$ğ $ğ $ğ$ğ $ğ $ğ $ğ $ğ $r   r:   c                   ó    — e Zd Zd„ Zd„ Zd„ ZdS )Ú_CompressedStreamReaderc                 ó‚   — t          |d¦  «        r|j        | _        n|j        | _        g | _        d| _        d| _        d S )NÚunbufferedreadr   F)Úsafehasattrr‡   Ú_readerÚreadÚ_pendingÚ_posÚ_eofr~   s     r   r   z _CompressedStreamReader.__init__V  sC   € İrĞ+Ñ,Ô,ğ 	#ØÔ,ˆDŒLˆLàœ7ˆDŒLØˆŒØˆŒ	ØˆŒ	ˆ	ˆ	r   c                 ó   — t          ¦   «         ‚r   rq   )r   Úchunks     r   Ú_decompressz#_CompressedStreamReader._decompress_  s   € İ!Ñ#Ô#Ğ#r   c                 ó  — g }	 | j         rt          | j         d         ¦  «        || j        z   k    r\| j         d         }|                     || j        | j        |z   …         ¦  «         | xj        |z  c_        d                     |¦  «        S | j                              d¦  «        }| j        r=|                     || j        d …         ¦  «         |t          |¦  «        | j        z
+  z  }n'|                     |¦  «         |t          |¦  «        z  }d| _        | j         °| j        rd                     |¦  «        S |                      d¦  «        }|                      |¦  «         |s#| j         s| j        sd                     |¦  «        S Œ‹)NTr   r   i   )	r‹   ÚlenrŒ   ÚappendÚjoinÚpopr   r‰   r   )r   ÚlÚbufÚnewbufr   s        r   rŠ   z_CompressedStreamReader.readb  s  € Øˆğ	%Ø”-ñ İt”} QÔ'Ñ(Ô(¨1¨t¬y©=Ò8Ğ8Ø!œ]¨1Ô-FØ—J’J˜v d¤i°$´)¸a±-Ğ&?Ô@ÑAÔAĞAØI”I ‘NI”IØŸ8š8 C™=œ=Ğ(àœ×*Ò*¨1Ñ-Ô-Ø”9ğ %Ø—J’J˜v d¤i k kÔ2Ñ3Ô3Ğ3Ø˜V™œ t¤yÑ0Ñ0AAà—J’J˜vÑ&Ô&Ğ&Ø˜V™œÑ$AØ”	ğ ”-ñ ğ  Œyğ %Ø—x’x ‘}”}Ğ$Ø—L’L Ñ'Ô'ˆEØ×Ò˜UÑ#Ô#Ğ#Øğ % ¤ğ %°t´yğ %à—x’x ‘}”}Ğ$ñ/	%r   N)r   r!   r"   r   r   rŠ   r#   r   r   r…   r…   U  sA   € € € € € ğğ ğ ğ$ğ $ğ $ğ%ğ %ğ %ğ %ğ %r   r…   c                   ó$   ‡ — e Zd Zˆ fd„Zd„ Zˆ xZS )Ú_GzipCompressedStreamReaderc                 óˆ   •— t          t          | ¦  «                             |¦  «         t          j        ¦   «         | _        d S r   )Úsuperrš   r   ÚzlibÚdecompressobjÚ
+_decompobj©r   r   Ú	__class__s     €r   r   z$_GzipCompressedStreamReader.__init__  s6   ø€ İÕ)¨4Ñ0Ô0×9Ò9¸"Ñ=Ô=Ğ=İÔ,Ñ.Ô.ˆŒˆˆr   c                 óL  — | j                              |¦  «        }|r| j                             |¦  «         | j                              ¦   «         }	 |                     d¦  «         |                     ¦   «          |j        dk    r	d| _        d S d S # t          j	        $ r Y d S w xY w)Nó   xT)
+rŸ   Ú
+decompressr‹   r“   ÚcopyÚflushÚunused_datar   r   r   )r   r   r˜   Úds       r   r   z'_GzipCompressedStreamReader._decompressƒ  s°   € Ø”×+Ò+¨EÑ2Ô2ˆØğ 	)ØŒM× Ò  Ñ(Ô(Ğ(ØŒO× Ò Ñ"Ô"ˆğ	ØLŠL˜ÑÔĞØGŠG‰IŒIˆIØŒ} Ò$Ğ$Ø ”			ğ %Ğ$øåŒzğ 	ğ 	ğ 	ØˆDˆDğ	øøøs   Á;B ÂB#Â"B#©r   r!   r"   r   r   Ú__classcell__©r¡   s   @r   rš   rš   ~  sG   ø€ € € € € ğ/ğ /ğ /ğ /ğ /ğğ ğ ğ ğ ğ ğ r   rš   c                   ó$   ‡ — e Zd Zˆ fd„Zd„ Zˆ xZS )Ú_BZ2CompressedStreamReaderc                 óˆ   •— t          t          | ¦  «                             |¦  «         t          j        ¦   «         | _        d S r   )rœ   r­   r   Úbz2ÚBZ2DecompressorrŸ   r    s     €r   r   z#_BZ2CompressedStreamReader.__init__’  s6   ø€ İÕ(¨$Ñ/Ô/×8Ò8¸Ñ<Ô<Ğ<İÔ-Ñ/Ô/ˆŒˆˆr   c                 ó  — | j                              |¦  «        }|r| j                             |¦  «         	 	 | j                              d¦  «        }|r| j                             |¦  «         nd S Œ:# t          $ r d| _        Y d S w xY w©NTr   )rŸ   r¤   r‹   r“   ÚEOFErrorr   ©r   r   r˜   s      r   r   z&_BZ2CompressedStreamReader._decompress–  s©   € Ø”×+Ò+¨EÑ2Ô2ˆØğ 	)ØŒM× Ò  Ñ(Ô(Ğ(ğ	ğØœ×3Ò3°CÑ8Ô8Øğ Ø”M×(Ò(¨Ñ0Ô0Ğ0Ğ0àEğøõ ğ 	ğ 	ğ 	ØˆDŒIˆIˆIˆIğ	øøøs   ¸8A3 Á2A3 Á3BÂBr©   r«   s   @r   r­   r­   ‘  sG   ø€ € € € € ğ0ğ 0ğ 0ğ 0ğ 0ğğ ğ ğ ğ ğ ğ r   r­   c                   ó   ‡ — e Zd Zˆ fd„Zˆ xZS )Ú#_TruncatedBZ2CompressedStreamReaderc                 óÈ   •— t          t          | ¦  «                             |¦  «         | j                             d¦  «        }|r| j                             |¦  «         d S d S )Nó   BZ)rœ   r¶   r   rŸ   r¤   r‹   r“   )r   r   r˜   r¡   s      €r   r   z,_TruncatedBZ2CompressedStreamReader.__init__¦  se   ø€ İÕ1°4Ñ8Ô8×AÒAÀ"ÑEÔEĞEØ”×+Ò+¨EÑ2Ô2ˆØğ 	)ØŒM× Ò  Ñ(Ô(Ğ(Ğ(Ğ(ğ	)ğ 	)r   )r   r!   r"   r   rª   r«   s   @r   r¶   r¶   ¥  s8   ø€ € € € € ğ)ğ )ğ )ğ )ğ )ğ )ğ )ğ )ğ )r   r¶   c                   ó$   ‡ — e Zd Zˆ fd„Zd„ Zˆ xZS )Ú_ZstdCompressedStreamReaderc                 ó¼   •— t          t          | ¦  «                             |¦  «         || _        |                     ¦   «                              ¦   «         | _        d S r   )rœ   rº   r   Ú_zstdÚZstdDecompressorr   rŸ   )r   r   Úzstdr¡   s      €r   r   z$_ZstdCompressedStreamReader.__init__®  sL   ø€ İÕ)¨4Ñ0Ô0×9Ò9¸"Ñ=Ô=Ğ=ØˆŒ
+Ø×/Ò/Ñ1Ô1×?Ò?ÑAÔAˆŒˆˆr   c                 ó   — | j                              |¦  «        }|r| j                             |¦  «         	 	 | j                              d¦  «        }|r| j                             |¦  «         nd S Œ:# | j        j        $ r d| _        Y d S w xY wr²   )rŸ   r¤   r‹   r“   r¼   Ú	ZstdErrorr   r´   s      r   r   z'_ZstdCompressedStreamReader._decompress³  s®   € Ø”×+Ò+¨EÑ2Ô2ˆØğ 	)ØŒM× Ò  Ñ(Ô(Ğ(ğ	ğØœ×3Ò3°CÑ8Ô8Øğ Ø”M×(Ò(¨Ñ0Ô0Ğ0Ğ0àEğøğ ŒzÔ#ğ 	ğ 	ğ 	ØˆDŒIˆIˆIˆIğ	øøøs   ¸8A3 Á2A3 Á3BÂBr©   r«   s   @r   rº   rº   ­  sL   ø€ € € € € ğBğ Bğ Bğ Bğ Bğ
+ğ ğ ğ ğ ğ ğ r   rº   c                   óV   — e Zd Zd„ Zd„ Zd„ Zd„ Zdd„Zd„ Z G d„ d	¦  «        Z	dd
+„Z
+dS )Ú_zlibenginec                 ó   — dS )Nó   zlibr#   r,   s    r   r   z_zlibengine.nameÃ  ó   € Øˆwr   c                 ó   — dS )zÜzlib compression using the DEFLATE algorithm.
+
+        All Mercurial clients should support this format. The compression
+        algorithm strikes a reasonable balance between compression ratio
+        and size.
+        )s   gzips   GZr#   r,   s    r   r>   z_zlibengine.bundletypeÆ  s	   € ğ ˆ~r   c                 ó$   — t          ddd¦  «        S )NrÄ   é   ©Úcompewireprotosupportr,   s    r   r?   z_zlibengine.wireprotosupportÏ  ó   € İ$ W¨b°"Ñ5Ô5Ğ5r   c                 ó   — dS )Nr£   r#   r,   s    r   r@   z_zlibengine.revlogheaderÒ  s   € Øˆtr   Nc              #   óÎ   K  — |pi }t          j        |                     dd¦  «        ¦  «        }|D ]}|                     |¦  «        }|r|V — Œ|                     ¦   «         V — d S )Nó   levelr[   )r   ÚcompressobjÚgetÚcompressr¦   ©r   rz   r{   Úzr   Údatas         r   r|   z_zlibengine.compressstreamÕ  sv   è è € ØˆzrˆåÔ˜TŸXšX h°Ñ3Ô3Ñ4Ô4ˆØğ 	ğ 	ˆEØ—:’:˜eÑ$Ô$ˆDğ ğ Ø
+
+
+øàgŠg‰iŒiˆˆˆˆˆr   c                 ó    — t          |¦  «        S r   )rš   r~   s     r   r€   z_zlibengine.decompressorreaderâ  s   € İ*¨2Ñ.Ô.Ğ.r   c                   ó"   — e Zd Zdd„Zd„ Zd„ ZdS )ú _zlibengine.zlibrevlogcompressorNc                 ó   — || _         d S r   )Ú_level)r   Úlevels     r   r   z)_zlibengine.zlibrevlogcompressor.__init__æ  s   € ØˆDŒKˆKˆKr   c                 ó¦  — t          |¦  «        }|dk    sJ ‚|dk     rd S |dk    rM| j        €t          j        |¦  «        }nt          j        || j        ¦  «        }t          |¦  «        |k     r|S d S | j        €t          j        ¦   «         }nt          j        | j        ¬¦  «        }g }d}||k     r=|dz   }|                     |                     |||…         ¦  «        ¦  «         |}||k     °=|                     |                     ¦   «         ¦  «         t          t          t           |¦  «        ¦  «        |k     rd 	                    |¦  «        S d S )Nr   é,   é@B ©rÚ   i   r   )
+r’   rÙ   r   rÑ   rÏ   r“   r¦   ÚsumÚmapr”   )r   rÔ   ÚinsizeÚ
+compressedrÓ   ÚpartsÚposÚpos2s           r   rÑ   z)_zlibengine.zlibrevlogcompressor.compressé  sH  € İ˜‘Y”YˆFà˜A’::::à˜Š{ˆ{Øtà˜7Ò"Ğ"Ø”;Ğ&İ!%¤¨tÑ!4Ô!4JJå!%¤¨t°T´[Ñ!AÔ!AJİz‘?”? VÒ+Ğ+Ø%Ğ%Øtğ ”;Ğ&İÔ(Ñ*Ô*AAåÔ(¨t¬{Ğ;Ñ;Ô;AØØØ˜F’llØ ™=DØ—L’L §¢¨D°°T°¬NÑ!;Ô!;Ñ<Ô<Ğ<ØCğ ˜F’llğ —’˜QŸWšW™YœYÑ'Ô'Ğ'å•s3 ‘”Ñ'Ô'¨&Ò0Ğ0ØŸ8š8 E™?œ?Ğ*Øtr   c                 óÆ   — 	 t          j        |¦  «        S # t           j        $ r;}t          j        t	          d¦  «        t          j        |¦  «        z  ¦  «        ‚d }~ww xY w)Nó   revlog decompress error: %s)r   r¤   r   ÚStorageErrorr<   r	   Úforcebytestr)r   rÔ   rW   s      r   r¤   z+_zlibengine.zlibrevlogcompressor.decompress  sl   € ğİ” tÑ,Ô,Ğ,øİ”:ğ ğ ğ İÔ(İĞ4Ñ5Ô5İ Ô-¨aÑ0Ô0ñ1ñô ğ øøøøğøøøs   ‚ –A ¥6AÁA r   ©r   r!   r"   r   rÑ   r¤   r#   r   r   Úzlibrevlogcompressorr×   å  sG   € € € € € ğ	 ğ 	 ğ 	 ğ 	 ğ#	ğ #	ğ #	ğJ	ğ 	ğ 	ğ 	ğ 	r   rë   c                 ó^   — d }||                      d¦  «        }|                      |¦  «        S )Ns
+   zlib.level)rĞ   rë   ©r   r{   rÚ   s      r   rƒ   z_zlibengine.revlogcompressor  s2   € ØˆØĞØ—H’H˜]Ñ+Ô+ˆEØ×(Ò(¨Ñ/Ô/Ğ/r   r   )r   r!   r"   r   r>   r?   r@   r|   r€   rë   rƒ   r#   r   r   rÂ   rÂ   Â  s°   € € € € € ğğ ğ ğğ ğ ğ6ğ 6ğ 6ğğ ğ ğğ ğ ğ ğ/ğ /ğ /ğ0ğ 0ğ 0ğ 0ğ 0ñ 0ô 0ğ 0ğd0ğ 0ğ 0ğ 0ğ 0ğ 0r   rÂ   c                   ó.   — e Zd Zd„ Zd„ Zd„ Zdd„Zd„ ZdS )Ú
+_bz2enginec                 ó   — dS )Ns   bz2r#   r,   s    r   r   z_bz2engine.name"  s   € Øˆvr   c                 ó   — dS )a“  An algorithm that produces smaller bundles than ``gzip``.
+
+        All Mercurial clients should support this format.
+
+        This engine will likely produce smaller bundles than ``gzip`` but
+        will be significantly slower, both during compression and
+        decompression.
+
+        If available, the ``zstd`` engine can yield similar or better
+        compression at much higher speeds.
+        )ó   bzip2r¸   r#   r,   s    r   r>   z_bz2engine.bundletype%  s	   € ğ ˆr   c                 ó$   — t          ddd¦  «        S )Nrò   r   rÉ   r,   s    r   r?   z_bz2engine.wireprotosupport5  s   € İ$ X¨q°!Ñ4Ô4Ğ4r   Nc              #   óÎ   K  — |pi }t          j        |                     dd¦  «        ¦  «        }|D ]}|                     |¦  «        }|r|V — Œ|                     ¦   «         V — d S )NrÎ   é	   )r¯   ÚBZ2CompressorrĞ   rÑ   r¦   rÒ   s         r   r|   z_bz2engine.compressstream8  st   è è € ØˆzrˆİÔ˜dŸhšh x°Ñ3Ô3Ñ4Ô4ˆØğ 	ğ 	ˆEØ—:’:˜eÑ$Ô$ˆDØğ Ø
+
+
+øàgŠg‰iŒiˆˆˆˆˆr   c                 ó    — t          |¦  «        S r   )r­   r~   s     r   r€   z_bz2engine.decompressorreaderB  s   € İ)¨"Ñ-Ô-Ğ-r   r   )r   r!   r"   r   r>   r?   r|   r€   r#   r   r   rï   rï   !  sd   € € € € € ğğ ğ ğğ ğ ğ 5ğ 5ğ 5ğğ ğ ğ ğ.ğ .ğ .ğ .ğ .r   rï   c                   ó    — e Zd Zd„ Zd„ Zd„ ZdS )Ú_truncatedbz2enginec                 ó   — dS )Ns   bz2truncatedr#   r,   s    r   r   z_truncatedbz2engine.nameJ  s   € Øˆr   c                 ó   — dS )N)Ns   _truncatedBZr#   r,   s    r   r>   z_truncatedbz2engine.bundletypeM  s   € Ø$Ğ$r   c                 ó    — t          |¦  «        S r   )r¶   r~   s     r   r€   z&_truncatedbz2engine.decompressorreaderR  s   € İ2°2Ñ6Ô6Ğ6r   N)r   r!   r"   r   r>   r€   r#   r   r   rù   rù   I  sA   € € € € € ğğ ğ ğ%ğ %ğ %ğ
+7ğ 7ğ 7ğ 7ğ 7r   rù   c                   óV   — e Zd Zd„ Zd„ Zd„ Zd„ Zdd„Zd„ Z G d„ d	¦  «        Z	dd
+„Z
+dS )Ú_noopenginec                 ó   — dS )Nó   noner#   r,   s    r   r   z_noopengine.nameZ  rÅ   r   c                 ó   — dS )zmNo compression is performed.
+
+        Use this compression engine to explicitly disable compression.
+        )r   s   UNr#   r,   s    r   r>   z_noopengine.bundletype]  s	   € ğ
+ ˆ~r   c                 ó$   — t          ddd¦  «        S )Nr   r   é
+   rÉ   r,   s    r   r?   z_noopengine.wireprotosupportg  s   € İ$ W¨a°Ñ4Ô4Ğ4r   c                 ó   — dS )Nó    r#   r,   s    r   r@   z_noopengine.revlogheaderl  s   € Øˆur   Nc                 ó   — |S r   r#   ry   s      r   r|   z_noopengine.compressstreamo  ó   € Øˆ	r   c                 ó   — |S r   r#   r~   s     r   r€   z_noopengine.decompressorreaderr  r  r   c                   ó   — e Zd Zd„ ZdS )ú _noopengine.nooprevlogcompressorc                 ó   — d S r   r#   )r   rÔ   s     r   rÑ   z)_noopengine.nooprevlogcompressor.compressv  s   € Ø4r   N)r   r!   r"   rÑ   r#   r   r   Únooprevlogcompressorr
+  u  s#   € € € € € ğ	ğ 	ğ 	ğ 	ğ 	r   r  c                 ó*   — |                       ¦   «         S r   )r  r‚   s     r   rƒ   z_noopengine.revlogcompressory  s   € Ø×(Ò(Ñ*Ô*Ğ*r   r   )r   r!   r"   r   r>   r?   r@   r|   r€   r  rƒ   r#   r   r   rş   rş   Y  s¯   € € € € € ğğ ğ ğğ ğ ğ5ğ 5ğ 5ğ
+ğ ğ ğğ ğ ğ ğğ ğ ğğ ğ ğ ğ ñ ô ğ ğ+ğ +ğ +ğ +ğ +ğ +r   rş   c                   ór   — e Zd Zd„ Zed„ ¦   «         Zd„ Zd„ Zd„ Zd„ Z	dd„Z
+d	„ Z G d
+„ d¦  «        Zdd„ZdS )Ú_zstdenginec                 ó   — dS )Nó   zstdr#   r,   s    r   r   z_zstdengine.name  rÅ   r   c                 óD   — 	 ddl m} |j         |S # t          $ r Y d S w xY w)Nr   )r¾   )Ú r¾   Ú__version__ÚImportError)r   r¾   s     r   Ú_modulez_zstdengine._module„  sK   € ğ	ØĞĞĞĞĞğ ÔĞØˆKøİğ 	ğ 	ğ 	Ø44ğ	øøøs   ‚ ‘
+c                 ó*   — t          | j        ¦  «        S r   )Úboolr  r,   s    r   rO   z_zstdengine.available‘  s   € İD”LÑ!Ô!Ğ!r   c                 ó   — dS )aì  A modern compression algorithm that is fast and highly flexible.
+
+        Only supported by Mercurial 4.1 and newer clients.
+
+        With the default settings, zstd compression is both faster and yields
+        better compression than ``gzip``. It also frequently yields better
+        compression than ``bzip2`` while operating at much higher speeds.
+
+        If this engine is available and backwards compatibility is not a
+        concern, it is likely the best available engine.
+        )r  s   ZSr#   r,   s    r   r>   z_zstdengine.bundletype”  s	   € ğ ˆ~r   c                 ó$   — t          ddd¦  «        S )Nr  é2   rÉ   r,   s    r   r?   z_zstdengine.wireprotosupport¢  rË   r   c                 ó   — dS )Nó   (r#   r,   s    r   r@   z_zstdengine.revlogheader¥  rÅ   r   Nc              #   ó6  K  — |pi }|                      dd¦  «        }|                      dd¦  «        }| j        }|                     ||¬¦  «                             ¦   «         }|D ]}|                     |¦  «        }|r|V — Œ|                     ¦   «         V — d S )NrÎ   é   s   threadsr   )rÚ   Úthreads)rĞ   r  ÚZstdCompressorrÏ   rÑ   r¦   )	r   rz   r{   rÚ   r   r¾   rÓ   r   rÔ   s	            r   r|   z_zstdengine.compressstream¨  s©   è è € Øˆzrˆğ —’˜ 1Ñ%Ô%ˆà—(’(˜: qÑ)Ô)ˆàŒ|ˆØ×Ò e°WĞÑ=Ô=×IÒIÑKÔKˆØğ 	ğ 	ˆEØ—:’:˜eÑ$Ô$ˆDØğ Ø
+
+
+øàgŠg‰iŒiˆˆˆˆˆr   c                 ó,   — t          || j        ¦  «        S r   )rº   r  r~   s     r   r€   z_zstdengine.decompressorreaderº  s   € İ*¨2¨t¬|Ñ<Ô<Ğ<r   c                   ó"   — e Zd Zdd„Zd„ Zd„ ZdS )ú _zstdengine.zstdrevlogcompressorr  c                 ó   — |                      |¬¦  «        | _        |                     ¦   «         | _        |j        | _        |j        | _        d S )NrŞ   )r!  Ú_cctxr½   Ú_dctxÚ"COMPRESSION_RECOMMENDED_INPUT_SIZEÚ_compinsizeÚ$DECOMPRESSION_RECOMMENDED_INPUT_SIZEÚ_decompinsize)r   r¾   rÚ   s      r   r   z)_zstdengine.zstdrevlogcompressor.__init__¾  sK   € ğ
+ ×,Ò,°5Ğ,Ñ9Ô9ˆDŒJØ×.Ò.Ñ0Ô0ˆDŒJØ#ÔFˆDÔØ!%Ô!JˆDÔĞĞr   c                 óH  — t          |¦  «        }|dk    sJ ‚|dk     rd S |dk    r1| j                             |¦  «        }t          |¦  «        |k     r|S d S | j                             ¦   «         }g }d}||k     rF|| j        z   }|                     |||…         ¦  «        }|r|                     |¦  «         |}||k     °F|                     |                     ¦   «         ¦  «         t          t          t           |¦  «        ¦  «        |k     rd 	                    |¦  «        S d S )Nr   r  rİ   r   )
+r’   r&  rÑ   rÏ   r)  r“   r¦   rß   rà   r”   )	r   rÔ   rá   râ   rÓ   Úchunksrä   rå   r   s	            r   rÑ   z)_zstdengine.zstdrevlogcompressor.compressÈ  s*  € İ˜‘Y”YˆFà˜A’::::à˜Š{ˆ{Øtà˜7Ò"Ğ"Ø!œZ×0Ò0°Ñ6Ô6
+İz‘?”? VÒ+Ğ+Ø%Ğ%Øtà”J×*Ò*Ñ,Ô,ØØØ˜F’llØ Ô!1Ñ1DØŸJšJ t¨C°¨H¤~Ñ6Ô6EØğ -ØŸš eÑ,Ô,Ğ,ØCğ ˜F’llğ —’˜aŸgšg™iœiÑ(Ô(Ğ(å•s3 Ñ'Ô'Ñ(Ô(¨6Ò1Ğ1ØŸ8š8 FÑ+Ô+Ğ+Øtr   c                 ó®  — t          |¦  «        }	 | j                             ¦   «         }g }d}||k     rF|| j        z   }|                     |||…         ¦  «        }|r|                     |¦  «         |}||k     °Fd                     |¦  «        S # t          $ r;}t          j	        t          d¦  «        t          j        |¦  «        z  ¦  «        ‚d }~ww xY w)Nr   r   rç   )r’   r'  r   r+  r¤   r“   r”   Ú	Exceptionr   rè   r<   r	   ré   )	r   rÔ   rá   Údobjr-  rä   rå   r   rW   s	            r   r¤   z+_zstdengine.zstdrevlogcompressor.decompresså  sñ   € İ˜‘Y”YˆFğğ ”z×/Ò/Ñ1Ô1ØØØ˜F’llØ Ô!3Ñ3DØ ŸOšO¨D°°T°¬NÑ;Ô;EØğ -ØŸš eÑ,Ô,Ğ,ØCğ ˜F’llğ —x’x Ñ'Ô'Ğ'øİğ ğ ğ İÔ(İĞ4Ñ5Ô5İ Ô-¨aÑ0Ô0ñ1ñô ğ øøøøğøøøs   ‘A=B Â
+CÂ6CÃCN)r  rê   r#   r   r   Úzstdrevlogcompressorr$  ½  sJ   € € € € € ğ	Kğ 	Kğ 	Kğ 	Kğ	ğ 	ğ 	ğ:	ğ 	ğ 	ğ 	ğ 	r   r1  c                 ó¢   — |pi }|                      d¦  «        }|€|                      d¦  «        }|€d}|                      | j        |¬¦  «        S )Ns
+   zstd.levelrÎ   r  rŞ   )rĞ   r1  r  rí   s      r   rƒ   z_zstdengine.revlogcompressorı  sW   € ØˆzrˆØ—’˜Ñ'Ô'ˆØˆ=Ø—H’H˜XÑ&Ô&ˆEØˆ=ØˆEØ×(Ò(¨¬¸UĞ(ÑCÔCĞCr   r   )r   r!   r"   r   r   r  rO   r>   r?   r@   r|   r€   r1  rƒ   r#   r   r   r  r  €  sà   € € € € € ğğ ğ ğ ğ
+ğ 
+ñ „]ğ
+ğ"ğ "ğ "ğğ ğ ğ6ğ 6ğ 6ğğ ğ ğğ ğ ğ ğ$=ğ =ğ =ğ>ğ >ğ >ğ >ğ >ñ >ô >ğ >ğ@Dğ Dğ Dğ Dğ Dğ Dr   r  c                  ó˜  — i }  G d„ d¦  «        }t           D ]²}t           |         }|                     ¦   «         sŒ$|                     ¦   «         }|r|d         sŒCd|d         t          j        |j        ¦  «        fz  } |¦   «         }t          j        |¦  «        |_        |j        j        |_        |j        |_        || |d         <   Œ³| S )z@Obtains a list of available bundle compressions for use in help.c                   ó   — e Zd ZdS )ú*bundlecompressiontopics.<locals>.docobjectN)r   r!   r"   r#   r   r   Ú	docobjectr5    s   € € € € € Øˆr   r6  r   s   ``%s``
+    %s)	ÚcompenginesrO   r>   r   ÚgetdocÚsysstrrm   Ú_origdocÚ	_origfunc)Úitemsr6  r   rA   ÚbtÚdocr    s          r   Úbundlecompressiontopicsr?  
+  sñ   € ğ €Eğğ ğ ğ ğ ñ ô ğ õ ğ ğ ˆİ˜TÔ"ˆà×ÒÑ!Ô!ğ 	Øà×ÒÑ Ô ˆØğ 	˜˜Aœğ 	Øà 2 a¤5­(¬/¸&Ô:KÑ*LÔ*LĞ"MÑMˆà	‘”ˆİ œ¨Ñ,Ô,ˆŒØÔ*Ô2ˆŒØ Ô+ˆŒàˆˆbŒe‰ˆà€Lr   )!r¯   Úcollectionsr   r   r   r  r   r   r	   rˆ   r<   r_   r`   Ú
+namedtuplerÊ   r   r%   r7  r:   r…   rš   r­   r¶   rº   rÂ   rF   rï   rù   rş   r  r?  ra   Úi18nfunctionsr#   r   r   ú<module>rC     s×  ğğ €
+€
+€
+Ø Ğ Ğ Ğ Ø €€€à Ğ Ğ Ğ Ğ Ğ ğğ ğ ğ ğ ğ ğ ğ ğ ğ ğ
+ Ğ Ğ Ğ Ğ Ğ àÔ"€ğ 	„F€ğ €
+Ø€
+à.˜Ô.Ø Ø0ñô Ğ ğ(ğ (ğ (ğ (ğ (ñ (ô (ğ (ğf:ğ f:ğ f:ğ f:ğ f:ñ f:ô f:ğ f:ğR  ĞÑ!Ô!€ğt$ğ t$ğ t$ğ t$ğ t$ñ t$ô t$ğ t$ğn&%ğ &%ğ &%ğ &%ğ &%ñ &%ô &%ğ &%ğRğ ğ ğ ğ Ğ"9ñ ô ğ ğ&ğ ğ ğ ğ Ğ!8ñ ô ğ ğ()ğ )ğ )ğ )ğ )Ğ*Dñ )ô )ğ )ğğ ğ ğ ğ Ğ"9ñ ô ğ ğ*Y0ğ Y0ğ Y0ğ Y0ğ Y0Ğ#ñ Y0ô Y0ğ Y0ğx × Ò [[‘]”]Ñ #Ô #Ğ #ğ".ğ ".ğ ".ğ ".ğ ".Ğ"ñ ".ô ".ğ ".ğJ × Ò ZZ‘\”\Ñ "Ô "Ğ "ğ
+7ğ 
+7ğ 
+7ğ 
+7ğ 
+7Ğ+ñ 
+7ô 
+7ğ 
+7ğ × Ò Ğ(Ğ(Ñ*Ô*Ñ +Ô +Ğ +ğ!+ğ !+ğ !+ğ !+ğ !+Ğ#ñ !+ô !+ğ !+ğH × Ò [[‘]”]Ñ #Ô #Ğ #ğDDğ DDğ DDğ DDğ DDĞ#ñ DDô DDğ DDğN × Ò [[‘]”]Ñ #Ô #Ğ #ğğ ğ ğ@ (Ğ'Ñ)Ô)×0Ò0Ñ2Ô2€€€r                                                                                                                                                                                                                                                                                                                                                                                                                                                                 usr/lib/python3/dist-packages/mercurial/utils/__pycache__/dateutil.cpython-311.pyc                  0000644 0000000 0000000 00000035752 14714551122 026634  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        §
+    	^µcÿ-  ã                   óÂ   — d dl Z d dlZd dlZddlmZ ddlmZmZmZ ej	        rd dl
+mZmZmZmZmZmZ eeef         ZdZedz   Zdd„Zdd
+„Zdd„Zd„ Zdd„Zdd„Zd„ ZdS )é    Né   )Ú_)ÚencodingÚerrorÚpycompat)ÚCallableÚDictÚIterableÚOptionalÚTupleÚUnion)s   %Y-%m-%dT%H:%M:%Ss   %Y-%m-%dT%H:%Ms   %Y-%m-%dT%H%M%Ss   %Y-%m-%dT%H%Ms   %Y-%m-%d %H:%M:%Só   %Y-%m-%d %H:%Ms   %Y-%m-%d %H%M%Ss   %Y-%m-%d %H%Ms   %Y-%m-%d %I:%M:%S%pr   s   %Y-%m-%d %I:%M%pó   %Y-%m-%ds   %m-%ds   %m/%ds   %m/%d/%ys   %m/%d/%Ys   %a %b %d %H:%M:%S %Ys   %a %b %d %I:%M:%S%p %Ys   %a, %d %b %Y %H:%M:%Ss   %b %d %H:%M:%S %Ys   %b %d %I:%M:%S%p %Ys   %b %d %H:%M:%Ss   %b %d %I:%M:%S%ps   %b %d %H:%Ms   %b %d %I:%M%ps   %b %d %Ys   %b %ds   %H:%M:%Ss
+   %I:%M:%S%ps   %H:%Ms   %I:%M%p)s   %Ys   %Y-%ms   %bs   %b %Yc                 óL  — | €t          j         ¦   «         } | dk     r5t          d¦  «        }t          j        t          d¦  «        | z  |¬¦  «        ‚t          j                             | ¦  «        t          j                             | ¦  «        z
+  }|j        dz  |j        z   }| |fS )zmReturn a unix timestamp (or the current time) as a (unixtime,
+    offset) tuple based off the local timezone.Nr   s   check your clocks   negative timestamp: %d)Úhinti€Q )	Útimer   r   Ú
+InputErrorÚdatetimeÚutcfromtimestampÚfromtimestampÚdaysÚseconds)Ú	timestampr   ÚdeltaÚtzs       ú:/usr/lib/python3/dist-packages/mercurial/utils/dateutil.pyÚmakedater   K   s®   € ğ Ğİ”I‘K”Kˆ	Ø1‚}€}İĞ$Ñ%Ô%ˆİÔİĞ'Ñ(Ô(¨9Ñ4¸4ğ
+ñ 
+ô 
+ğ 	
+õ Ô×.Ò.Øñô åÔ×'Ò'¨	Ñ2Ô2ñ3€Eğ 
+ŒeÑ	˜eœmÑ	+€BØbˆ=Ğó    ó   %a %b %d %H:%M:%S %Y %1%2c                 ó,  — | pt          ¦   «         \  }}d|v sd|v sd|v ry|dk    rdpd}t          |¦  «        dz  }t          |d¦  «        \  }}|                     dd¦  «        }|                     dd	||fz  ¦  «        }|                     dd
+|z  ¦  «        }||z
+  }|dk    rd}n|dk     rd}t	          j        ddd¦  «        t	          j        |¬¦  «        z   }t          j        |                     t          j	        |¦  «        ¦  «        ¦  «        }	|	S )aò  represent a (unixtime, offset) tuple as a localized time.
+    unixtime is seconds since the epoch, and offset is the time zone's
+    number of seconds away from UTC.
+
+    >>> datestr((0, 0))
+    'Thu Jan 01 00:00:00 1970 +0000'
+    >>> datestr((42, 0))
+    'Thu Jan 01 00:00:42 1970 +0000'
+    >>> datestr((-42, 0))
+    'Wed Dec 31 23:59:18 1969 +0000'
+    >>> datestr((0x7fffffff, 0))
+    'Tue Jan 19 03:14:07 2038 +0000'
+    >>> datestr((-0x80000000, 0))
+    'Fri Dec 13 20:45:52 1901 +0000'
+    s   %1s   %2s   %zr   ó   -ó   +é<   s   %1%2s   %c%02ds   %02déÿÿÿé   €i²  é   )r   )
+r   ÚabsÚdivmodÚreplacer   Ú	timedeltar   Ú
+strtolocalÚstrftimeÚstrfromlocal)
+ÚdateÚformatÚtr   ÚsignÚminutesÚqÚrÚdÚss
+             r   Údatestrr7   ]   s&  € ğ" Ğ•H‘J”JE€A€rØ€€˜% 6˜/˜/¨U°f¨_¨_ØQ’Ğ ˜DĞ( Dˆİb‘'”'˜R‘-ˆİg˜rÑ"Ô"‰ˆˆ1Ø—’  wÑ/Ô/ˆØ—’  y°D¸!°9Ñ'<Ñ=Ô=ˆØ—’  w°¡{Ñ3Ô3ˆØ	ˆB‰€AØˆ:‚~€~ØˆˆØ	
+ˆ[ŠˆØˆõ 	Ô˜$  1Ñ%Ô%­Ô(:À1Ğ(EÑ(EÔ(EÑE€AİÔ˜AŸJšJ¥xÔ'<¸VÑ'DÔ'DÑEÔEÑFÔF€AØ€Hr   c                 ó$   — t          | d¬¦  «        S )z1turn (timestamp, tzoff) tuple into iso 8631 date.r   )r/   )r7   )r.   s    r   Ú	shortdater9   ƒ   s   € õ 4 Ğ,Ñ,Ô,Ğ,r   c                 óğ  — t          j        | ¦  «        } |                      d¦  «        s|                      d¦  «        rd| dd…                              ¦   «         fS t	          | ¦  «        dk    r| d         dv r…| d	d…                              ¦   «         ri| d         d
+k    rdpd}t          | d	d…         ¦  «        }t          | dd…         ¦  «        }| |dz  |z   z  dz  | dd…                              ¦   «         fS |                      d¦  «        r(| dd…                              ¦   «         rd| dd…         fS t	          | ¦  «        dk    r¥| d         dv r›| d         dk    r| dd…                              ¦   «         rs| dd…                              ¦   «         rW| d         d
+k    rdpd}t          | dd…         ¦  «        }t          | dd…         ¦  «        }| |dz  |z   z  dz  | dd…         fS d| fS )zVfind a trailing timezone, if any, in string, and return a
+    (offset, remainder) pairs   GMTs   UTCr   Néıÿÿÿé   éûÿÿÿs   +-éüÿÿÿr"   r&   éÿÿÿÿéşÿÿÿr#   ó   Zé   iúÿÿÿó   :)r   ÚbytestrÚendswithÚrstripÚlenÚisdigitÚint)r6   r1   Úhoursr2   s       r   ÚparsetimezonerK   ‰   s
+  € õ 	Ô˜ÑÔ€Aà‡z‚z&ÑÔğ "˜QŸZšZ¨Ñ/Ô/ğ "Ø!CRC”&—-’-‘/”/Ğ!Ğ!õ ˆ1v„v‚{€{q˜”u ~~¨!¨B¨C¨C¬&¯.ª.Ñ*:Ô*:~Ø"”˜’Ğ$ 1Ğ*¨ˆİAb˜e”H‘”ˆİa˜˜˜”f‘+”+ˆØˆu˜ ™
+ WÑ,Ñ-°Ñ2°A°c°r°c´F·M²M±O´OĞCĞCğ 	‡z‚z$ÑÔğ ˜A˜b ˜eœH×,Ò,Ñ.Ô.ğ Ø!CRC”&ˆyĞõ 	ˆA‰Œ!ŠˆØˆbŒEUˆNˆNØˆbŒETŠMˆMØˆbˆeŒH×ÒÑÔğ àˆbˆcˆcŒFNŠNÑÔğ ğ "”˜’Ğ$ 1Ğ*¨ˆİAb˜e”H‘”ˆİa˜˜˜”f‘+”+ˆØˆu˜ ™
+ WÑ,Ñ-°Ñ2°A°c°r°c´FĞ:Ğ:àˆ7€Nr   c                 óè  ‡— |€i }t          | ¦  «        \  }}d}dD ]K}t          j        |¦  «        }ˆfd„|D ¦   «         }|s#|d||         |         z   z  }‰d|d         z   z  ŠŒId}ŒLt          j        t          j        |¦  «        t          j        ‰¦  «        ¦  «        }t          t          j	        |¦  «        ¦  «        }	|€'t          t          j
+        |¦  «        ¦  «        }
+|

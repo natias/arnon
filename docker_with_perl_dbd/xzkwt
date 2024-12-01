@@ -1,0 +1,1000 @@
+        local $Data::Dumper::Sortkeys = 1;
+        $data = Data::Dumper::Dumper(\%bad);
+        1;
+    };
+
+    $data = "Could not dump data... sorry." unless defined $data;
+
+    $self->abort_trace("Not all files from hub '$hid' have been collected!\nHere is the leftover data:\n========================\n$data\n===================\n");
+}
+
+sub send {
+    my $self = shift;
+    my ($hid, $e, $global) = @_;
+
+    my $tempdir = $self->{+TEMPDIR};
+    my $hfile = $self->hub_file($hid);
+    my $dest = $global ? 'GLOBAL' : $hid;
+
+    $self->abort(<<"    EOT") unless $global || -f $hfile;
+hub '$hid' is not available, failed to send event!
+
+There was an attempt to send an event to a hub in a parent process or thread,
+but that hub appears to be gone. This can happen if you fork, or start a new
+thread from inside subtest, and the parent finishes the subtest before the
+child returns.
+
+This can also happen if the parent process is done testing before the child
+finishes. Test2 normally waits automatically in the root process, but will not
+do so if Test::Builder is loaded for legacy reasons.
+    EOT
+
+    my $file = $self->event_file($dest, $e);
+    my $ready = File::Spec->canonpath("$file.ready");
+
+    if ($global) {
+        my $name = $ready;
+        $name =~ s{^.*(GLOBAL)}{GLOBAL};
+        $self->{+GLOBALS}->{$hid}->{$name}++;
+    }
+
+    # Write and rename the file.
+    my ($ren_ok, $ren_err);
+    my ($ok, $err) = try_sig_mask(sub {
+        Storable::store($e, $file);
+        ($ren_ok, $ren_err) = do_rename("$file", $ready);
+    });
+
+    if ($ok) {
+        $self->abort("Could not rename file '$file' -> '$ready': $ren_err") unless $ren_ok;
+        test2_ipc_set_pending($file);
+    }
+    else {
+        my $src_file = __FILE__;
+        $err =~ s{ at \Q$src_file\E.*$}{};
+        chomp($err);
+        my $tid = get_tid();
+        my $trace = $e->trace->debug;
+        my $type = blessed($e);
+
+        $self->abort(<<"        EOT");
+
+*******************************************************************************
+There was an error writing an event:
+Destination: $dest
+Origin PID:  $$
+Origin TID:  $tid
+Event Type:  $type
+Event Trace: $trace
+File Name:   $file
+Ready Name:  $ready
+Error: $err
+*******************************************************************************
+
+        EOT
+    }
+
+    return 1;
+}
+
+sub driver_abort {
+    my $self = shift;
+    my ($msg) = @_;
+
+    local ($@, $!, $?, $^E);
+    eval {
+        my $abort = File::Spec->catfile($self->{+TEMPDIR}, "ABORT");
+        open(my $fh, '>>', $abort) or die "Could not open abort file: $!";
+        print $fh $msg, "\n";
+        close($fh) or die "Could not close abort file: $!";
+        1;
+    } or warn $@;
+}
+
+sub cull {
+    my $self = shift;
+    my ($hid) = @_;
+
+    my $tempdir = $self->{+TEMPDIR};
+
+    opendir(my $dh, $tempdir) or $self->abort("could not open IPC temp dir ($tempdir)!");
+
+    my $read = $self->{+READ_IDS};
+    my $timeouts = $self->{+TIMEOUTS};
+
+    my @out;
+    for my $info (sort cmp_events map { $self->should_read_event($hid, $_) } readdir($dh)) {
+        unless ($info->{global}) {
+            my $next = $self->{+READ_IDS}->{$info->{hid}}->{$info->{pid}}->{$info->{tid}} ||= 1;
+
+            $timeouts->{$info->{file}} ||= time;
+
+            if ($next != $info->{eid}) {
+                # Wait up to N seconds for missing events
+                next unless 5 < time - $timeouts->{$info->{file}};
+                $self->abort("Missing event HID: $info->{hid}, PID: $info->{pid}, TID: $info->{tid}, EID: $info->{eid}.");
+            }
+
+            $self->{+READ_IDS}->{$info->{hid}}->{$info->{pid}}->{$info->{tid}} = $info->{eid} + 1;
+        }
+
+        my $full = $info->{full_path};
+        my $obj = $self->read_event_file($full);
+        push @out => $obj;
+
+        # Do not remove global events
+        next if $info->{global};
+
+        if ($ENV{T2_KEEP_TEMPDIR}) {
+            my $complete = File::Spec->canonpath("$full.complete");
+            my ($ok, $err) = do_rename($full, $complete);
+            $self->abort("Could not rename IPC file '$full', '$complete': $err") unless $ok;
+        }
+        else {
+            my ($ok, $err) = do_unlink("$full");
+            $self->abort("Could not unlink IPC file '$full': $err") unless $ok;
+        }
+    }
+
+    closedir($dh);
+    return @out;
+}
+
+sub parse_event_filename {
+    my $self = shift;
+    my ($file) = @_;
+
+    # The || is to force 0 in false
+    my $complete = substr($file, -9, 9) eq '.complete' || 0 and substr($file, -9, 9, "");
+    my $ready    = substr($file, -6, 6) eq '.ready'    || 0 and substr($file, -6, 6, "");
+
+    my @parts = split ipc_separator, $file;
+    my ($global, $hid) = $parts[0] eq 'GLOBAL' ? (1, shift @parts) : (0, join ipc_separator, splice(@parts, 0, 4));
+    my ($pid, $tid, $eid) = splice(@parts, 0, 3);
+    my $type = join '::' => @parts;
+
+    return {
+        file     => $file,
+        ready    => !!$ready,
+        complete => !!$complete,
+        global   => $global,
+        type     => $type,
+        hid      => $hid,
+        pid      => $pid,
+        tid      => $tid,
+        eid      => $eid,
+    };
+}
+
+sub should_read_event {
+    my $self = shift;
+    my ($hid, $file) = @_;
+
+    return if substr($file, 0, 1) eq '.';
+    return if substr($file, 0, 3) eq 'HUB';
+    CORE::exit(255) if $file eq 'ABORT';
+
+    my $parsed = $self->parse_event_filename($file);
+
+    return if $parsed->{complete};
+    return unless $parsed->{ready};
+    return unless $parsed->{global} || $parsed->{hid} eq $hid;
+
+    return if $parsed->{global} && $self->{+GLOBALS}->{$hid}->{$file}++;
+
+    # Untaint the path.
+    my $full = File::Spec->catfile($self->{+TEMPDIR}, $file);
+    ($full) = ($full =~ m/^(.*)$/gs) if ${^TAINT};
+
+    $parsed->{full_path} = $full;
+
+    return $parsed;
+}
+
+sub cmp_events {
+    # Globals first
+    return -1 if $a->{global} && !$b->{global};
+    return  1 if $b->{global} && !$a->{global};
+
+    return $a->{pid} <=> $b->{pid}
+        || $a->{tid} <=> $b->{tid}
+        || $a->{eid} <=> $b->{eid};
+}
+
+sub read_event_file {
+    my $self = shift;
+    my ($file) = @_;
+
+    my $obj = Storable::retrieve($file);
+    $self->abort("Got an unblessed object: '$obj'")
+        unless blessed($obj);
+
+    unless ($obj->isa('Test2::Event')) {
+        my $pkg  = blessed($obj);
+        my $mod_file = pkg_to_file($pkg);
+        my ($ok, $err) = try { require $mod_file };
+
+        $self->abort("Event has unknown type ($pkg), tried to load '$mod_file' but failed: $err")
+            unless $ok;
+
+        $self->abort("'$obj' is not a 'Test2::Event' object")
+            unless $obj->isa('Test2::Event');
+    }
+
+    return $obj;
+}
+
+sub waiting {
+    my $self = shift;
+    require Test2::Event::Waiting;
+    $self->send(
+        GLOBAL => Test2::Event::Waiting->new(
+            trace => Test2::EventFacet::Trace->new(frame => [caller()]),
+        ),
+        'GLOBAL'
+    );
+    return;
+}
+
+sub DESTROY {
+    my $self = shift;
+
+    return unless defined $self->pid;
+    return unless defined $self->tid;
+
+    return unless $$        == $self->pid;
+    return unless get_tid() == $self->tid;
+
+    my $tempdir = $self->{+TEMPDIR};
+
+    my $aborted = 0;
+    my $abort_file = File::Spec->catfile($self->{+TEMPDIR}, "ABORT");
+    if (-e $abort_file) {
+        $aborted = 1;
+        my ($ok, $err) = do_unlink($abort_file);
+        warn $err unless $ok;
+    }
+
+    opendir(my $dh, $tempdir) or $self->abort("Could not open temp dir! ($tempdir)");
+    while(my $file = readdir($dh)) {
+        next if $file =~ m/^\.+$/;
+        next if $file =~ m/\.complete$/;
+        my $full = File::Spec->catfile($tempdir, $file);
+
+        my $sep = ipc_separator;
+        if ($aborted || $file =~ m/^(GLOBAL|HUB$sep)/) {
+            $full =~ m/^(.*)$/;
+            $full = $1; # Untaint it
+            next if $ENV{T2_KEEP_TEMPDIR};
+            my ($ok, $err) = do_unlink($full);
+            $self->abort("Could not unlink IPC file '$full': $err") unless $ok;
+            next;
+        }
+
+        $self->abort("Leftover files in the directory ($full)!\n");
+    }
+    closedir($dh);
+
+    if ($ENV{T2_KEEP_TEMPDIR}) {
+        print STDERR "# Not removing temp dir: $tempdir\n";
+        return;
+    }
+
+    my $abort = File::Spec->catfile($self->{+TEMPDIR}, "ABORT");
+    unlink($abort) if -e $abort;
+    rmdir($tempdir) or warn "Could not remove IPC temp dir ($tempdir)";
+}
+
+1;
+
+__END__
+
+=pod
+
+=encoding UTF-8
+
+=head1 NAME
+
+Test2::IPC::Driver::Files - Temp dir + Files concurrency model.
+
+=head1 DESCRIPTION
+
+This is the default, and fallback concurrency model for L<Test2>. This
+sends events between processes and threads using serialized files in a
+temporary directory. This is not particularly fast, but it works everywhere.
+
+=head1 SYNOPSIS
+
+    use Test2::IPC::Driver::Files;
+
+    # IPC is now enabled
+
+=head1 ENVIRONMENT VARIABLES
+
+=over 4
+
+=item T2_KEEP_TEMPDIR=0
+
+When true, the tempdir used by the IPC driver will not be deleted when the test
+is done.
+
+=item T2_TEMPDIR_TEMPLATE='test2-XXXXXX'
+
+This can be used to set the template for the IPC temp dir. The template should
+follow template specifications from L<File::Temp>.
+
+=back
+
+=head1 SEE ALSO
+
+See L<Test2::IPC::Driver> for methods.
+
+=head1 SOURCE
+
+The source code repository for Test2 can be found at
+L<https://github.com/Test-More/test-more/>.
+
+=head1 MAINTAINERS
+
+=over 4
+
+=item Chad Granum E<lt>exodist@cpan.orgE<gt>
+
+=back
+
+=head1 AUTHORS
+
+=over 4
+
+=item Chad Granum E<lt>exodist@cpan.orgE<gt>
+
+=back
+
+=head1 COPYRIGHT
+
+Copyright 2020 Chad Granum E<lt>exodist@cpan.orgE<gt>.
+
+This program is free software; you can redistribute it and/or
+modify it under the same terms as Perl itself.
+
+See L<https://dev.perl.org/licenses/>
+
+=cut
+                                                                                                                                                                                                                                                              usr/local/lib/perl5/5.40.0/Test2/IPC/Driver.pm                                                      0000444 0000000 0000000 00000014574 14714567415 016724  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        package Test2::IPC::Driver;
+use strict;
+use warnings;
+
+our $VERSION = '1.302199';
+
+
+use Carp qw/confess/;
+use Test2::Util::HashBase qw{no_fatal no_bail};
+
+use Test2::API qw/test2_ipc_add_driver/;
+
+my %ADDED;
+sub import {
+    my $class = shift;
+    return if $class eq __PACKAGE__;
+    return if $ADDED{$class}++;
+    test2_ipc_add_driver($class);
+}
+
+sub pending { -1 }
+sub set_pending { -1 }
+
+for my $meth (qw/send cull add_hub drop_hub waiting is_viable/) {
+    no strict 'refs';
+    *$meth = sub {
+        my $thing = shift;
+        confess "'$thing' did not define the required method '$meth'."
+    };
+}
+
+# Print the error and call exit. We are not using 'die' cause this is a
+# catastrophic error that should never be caught. If we get here it
+# means some serious shit has happened in a child process, the only way
+# to inform the parent may be to exit false.
+
+sub abort {
+    my $self = shift;
+    chomp(my ($msg) = @_);
+
+    $self->driver_abort($msg) if $self->can('driver_abort');
+
+    print STDERR "IPC Fatal Error: $msg\n";
+    print STDOUT "Bail out! IPC Fatal Error: $msg\n" unless $self->no_bail;
+
+    CORE::exit(255) unless $self->no_fatal;
+}
+
+sub abort_trace {
+    my $self = shift;
+    my ($msg) = @_;
+    # Older versions of Carp do not export longmess() function, so it needs to be called with package name
+    $self->abort(Carp::longmess($msg));
+}
+
+1;
+
+__END__
+
+=pod
+
+=encoding UTF-8
+
+=head1 NAME
+
+Test2::IPC::Driver - Base class for Test2 IPC drivers.
+
+=head1 SYNOPSIS
+
+    package Test2::IPC::Driver::MyDriver;
+
+    use base 'Test2::IPC::Driver';
+
+    ...
+
+=head1 METHODS
+
+=over 4
+
+=item $self->abort($msg)
+
+If an IPC encounters a fatal error it should use this. This will print the
+message to STDERR with C<'IPC Fatal Error: '> prefixed to it, then it will
+forcefully exit 255. IPC errors may occur in threads or processes other than
+the main one, this method provides the best chance of the harness noticing the
+error.
+
+=item $self->abort_trace($msg)
+
+This is the same as C<< $ipc->abort($msg) >> except that it uses
+C<Carp::longmess> to add a stack trace to the message.
+
+=back
+
+=head1 LOADING DRIVERS
+
+Test2::IPC::Driver has an C<import()> method. All drivers inherit this import
+method. This import method registers the driver.
+
+In most cases you just need to load the desired IPC driver to make it work. You
+should load this driver as early as possible. A warning will be issued if you
+load it too late for it to be effective.
+
+    use Test2::IPC::Driver::MyDriver;
+    ...
+
+=head1 WRITING DRIVERS
+
+    package Test2::IPC::Driver::MyDriver;
+    use strict;
+    use warnings;
+
+    use base 'Test2::IPC::Driver';
+
+    sub is_viable {
+        return 0 if $^O eq 'win32'; # Will not work on windows.
+        return 1;
+    }
+
+    sub add_hub {
+        my $self = shift;
+        my ($hid) = @_;
+
+        ... # Make it possible to contact the hub
+    }
+
+    sub drop_hub {
+        my $self = shift;
+        my ($hid) = @_;
+
+        ... # Nothing should try to reach the hub anymore.
+    }
+
+    sub send {
+        my $self = shift;
+        my ($hid, $e, $global) = @_;
+
+        ... # Send the event to the proper hub.
+
+        # This may notify other procs/threads that there is a pending event.
+        Test2::API::test2_ipc_set_pending($uniq_val);
+    }
+
+    sub cull {
+        my $self = shift;
+        my ($hid) = @_;
+
+        my @events = ...; # Here is where you get the events for the hub
+
+        return @events;
+    }
+
+    sub waiting {
+        my $self = shift;
+
+        ... # Notify all listening procs and threads that the main
+        ... # process/thread is waiting for them to finish.
+    }
+
+    1;
+
+=head2 METHODS SUBCLASSES MUST IMPLEMENT
+
+=over 4
+
+=item $ipc->is_viable
+
+This should return true if the driver works in the current environment. This
+should return false if it does not. This is a CLASS method.
+
+=item $ipc->add_hub($hid)
+
+This is used to alert the driver that a new hub is expecting events. The driver
+should keep track of the process and thread ids, the hub should only be dropped
+by the proc+thread that started it.
+
+    sub add_hub {
+        my $self = shift;
+        my ($hid) = @_;
+
+        ... # Make it possible to contact the hub
+    }
+
+=item $ipc->drop_hub($hid)
+
+This is used to alert the driver that a hub is no longer accepting events. The
+driver should keep track of the process and thread ids, the hub should only be
+dropped by the proc+thread that started it (This is the drivers responsibility
+to enforce).
+
+    sub drop_hub {
+        my $self = shift;
+        my ($hid) = @_;
+
+        ... # Nothing should try to reach the hub anymore.
+    }
+
+=item $ipc->send($hid, $event);
+
+=item $ipc->send($hid, $event, $global);
+
+Used to send events from the current process/thread to the specified hub in its
+process+thread.
+
+    sub send {
+        my $self = shift;
+        my ($hid, $e) = @_;
+
+        ... # Send the event to the proper hub.
+
+        # This may notify other procs/threads that there is a pending event.
+        Test2::API::test2_ipc_set_pending($uniq_val);
+    }
+
+If C<$global> is true then the driver should send the event to all hubs in all
+processes and threads.
+
+=item @events = $ipc->cull($hid)
+
+Used to collect events that have been sent to the specified hub.
+
+    sub cull {
+        my $self = shift;
+        my ($hid) = @_;
+
+        my @events = ...; # Here is where you get the events for the hub
+
+        return @events;
+    }
+
+=item $ipc->waiting()
+
+This is called in the parent process when it is complete and waiting for all
+child processes and threads to complete.
+
+    sub waiting {
+        my $self = shift;
+
+        ... # Notify all listening procs and threads that the main
+        ... # process/thread is waiting for them to finish.
+    }
+
+=back
+
+=head2 METHODS SUBCLASSES MAY IMPLEMENT OR OVERRIDE
+
+=over 4
+
+=item $ipc->driver_abort($msg)
+
+This is a hook called by C<< Test2::IPC::Driver->abort() >>. This is your
+chance to cleanup when an abort happens. You cannot prevent the abort, but you
+can gracefully except it.
+
+=back
+
+=head1 SOURCE
+
+The source code repository for Test2 can be found at
+L<https://github.com/Test-More/test-more/>.
+
+=head1 MAINTAINERS
+
+=over 4
+
+=item Chad Granum E<lt>exodist@cpan.orgE<gt>
+
+=back
+
+=head1 AUTHORS
+
+=over 4
+
+=item Chad Granum E<lt>exodist@cpan.orgE<gt>
+
+=back
+
+=head1 COPYRIGHT
+
+Copyright 2020 Chad Granum E<lt>exodist@cpan.orgE<gt>.
+
+This program is free software; you can redistribute it and/or
+modify it under the same terms as Perl itself.
+
+See L<https://dev.perl.org/licenses/>
+
+=cut
+                                                                                                                                    usr/local/lib/perl5/5.40.0/Test2/IPC.pm                                                             0000444 0000000 0000000 00000006150 14714567415 015460  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        package Test2::IPC;
+use strict;
+use warnings;
+
+our $VERSION = '1.302199';
+
+
+use Test2::API::Instance;
+use Test2::Util qw/get_tid/;
+use Test2::API qw{
+    test2_in_preload
+    test2_init_done
+    test2_ipc
+    test2_has_ipc
+    test2_ipc_enable_polling
+    test2_pid
+    test2_stack
+    test2_tid
+    context
+};
+
+# Make sure stuff is finalized before anyone tried to fork or start a new thread.
+{
+    # Avoid warnings if things are loaded at run-time
+    no warnings 'void';
+    INIT {
+        use warnings 'void';
+        context()->release() unless test2_in_preload();
+    }
+}
+
+use Carp qw/confess/;
+
+our @EXPORT_OK = qw/cull/;
+BEGIN { require Exporter; our @ISA = qw(Exporter) }
+
+sub unimport { Test2::API::test2_ipc_disable() }
+
+sub import {
+    goto &Exporter::import if test2_has_ipc || !test2_init_done();
+
+    confess "IPC is disabled" if Test2::API::test2_ipc_disabled();
+    confess "Cannot add IPC in a child process (" . test2_pid() . " vs $$)" if test2_pid() != $$;
+    confess "Cannot add IPC in a child thread (" . test2_tid() . " vs " . get_tid() . ")"  if test2_tid() != get_tid();
+
+    Test2::API::_set_ipc(_make_ipc());
+    apply_ipc(test2_stack());
+
+    goto &Exporter::import;
+}
+
+sub _make_ipc {
+    # Find a driver
+    my ($driver) = Test2::API::test2_ipc_drivers();
+    unless ($driver) {
+        require Test2::IPC::Driver::Files;
+        $driver = 'Test2::IPC::Driver::Files';
+    }
+
+    return $driver->new();
+}
+
+sub apply_ipc {
+    my $stack = shift;
+
+    my ($root) = @$stack;
+
+    return unless $root;
+
+    confess "Cannot add IPC in a child process" if $root->pid != $$;
+    confess "Cannot add IPC in a child thread"  if $root->tid != get_tid();
+
+    my $ipc = $root->ipc || test2_ipc() || _make_ipc();
+
+    # Add the IPC to all hubs
+    for my $hub (@$stack) {
+        my $has = $hub->ipc;
+        confess "IPC Mismatch!" if $has && $has != $ipc;
+        next if $has;
+        $hub->set_ipc($ipc);
+        $ipc->add_hub($hub->hid);
+    }
+
+    test2_ipc_enable_polling();
+
+    return $ipc;
+}
+
+sub cull {
+    my $ctx = context();
+    $ctx->hub->cull;
+    $ctx->release;
+}
+
+1;
+
+__END__
+
+=pod
+
+=encoding UTF-8
+
+=head1 NAME
+
+Test2::IPC - Turn on IPC for threading or forking support.
+
+=head1 SYNOPSIS
+
+You should C<use Test2::IPC;> as early as possible in your test file. If you
+import this module after API initialization it will attempt to retrofit IPC
+onto the existing hubs.
+
+=head2 DISABLING IT
+
+You can use C<no Test2::IPC;> to disable IPC for good. You can also use the
+T2_NO_IPC env var.
+
+=head1 EXPORTS
+
+All exports are optional.
+
+=over 4
+
+=item cull()
+
+Cull allows you to collect results from other processes or threads on demand.
+
+=back
+
+=head1 SOURCE
+
+The source code repository for Test2 can be found at
+L<https://github.com/Test-More/test-more/>.
+
+=head1 MAINTAINERS
+
+=over 4
+
+=item Chad Granum E<lt>exodist@cpan.orgE<gt>
+
+=back
+
+=head1 AUTHORS
+
+=over 4
+
+=item Chad Granum E<lt>exodist@cpan.orgE<gt>
+
+=back
+
+=head1 COPYRIGHT
+
+Copyright 2020 Chad Granum E<lt>exodist@cpan.orgE<gt>.
+
+This program is free software; you can redistribute it and/or
+modify it under the same terms as Perl itself.
+
+See L<https://dev.perl.org/licenses/>
+
+=cut
+                                                                                                                                                                                                                                                                                                                                                                                                                        usr/local/lib/perl5/5.40.0/Test2/Manual/                                                            0000755 0000000 0000000 00000000000 14714567415 015724  5                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        usr/local/lib/perl5/5.40.0/Test2/Manual/Anatomy/                                                    0000755 0000000 0000000 00000000000 14714567415 017334  5                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        usr/local/lib/perl5/5.40.0/Test2/Manual/Anatomy/API.pm                                              0000444 0000000 0000000 00000003615 14714567415 020306  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        package Test2::Manual::Anatomy::API;
+use strict;
+use warnings;
+
+our $VERSION = '0.000162';
+
+1;
+
+__END__
+
+=head1 NAME
+
+Test2::Manual::Anatomy::API - Internals documentation for the API.
+
+=head1 DESCRIPTION
+
+This document covers some of the internals of L<Test2::API>.
+
+=head1 IMPLEMENTATION DETAILS
+
+=head2 Test2::API
+
+L<Test2::API> provides a functional interface to any test2 global state. This
+API should be preserved regardless of internal details of how and where the
+global state is stored.
+
+This module itself does not store any state (with a few minor exceptions) but
+instead relies on L<Test2::API::Instance> to store state. This module is really
+intended to be the layer between the consumer and the implementation details.
+Ideally the implementation details can change any way they like, and this
+module can be updated to use the new details without breaking anything.
+
+=head2 Test2::API::Instance
+
+L<Test2::API::Instance> is where the global state is actually managed. This is
+an implementation detail, and should not be relied upon. It is entirely
+possible that L<Test2::API::Instance> could be removed completely, or changed
+in incompatible ways. Really these details are free to change so long as
+L<Test2::API> is not broken.
+
+L<Test2::API::Instance> is fairly well documented, so no additionally
+documentation is needed for this manual page.
+
+=head1 SEE ALSO
+
+L<Test2::Manual> - Primary index of the manual.
+
+=head1 SOURCE
+
+The source code repository for Test2-Manual can be found at
+F<https://github.com/Test-More/Test2-Suite/>.
+
+=head1 MAINTAINERS
+
+=over 4
+
+=item Chad Granum E<lt>exodist@cpan.orgE<gt>
+
+=back
+
+=head1 AUTHORS
+
+=over 4
+
+=item Chad Granum E<lt>exodist@cpan.orgE<gt>
+
+=back
+
+=head1 COPYRIGHT
+
+Copyright 2018 Chad Granum E<lt>exodist@cpan.orgE<gt>.
+
+This program is free software; you can redistribute it and/or
+modify it under the same terms as Perl itself.
+
+See F<http://dev.perl.org/licenses/>
+
+=cut
+                                                                                                                   usr/local/lib/perl5/5.40.0/Test2/Manual/Anatomy/Context.pm                                          0000444 0000000 0000000 00000007260 14714567415 021321  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        package Test2::Manual::Anatomy::Context;
+use strict;
+use warnings;
+
+our $VERSION = '0.000162';
+
+1;
+
+__END__
+
+=head1 NAME
+
+Test2::Manual::Anatomy::Context - Internals documentation for the Context
+objects.
+
+=head1 DESCRIPTION
+
+This document explains how the L<Test2::API::Context> object works.
+
+=head1 WHAT IS THE CONTEXT OBJECT?
+
+The context object is one of the key components of Test2, and makes many
+features possible that would otherwise be impossible. Every test tool starts by
+getting a context, and ends by releasing the context. A test tool does all its
+work between getting and releasing the context. The context instance is the
+primary interface for sending events to the Test2 stack. Finally the context
+system is responsible for tracking what file and line number a tool operates
+on, which is critical for debugging.
+
+=head2 PRIMARY INTERFACE FOR TEST TOOLS
+
+Nearly every Test2 based tool should start by calling C<$ctx =
+Test2::API::context()> in order to get a context object, and should end by
+calling C<< $ctx->release() >>. Once a tool has its context object it can call
+methods on the object to send events or have other effects. Nearly everything a
+test tool needs to do should be done through the context object.
+
+=head2 TRACK FILE AND LINE NUMBERS FOR ERROR REPORTING
+
+When you call C<Test2::API::Context> a new context object will be returned. If
+there is already a context object in effect (from a different point in the
+stack) you will get a clone of the existing one. If there is not already a
+current context then a completely new one will be generated. When a new context
+is generated Test2 will determine the file name and line number for your test
+code, these will be used when reporting any failures.
+
+Typically the file and line number will be determined using C<caller()> to look
+at your tools caller. The C<$Test::Builder::Level> will be respected if
+detected, but is discouraged in favor of just using context objects at every
+level.
+
+When calling C<Test2::API::Context()> you can specify the
+C<< level => $count >> arguments if you need to look at a deeper caller.
+
+=head2 PRESERVE $?, $!, $^E AND $@
+
+When you call C<Test2::API::context()> the current values of C<$?>, C<$!>,
+C<$^E>, and C<$@> are stored in the context object itself. Whenever the context
+is released the original values of these variables will be restored. This
+protects the variables from any side effects caused by testing tools.
+
+=head2 FINALIZE THE API STATE
+
+L<Test2::API> works via a hidden singleton instance of L<Test2::API::Instance>.
+The singleton has some state that is not set in stone until the last possible
+minute. The last possible minute happens to be the first time a context is
+acquired. State includes IPC instance, Formatter class, Root PID, etc.
+
+=head2 FIND/CREATE THE CURRENT/ROOT HUB
+
+L<Test2> has a stack of hubs, the stack can be accessed via
+L<Test2::API::test2_stack>. When you get a context it will find the current
+hub, if there is no current hub then the root one will be initialized.
+
+=head2 PROVIDE HOOKS
+
+There are hooks that run when contexts are created, found, and released. See
+L<Test2::API> for details on these hooks and how to use them.
+
+=head1 SEE ALSO
+
+L<Test2::Manual> - Primary index of the manual.
+
+=head1 SOURCE
+
+The source code repository for Test2-Manual can be found at
+F<https://github.com/Test-More/Test2-Suite/>.
+
+=head1 MAINTAINERS
+
+=over 4
+
+=item Chad Granum E<lt>exodist@cpan.orgE<gt>
+
+=back
+
+=head1 AUTHORS
+
+=over 4
+
+=item Chad Granum E<lt>exodist@cpan.orgE<gt>
+
+=back
+
+=head1 COPYRIGHT
+
+Copyright 2018 Chad Granum E<lt>exodist@cpan.orgE<gt>.
+
+This program is free software; you can redistribute it and/or
+modify it under the same terms as Perl itself.
+
+See F<http://dev.perl.org/licenses/>
+

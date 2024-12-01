@@ -1,0 +1,1000 @@
+#pod =cut
+
+sub tempfile {
+  if ( @_ && $_[0] eq 'File::Temp' ) {
+      croak "'tempfile' can't be called as a method";
+  }
+  # Can not check for argument count since we can have any
+  # number of args
+
+  # Default options
+  my %options = (
+                 "DIR"    => undef, # Directory prefix
+                 "SUFFIX" => '',    # Template suffix
+                 "UNLINK" => 0,     # Do not unlink file on exit
+                 "OPEN"   => 1,     # Open file
+                 "TMPDIR" => 0,     # Place tempfile in tempdir if template specified
+                 "EXLOCK" => 0,     # Open file with O_EXLOCK
+                 "PERMS"  => undef, # File permissions
+                );
+
+  # Check to see whether we have an odd or even number of arguments
+  my ($maybe_template, $args) = _parse_args(@_);
+  my $template = @$maybe_template ? $maybe_template->[0] : undef;
+
+  # Read the options and merge with defaults
+  %options = (%options, %$args);
+
+  # First decision is whether or not to open the file
+  if (! $options{"OPEN"}) {
+
+    warn "tempfile(): temporary filename requested but not opened.\nPossibly unsafe, consider using tempfile() with OPEN set to true\n"
+      if $^W;
+
+  }
+
+  if ($options{"DIR"} and $^O eq 'VMS') {
+
+    # on VMS turn []foo into [.foo] for concatenation
+    $options{"DIR"} = VMS::Filespec::vmspath($options{"DIR"});
+  }
+
+  # Construct the template
+
+  # Have a choice of trying to work around the mkstemp/mktemp/tmpnam etc
+  # functions or simply constructing a template and using _gettemp()
+  # explicitly. Go for the latter
+
+  # First generate a template if not defined and prefix the directory
+  # If no template must prefix the temp directory
+  if (defined $template) {
+    # End up with current directory if neither DIR not TMPDIR are set
+    if ($options{"DIR"}) {
+
+      $template = File::Spec->catfile($options{"DIR"}, $template);
+
+    } elsif ($options{TMPDIR}) {
+
+      $template = File::Spec->catfile(_wrap_file_spec_tmpdir(), $template );
+
+    }
+
+  } else {
+
+    if ($options{"DIR"}) {
+
+      $template = File::Spec->catfile($options{"DIR"}, TEMPXXX);
+
+    } else {
+
+      $template = File::Spec->catfile(_wrap_file_spec_tmpdir(), TEMPXXX);
+
+    }
+
+  }
+
+  # Now add a suffix
+  $template .= $options{"SUFFIX"};
+
+  # Determine whether we should tell _gettemp to unlink the file
+  # On unix this is irrelevant and can be worked out after the file is
+  # opened (simply by unlinking the open filehandle). On Windows or VMS
+  # we have to indicate temporary-ness when we open the file. In general
+  # we only want a true temporary file if we are returning just the
+  # filehandle - if the user wants the filename they probably do not
+  # want the file to disappear as soon as they close it (which may be
+  # important if they want a child process to use the file)
+  # For this reason, tie unlink_on_close to the return context regardless
+  # of OS.
+  my $unlink_on_close = ( wantarray ? 0 : 1);
+
+  # Create the file
+  my ($fh, $path, $errstr);
+  croak "Error in tempfile() using template $template: $errstr"
+    unless (($fh, $path) = _gettemp($template,
+                                    "open"             => $options{OPEN},
+                                    "mkdir"            => 0,
+                                    "unlink_on_close"  => $unlink_on_close,
+                                    "suffixlen"        => length($options{SUFFIX}),
+                                    "ErrStr"           => \$errstr,
+                                    "use_exlock"       => $options{EXLOCK},
+                                    "file_permissions" => $options{PERMS},
+                                   ) );
+
+  # Set up an exit handler that can do whatever is right for the
+  # system. This removes files at exit when requested explicitly or when
+  # system is asked to unlink_on_close but is unable to do so because
+  # of OS limitations.
+  # The latter should be achieved by using a tied filehandle.
+  # Do not check return status since this is all done with END blocks.
+  _deferred_unlink($fh, $path, 0) if $options{"UNLINK"};
+
+  # Return
+  if (wantarray()) {
+
+    if ($options{'OPEN'}) {
+      return ($fh, $path);
+    } else {
+      return (undef, $path);
+    }
+
+  } else {
+
+    # Unlink the file. It is up to unlink0 to decide what to do with
+    # this (whether to unlink now or to defer until later)
+    unlink0($fh, $path) or croak "Error unlinking file $path using unlink0";
+
+    # Return just the filehandle.
+    return $fh;
+  }
+
+
+}
+
+# On Windows under taint mode, File::Spec could suggest "C:\" as a tempdir
+# which might not be writable.  If that is the case, we fallback to a
+# user directory.  See https://rt.cpan.org/Ticket/Display.html?id=60340
+
+{
+  my ($alt_tmpdir, $checked);
+
+  sub _wrap_file_spec_tmpdir {
+    return File::Spec->tmpdir unless $^O eq "MSWin32" && ${^TAINT};
+
+    if ( $checked ) {
+      return $alt_tmpdir ? $alt_tmpdir : File::Spec->tmpdir;
+    }
+
+    # probe what File::Spec gives and find a fallback
+    my $xxpath = _replace_XX( "X" x 10, 0 );
+
+    # First, see if File::Spec->tmpdir is writable
+    my $tmpdir = File::Spec->tmpdir;
+    my $testpath = File::Spec->catdir( $tmpdir, $xxpath );
+    if (mkdir( $testpath, 0700) ) {
+      $checked = 1;
+      rmdir $testpath;
+      return $tmpdir;
+    }
+
+    # Next, see if CSIDL_LOCAL_APPDATA is writable
+    require Win32;
+    my $local_app = File::Spec->catdir(
+      Win32::GetFolderPath( Win32::CSIDL_LOCAL_APPDATA() ), 'Temp'
+    );
+    $testpath = File::Spec->catdir( $local_app, $xxpath );
+    if ( -e $local_app or mkdir( $local_app, 0700 ) ) {
+      if (mkdir( $testpath, 0700) ) {
+        $checked = 1;
+        rmdir $testpath;
+        return $alt_tmpdir = $local_app;
+      }
+    }
+
+    # Can't find something writable
+    croak << "HERE";
+Couldn't find a writable temp directory in taint mode. Tried:
+  $tmpdir
+  $local_app
+
+Try setting and untainting the TMPDIR environment variable.
+HERE
+
+  }
+}
+
+#pod =item B<tempdir>
+#pod
+#pod This is the recommended interface for creation of temporary
+#pod directories.  By default the directory will not be removed on exit
+#pod (that is, it won't be temporary; this behaviour can not be changed
+#pod because of issues with backwards compatibility). To enable removal
+#pod either use the CLEANUP option which will trigger removal on program
+#pod exit, or consider using the "newdir" method in the object interface which
+#pod will allow the directory to be cleaned up when the object goes out of
+#pod scope.
+#pod
+#pod The behaviour of the function depends on the arguments:
+#pod
+#pod   $tempdir = tempdir();
+#pod
+#pod Create a directory in tmpdir() (see L<File::Spec|File::Spec>).
+#pod
+#pod   $tempdir = tempdir( $template );
+#pod
+#pod Create a directory from the supplied template. This template is
+#pod similar to that described for tempfile(). `X' characters at the end
+#pod of the template are replaced with random letters to construct the
+#pod directory name. At least four `X' characters must be in the template.
+#pod
+#pod   $tempdir = tempdir ( DIR => $dir );
+#pod
+#pod Specifies the directory to use for the temporary directory.
+#pod The temporary directory name is derived from an internal template.
+#pod
+#pod   $tempdir = tempdir ( $template, DIR => $dir );
+#pod
+#pod Prepend the supplied directory name to the template. The template
+#pod should not include parent directory specifications itself. Any parent
+#pod directory specifications are removed from the template before
+#pod prepending the supplied directory.
+#pod
+#pod   $tempdir = tempdir ( $template, TMPDIR => 1 );
+#pod
+#pod Using the supplied template, create the temporary directory in
+#pod a standard location for temporary files. Equivalent to doing
+#pod
+#pod   $tempdir = tempdir ( $template, DIR => File::Spec->tmpdir);
+#pod
+#pod but shorter. Parent directory specifications are stripped from the
+#pod template itself. The C<TMPDIR> option is ignored if C<DIR> is set
+#pod explicitly.  Additionally, C<TMPDIR> is implied if neither a template
+#pod nor a directory are supplied.
+#pod
+#pod   $tempdir = tempdir( $template, CLEANUP => 1);
+#pod
+#pod Create a temporary directory using the supplied template, but
+#pod attempt to remove it (and all files inside it) when the program
+#pod exits. Note that an attempt will be made to remove all files from
+#pod the directory even if they were not created by this module (otherwise
+#pod why ask to clean it up?). The directory removal is made with
+#pod the rmtree() function from the L<File::Path|File::Path> module.
+#pod Of course, if the template is not specified, the temporary directory
+#pod will be created in tmpdir() and will also be removed at program exit.
+#pod
+#pod Will croak() if there is an error.
+#pod
+#pod Current API available since 0.05.
+#pod
+#pod =cut
+
+# '
+
+sub tempdir  {
+  if ( @_ && $_[0] eq 'File::Temp' ) {
+      croak "'tempdir' can't be called as a method";
+  }
+
+  # Can not check for argument count since we can have any
+  # number of args
+
+  # Default options
+  my %options = (
+                 "CLEANUP"    => 0, # Remove directory on exit
+                 "DIR"        => '', # Root directory
+                 "TMPDIR"     => 0,  # Use tempdir with template
+                );
+
+  # Check to see whether we have an odd or even number of arguments
+  my ($maybe_template, $args) = _parse_args(@_);
+  my $template = @$maybe_template ? $maybe_template->[0] : undef;
+
+  # Read the options and merge with defaults
+  %options = (%options, %$args);
+
+  # Modify or generate the template
+
+  # Deal with the DIR and TMPDIR options
+  if (defined $template) {
+
+    # Need to strip directory path if using DIR or TMPDIR
+    if ($options{'TMPDIR'} || $options{'DIR'}) {
+
+      # Strip parent directory from the filename
+      #
+      # There is no filename at the end
+      $template = VMS::Filespec::vmspath($template) if $^O eq 'VMS';
+      my ($volume, $directories, undef) = File::Spec->splitpath( $template, 1);
+
+      # Last directory is then our template
+      $template = (File::Spec->splitdir($directories))[-1];
+
+      # Prepend the supplied directory or temp dir
+      if ($options{"DIR"}) {
+
+        $template = File::Spec->catdir($options{"DIR"}, $template);
+
+      } elsif ($options{TMPDIR}) {
+
+        # Prepend tmpdir
+        $template = File::Spec->catdir(_wrap_file_spec_tmpdir(), $template);
+
+      }
+
+    }
+
+  } else {
+
+    if ($options{"DIR"}) {
+
+      $template = File::Spec->catdir($options{"DIR"}, TEMPXXX);
+
+    } else {
+
+      $template = File::Spec->catdir(_wrap_file_spec_tmpdir(), TEMPXXX);
+
+    }
+
+  }
+
+  # Create the directory
+  my $tempdir;
+  my $suffixlen = 0;
+  if ($^O eq 'VMS') {           # dir names can end in delimiters
+    $template =~ m/([\.\]:>]+)$/;
+    $suffixlen = length($1);
+  }
+  if ( ($^O eq 'MacOS') && (substr($template, -1) eq ':') ) {
+    # dir name has a trailing ':'
+    ++$suffixlen;
+  }
+
+  my $errstr;
+  croak "Error in tempdir() using $template: $errstr"
+    unless ((undef, $tempdir) = _gettemp($template,
+                                         "open" => 0,
+                                         "mkdir"=> 1 ,
+                                         "suffixlen" => $suffixlen,
+                                         "ErrStr" => \$errstr,
+                                        ) );
+
+  # Install exit handler; must be dynamic to get lexical
+  if ( $options{'CLEANUP'} && -d $tempdir) {
+    _deferred_unlink(undef, $tempdir, 1);
+  }
+
+  # Return the dir name
+  return $tempdir;
+
+}
+
+#pod =back
+#pod
+#pod =head1 MKTEMP FUNCTIONS
+#pod
+#pod The following functions are Perl implementations of the
+#pod mktemp() family of temp file generation system calls.
+#pod
+#pod =over 4
+#pod
+#pod =item B<mkstemp>
+#pod
+#pod Given a template, returns a filehandle to the temporary file and the name
+#pod of the file.
+#pod
+#pod   ($fh, $name) = mkstemp( $template );
+#pod
+#pod In scalar context, just the filehandle is returned.
+#pod
+#pod The template may be any filename with some number of X's appended
+#pod to it, for example F</tmp/temp.XXXX>. The trailing X's are replaced
+#pod with unique alphanumeric combinations.
+#pod
+#pod Will croak() if there is an error.
+#pod
+#pod Current API available since 0.05.
+#pod
+#pod =cut
+
+
+
+sub mkstemp {
+
+  croak "Usage: mkstemp(template)"
+    if scalar(@_) != 1;
+
+  my $template = shift;
+
+  my ($fh, $path, $errstr);
+  croak "Error in mkstemp using $template: $errstr"
+    unless (($fh, $path) = _gettemp($template,
+                                    "open" => 1,
+                                    "mkdir"=> 0 ,
+                                    "suffixlen" => 0,
+                                    "ErrStr" => \$errstr,
+                                   ) );
+
+  if (wantarray()) {
+    return ($fh, $path);
+  } else {
+    return $fh;
+  }
+
+}
+
+
+#pod =item B<mkstemps>
+#pod
+#pod Similar to mkstemp(), except that an extra argument can be supplied
+#pod with a suffix to be appended to the template.
+#pod
+#pod   ($fh, $name) = mkstemps( $template, $suffix );
+#pod
+#pod For example a template of C<testXXXXXX> and suffix of C<.dat>
+#pod would generate a file similar to F<testhGji_w.dat>.
+#pod
+#pod Returns just the filehandle alone when called in scalar context.
+#pod
+#pod Will croak() if there is an error.
+#pod
+#pod Current API available since 0.05.
+#pod
+#pod =cut
+
+sub mkstemps {
+
+  croak "Usage: mkstemps(template, suffix)"
+    if scalar(@_) != 2;
+
+
+  my $template = shift;
+  my $suffix   = shift;
+
+  $template .= $suffix;
+
+  my ($fh, $path, $errstr);
+  croak "Error in mkstemps using $template: $errstr"
+    unless (($fh, $path) = _gettemp($template,
+                                    "open" => 1,
+                                    "mkdir"=> 0 ,
+                                    "suffixlen" => length($suffix),
+                                    "ErrStr" => \$errstr,
+                                   ) );
+
+  if (wantarray()) {
+    return ($fh, $path);
+  } else {
+    return $fh;
+  }
+
+}
+
+#pod =item B<mkdtemp>
+#pod
+#pod Create a directory from a template. The template must end in
+#pod X's that are replaced by the routine.
+#pod
+#pod   $tmpdir_name = mkdtemp($template);
+#pod
+#pod Returns the name of the temporary directory created.
+#pod
+#pod Directory must be removed by the caller.
+#pod
+#pod Will croak() if there is an error.
+#pod
+#pod Current API available since 0.05.
+#pod
+#pod =cut
+
+#' # for emacs
+
+sub mkdtemp {
+
+  croak "Usage: mkdtemp(template)"
+    if scalar(@_) != 1;
+
+  my $template = shift;
+  my $suffixlen = 0;
+  if ($^O eq 'VMS') {           # dir names can end in delimiters
+    $template =~ m/([\.\]:>]+)$/;
+    $suffixlen = length($1);
+  }
+  if ( ($^O eq 'MacOS') && (substr($template, -1) eq ':') ) {
+    # dir name has a trailing ':'
+    ++$suffixlen;
+  }
+  my ($junk, $tmpdir, $errstr);
+  croak "Error creating temp directory from template $template\: $errstr"
+    unless (($junk, $tmpdir) = _gettemp($template,
+                                        "open" => 0,
+                                        "mkdir"=> 1 ,
+                                        "suffixlen" => $suffixlen,
+                                        "ErrStr" => \$errstr,
+                                       ) );
+
+  return $tmpdir;
+
+}
+
+#pod =item B<mktemp>
+#pod
+#pod Returns a valid temporary filename but does not guarantee
+#pod that the file will not be opened by someone else.
+#pod
+#pod   $unopened_file = mktemp($template);
+#pod
+#pod Template is the same as that required by mkstemp().
+#pod
+#pod Will croak() if there is an error.
+#pod
+#pod Current API available since 0.05.
+#pod
+#pod =cut
+
+sub mktemp {
+
+  croak "Usage: mktemp(template)"
+    if scalar(@_) != 1;
+
+  my $template = shift;
+
+  my ($tmpname, $junk, $errstr);
+  croak "Error getting name to temp file from template $template: $errstr"
+    unless (($junk, $tmpname) = _gettemp($template,
+                                         "open" => 0,
+                                         "mkdir"=> 0 ,
+                                         "suffixlen" => 0,
+                                         "ErrStr" => \$errstr,
+                                        ) );
+
+  return $tmpname;
+}
+
+#pod =back
+#pod
+#pod =head1 POSIX FUNCTIONS
+#pod
+#pod This section describes the re-implementation of the tmpnam()
+#pod and tmpfile() functions described in L<POSIX>
+#pod using the mkstemp() from this module.
+#pod
+#pod Unlike the L<POSIX|POSIX> implementations, the directory used
+#pod for the temporary file is not specified in a system include
+#pod file (C<P_tmpdir>) but simply depends on the choice of tmpdir()
+#pod returned by L<File::Spec|File::Spec>. On some implementations this
+#pod location can be set using the C<TMPDIR> environment variable, which
+#pod may not be secure.
+#pod If this is a problem, simply use mkstemp() and specify a template.
+#pod
+#pod =over 4
+#pod
+#pod =item B<tmpnam>
+#pod
+#pod When called in scalar context, returns the full name (including path)
+#pod of a temporary file (uses mktemp()). The only check is that the file does
+#pod not already exist, but there is no guarantee that that condition will
+#pod continue to apply.
+#pod
+#pod   $file = tmpnam();
+#pod
+#pod When called in list context, a filehandle to the open file and
+#pod a filename are returned. This is achieved by calling mkstemp()
+#pod after constructing a suitable template.
+#pod
+#pod   ($fh, $file) = tmpnam();
+#pod
+#pod If possible, this form should be used to prevent possible
+#pod race conditions.
+#pod
+#pod See L<File::Spec/tmpdir> for information on the choice of temporary
+#pod directory for a particular operating system.
+#pod
+#pod Will croak() if there is an error.
+#pod
+#pod Current API available since 0.05.
+#pod
+#pod =cut
+
+sub tmpnam {
+
+  # Retrieve the temporary directory name
+  my $tmpdir = _wrap_file_spec_tmpdir();
+
+  # XXX I don't know under what circumstances this occurs, -- xdg 2016-04-02
+  croak "Error temporary directory is not writable"
+    if $tmpdir eq '';
+
+  # Use a ten character template and append to tmpdir
+  my $template = File::Spec->catfile($tmpdir, TEMPXXX);
+
+  if (wantarray() ) {
+    return mkstemp($template);
+  } else {
+    return mktemp($template);
+  }
+
+}
+
+#pod =item B<tmpfile>
+#pod
+#pod Returns the filehandle of a temporary file.
+#pod
+#pod   $fh = tmpfile();
+#pod
+#pod The file is removed when the filehandle is closed or when the program
+#pod exits. No access to the filename is provided.
+#pod
+#pod If the temporary file can not be created undef is returned.
+#pod Currently this command will probably not work when the temporary
+#pod directory is on an NFS file system.
+#pod
+#pod Will croak() if there is an error.
+#pod
+#pod Available since 0.05.
+#pod
+#pod Returning undef if unable to create file added in 0.12.
+#pod
+#pod =cut
+
+sub tmpfile {
+
+  # Simply call tmpnam() in a list context
+  my ($fh, $file) = tmpnam();
+
+  # Make sure file is removed when filehandle is closed
+  # This will fail on NFS
+  unlink0($fh, $file)
+    or return undef;
+
+  return $fh;
+
+}
+
+#pod =back
+#pod
+#pod =head1 ADDITIONAL FUNCTIONS
+#pod
+#pod These functions are provided for backwards compatibility
+#pod with common tempfile generation C library functions.
+#pod
+#pod They are not exported and must be addressed using the full package
+#pod name.
+#pod
+#pod =over 4
+#pod
+#pod =item B<tempnam>
+#pod
+#pod Return the name of a temporary file in the specified directory
+#pod using a prefix. The file is guaranteed not to exist at the time
+#pod the function was called, but such guarantees are good for one
+#pod clock tick only.  Always use the proper form of C<sysopen>
+#pod with C<O_CREAT | O_EXCL> if you must open such a filename.
+#pod
+#pod   $filename = File::Temp::tempnam( $dir, $prefix );
+#pod
+#pod Equivalent to running mktemp() with $dir/$prefixXXXXXXXX
+#pod (using unix file convention as an example)
+#pod
+#pod Because this function uses mktemp(), it can suffer from race conditions.
+#pod
+#pod Will croak() if there is an error.
+#pod
+#pod Current API available since 0.05.
+#pod
+#pod =cut
+
+sub tempnam {
+
+  croak 'Usage tempnam($dir, $prefix)' unless scalar(@_) == 2;
+
+  my ($dir, $prefix) = @_;
+
+  # Add a string to the prefix
+  $prefix .= 'XXXXXXXX';
+
+  # Concatenate the directory to the file
+  my $template = File::Spec->catfile($dir, $prefix);
+
+  return mktemp($template);
+
+}
+
+#pod =back
+#pod
+#pod =head1 UTILITY FUNCTIONS
+#pod
+#pod Useful functions for dealing with the filehandle and filename.
+#pod
+#pod =over 4
+#pod
+#pod =item B<unlink0>
+#pod
+#pod Given an open filehandle and the associated filename, make a safe
+#pod unlink. This is achieved by first checking that the filename and
+#pod filehandle initially point to the same file and that the number of
+#pod links to the file is 1 (all fields returned by stat() are compared).
+#pod Then the filename is unlinked and the filehandle checked once again to
+#pod verify that the number of links on that file is now 0.  This is the
+#pod closest you can come to making sure that the filename unlinked was the
+#pod same as the file whose descriptor you hold.
+#pod
+#pod   unlink0($fh, $path)
+#pod      or die "Error unlinking file $path safely";
+#pod
+#pod Returns false on error but croaks() if there is a security
+#pod anomaly. The filehandle is not closed since on some occasions this is
+#pod not required.
+#pod
+#pod On some platforms, for example Windows NT, it is not possible to
+#pod unlink an open file (the file must be closed first). On those
+#pod platforms, the actual unlinking is deferred until the program ends and
+#pod good status is returned. A check is still performed to make sure that
+#pod the filehandle and filename are pointing to the same thing (but not at
+#pod the time the end block is executed since the deferred removal may not
+#pod have access to the filehandle).
+#pod
+#pod Additionally, on Windows NT not all the fields returned by stat() can
+#pod be compared. For example, the C<dev> and C<rdev> fields seem to be
+#pod different.  Also, it seems that the size of the file returned by stat()
+#pod does not always agree, with C<stat(FH)> being more accurate than
+#pod C<stat(filename)>, presumably because of caching issues even when
+#pod using autoflush (this is usually overcome by waiting a while after
+#pod writing to the tempfile before attempting to C<unlink0> it).
+#pod
+#pod Finally, on NFS file systems the link count of the file handle does
+#pod not always go to zero immediately after unlinking. Currently, this
+#pod command is expected to fail on NFS disks.
+#pod
+#pod This function is disabled if the global variable $KEEP_ALL is true
+#pod and an unlink on open file is supported. If the unlink is to be deferred
+#pod to the END block, the file is still registered for removal.
+#pod
+#pod This function should not be called if you are using the object oriented
+#pod interface since the it will interfere with the object destructor deleting
+#pod the file.
+#pod
+#pod Available Since 0.05.
+#pod
+#pod If can not unlink open file, defer removal until later available since 0.06.
+#pod
+#pod =cut
+
+sub unlink0 {
+
+  croak 'Usage: unlink0(filehandle, filename)'
+    unless scalar(@_) == 2;
+
+  # Read args
+  my ($fh, $path) = @_;
+
+  cmpstat($fh, $path) or return 0;
+
+  # attempt remove the file (does not work on some platforms)
+  if (_can_unlink_opened_file()) {
+
+    # return early (Without unlink) if we have been instructed to retain files.
+    return 1 if $KEEP_ALL;
+
+    # XXX: do *not* call this on a directory; possible race
+    #      resulting in recursive removal
+    croak "unlink0: $path has become a directory!" if -d $path;
+    unlink($path) or return 0;
+
+    # Stat the filehandle
+    my @fh = stat $fh;
+
+    print "Link count = $fh[3] \n" if $DEBUG;
+
+    # Make sure that the link count is zero
+    # - Cygwin provides deferred unlinking, however,
+    #   on Win9x the link count remains 1
+    # On NFS the link count may still be 1 but we can't know that
+    # we are on NFS.  Since we can't be sure, we'll defer it
+
+    return 1 if $fh[3] == 0 || $^O eq 'cygwin';
+  }
+  # fall-through if we can't unlink now
+  _deferred_unlink($fh, $path, 0);
+  return 1;
+}
+
+#pod =item B<cmpstat>
+#pod
+#pod Compare C<stat> of filehandle with C<stat> of provided filename.  This
+#pod can be used to check that the filename and filehandle initially point
+#pod to the same file and that the number of links to the file is 1 (all
+#pod fields returned by stat() are compared).
+#pod
+#pod   cmpstat($fh, $path)
+#pod      or die "Error comparing handle with file";
+#pod
+#pod Returns false if the stat information differs or if the link count is
+#pod greater than 1. Calls croak if there is a security anomaly.
+#pod
+#pod On certain platforms, for example Windows, not all the fields returned by stat()
+#pod can be compared. For example, the C<dev> and C<rdev> fields seem to be
+#pod different in Windows.  Also, it seems that the size of the file
+#pod returned by stat() does not always agree, with C<stat(FH)> being more
+#pod accurate than C<stat(filename)>, presumably because of caching issues
+#pod even when using autoflush (this is usually overcome by waiting a while
+#pod after writing to the tempfile before attempting to C<unlink0> it).
+#pod
+#pod Not exported by default.
+#pod
+#pod Current API available since 0.14.
+#pod
+#pod =cut
+
+sub cmpstat {
+
+  croak 'Usage: cmpstat(filehandle, filename)'
+    unless scalar(@_) == 2;
+
+  # Read args
+  my ($fh, $path) = @_;
+
+  warn "Comparing stat\n"
+    if $DEBUG;
+
+  # Stat the filehandle - which may be closed if someone has manually
+  # closed the file. Can not turn off warnings without using $^W
+  # unless we upgrade to 5.006 minimum requirement
+  my @fh;
+  {
+    local ($^W) = 0;
+    @fh = stat $fh;
+  }
+  return unless @fh;
+
+  if ($fh[3] > 1 && $^W) {
+    carp "unlink0: fstat found too many links; SB=@fh" if $^W;
+  }
+
+  # Stat the path
+  my @path = stat $path;
+
+  unless (@path) {
+    carp "unlink0: $path is gone already" if $^W;
+    return;
+  }
+
+  # this is no longer a file, but may be a directory, or worse
+  unless (-f $path) {
+    confess "panic: $path is no longer a file: SB=@fh";
+  }
+
+  # Do comparison of each member of the array
+  # On WinNT dev and rdev seem to be different
+  # depending on whether it is a file or a handle.
+  # Cannot simply compare all members of the stat return
+  # Select the ones we can use
+  my @okstat = (0..$#fh);       # Use all by default
+  if ($^O eq 'MSWin32') {
+    @okstat = (1,2,3,4,5,7,8,9,10);
+  } elsif ($^O eq 'os2') {
+    @okstat = (0, 2..$#fh);
+  } elsif ($^O eq 'VMS') {      # device and file ID are sufficient
+    @okstat = (0, 1);
+  } elsif ($^O eq 'dos') {
+    @okstat = (0,2..7,11..$#fh);
+  } elsif ($^O eq 'mpeix') {
+    @okstat = (0..4,8..10);
+  }
+
+  # Now compare each entry explicitly by number
+  for (@okstat) {
+    print "Comparing: $_ : $fh[$_] and $path[$_]\n" if $DEBUG;
+    # Use eq rather than == since rdev, blksize, and blocks (6, 11,
+    # and 12) will be '' on platforms that do not support them.  This
+    # is fine since we are only comparing integers.
+    unless ($fh[$_] eq $path[$_]) {
+      warn "Did not match $_ element of stat\n" if $DEBUG;
+      return 0;
+    }
+  }
+
+  return 1;
+}
+
+#pod =item B<unlink1>
+#pod
+#pod Similar to C<unlink0> except after file comparison using cmpstat, the
+#pod filehandle is closed prior to attempting to unlink the file. This
+#pod allows the file to be removed without using an END block, but does
+#pod mean that the post-unlink comparison of the filehandle state provided
+#pod by C<unlink0> is not available.
+#pod
+#pod   unlink1($fh, $path)
+#pod      or die "Error closing and unlinking file";
+#pod
+#pod Usually called from the object destructor when using the OO interface.
+#pod
+#pod Not exported by default.
+#pod
+#pod This function is disabled if the global variable $KEEP_ALL is true.
+#pod
+#pod Can call croak() if there is a security anomaly during the stat()
+#pod comparison.
+#pod
+#pod Current API available since 0.14.
+#pod
+#pod =cut
+
+sub unlink1 {
+  croak 'Usage: unlink1(filehandle, filename)'
+    unless scalar(@_) == 2;
+
+  # Read args
+  my ($fh, $path) = @_;
+
+  cmpstat($fh, $path) or return 0;
+
+  # Close the file
+  close( $fh ) or return 0;
+
+  # Make sure the file is writable (for windows)
+  _force_writable( $path );
+
+  # return early (without unlink) if we have been instructed to retain files.
+  return 1 if $KEEP_ALL;
+
+  # remove the file
+  return unlink($path);
+}
+
+#pod =item B<cleanup>
+#pod
+#pod Calling this function will cause any temp files or temp directories
+#pod that are registered for removal to be removed. This happens automatically
+#pod when the process exits but can be triggered manually if the caller is sure
+#pod that none of the temp files are required. This method can be registered as
+#pod an Apache callback.
+#pod
+#pod Note that if a temp directory is your current directory, it cannot be
+#pod removed.  C<chdir()> out of the directory first before calling
+#pod C<cleanup()>. (For the cleanup at program exit when the CLEANUP flag
+#pod is set, this happens automatically.)
+#pod
+#pod On OSes where temp files are automatically removed when the temp file
+#pod is closed, calling this function will have no effect other than to remove
+#pod temporary directories (which may include temporary files).
+#pod
+#pod   File::Temp::cleanup();
+#pod
+#pod Not exported by default.
+#pod
+#pod Current API available since 0.15.
+#pod
+#pod =back
+#pod
+#pod =head1 PACKAGE VARIABLES
+#pod
+#pod These functions control the global state of the package.
+#pod
+#pod =over 4
+#pod
+#pod =item B<safe_level>
+#pod
+#pod Controls the lengths to which the module will go to check the safety of the
+#pod temporary file or directory before proceeding.
+#pod Options are:
+#pod
+#pod =over 8
+#pod
+#pod =item STANDARD
+#pod
+#pod Do the basic security measures to ensure the directory exists and is
+#pod writable, that temporary files are opened only if they do not already
+#pod exist, and that possible race conditions are avoided.  Finally the
+#pod L<unlink0|"unlink0"> function is used to remove files safely.
+#pod
+#pod =item MEDIUM
+#pod
+#pod In addition to the STANDARD security, the output directory is checked
+#pod to make sure that it is owned either by root or the user running the
+#pod program. If the directory is writable by group or by other, it is then
+#pod checked to make sure that the sticky bit is set.
+#pod
+#pod Will not work on platforms that do not support the C<-k> test
+#pod for sticky bit.
+#pod
+#pod =item HIGH
+#pod
+#pod In addition to the MEDIUM security checks, also check for the
+#pod possibility of ``chown() giveaway'' using the L<POSIX|POSIX>
+#pod sysconf() function. If this is a possibility, each directory in the
+#pod path is checked in turn for safeness, recursively walking back to the
+#pod root directory.
+#pod
+#pod For platforms that do not support the L<POSIX|POSIX>
+#pod C<_PC_CHOWN_RESTRICTED> symbol (for example, Windows NT) it is
+#pod assumed that ``chown() giveaway'' is possible and the recursive test
+#pod is performed.
+#pod
+#pod =back
+#pod
+#pod The level can be changed as follows:
+#pod
+#pod   File::Temp->safe_level( File::Temp::HIGH );
+#pod
+#pod The level constants are not exported by the module.

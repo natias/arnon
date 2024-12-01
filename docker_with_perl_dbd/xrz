@@ -1,0 +1,1000 @@
+    def __setitem__(self, k, v):
+        if not self._read:
+            self.read()
+        super(manifestfulltextcache, self).__setitem__(k, v)
+        self._dirty = True
+
+    def __delitem__(self, k):
+        if not self._read:
+            self.read()
+        super(manifestfulltextcache, self).__delitem__(k)
+        self._dirty = True
+
+    def get(self, k, default=None):
+        if not self._read:
+            self.read()
+        return super(manifestfulltextcache, self).get(k, default=default)
+
+    def clear(self, clear_persisted_data=False):
+        super(manifestfulltextcache, self).clear()
+        if clear_persisted_data:
+            self._dirty = True
+            self.write()
+        self._read = False
+
+
+# and upper bound of what we expect from compression
+# (real live value seems to be "3")
+MAXCOMPRESSION = 3
+
+
+class FastdeltaUnavailable(Exception):
+    """Exception raised when fastdelta isn't usable on a manifest."""
+
+
+@interfaceutil.implementer(repository.imanifeststorage)
+class manifestrevlog:
+    """A revlog that stores manifest texts. This is responsible for caching the
+    full-text manifest contents.
+    """
+
+    def __init__(
+        self,
+        nodeconstants,
+        opener,
+        tree=b'',
+        dirlogcache=None,
+        treemanifest=False,
+    ):
+        """Constructs a new manifest revlog
+
+        `indexfile` - used by extensions to have two manifests at once, like
+        when transitioning between flatmanifeset and treemanifests.
+
+        `treemanifest` - used to indicate this is a tree manifest revlog. Opener
+        options can also be used to make this a tree manifest revlog. The opener
+        option takes precedence, so if it is set to True, we ignore whatever
+        value is passed in to the constructor.
+        """
+        self.nodeconstants = nodeconstants
+        # During normal operations, we expect to deal with not more than four
+        # revs at a time (such as during commit --amend). When rebasing large
+        # stacks of commits, the number can go up, hence the config knob below.
+        cachesize = 4
+        optiontreemanifest = False
+        opts = getattr(opener, 'options', None)
+        if opts is not None:
+            cachesize = opts.get(b'manifestcachesize', cachesize)
+            optiontreemanifest = opts.get(b'treemanifest', False)
+
+        self._treeondisk = optiontreemanifest or treemanifest
+
+        self._fulltextcache = manifestfulltextcache(cachesize)
+
+        if tree:
+            assert self._treeondisk, (tree, b'opts is %r' % opts)
+
+        radix = b'00manifest'
+        if tree:
+            radix = b"meta/" + tree + radix
+
+        self.tree = tree
+
+        # The dirlogcache is kept on the root manifest log
+        if tree:
+            self._dirlogcache = dirlogcache
+        else:
+            self._dirlogcache = {b'': self}
+
+        self._revlog = revlog.revlog(
+            opener,
+            target=(revlog_constants.KIND_MANIFESTLOG, self.tree),
+            radix=radix,
+            # only root indexfile is cached
+            checkambig=not bool(tree),
+            mmaplargeindex=True,
+            upperboundcomp=MAXCOMPRESSION,
+            persistentnodemap=opener.options.get(b'persistent-nodemap', False),
+        )
+
+        self.index = self._revlog.index
+        self._generaldelta = self._revlog._generaldelta
+
+    def _setupmanifestcachehooks(self, repo):
+        """Persist the manifestfulltextcache on lock release"""
+        if not util.safehasattr(repo, b'_wlockref'):
+            return
+
+        self._fulltextcache._opener = repo.wcachevfs
+        if repo._currentlock(repo._wlockref) is None:
+            return
+
+        reporef = weakref.ref(repo)
+        manifestrevlogref = weakref.ref(self)
+
+        def persistmanifestcache(success):
+            # Repo is in an unknown state, do not persist.
+            if not success:
+                return
+
+            repo = reporef()
+            self = manifestrevlogref()
+            if repo is None or self is None:
+                return
+            if repo.manifestlog.getstorage(b'') is not self:
+                # there's a different manifest in play now, abort
+                return
+            self._fulltextcache.write()
+
+        repo._afterlock(persistmanifestcache)
+
+    @property
+    def fulltextcache(self):
+        return self._fulltextcache
+
+    def clearcaches(self, clear_persisted_data=False):
+        self._revlog.clearcaches()
+        self._fulltextcache.clear(clear_persisted_data=clear_persisted_data)
+        self._dirlogcache = {self.tree: self}
+
+    def dirlog(self, d):
+        if d:
+            assert self._treeondisk
+        if d not in self._dirlogcache:
+            mfrevlog = manifestrevlog(
+                self.nodeconstants,
+                self.opener,
+                d,
+                self._dirlogcache,
+                treemanifest=self._treeondisk,
+            )
+            self._dirlogcache[d] = mfrevlog
+        return self._dirlogcache[d]
+
+    def add(
+        self,
+        m,
+        transaction,
+        link,
+        p1,
+        p2,
+        added,
+        removed,
+        readtree=None,
+        match=None,
+    ):
+        """add some manifest entry in to the manifest log
+
+        input:
+
+          m:           the manifest dict we want to store
+          transaction: the open transaction
+          p1:          manifest-node of p1
+          p2:          manifest-node of p2
+          added:       file added/changed compared to parent
+          removed:     file removed compared to parent
+
+        tree manifest input:
+
+          readtree:    a function to read a subtree
+          match:       a filematcher for the subpart of the tree manifest
+        """
+        try:
+            if p1 not in self.fulltextcache:
+                raise FastdeltaUnavailable()
+            # If our first parent is in the manifest cache, we can
+            # compute a delta here using properties we know about the
+            # manifest up-front, which may save time later for the
+            # revlog layer.
+
+            _checkforbidden(added)
+            # combine the changed lists into one sorted iterator
+            work = heapq.merge(
+                [(x, False) for x in sorted(added)],
+                [(x, True) for x in sorted(removed)],
+            )
+
+            arraytext, deltatext = m.fastdelta(self.fulltextcache[p1], work)
+            cachedelta = self._revlog.rev(p1), deltatext
+            text = util.buffer(arraytext)
+            rev = self._revlog.addrevision(
+                text, transaction, link, p1, p2, cachedelta
+            )
+            n = self._revlog.node(rev)
+        except FastdeltaUnavailable:
+            # The first parent manifest isn't already loaded or the
+            # manifest implementation doesn't support fastdelta, so
+            # we'll just encode a fulltext of the manifest and pass
+            # that through to the revlog layer, and let it handle the
+            # delta process.
+            if self._treeondisk:
+                assert readtree, b"readtree must be set for treemanifest writes"
+                assert match, b"match must be specified for treemanifest writes"
+                m1 = readtree(self.tree, p1)
+                m2 = readtree(self.tree, p2)
+                n = self._addtree(
+                    m, transaction, link, m1, m2, readtree, match=match
+                )
+                arraytext = None
+            else:
+                text = m.text()
+                rev = self._revlog.addrevision(text, transaction, link, p1, p2)
+                n = self._revlog.node(rev)
+                arraytext = bytearray(text)
+
+        if arraytext is not None:
+            self.fulltextcache[n] = arraytext
+
+        return n
+
+    def _addtree(self, m, transaction, link, m1, m2, readtree, match):
+        # If the manifest is unchanged compared to one parent,
+        # don't write a new revision
+        if self.tree != b'' and (
+            m.unmodifiedsince(m1) or m.unmodifiedsince(m2)
+        ):
+            return m.node()
+
+        def writesubtree(subm, subp1, subp2, match):
+            sublog = self.dirlog(subm.dir())
+            sublog.add(
+                subm,
+                transaction,
+                link,
+                subp1,
+                subp2,
+                None,
+                None,
+                readtree=readtree,
+                match=match,
+            )
+
+        m.writesubtrees(m1, m2, writesubtree, match)
+        text = m.dirtext()
+        n = None
+        if self.tree != b'':
+            # Double-check whether contents are unchanged to one parent
+            if text == m1.dirtext():
+                n = m1.node()
+            elif text == m2.dirtext():
+                n = m2.node()
+
+        if not n:
+            rev = self._revlog.addrevision(
+                text, transaction, link, m1.node(), m2.node()
+            )
+            n = self._revlog.node(rev)
+
+        # Save nodeid so parent manifest can calculate its nodeid
+        m.setnode(n)
+        return n
+
+    def __len__(self):
+        return len(self._revlog)
+
+    def __iter__(self):
+        return self._revlog.__iter__()
+
+    def rev(self, node):
+        return self._revlog.rev(node)
+
+    def node(self, rev):
+        return self._revlog.node(rev)
+
+    def lookup(self, value):
+        return self._revlog.lookup(value)
+
+    def parentrevs(self, rev):
+        return self._revlog.parentrevs(rev)
+
+    def parents(self, node):
+        return self._revlog.parents(node)
+
+    def linkrev(self, rev):
+        return self._revlog.linkrev(rev)
+
+    def checksize(self):
+        return self._revlog.checksize()
+
+    def revision(self, node, _df=None):
+        return self._revlog.revision(node, _df=_df)
+
+    def rawdata(self, node, _df=None):
+        return self._revlog.rawdata(node, _df=_df)
+
+    def revdiff(self, rev1, rev2):
+        return self._revlog.revdiff(rev1, rev2)
+
+    def cmp(self, node, text):
+        return self._revlog.cmp(node, text)
+
+    def deltaparent(self, rev):
+        return self._revlog.deltaparent(rev)
+
+    def emitrevisions(
+        self,
+        nodes,
+        nodesorder=None,
+        revisiondata=False,
+        assumehaveparentrevisions=False,
+        deltamode=repository.CG_DELTAMODE_STD,
+        sidedata_helpers=None,
+    ):
+        return self._revlog.emitrevisions(
+            nodes,
+            nodesorder=nodesorder,
+            revisiondata=revisiondata,
+            assumehaveparentrevisions=assumehaveparentrevisions,
+            deltamode=deltamode,
+            sidedata_helpers=sidedata_helpers,
+        )
+
+    def addgroup(
+        self,
+        deltas,
+        linkmapper,
+        transaction,
+        alwayscache=False,
+        addrevisioncb=None,
+        duplicaterevisioncb=None,
+    ):
+        return self._revlog.addgroup(
+            deltas,
+            linkmapper,
+            transaction,
+            alwayscache=alwayscache,
+            addrevisioncb=addrevisioncb,
+            duplicaterevisioncb=duplicaterevisioncb,
+        )
+
+    def rawsize(self, rev):
+        return self._revlog.rawsize(rev)
+
+    def getstrippoint(self, minlink):
+        return self._revlog.getstrippoint(minlink)
+
+    def strip(self, minlink, transaction):
+        return self._revlog.strip(minlink, transaction)
+
+    def files(self):
+        return self._revlog.files()
+
+    def clone(self, tr, destrevlog, **kwargs):
+        if not isinstance(destrevlog, manifestrevlog):
+            raise error.ProgrammingError(b'expected manifestrevlog to clone()')
+
+        return self._revlog.clone(tr, destrevlog._revlog, **kwargs)
+
+    def storageinfo(
+        self,
+        exclusivefiles=False,
+        sharedfiles=False,
+        revisionscount=False,
+        trackedsize=False,
+        storedsize=False,
+    ):
+        return self._revlog.storageinfo(
+            exclusivefiles=exclusivefiles,
+            sharedfiles=sharedfiles,
+            revisionscount=revisionscount,
+            trackedsize=trackedsize,
+            storedsize=storedsize,
+        )
+
+    @property
+    def opener(self):
+        return self._revlog.opener
+
+    @opener.setter
+    def opener(self, value):
+        self._revlog.opener = value
+
+
+@interfaceutil.implementer(repository.imanifestlog)
+class manifestlog:
+    """A collection class representing the collection of manifest snapshots
+    referenced by commits in the repository.
+
+    In this situation, 'manifest' refers to the abstract concept of a snapshot
+    of the list of files in the given commit. Consumers of the output of this
+    class do not care about the implementation details of the actual manifests
+    they receive (i.e. tree or flat or lazily loaded, etc)."""
+
+    def __init__(self, opener, repo, rootstore, narrowmatch):
+        self.nodeconstants = repo.nodeconstants
+        usetreemanifest = False
+        cachesize = 4
+
+        opts = getattr(opener, 'options', None)
+        if opts is not None:
+            usetreemanifest = opts.get(b'treemanifest', usetreemanifest)
+            cachesize = opts.get(b'manifestcachesize', cachesize)
+
+        self._treemanifests = usetreemanifest
+
+        self._rootstore = rootstore
+        self._rootstore._setupmanifestcachehooks(repo)
+        self._narrowmatch = narrowmatch
+
+        # A cache of the manifestctx or treemanifestctx for each directory
+        self._dirmancache = {}
+        self._dirmancache[b''] = util.lrucachedict(cachesize)
+
+        self._cachesize = cachesize
+
+    def __getitem__(self, node):
+        """Retrieves the manifest instance for the given node. Throws a
+        LookupError if not found.
+        """
+        return self.get(b'', node)
+
+    def get(self, tree, node, verify=True):
+        """Retrieves the manifest instance for the given node. Throws a
+        LookupError if not found.
+
+        `verify` - if True an exception will be thrown if the node is not in
+                   the revlog
+        """
+        if node in self._dirmancache.get(tree, ()):
+            return self._dirmancache[tree][node]
+
+        if not self._narrowmatch.always():
+            if not self._narrowmatch.visitdir(tree[:-1]):
+                return excludeddirmanifestctx(self.nodeconstants, tree, node)
+        if tree:
+            if self._rootstore._treeondisk:
+                if verify:
+                    # Side-effect is LookupError is raised if node doesn't
+                    # exist.
+                    self.getstorage(tree).rev(node)
+
+                m = treemanifestctx(self, tree, node)
+            else:
+                raise error.Abort(
+                    _(
+                        b"cannot ask for manifest directory '%s' in a flat "
+                        b"manifest"
+                    )
+                    % tree
+                )
+        else:
+            if verify:
+                # Side-effect is LookupError is raised if node doesn't exist.
+                self._rootstore.rev(node)
+
+            if self._treemanifests:
+                m = treemanifestctx(self, b'', node)
+            else:
+                m = manifestctx(self, node)
+
+        if node != self.nodeconstants.nullid:
+            mancache = self._dirmancache.get(tree)
+            if not mancache:
+                mancache = util.lrucachedict(self._cachesize)
+                self._dirmancache[tree] = mancache
+            mancache[node] = m
+        return m
+
+    def getstorage(self, tree):
+        return self._rootstore.dirlog(tree)
+
+    def clearcaches(self, clear_persisted_data=False):
+        self._dirmancache.clear()
+        self._rootstore.clearcaches(clear_persisted_data=clear_persisted_data)
+
+    def rev(self, node):
+        return self._rootstore.rev(node)
+
+    def update_caches(self, transaction):
+        return self._rootstore._revlog.update_caches(transaction=transaction)
+
+
+@interfaceutil.implementer(repository.imanifestrevisionwritable)
+class memmanifestctx:
+    def __init__(self, manifestlog):
+        self._manifestlog = manifestlog
+        self._manifestdict = manifestdict(manifestlog.nodeconstants.nodelen)
+
+    def _storage(self):
+        return self._manifestlog.getstorage(b'')
+
+    def copy(self):
+        memmf = memmanifestctx(self._manifestlog)
+        memmf._manifestdict = self.read().copy()
+        return memmf
+
+    def read(self):
+        return self._manifestdict
+
+    def write(self, transaction, link, p1, p2, added, removed, match=None):
+        return self._storage().add(
+            self._manifestdict,
+            transaction,
+            link,
+            p1,
+            p2,
+            added,
+            removed,
+            match=match,
+        )
+
+
+@interfaceutil.implementer(repository.imanifestrevisionstored)
+class manifestctx:
+    """A class representing a single revision of a manifest, including its
+    contents, its parent revs, and its linkrev.
+    """
+
+    def __init__(self, manifestlog, node):
+        self._manifestlog = manifestlog
+        self._data = None
+
+        self._node = node
+
+        # TODO: We eventually want p1, p2, and linkrev exposed on this class,
+        # but let's add it later when something needs it and we can load it
+        # lazily.
+        # self.p1, self.p2 = store.parents(node)
+        # rev = store.rev(node)
+        # self.linkrev = store.linkrev(rev)
+
+    def _storage(self):
+        return self._manifestlog.getstorage(b'')
+
+    def node(self):
+        return self._node
+
+    def copy(self):
+        memmf = memmanifestctx(self._manifestlog)
+        memmf._manifestdict = self.read().copy()
+        return memmf
+
+    @propertycache
+    def parents(self):
+        return self._storage().parents(self._node)
+
+    def read(self):
+        if self._data is None:
+            nc = self._manifestlog.nodeconstants
+            if self._node == nc.nullid:
+                self._data = manifestdict(nc.nodelen)
+            else:
+                store = self._storage()
+                if self._node in store.fulltextcache:
+                    text = pycompat.bytestr(store.fulltextcache[self._node])
+                else:
+                    text = store.revision(self._node)
+                    arraytext = bytearray(text)
+                    store.fulltextcache[self._node] = arraytext
+                self._data = manifestdict(nc.nodelen, text)
+        return self._data
+
+    def readfast(self, shallow=False):
+        """Calls either readdelta or read, based on which would be less work.
+        readdelta is called if the delta is against the p1, and therefore can be
+        read quickly.
+
+        If `shallow` is True, nothing changes since this is a flat manifest.
+        """
+        store = self._storage()
+        r = store.rev(self._node)
+        deltaparent = store.deltaparent(r)
+        if deltaparent != nullrev and deltaparent in store.parentrevs(r):
+            return self.readdelta()
+        return self.read()
+
+    def readdelta(self, shallow=False):
+        """Returns a manifest containing just the entries that are present
+        in this manifest, but not in its p1 manifest. This is efficient to read
+        if the revlog delta is already p1.
+
+        Changing the value of `shallow` has no effect on flat manifests.
+        """
+        store = self._storage()
+        r = store.rev(self._node)
+        d = mdiff.patchtext(store.revdiff(store.deltaparent(r), r))
+        return manifestdict(store.nodeconstants.nodelen, d)
+
+    def find(self, key):
+        return self.read().find(key)
+
+
+@interfaceutil.implementer(repository.imanifestrevisionwritable)
+class memtreemanifestctx:
+    def __init__(self, manifestlog, dir=b''):
+        self._manifestlog = manifestlog
+        self._dir = dir
+        self._treemanifest = treemanifest(manifestlog.nodeconstants)
+
+    def _storage(self):
+        return self._manifestlog.getstorage(b'')
+
+    def copy(self):
+        memmf = memtreemanifestctx(self._manifestlog, dir=self._dir)
+        memmf._treemanifest = self._treemanifest.copy()
+        return memmf
+
+    def read(self):
+        return self._treemanifest
+
+    def write(self, transaction, link, p1, p2, added, removed, match=None):
+        def readtree(dir, node):
+            return self._manifestlog.get(dir, node).read()
+
+        return self._storage().add(
+            self._treemanifest,
+            transaction,
+            link,
+            p1,
+            p2,
+            added,
+            removed,
+            readtree=readtree,
+            match=match,
+        )
+
+
+@interfaceutil.implementer(repository.imanifestrevisionstored)
+class treemanifestctx:
+    def __init__(self, manifestlog, dir, node):
+        self._manifestlog = manifestlog
+        self._dir = dir
+        self._data = None
+
+        self._node = node
+
+        # TODO: Load p1/p2/linkrev lazily. They need to be lazily loaded so that
+        # we can instantiate treemanifestctx objects for directories we don't
+        # have on disk.
+        # self.p1, self.p2 = store.parents(node)
+        # rev = store.rev(node)
+        # self.linkrev = store.linkrev(rev)
+
+    def _storage(self):
+        narrowmatch = self._manifestlog._narrowmatch
+        if not narrowmatch.always():
+            if not narrowmatch.visitdir(self._dir[:-1]):
+                return excludedmanifestrevlog(
+                    self._manifestlog.nodeconstants, self._dir
+                )
+        return self._manifestlog.getstorage(self._dir)
+
+    def read(self):
+        if self._data is None:
+            store = self._storage()
+            if self._node == self._manifestlog.nodeconstants.nullid:
+                self._data = treemanifest(self._manifestlog.nodeconstants)
+            # TODO accessing non-public API
+            elif store._treeondisk:
+                m = treemanifest(self._manifestlog.nodeconstants, dir=self._dir)
+
+                def gettext():
+                    return store.revision(self._node)
+
+                def readsubtree(dir, subm):
+                    # Set verify to False since we need to be able to create
+                    # subtrees for trees that don't exist on disk.
+                    return self._manifestlog.get(dir, subm, verify=False).read()
+
+                m.read(gettext, readsubtree)
+                m.setnode(self._node)
+                self._data = m
+            else:
+                if self._node in store.fulltextcache:
+                    text = pycompat.bytestr(store.fulltextcache[self._node])
+                else:
+                    text = store.revision(self._node)
+                    arraytext = bytearray(text)
+                    store.fulltextcache[self._node] = arraytext
+                self._data = treemanifest(
+                    self._manifestlog.nodeconstants, dir=self._dir, text=text
+                )
+
+        return self._data
+
+    def node(self):
+        return self._node
+
+    def copy(self):
+        memmf = memtreemanifestctx(self._manifestlog, dir=self._dir)
+        memmf._treemanifest = self.read().copy()
+        return memmf
+
+    @propertycache
+    def parents(self):
+        return self._storage().parents(self._node)
+
+    def readdelta(self, shallow=False):
+        """Returns a manifest containing just the entries that are present
+        in this manifest, but not in its p1 manifest. This is efficient to read
+        if the revlog delta is already p1.
+
+        If `shallow` is True, this will read the delta for this directory,
+        without recursively reading subdirectory manifests. Instead, any
+        subdirectory entry will be reported as it appears in the manifest, i.e.
+        the subdirectory will be reported among files and distinguished only by
+        its 't' flag.
+        """
+        store = self._storage()
+        if shallow:
+            r = store.rev(self._node)
+            d = mdiff.patchtext(store.revdiff(store.deltaparent(r), r))
+            return manifestdict(store.nodeconstants.nodelen, d)
+        else:
+            # Need to perform a slow delta
+            r0 = store.deltaparent(store.rev(self._node))
+            m0 = self._manifestlog.get(self._dir, store.node(r0)).read()
+            m1 = self.read()
+            md = treemanifest(self._manifestlog.nodeconstants, dir=self._dir)
+            for f, ((n0, fl0), (n1, fl1)) in m0.diff(m1).items():
+                if n1:
+                    md[f] = n1
+                    if fl1:
+                        md.setflag(f, fl1)
+            return md
+
+    def readfast(self, shallow=False):
+        """Calls either readdelta or read, based on which would be less work.
+        readdelta is called if the delta is against the p1, and therefore can be
+        read quickly.
+
+        If `shallow` is True, it only returns the entries from this manifest,
+        and not any submanifests.
+        """
+        store = self._storage()
+        r = store.rev(self._node)
+        deltaparent = store.deltaparent(r)
+        if deltaparent != nullrev and deltaparent in store.parentrevs(r):
+            return self.readdelta(shallow=shallow)
+
+        if shallow:
+            return manifestdict(
+                store.nodeconstants.nodelen, store.revision(self._node)
+            )
+        else:
+            return self.read()
+
+    def find(self, key):
+        return self.read().find(key)
+
+
+class excludeddir(treemanifest):
+    """Stand-in for a directory that is excluded from the repository.
+
+    With narrowing active on a repository that uses treemanifests,
+    some of the directory revlogs will be excluded from the resulting
+    clone. This is a huge storage win for clients, but means we need
+    some sort of pseudo-manifest to surface to internals so we can
+    detect a merge conflict outside the narrowspec. That's what this
+    class is: it stands in for a directory whose node is known, but
+    whose contents are unknown.
+    """
+
+    def __init__(self, nodeconstants, dir, node):
+        super(excludeddir, self).__init__(nodeconstants, dir)
+        self._node = node
+        # Add an empty file, which will be included by iterators and such,
+        # appearing as the directory itself (i.e. something like "dir/")
+        self._files[b''] = node
+        self._flags[b''] = b't'
+
+    # Manifests outside the narrowspec should never be modified, so avoid
+    # copying. This makes a noticeable difference when there are very many
+    # directories outside the narrowspec. Also, it makes sense for the copy to
+    # be of the same type as the original, which would not happen with the
+    # super type's copy().
+    def copy(self):
+        return self
+
+
+class excludeddirmanifestctx(treemanifestctx):
+    """context wrapper for excludeddir - see that docstring for rationale"""
+
+    def __init__(self, nodeconstants, dir, node):
+        self.nodeconstants = nodeconstants
+        self._dir = dir
+        self._node = node
+
+    def read(self):
+        return excludeddir(self.nodeconstants, self._dir, self._node)
+
+    def readfast(self, shallow=False):
+        # special version of readfast since we don't have underlying storage
+        return self.read()
+
+    def write(self, *args):
+        raise error.ProgrammingError(
+            b'attempt to write manifest from excluded dir %s' % self._dir
+        )
+
+
+class excludedmanifestrevlog(manifestrevlog):
+    """Stand-in for excluded treemanifest revlogs.
+
+    When narrowing is active on a treemanifest repository, we'll have
+    references to directories we can't see due to the revlog being
+    skipped. This class exists to conform to the manifestrevlog
+    interface for those directories and proactively prevent writes to
+    outside the narrowspec.
+    """
+
+    def __init__(self, nodeconstants, dir):
+        self.nodeconstants = nodeconstants
+        self._dir = dir
+
+    def __len__(self):
+        raise error.ProgrammingError(
+            b'attempt to get length of excluded dir %s' % self._dir
+        )
+
+    def rev(self, node):
+        raise error.ProgrammingError(
+            b'attempt to get rev from excluded dir %s' % self._dir
+        )
+
+    def linkrev(self, node):
+        raise error.ProgrammingError(
+            b'attempt to get linkrev from excluded dir %s' % self._dir
+        )
+
+    def node(self, rev):
+        raise error.ProgrammingError(
+            b'attempt to get node from excluded dir %s' % self._dir
+        )
+
+    def add(self, *args, **kwargs):
+        # We should never write entries in dirlogs outside the narrow clone.
+        # However, the method still gets called from writesubtree() in
+        # _addtree(), so we need to handle it. We should possibly make that
+        # avoid calling add() with a clean manifest (_dirty is always False
+        # in excludeddir instances).
+        pass
+                                                                                                                                                                                                                                                                                                                                                                                                                                       usr/lib/python3/dist-packages/mercurial/match.py                                                    0000644 0000000 0000000 00000150223 14355257011 020405  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        # match.py - filename matching
+#
+#  Copyright 2008, 2009 Olivia Mackall <olivia@selenic.com> and others
+#
+# This software may be used and distributed according to the terms of the
+# GNU General Public License version 2 or any later version.
+
+
+import bisect
+import copy
+import itertools
+import os
+import re
+
+from .i18n import _
+from .pycompat import open
+from . import (
+    encoding,
+    error,
+    pathutil,
+    policy,
+    pycompat,
+    util,
+)
+from .utils import stringutil
+
+rustmod = policy.importrust('dirstate')
+
+allpatternkinds = (
+    b're',
+    b'glob',
+    b'path',
+    b'relglob',
+    b'relpath',
+    b'relre',
+    b'rootglob',
+    b'listfile',
+    b'listfile0',
+    b'set',
+    b'include',
+    b'subinclude',
+    b'rootfilesin',
+)
+cwdrelativepatternkinds = (b'relpath', b'glob')
+
+propertycache = util.propertycache
+
+
+def _rematcher(regex):
+    """compile the regexp with the best available regexp engine and return a
+    matcher function"""
+    m = util.re.compile(regex)
+    try:
+        # slightly faster, provided by facebook's re2 bindings
+        return m.test_match
+    except AttributeError:
+        return m.match
+
+
+def _expandsets(cwd, kindpats, ctx=None, listsubrepos=False, badfn=None):
+    '''Returns the kindpats list with the 'set' patterns expanded to matchers'''
+    matchers = []
+    other = []
+
+    for kind, pat, source in kindpats:
+        if kind == b'set':
+            if ctx is None:
+                raise error.ProgrammingError(
+                    b"fileset expression with no context"
+                )
+            matchers.append(ctx.matchfileset(cwd, pat, badfn=badfn))
+
+            if listsubrepos:
+                for subpath in ctx.substate:
+                    sm = ctx.sub(subpath).matchfileset(cwd, pat, badfn=badfn)
+                    pm = prefixdirmatcher(subpath, sm, badfn=badfn)
+                    matchers.append(pm)
+
+            continue
+        other.append((kind, pat, source))
+    return matchers, other
+
+
+def _expandsubinclude(kindpats, root):
+    """Returns the list of subinclude matcher args and the kindpats without the
+    subincludes in it."""
+    relmatchers = []
+    other = []
+
+    for kind, pat, source in kindpats:
+        if kind == b'subinclude':
+            sourceroot = pathutil.dirname(util.normpath(source))
+            pat = util.pconvert(pat)
+            path = pathutil.join(sourceroot, pat)
+
+            newroot = pathutil.dirname(path)
+            matcherargs = (newroot, b'', [], [b'include:%s' % path])
+
+            prefix = pathutil.canonpath(root, root, newroot)
+            if prefix:
+                prefix += b'/'
+            relmatchers.append((prefix, matcherargs))
+        else:
+            other.append((kind, pat, source))
+
+    return relmatchers, other
+
+
+def _kindpatsalwaysmatch(kindpats):
+    """Checks whether the kindspats match everything, as e.g.
+    'relpath:.' does.
+    """
+    for kind, pat, source in kindpats:
+        if pat != b'' or kind not in [b'relpath', b'glob']:
+            return False
+    return True
+
+
+def _buildkindpatsmatcher(
+    matchercls,
+    root,
+    cwd,
+    kindpats,
+    ctx=None,
+    listsubrepos=False,
+    badfn=None,
+):
+    matchers = []
+    fms, kindpats = _expandsets(
+        cwd,
+        kindpats,
+        ctx=ctx,
+        listsubrepos=listsubrepos,
+        badfn=badfn,
+    )
+    if kindpats:
+        m = matchercls(root, kindpats, badfn=badfn)
+        matchers.append(m)
+    if fms:
+        matchers.extend(fms)
+    if not matchers:
+        return nevermatcher(badfn=badfn)
+    if len(matchers) == 1:
+        return matchers[0]
+    return unionmatcher(matchers)
+
+
+def match(
+    root,

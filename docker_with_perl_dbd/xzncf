@@ -1,0 +1,1000 @@
+{
+  my ($linker, $target) = @_;
+
+  # If the user wrote a custom link command, we don't define ours.
+  my $custom_link = "${target}_LINK";
+  if (set_seen ($custom_link))
+    {
+      my $verbose = $custom_link if var (verbose_var ($custom_link));
+      return ($custom_link, $verbose);
+    }
+
+  my $xlink = $linker ? $linker : 'LINK';
+
+  my $lang = $link_languages{$xlink};
+  prog_error "Unknown language for linker variable '$xlink'"
+    unless $lang;
+
+  my $link_command = $lang->link;
+  if (var 'LIBTOOL')
+    {
+      my $libtool_tag = '';
+      $libtool_tag = '--tag=' . $lang->libtool_tag . ' '
+	if $lang->libtool_tag && exists $libtool_tags{$lang->libtool_tag};
+
+      my $verbose = define_verbose_libtool ();
+      $link_command =
+	"\$(LIBTOOL) $verbose $libtool_tag\$(AM_LIBTOOLFLAGS) \$(LIBTOOLFLAGS) "
+	. "--mode=link " . $link_command;
+    }
+
+  # Rewrite each occurrence of 'AM_$flag' in the link
+  # command into '${derived}_$flag' if it exists.
+  my $orig_command = $link_command;
+  my @flags = (@{$lang->flags}, 'LDFLAGS');
+  push @flags, 'LIBTOOLFLAGS' if var 'LIBTOOL';
+  for my $flag (@flags)
+    {
+      my $val = "${target}_$flag";
+      $link_command =~ s/\(AM_$flag\)/\($val\)/
+	if set_seen ($val);
+    }
+
+  # If the computed command is the same as the generic command, use
+  # the command linker variable.
+  return ($lang->linker, $lang->lder)
+    if $link_command eq $orig_command;
+
+  define_variable ("${target}_LINK", $link_command, INTERNAL);
+  return ("${target}_LINK", $lang->lder);
+}
+
+################################################################
+
+# check_trailing_slash ($WHERE, $LINE)
+# ------------------------------------
+# Return 1 iff $LINE ends with a slash.
+# Might modify $LINE.
+sub check_trailing_slash ($\$)
+{
+  my ($where, $line) = @_;
+
+  # Ignore '##' lines.
+  return 0 if $$line =~ /$IGNORE_PATTERN/o;
+
+  # Catch and fix a common error.
+  msg "syntax", $where, "whitespace following trailing backslash"
+    if $$line =~ s/\\\s+\n$/\\\n/;
+
+  return $$line =~ /\\$/;
+}
+
+
+# read_am_file ($AMFILE, $WHERE, $RELDIR)
+# ---------------------------------------
+# Read $AMFILE file name which is located in $RELDIR, and set up
+# global variables resetted by '&generate_makefile'.  Simultaneously
+# copy lines from $AMFILE into '$output_trailer', or define variables
+# as appropriate.
+#
+# NOTE: We put rules in the trailer section.  We want user rules to
+# come after our generated stuff.
+sub read_am_file
+{
+    my ($amfile, $where, $reldir) = @_;
+    my $canon_reldir = &canonicalize ($reldir);
+
+    my $am_file = new Automake::XFile ("< $amfile");
+    verb "reading $amfile";
+
+    # Keep track of the youngest output dependency.
+    my $mtime = mtime $amfile;
+    $output_deps_greatest_timestamp = $mtime
+      if $mtime > $output_deps_greatest_timestamp;
+
+    my $spacing = '';
+    my $comment = '';
+    my $blank = 0;
+    my $saw_bk = 0;
+    my $var_look = VAR_ASIS;
+
+    use constant IN_VAR_DEF => 0;
+    use constant IN_RULE_DEF => 1;
+    use constant IN_COMMENT => 2;
+    my $prev_state = IN_RULE_DEF;
+
+    while ($_ = $am_file->getline)
+    {
+	$where->set ("$amfile:$.");
+	if (/$IGNORE_PATTERN/o)
+	{
+	    # Merely delete comments beginning with two hashes.
+	}
+	elsif (/$WHITE_PATTERN/o)
+	{
+	    error $where, "blank line following trailing backslash"
+	      if $saw_bk;
+	    # Stick a single white line before the incoming macro or rule.
+	    $spacing = "\n";
+	    $blank = 1;
+	    # Flush all comments seen so far.
+	    if ($comment ne '')
+	    {
+		$output_vars .= $comment;
+		$comment = '';
+	    }
+	}
+	elsif (/$COMMENT_PATTERN/o)
+	{
+	    # Stick comments before the incoming macro or rule.  Make
+	    # sure a blank line precedes the first block of comments.
+	    $spacing = "\n" unless $blank;
+	    $blank = 1;
+	    $comment .= $spacing . $_;
+	    $spacing = '';
+	    $prev_state = IN_COMMENT;
+	}
+	else
+	{
+	    last;
+	}
+	$saw_bk = check_trailing_slash ($where, $_);
+    }
+
+    # We save the conditional stack on entry, and then check to make
+    # sure it is the same on exit.  This lets us conditionally include
+    # other files.
+    my @saved_cond_stack = @cond_stack;
+    my $cond = new Automake::Condition (@cond_stack);
+
+    my $last_var_name = '';
+    my $last_var_type = '';
+    my $last_var_value = '';
+    my $last_where;
+    # FIXME: shouldn't use $_ in this loop; it is too big.
+    while ($_)
+    {
+	$where->set ("$amfile:$.");
+
+	# Make sure the line is \n-terminated.
+	chomp;
+	$_ .= "\n";
+
+	# Don't look at MAINTAINER_MODE_TRUE here.  That shouldn't be
+	# used by users.  @MAINT@ is an anachronism now.
+	$_ =~ s/\@MAINT\@//g
+	    unless $seen_maint_mode;
+
+	my $new_saw_bk = check_trailing_slash ($where, $_);
+
+	if ($reldir eq '.')
+	  {
+	    # If present, eat the following '_' or '/', converting
+	    # "%reldir%/foo" and "%canon_reldir%_foo" into plain "foo"
+	    # when $reldir is '.'.
+	    $_ =~ s,%(D|reldir)%/,,g;
+	    $_ =~ s,%(C|canon_reldir)%_,,g;
+	  }
+	$_ =~ s/%(D|reldir)%/${reldir}/g;
+	$_ =~ s/%(C|canon_reldir)%/${canon_reldir}/g;
+
+	if (/$IGNORE_PATTERN/o)
+	{
+	    # Merely delete comments beginning with two hashes.
+
+	    # Keep any backslash from the previous line.
+	    $new_saw_bk = $saw_bk;
+	}
+	elsif (/$WHITE_PATTERN/o)
+	{
+	    # Stick a single white line before the incoming macro or rule.
+	    $spacing = "\n";
+	    error $where, "blank line following trailing backslash"
+	      if $saw_bk;
+	}
+	elsif (/$COMMENT_PATTERN/o)
+	{
+	    error $where, "comment following trailing backslash"
+	      if $saw_bk && $prev_state != IN_COMMENT;
+
+	    # Stick comments before the incoming macro or rule.
+	    $comment .= $spacing . $_;
+	    $spacing = '';
+	    $prev_state = IN_COMMENT;
+	}
+	elsif ($saw_bk)
+	{
+	    if ($prev_state == IN_RULE_DEF)
+	    {
+	      my $cond = new Automake::Condition @cond_stack;
+	      $output_trailer .= $cond->subst_string;
+	      $output_trailer .= $_;
+	    }
+	    elsif ($prev_state == IN_COMMENT)
+	    {
+		# If the line doesn't start with a '#', add it.
+		# We do this because a continued comment like
+		#   # A = foo \
+		#         bar \
+		#         baz
+		# is not portable.  BSD make doesn't honor
+		# escaped newlines in comments.
+		s/^#?/#/;
+		$comment .= $spacing . $_;
+	    }
+	    else # $prev_state == IN_VAR_DEF
+	    {
+	      $last_var_value .= ' '
+		unless $last_var_value =~ /\s$/;
+	      $last_var_value .= $_;
+
+	      if (!/\\$/)
+		{
+		  Automake::Variable::define ($last_var_name, VAR_MAKEFILE,
+					      $last_var_type, $cond,
+					      $last_var_value, $comment,
+					      $last_where, VAR_ASIS)
+		    if $cond != FALSE;
+		  $comment = $spacing = '';
+		}
+	    }
+	}
+
+	elsif (/$IF_PATTERN/o)
+	  {
+	    $cond = cond_stack_if ($1, $2, $where);
+	  }
+	elsif (/$ELSE_PATTERN/o)
+	  {
+	    $cond = cond_stack_else ($1, $2, $where);
+	  }
+	elsif (/$ENDIF_PATTERN/o)
+	  {
+	    $cond = cond_stack_endif ($1, $2, $where);
+	  }
+
+	elsif (/$RULE_PATTERN/o)
+	{
+	    # Found a rule.
+	    $prev_state = IN_RULE_DEF;
+
+	    # For now we have to output all definitions of user rules
+	    # and can't diagnose duplicates (see the comment in
+	    # Automake::Rule::define). So we go on and ignore the return value.
+	    Automake::Rule::define ($1, $amfile, RULE_USER, $cond, $where);
+
+	    check_variable_expansions ($_, $where);
+
+	    $output_trailer .= $comment . $spacing;
+	    my $cond = new Automake::Condition @cond_stack;
+	    $output_trailer .= $cond->subst_string;
+	    $output_trailer .= $_;
+	    $comment = $spacing = '';
+	}
+	elsif (/$ASSIGNMENT_PATTERN/o)
+	{
+	    # Found a macro definition.
+	    $prev_state = IN_VAR_DEF;
+	    $last_var_name = $1;
+	    $last_var_type = $2;
+	    $last_var_value = $3;
+	    $last_where = $where->clone;
+	    if ($3 ne '' && substr ($3, -1) eq "\\")
+	      {
+		# We preserve the '\' because otherwise the long lines
+		# that are generated will be truncated by broken
+		# 'sed's.
+		$last_var_value = $3 . "\n";
+	      }
+	    # Normally we try to output variable definitions in the
+	    # same format they were input.  However, POSIX compliant
+	    # systems are not required to support lines longer than
+	    # 2048 bytes (most notably, some sed implementation are
+	    # limited to 4000 bytes, and sed is used by config.status
+	    # to rewrite Makefile.in into Makefile).  Moreover nobody
+	    # would really write such long lines by hand since it is
+	    # hardly maintainable.  So if a line is longer that 1000
+	    # bytes (an arbitrary limit), assume it has been
+	    # automatically generated by some tools, and flatten the
+	    # variable definition.  Otherwise, keep the variable as it
+	    # as been input.
+	    $var_look = VAR_PRETTY if length ($last_var_value) >= 1000;
+
+	    if (!/\\$/)
+	      {
+		Automake::Variable::define ($last_var_name, VAR_MAKEFILE,
+					    $last_var_type, $cond,
+					    $last_var_value, $comment,
+					    $last_where, $var_look)
+		  if $cond != FALSE;
+		$comment = $spacing = '';
+		$var_look = VAR_ASIS;
+	      }
+	}
+	elsif (/$INCLUDE_PATTERN/o)
+	{
+	    my $path = $1;
+
+	    if ($path =~ s/^\$\(top_srcdir\)\///)
+	      {
+		push (@include_stack, "\$\(top_srcdir\)/$path");
+		# Distribute any included file.
+
+		# Always use the $(top_srcdir) prefix in DIST_COMMON,
+		# otherwise OSF make will implicitly copy the included
+		# file in the build tree during "make distdir" to satisfy
+		# the dependency.
+		# (subdir-am-cond.sh and subdir-ac-cond.sh will fail)
+		push_dist_common ("\$\(top_srcdir\)/$path");
+	      }
+	    else
+	      {
+		$path =~ s/\$\(srcdir\)\///;
+		push (@include_stack, "\$\(srcdir\)/$path");
+		# Always use the $(srcdir) prefix in DIST_COMMON,
+		# otherwise OSF make will implicitly copy the included
+		# file in the build tree during "make distdir" to satisfy
+		# the dependency.
+		# (subdir-am-cond.sh and subdir-ac-cond.sh will fail)
+		push_dist_common ("\$\(srcdir\)/$path");
+		$path = $relative_dir . "/" . $path if $relative_dir ne '.';
+	      }
+	    my $new_reldir = File::Spec->abs2rel ($path, $relative_dir);
+	    $new_reldir = '.' if $new_reldir !~ s,/[^/]*$,,;
+	    $where->push_context ("'$path' included from here");
+	    read_am_file ($path, $where, $new_reldir);
+	    $where->pop_context;
+	}
+	else
+	{
+	    # This isn't an error; it is probably a continued rule.
+	    # In fact, this is what we assume.
+	    $prev_state = IN_RULE_DEF;
+	    check_variable_expansions ($_, $where);
+	    $output_trailer .= $comment . $spacing;
+	    my $cond = new Automake::Condition @cond_stack;
+	    $output_trailer .= $cond->subst_string;
+	    $output_trailer .= $_;
+	    $comment = $spacing = '';
+	    error $where, "'#' comment at start of rule is unportable"
+	      if $_ =~ /^\t\s*\#/;
+	}
+
+	$saw_bk = $new_saw_bk;
+	$_ = $am_file->getline;
+    }
+
+    $output_trailer .= $comment;
+
+    error ($where, "trailing backslash on last line")
+      if $saw_bk;
+
+    error ($where, (@cond_stack ? "unterminated conditionals: @cond_stack"
+		    : "too many conditionals closed in include file"))
+      if "@saved_cond_stack" ne "@cond_stack";
+}
+
+
+# A helper for read_main_am_file which initializes configure variables
+# and variables from header-vars.am.
+sub define_standard_variables ()
+{
+  my $saved_output_vars = $output_vars;
+  my ($comments, undef, $rules) =
+    file_contents_internal (1, "$libdir/am/header-vars.am",
+			    new Automake::Location);
+
+  foreach my $var (sort keys %configure_vars)
+    {
+      define_configure_variable ($var);
+    }
+
+  $output_vars .= $comments . $rules;
+}
+
+
+# read_main_am_file ($MAKEFILE_AM, $MAKEFILE_IN)
+# ----------------------------------------------
+sub read_main_am_file
+{
+    my ($amfile, $infile) = @_;
+
+    # This supports the strange variable tricks we are about to play.
+    prog_error ("variable defined before read_main_am_file\n" . variables_dump ())
+      if (scalar (variables) > 0);
+
+    # Generate copyright header for generated Makefile.in.
+    # We do discard the output of predefined variables, handled below.
+    $output_vars = ("# " . basename ($infile) . " generated by automake "
+		   . $VERSION . " from " . basename ($amfile) . ".\n");
+    $output_vars .= '# ' . subst ('configure_input') . "\n";
+    $output_vars .= $gen_copyright;
+
+    # We want to predefine as many variables as possible.  This lets
+    # the user set them with '+=' in Makefile.am.
+    define_standard_variables;
+
+    # Read user file, which might override some of our values.
+    read_am_file ($amfile, new Automake::Location, '.');
+}
+
+
+
+################################################################
+
+# $STRING
+# flatten ($ORIGINAL_STRING)
+# --------------------------
+sub flatten
+{
+  $_ = shift;
+
+  s/\\\n//somg;
+  s/\s+/ /g;
+  s/^ //;
+  s/ $//;
+
+  return $_;
+}
+
+
+# transform_token ($TOKEN, \%PAIRS, $KEY)
+# ---------------------------------------
+# Return the value associated to $KEY in %PAIRS, as used on $TOKEN
+# (which should be ?KEY? or any of the special %% requests)..
+sub transform_token ($\%$)
+{
+  my ($token, $transform, $key) = @_;
+  my $res = $transform->{$key};
+  prog_error "Unknown key '$key' in '$token'" unless defined $res;
+  return $res;
+}
+
+
+# transform ($TOKEN, \%PAIRS)
+# ---------------------------
+# If ($TOKEN, $VAL) is in %PAIRS:
+#   - replaces %KEY% with $VAL,
+#   - enables/disables ?KEY? and ?!KEY?,
+#   - replaces %?KEY% with TRUE or FALSE.
+sub transform ($\%)
+{
+  my ($token, $transform) = @_;
+
+  # %KEY%.
+  # Must be before the following pattern to exclude the case
+  # when there is neither IFTRUE nor IFFALSE.
+  if ($token =~ /^%([\w\-]+)%$/)
+    {
+      return transform_token ($token, %$transform, $1);
+    }
+  # %?KEY%.
+  elsif ($token =~ /^%\?([\w\-]+)%$/)
+    {
+      return transform_token ($token, %$transform, $1) ? 'TRUE' : 'FALSE';
+    }
+  # ?KEY? and ?!KEY?.
+  elsif ($token =~ /^ \? (!?) ([\w\-]+) \? $/x)
+    {
+      my $neg = ($1 eq '!') ? 1 : 0;
+      my $val = transform_token ($token, %$transform, $2);
+      return (!!$val == $neg) ? '##%' : '';
+    }
+  else
+    {
+      prog_error "Unknown request format: $token";
+    }
+}
+
+# $TEXT
+# preprocess_file ($MAKEFILE, [%TRANSFORM])
+# -----------------------------------------
+# Load a $MAKEFILE, apply the %TRANSFORM, and return the result.
+# No extra parsing or post-processing is done (i.e., recognition of
+# rules declaration or of make variables definitions).
+sub preprocess_file
+{
+  my ($file, %transform) = @_;
+
+  # Complete %transform with global options.
+  # Note that %transform goes last, so it overrides global options.
+  %transform = ( 'MAINTAINER-MODE'
+		 => $seen_maint_mode ? subst ('MAINTAINER_MODE_TRUE') : '',
+
+		 'XZ'          => !! option 'dist-xz',
+		 'LZIP'        => !! option 'dist-lzip',
+		 'BZIP2'       => !! option 'dist-bzip2',
+		 'COMPRESS'    => !! option 'dist-tarZ',
+		 'GZIP'        =>  ! option 'no-dist-gzip',
+		 'SHAR'        => !! option 'dist-shar',
+		 'ZIP'         => !! option 'dist-zip',
+		 'ZSTD'        => !! option 'dist-zstd',
+		 'DIST_BUILT_SOURCES' => !! option 'dist-built-sources',
+
+		 'INSTALL-INFO' =>  ! option 'no-installinfo',
+		 'INSTALL-MAN'  =>  ! option 'no-installman',
+		 'CK-NEWS'      => !! option 'check-news',
+
+		 'SUBDIRS'      => !! var ('SUBDIRS'),
+		 'TOPDIR_P'     => $relative_dir eq '.',
+
+		 'BUILD'    => ($seen_canonical >= AC_CANONICAL_BUILD),
+		 'HOST'     => ($seen_canonical >= AC_CANONICAL_HOST),
+		 'TARGET'   => ($seen_canonical >= AC_CANONICAL_TARGET),
+
+		 'LIBTOOL'      => !! var ('LIBTOOL'),
+		 'NONLIBTOOL'   => 1,
+		%transform);
+
+  if (! defined ($_ = $am_file_cache{$file}))
+    {
+      verb "reading $file";
+      # Swallow the whole file.
+      my $fc_file = new Automake::XFile "< $file";
+      my $saved_dollar_slash = $/;
+      undef $/;
+      $_ = $fc_file->getline;
+      $/ = $saved_dollar_slash;
+      $fc_file->close;
+      # Remove ##-comments.
+      # Besides we don't need more than two consecutive new-lines.
+      s/(?:$IGNORE_PATTERN|(?<=\n\n)\n+)//gom;
+      # Remember the contents of the just-read file.
+      $am_file_cache{$file} = $_;
+    }
+
+  # Substitute Automake template tokens.
+  s/(?: % \?? [\w\-]+ %
+      | \? !? [\w\-]+ \?
+    )/transform($&, %transform)/gex;
+  # transform() may have added some ##%-comments to strip.
+  # (we use '##%' instead of '##' so we can distinguish ##%##%##% from
+  # ####### and do not remove the latter.)
+  s/^[ \t]*(?:##%)+.*\n//gm;
+
+  return $_;
+}
+
+
+# @PARAGRAPHS
+# make_paragraphs ($MAKEFILE, [%TRANSFORM])
+# -----------------------------------------
+# Load a $MAKEFILE, apply the %TRANSFORM, and return it as a list of
+# paragraphs.
+sub make_paragraphs
+{
+  my ($file, %transform) = @_;
+  $transform{FIRST} = !$transformed_files{$file};
+  $transformed_files{$file} = 1;
+
+  my @lines = split /(?<!\\)\n/, preprocess_file ($file, %transform);
+  my @res;
+
+  while (defined ($_ = shift @lines))
+    {
+      my $paragraph = $_;
+      # If we are a rule, eat as long as we start with a tab.
+      if (/$RULE_PATTERN/smo)
+	{
+	  while (defined ($_ = shift @lines) && $_ =~ /^\t/)
+	    {
+	      $paragraph .= "\n$_";
+	    }
+	  unshift (@lines, $_);
+	}
+
+      # If we are a comments, eat as much comments as you can.
+      elsif (/$COMMENT_PATTERN/smo)
+	{
+	  while (defined ($_ = shift @lines)
+		 && $_ =~ /$COMMENT_PATTERN/smo)
+	    {
+	      $paragraph .= "\n$_";
+	    }
+	  unshift (@lines, $_);
+	}
+
+      push @res, $paragraph;
+    }
+
+  return @res;
+}
+
+
+
+# ($COMMENT, $VARIABLES, $RULES)
+# file_contents_internal ($IS_AM, $FILE, $WHERE, [%TRANSFORM])
+# ------------------------------------------------------------
+# Return contents of a file from $libdir/am, automatically skipping
+# macros or rules which are already known. $IS_AM iff the caller is
+# reading an Automake file (as opposed to the user's Makefile.am).
+sub file_contents_internal
+{
+    my ($is_am, $file, $where, %transform) = @_;
+
+    $where->set ($file);
+
+    my $result_vars = '';
+    my $result_rules = '';
+    my $comment = '';
+    my $spacing = '';
+
+    # The following flags are used to track rules spanning across
+    # multiple paragraphs.
+    my $is_rule = 0;		# 1 if we are processing a rule.
+    my $discard_rule = 0;	# 1 if the current rule should not be output.
+
+    # We save the conditional stack on entry, and then check to make
+    # sure it is the same on exit.  This lets us conditionally include
+    # other files.
+    my @saved_cond_stack = @cond_stack;
+    my $cond = new Automake::Condition (@cond_stack);
+
+    foreach (make_paragraphs ($file, %transform))
+    {
+	# FIXME: no line number available.
+	$where->set ($file);
+
+	# Sanity checks.
+	error $where, "blank line following trailing backslash:\n$_"
+	  if /\\$/;
+	error $where, "comment following trailing backslash:\n$_"
+	  if /\\#/;
+
+	if (/^$/)
+	{
+	    $is_rule = 0;
+	    # Stick empty line before the incoming macro or rule.
+	    $spacing = "\n";
+	}
+	elsif (/$COMMENT_PATTERN/mso)
+	{
+	    $is_rule = 0;
+	    # Stick comments before the incoming macro or rule.
+	    $comment = "$_\n";
+	}
+
+	# Handle inclusion of other files.
+	elsif (/$INCLUDE_PATTERN/o)
+	{
+	    if ($cond != FALSE)
+	      {
+		my $file = ($is_am ? "$libdir/am/" : '') . $1;
+		$where->push_context ("'$file' included from here");
+		# N-ary '.=' fails.
+		my ($com, $vars, $rules)
+		  = file_contents_internal ($is_am, $file, $where, %transform);
+		$where->pop_context;
+		$comment .= $com;
+		$result_vars .= $vars;
+		$result_rules .= $rules;
+	      }
+	}
+
+	# Handling the conditionals.
+	elsif (/$IF_PATTERN/o)
+	  {
+	    $cond = cond_stack_if ($1, $2, $file);
+	  }
+	elsif (/$ELSE_PATTERN/o)
+	  {
+	    $cond = cond_stack_else ($1, $2, $file);
+	  }
+	elsif (/$ENDIF_PATTERN/o)
+	  {
+	    $cond = cond_stack_endif ($1, $2, $file);
+	  }
+
+	# Handling rules.
+	elsif (/$RULE_PATTERN/mso)
+	{
+	  $is_rule = 1;
+	  $discard_rule = 0;
+	  # Separate relationship from optional actions: the first
+	  # `new-line tab" not preceded by backslash (continuation
+	  # line).
+	  my $paragraph = $_;
+	  /^(.*?)(?:(?<!\\)\n(\t.*))?$/s;
+	  my ($relationship, $actions) = ($1, $2 || '');
+
+	  # Separate targets from dependencies: the first colon.
+	  $relationship =~ /^([^:]+\S+) *: *(.*)$/som;
+	  my ($targets, $dependencies) = ($1, $2);
+	  # Remove the escaped new lines.
+	  # I don't know why, but I have to use a tmp $flat_deps.
+	  my $flat_deps = flatten ($dependencies);
+	  my @deps = split (' ', $flat_deps);
+
+	  foreach (split (' ', $targets))
+	    {
+	      # FIXME: 1. We are not robust to people defining several targets
+	      # at once, only some of them being in %dependencies.  The
+	      # actions from the targets in %dependencies are usually generated
+	      # from the content of %actions, but if some targets in $targets
+	      # are not in %dependencies the ELSE branch will output
+	      # a rule for all $targets (i.e. the targets which are both
+	      # in %dependencies and $targets will have two rules).
+
+	      # FIXME: 2. The logic here is not able to output a
+	      # multi-paragraph rule several time (e.g. for each condition
+	      # it is defined for) because it only knows the first paragraph.
+
+	      # FIXME: 3. We are not robust to people defining a subset
+	      # of a previously defined "multiple-target" rule.  E.g.
+	      # 'foo:' after 'foo bar:'.
+
+	      # Output only if not in FALSE.
+	      if (defined $dependencies{$_} && $cond != FALSE)
+		{
+		  depend ($_, @deps);
+		  register_action ($_, $actions);
+		}
+	      else
+		{
+		  # Free-lance dependency.  Output the rule for all the
+		  # targets instead of one by one.
+		  my @undefined_conds =
+		    Automake::Rule::define ($targets, $file,
+					    $is_am ? RULE_AUTOMAKE : RULE_USER,
+					    $cond, $where);
+		  for my $undefined_cond (@undefined_conds)
+		    {
+		      my $condparagraph = $paragraph;
+		      $condparagraph =~ s/^/$undefined_cond->subst_string/gme;
+		      $result_rules .= "$spacing$comment$condparagraph\n";
+		    }
+		  if (scalar @undefined_conds == 0)
+		    {
+		      # Remember to discard next paragraphs
+		      # if they belong to this rule.
+		      # (but see also FIXME: #2 above.)
+		      $discard_rule = 1;
+		    }
+		  $comment = $spacing = '';
+		  last;
+		}
+	    }
+	}
+
+	elsif (/$ASSIGNMENT_PATTERN/mso)
+	{
+	    my ($var, $type, $val) = ($1, $2, $3);
+	    error $where, "variable '$var' with trailing backslash"
+	      if /\\$/;
+
+	    $is_rule = 0;
+
+	    Automake::Variable::define ($var,
+					$is_am ? VAR_AUTOMAKE : VAR_MAKEFILE,
+					$type, $cond, $val, $comment, $where,
+					VAR_ASIS)
+	      if $cond != FALSE;
+
+	    $comment = $spacing = '';
+	}
+	else
+	{
+	    # This isn't an error; it is probably some tokens which
+	    # configure is supposed to replace, such as '@SET-MAKE@',
+	    # or some part of a rule cut by an if/endif.
+	    if (! $cond->false && ! ($is_rule && $discard_rule))
+	      {
+		s/^/$cond->subst_string/gme;
+		$result_rules .= "$spacing$comment$_\n";
+	      }
+	    $comment = $spacing = '';
+	}
+    }
+
+    error ($where, @cond_stack ?
+	   "unterminated conditionals: @cond_stack" :
+	   "too many conditionals closed in include file")
+      if "@saved_cond_stack" ne "@cond_stack";
+
+    return ($comment, $result_vars, $result_rules);
+}
+
+
+# $CONTENTS
+# file_contents ($BASENAME, $WHERE, [%TRANSFORM])
+# -----------------------------------------------
+# Return contents of a file from $libdir/am, automatically skipping
+# macros or rules which are already known.
+sub file_contents
+{
+    my ($basename, $where, %transform) = @_;
+    my ($comments, $variables, $rules) =
+      file_contents_internal (1, "$libdir/am/$basename.am", $where,
+			      %transform);
+    return "$comments$variables$rules";
+}
+
+
+# @PREFIX
+# am_primary_prefixes ($PRIMARY, $CAN_DIST, @PREFIXES)
+# ----------------------------------------------------
+# Find all variable prefixes that are used for install directories.  A
+# prefix 'zar' qualifies iff:
+#
+# * 'zardir' is a variable.
+# * 'zar_PRIMARY' is a variable.
+#
+# As a side effect, it looks for misspellings.  It is an error to have
+# a variable ending in a "reserved" suffix whose prefix is unknown, e.g.
+# "bni_PROGRAMS".  However, unusual prefixes are allowed if a variable
+# of the same name (with "dir" appended) exists.  For instance, if the
+# variable "zardir" is defined, then "zar_PROGRAMS" becomes valid.
+# This is to provide a little extra flexibility in those cases which
+# need it.
+sub am_primary_prefixes
+{
+  my ($primary, $can_dist, @prefixes) = @_;
+
+  local $_;
+  my %valid = map { $_ => 0 } @prefixes;
+  $valid{'EXTRA'} = 0;
+  foreach my $var (variables $primary)
+    {
+      # Automake is allowed to define variables that look like primaries
+      # but which aren't.  E.g. INSTALL_sh_DATA.
+      # Autoconf can also define variables like INSTALL_DATA, so
+      # ignore all configure variables (at least those which are not
+      # redefined in Makefile.am).
+      # FIXME: We should make sure that these variables are not
+      # conditionally defined (or else adjust the condition below).
+      my $def = $var->def (TRUE);
+      next if $def && $def->owner != VAR_MAKEFILE;
+
+      my $varname = $var->name;
+
+      if ($varname =~ /^(nobase_)?(dist_|nodist_)?(.*)_[[:alnum:]]+$/)
+	{
+	  my ($base, $dist, $X) = ($1 || '', $2 || '', $3 || '');
+	  if ($dist ne '' && ! $can_dist)
+	    {
+	      err_var ($var,
+		       "invalid variable '$varname': 'dist' is forbidden");
+	    }
+	  # Standard directories must be explicitly allowed.
+	  elsif (! defined $valid{$X} && exists $standard_prefix{$X})
+	    {
+	      err_var ($var,
+		       "'${X}dir' is not a legitimate directory " .
+		       "for '$primary'");
+	    }
+	  # A not explicitly valid directory is allowed if Xdir is defined.
+	  elsif (! defined $valid{$X} &&
+		 $var->requires_variables ("'$varname' is used", "${X}dir"))
+	    {
+	      # Nothing to do.  Any error message has been output
+	      # by $var->requires_variables.
+	    }
+	  else
+	    {
+	      # Ensure all extended prefixes are actually used.
+	      $valid{"$base$dist$X"} = 1;
+	    }
+	}
+      else
+	{
+	  prog_error "unexpected variable name: $varname";
+	}
+    }
+
+  # Return only those which are actually defined.
+  return sort grep { var ($_ . '_' . $primary) } keys %valid;
+}
+
+
+# am_install_var (-OPTION..., file, HOW, where...)
+# ------------------------------------------------
+#
+# Handle 'where_HOW' variable magic.  Does all lookups, generates
+# install code, and possibly generates code to define the primary
+# variable.  The first argument is the name of the .am file to munge,
+# the second argument is the primary variable (e.g. HEADERS), and all
+# subsequent arguments are possible installation locations.
+#
+# Returns list of [$location, $value] pairs, where
+# $value's are the values in all where_HOW variable, and $location
+# there associated location (the place here their parent variables were
+# defined).
+#
+# FIXME: this should be rewritten to be cleaner.  It should be broken
+# up into multiple functions.
+#
+sub am_install_var
+{
+  my (@args) = @_;
+
+  my $do_require = 1;
+  my $can_dist = 0;
+  my $default_dist = 0;
+  while (@args)
+    {
+      if ($args[0] eq '-noextra')
+	{
+	  $do_require = 0;
+	}
+      elsif ($args[0] eq '-candist')
+	{
+	  $can_dist = 1;
+	}
+      elsif ($args[0] eq '-defaultdist')
+	{
+	  $default_dist = 1;
+	  $can_dist = 1;
+	}
+      elsif ($args[0] !~ /^-/)
+	{
+	  last;
+	}
+      shift (@args);
+    }
+
+  my ($file, $primary, @prefix) = @args;
+
+  # Now that configure substitutions are allowed in where_HOW
+  # variables, it is an error to actually define the primary.  We
+  # allow 'JAVA', as it is customarily used to mean the Java
+  # interpreter.  This is but one of several Java hacks.  Similarly,
+  # 'PYTHON' is customarily used to mean the Python interpreter.
+  reject_var $primary, "'$primary' is an anachronism"
+    unless $primary eq 'JAVA' || $primary eq 'PYTHON';
+
+  # Get the prefixes which are valid and actually used.
+  @prefix = am_primary_prefixes ($primary, $can_dist, @prefix);
+
+  # If a primary includes a configure substitution, then the EXTRA_
+  # form is required.  Otherwise we can't properly do our job.
+  my $require_extra;
+
+  my @used = ();
+  my @result = ();
+
+  foreach my $X (@prefix)
+    {
+      my $nodir_name = $X;
+      my $one_name = $X . '_' . $primary;
+      my $one_var = var $one_name;
+
+      my $strip_subdir = 1;
+      # If subdir prefix should be preserved, do so.
+      if ($nodir_name =~ /^nobase_/)
+	{
+	  $strip_subdir = 0;
+	  $nodir_name =~ s/^nobase_//;
+	}
+
+      # If files should be distributed, do so.
+      my $dist_p = 0;
+      if ($can_dist)
+	{
+	  $dist_p = (($default_dist && $nodir_name !~ /^nodist_/)
+		     || (! $default_dist && $nodir_name =~ /^dist_/));
+	  $nodir_name =~ s/^(dist|nodist)_//;
+	}
+
+
+      # Use the location of the currently processed variable.
+      # We are not processing a particular condition, so pick the first
+      # available.
+      my $tmpcond = $one_var->conditions->one_cond;
+      my $where = $one_var->rdef ($tmpcond)->location->clone;
+
+      # Append actual contents of where_PRIMARY variable to
+      # @result, skipping @substitutions@.
+      foreach my $locvals ($one_var->value_as_list_recursive (location => 1))
+	{
+	  my ($loc, $value) = @$locvals;
+	  # Skip configure substitutions.
+	  if ($value =~ /^\@.*\@$/)
+	    {
+	      if ($nodir_name eq 'EXTRA')
+		{
+		  error ($where,
+			 "'$one_name' contains configure substitution, "
+			 . "but shouldn't");
+		}
+	      # Check here to make sure variables defined in
+	      # configure.ac do not imply that EXTRA_PRIMARY

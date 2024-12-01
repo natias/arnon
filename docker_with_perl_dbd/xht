@@ -1,0 +1,1000 @@
+  # 2) only members of the group 'hobbit' can commit to branch 'lake';
+  # 'hobbit' members and anyone else can still commit to any other branch.
+  lake = !@hobbit
+
+  # You can also deny access based on file paths:
+
+  [acl.allow]
+  # Empty
+
+  [acl.deny]
+  # 3) only 'gollum' can change the file below;
+  # 'gollum' and anyone else can still change any other file.
+  /misty/mountains/cave/ring = !gollum
+
+'''
+
+
+from mercurial.i18n import _
+from mercurial import (
+    error,
+    extensions,
+    match,
+    registrar,
+    util,
+)
+from mercurial.utils import procutil
+
+urlreq = util.urlreq
+
+# Note for extension authors: ONLY specify testedwith = 'ships-with-hg-core' for
+# extensions which SHIP WITH MERCURIAL. Non-mainline extensions should
+# be specifying the version(s) of Mercurial they are tested with, or
+# leave the attribute unspecified.
+testedwith = b'ships-with-hg-core'
+
+configtable = {}
+configitem = registrar.configitem(configtable)
+
+# deprecated config: acl.config
+configitem(
+    b'acl',
+    b'config',
+    default=None,
+)
+configitem(
+    b'acl.groups',
+    b'.*',
+    default=None,
+    generic=True,
+)
+configitem(
+    b'acl.deny.branches',
+    b'.*',
+    default=None,
+    generic=True,
+)
+configitem(
+    b'acl.allow.branches',
+    b'.*',
+    default=None,
+    generic=True,
+)
+configitem(
+    b'acl.deny',
+    b'.*',
+    default=None,
+    generic=True,
+)
+configitem(
+    b'acl.allow',
+    b'.*',
+    default=None,
+    generic=True,
+)
+configitem(
+    b'acl',
+    b'sources',
+    default=lambda: [b'serve'],
+)
+
+
+def _getusers(ui, group):
+
+    # First, try to use group definition from section [acl.groups]
+    hgrcusers = ui.configlist(b'acl.groups', group)
+    if hgrcusers:
+        return hgrcusers
+
+    ui.debug(b'acl: "%s" not defined in [acl.groups]\n' % group)
+    # If no users found in group definition, get users from OS-level group
+    try:
+        return util.groupmembers(group)
+    except KeyError:
+        raise error.Abort(_(b"group '%s' is undefined") % group)
+
+
+def _usermatch(ui, user, usersorgroups):
+
+    if usersorgroups == b'*':
+        return True
+
+    for ug in usersorgroups.replace(b',', b' ').split():
+
+        if ug.startswith(b'!'):
+            # Test for excluded user or group. Format:
+            # if ug is a user  name: !username
+            # if ug is a group name: !@groupname
+            ug = ug[1:]
+            if (
+                not ug.startswith(b'@')
+                and user != ug
+                or ug.startswith(b'@')
+                and user not in _getusers(ui, ug[1:])
+            ):
+                return True
+
+        # Test for user or group. Format:
+        # if ug is a user  name: username
+        # if ug is a group name: @groupname
+        elif (
+            user == ug or ug.startswith(b'@') and user in _getusers(ui, ug[1:])
+        ):
+            return True
+
+    return False
+
+
+def buildmatch(ui, repo, user, key):
+    '''return tuple of (match function, list enabled).'''
+    if not ui.has_section(key):
+        ui.debug(b'acl: %s not enabled\n' % key)
+        return None
+
+    pats = [
+        pat for pat, users in ui.configitems(key) if _usermatch(ui, user, users)
+    ]
+    ui.debug(
+        b'acl: %s enabled, %d entries for user %s\n' % (key, len(pats), user)
+    )
+
+    # Branch-based ACL
+    if not repo:
+        if pats:
+            # If there's an asterisk (meaning "any branch"), always return True;
+            # Otherwise, test if b is in pats
+            if b'*' in pats:
+                return util.always
+            return lambda b: b in pats
+        return util.never
+
+    # Path-based ACL
+    if pats:
+        return match.match(repo.root, b'', pats)
+    return util.never
+
+
+def ensureenabled(ui):
+    """make sure the extension is enabled when used as hook
+
+    When acl is used through hooks, the extension is never formally loaded and
+    enabled. This has some side effect, for example the config declaration is
+    never loaded. This function ensure the extension is enabled when running
+    hooks.
+    """
+    if b'acl' in ui._knownconfig:
+        return
+    ui.setconfig(b'extensions', b'acl', b'', source=b'internal')
+    extensions.loadall(ui, [b'acl'])
+
+
+def hook(ui, repo, hooktype, node=None, source=None, **kwargs):
+
+    ensureenabled(ui)
+
+    if hooktype not in [b'pretxnchangegroup', b'pretxncommit', b'prepushkey']:
+        raise error.Abort(
+            _(
+                b'config error - hook type "%s" cannot stop '
+                b'incoming changesets, commits, nor bookmarks'
+            )
+            % hooktype
+        )
+    if hooktype == b'pretxnchangegroup' and source not in ui.configlist(
+        b'acl', b'sources'
+    ):
+        ui.debug(b'acl: changes have source "%s" - skipping\n' % source)
+        return
+
+    user = None
+    if source == b'serve' and 'url' in kwargs:
+        url = kwargs['url'].split(b':')
+        if url[0] == b'remote' and url[1].startswith(b'http'):
+            user = urlreq.unquote(url[3])
+
+    if user is None:
+        user = procutil.getuser()
+
+    ui.debug(b'acl: checking access for user "%s"\n' % user)
+
+    if hooktype == b'prepushkey':
+        _pkhook(ui, repo, hooktype, node, source, user, **kwargs)
+    else:
+        _txnhook(ui, repo, hooktype, node, source, user, **kwargs)
+
+
+def _pkhook(ui, repo, hooktype, node, source, user, **kwargs):
+    if kwargs['namespace'] == b'bookmarks':
+        bookmark = kwargs['key']
+        ctx = kwargs['new']
+        allowbookmarks = buildmatch(ui, None, user, b'acl.allow.bookmarks')
+        denybookmarks = buildmatch(ui, None, user, b'acl.deny.bookmarks')
+
+        if denybookmarks and denybookmarks(bookmark):
+            raise error.Abort(
+                _(
+                    b'acl: user "%s" denied on bookmark "%s"'
+                    b' (changeset "%s")'
+                )
+                % (user, bookmark, ctx)
+            )
+        if allowbookmarks and not allowbookmarks(bookmark):
+            raise error.Abort(
+                _(
+                    b'acl: user "%s" not allowed on bookmark "%s"'
+                    b' (changeset "%s")'
+                )
+                % (user, bookmark, ctx)
+            )
+        ui.debug(
+            b'acl: bookmark access granted: "%s" on bookmark "%s"\n'
+            % (ctx, bookmark)
+        )
+
+
+def _txnhook(ui, repo, hooktype, node, source, user, **kwargs):
+    # deprecated config: acl.config
+    cfg = ui.config(b'acl', b'config')
+    if cfg:
+        ui.readconfig(
+            cfg,
+            sections=[
+                b'acl.groups',
+                b'acl.allow.branches',
+                b'acl.deny.branches',
+                b'acl.allow',
+                b'acl.deny',
+            ],
+        )
+
+    allowbranches = buildmatch(ui, None, user, b'acl.allow.branches')
+    denybranches = buildmatch(ui, None, user, b'acl.deny.branches')
+    allow = buildmatch(ui, repo, user, b'acl.allow')
+    deny = buildmatch(ui, repo, user, b'acl.deny')
+
+    for rev in range(repo[node].rev(), len(repo)):
+        ctx = repo[rev]
+        branch = ctx.branch()
+        if denybranches and denybranches(branch):
+            raise error.Abort(
+                _(b'acl: user "%s" denied on branch "%s" (changeset "%s")')
+                % (user, branch, ctx)
+            )
+        if allowbranches and not allowbranches(branch):
+            raise error.Abort(
+                _(
+                    b'acl: user "%s" not allowed on branch "%s"'
+                    b' (changeset "%s")'
+                )
+                % (user, branch, ctx)
+            )
+        ui.debug(
+            b'acl: branch access granted: "%s" on branch "%s"\n' % (ctx, branch)
+        )
+
+        for f in ctx.files():
+            if deny and deny(f):
+                raise error.Abort(
+                    _(b'acl: user "%s" denied on "%s" (changeset "%s")')
+                    % (user, f, ctx)
+                )
+            if allow and not allow(f):
+                raise error.Abort(
+                    _(
+                        b'acl: user "%s" not allowed on "%s"'
+                        b' (changeset "%s")'
+                    )
+                    % (user, f, ctx)
+                )
+        ui.debug(b'acl: path access granted: "%s"\n' % ctx)
+                                                                                                                                                                                                                                                                                                                                                                                                                          usr/lib/python3/dist-packages/hgext/amend.py                                                        0000644 0000000 0000000 00000004251 14355257011 017530  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        # amend.py - provide the amend command
+#
+# Copyright 2017 Facebook, Inc.
+#
+# This software may be used and distributed according to the terms of the
+# GNU General Public License version 2 or any later version.
+"""provide the amend command (EXPERIMENTAL)
+
+This extension provides an ``amend`` command that is similar to
+``commit --amend`` but does not prompt an editor.
+"""
+
+
+from mercurial.i18n import _
+from mercurial import (
+    cmdutil,
+    commands,
+    registrar,
+)
+
+# Note for extension authors: ONLY specify testedwith = 'ships-with-hg-core' for
+# extensions which SHIP WITH MERCURIAL. Non-mainline extensions should
+# be specifying the version(s) of Mercurial they are tested with, or
+# leave the attribute unspecified.
+testedwith = b'ships-with-hg-core'
+
+cmdtable = {}
+command = registrar.command(cmdtable)
+
+
+@command(
+    b'amend',
+    [
+        (
+            b'A',
+            b'addremove',
+            None,
+            _(b'mark new/missing files as added/removed before committing'),
+        ),
+        (b'e', b'edit', None, _(b'invoke editor on commit messages')),
+        (b'i', b'interactive', None, _(b'use interactive mode')),
+        (
+            b'',
+            b'close-branch',
+            None,
+            _(b'mark a branch as closed, hiding it from the branch list'),
+        ),
+        (b's', b'secret', None, _(b'use the secret phase for committing')),
+        (b'n', b'note', b'', _(b'store a note on the amend')),
+    ]
+    + cmdutil.walkopts
+    + cmdutil.commitopts
+    + cmdutil.commitopts2
+    + cmdutil.commitopts3,
+    _(b'[OPTION]... [FILE]...'),
+    helpcategory=command.CATEGORY_COMMITTING,
+    inferrepo=True,
+)
+def amend(ui, repo, *pats, **opts):
+    """amend the working copy parent with all or specified outstanding changes
+
+    Similar to :hg:`commit --amend`, but reuse the commit message without
+    invoking editor, unless ``--edit`` was set.
+
+    See :hg:`help commit` for more details.
+    """
+    cmdutil.check_note_size(opts)
+
+    with repo.wlock(), repo.lock():
+        if not opts.get('logfile'):
+            opts['message'] = opts.get('message') or repo[b'.'].description()
+        opts['amend'] = True
+        return commands._docommit(ui, repo, *pats, **opts)
+                                                                                                                                                                                                                                                                                                                                                       usr/lib/python3/dist-packages/hgext/automv.py                                                       0000644 0000000 0000000 00000007153 14355257011 017763  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        # automv.py
+#
+# Copyright 2013-2016 Facebook, Inc.
+#
+# This software may be used and distributed according to the terms of the
+# GNU General Public License version 2 or any later version.
+"""check for unrecorded moves at commit time (EXPERIMENTAL)
+
+This extension checks at commit/amend time if any of the committed files
+comes from an unrecorded mv.
+
+The threshold at which a file is considered a move can be set with the
+``automv.similarity`` config option. This option takes a percentage between 0
+(disabled) and 100 (files must be identical), the default is 95.
+
+"""
+
+# Using 95 as a default similarity is based on an analysis of the mercurial
+# repositories of the cpython, mozilla-central & mercurial repositories, as
+# well as 2 very large facebook repositories. At 95 50% of all potential
+# missed moves would be caught, as well as correspond with 87% of all
+# explicitly marked moves.  Together, 80% of moved files are 95% similar or
+# more.
+#
+# See http://markmail.org/thread/5pxnljesvufvom57 for context.
+
+
+from mercurial.i18n import _
+from mercurial import (
+    commands,
+    copies,
+    error,
+    extensions,
+    pycompat,
+    registrar,
+    scmutil,
+    similar,
+)
+
+configtable = {}
+configitem = registrar.configitem(configtable)
+
+configitem(
+    b'automv',
+    b'similarity',
+    default=95,
+)
+
+
+def extsetup(ui):
+    entry = extensions.wrapcommand(commands.table, b'commit', mvcheck)
+    entry[1].append(
+        (b'', b'no-automv', None, _(b'disable automatic file move detection'))
+    )
+
+
+def mvcheck(orig, ui, repo, *pats, **opts):
+    """Hook to check for moves at commit time"""
+    opts = pycompat.byteskwargs(opts)
+    renames = None
+    disabled = opts.pop(b'no_automv', False)
+    if not disabled:
+        threshold = ui.configint(b'automv', b'similarity')
+        if not 0 <= threshold <= 100:
+            raise error.Abort(_(b'automv.similarity must be between 0 and 100'))
+        if threshold > 0:
+            match = scmutil.match(repo[None], pats, opts)
+            added, removed = _interestingfiles(repo, match)
+            uipathfn = scmutil.getuipathfn(repo, legacyrelativevalue=True)
+            renames = _findrenames(
+                repo, uipathfn, added, removed, threshold / 100.0
+            )
+
+    with repo.wlock():
+        if renames is not None:
+            scmutil._markchanges(repo, (), (), renames)
+        return orig(ui, repo, *pats, **pycompat.strkwargs(opts))
+
+
+def _interestingfiles(repo, matcher):
+    """Find what files were added or removed in this commit.
+
+    Returns a tuple of two lists: (added, removed). Only files not *already*
+    marked as moved are included in the added list.
+
+    """
+    stat = repo.status(match=matcher)
+    added = stat.added
+    removed = stat.removed
+
+    copy = copies.pathcopies(repo[b'.'], repo[None], matcher)
+    # remove the copy files for which we already have copy info
+    added = [f for f in added if f not in copy]
+
+    return added, removed
+
+
+def _findrenames(repo, uipathfn, added, removed, similarity):
+    """Find what files in added are really moved files.
+
+    Any file named in removed that is at least similarity% similar to a file
+    in added is seen as a rename.
+
+    """
+    renames = {}
+    if similarity > 0:
+        for src, dst, score in similar.findrenames(
+            repo, added, removed, similarity
+        ):
+            if repo.ui.verbose:
+                repo.ui.status(
+                    _(b'detected move of %s as %s (%d%% similar)\n')
+                    % (uipathfn(src), uipathfn(dst), score * 100)
+                )
+            renames[dst] = src
+    if renames:
+        repo.ui.status(_(b'detected move of %d files\n') % len(renames))
+    return renames
+                                                                                                                                                                                                                                                                                                                                                                                                                     usr/lib/python3/dist-packages/hgext/beautifygraph.py                                                0000644 0000000 0000000 00000006070 14355257011 021277  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        # -*- coding: UTF-8 -*-
+# beautifygraph.py - improve graph output by using Unicode characters
+#
+# Copyright 2018 John Stiles <johnstiles@gmail.com>
+#
+# This software may be used and distributed according to the terms of the
+# GNU General Public License version 2 or any later version.
+
+'''beautify log -G output by using Unicode characters (EXPERIMENTAL)
+
+   A terminal with UTF-8 support and monospace narrow text are required.
+'''
+
+
+from mercurial.i18n import _
+from mercurial import (
+    encoding,
+    extensions,
+    graphmod,
+    templatekw,
+)
+
+# Note for extension authors: ONLY specify testedwith = 'ships-with-hg-core' for
+# extensions which SHIP WITH MERCURIAL. Non-mainline extensions should
+# be specifying the version(s) of Mercurial they are tested with, or
+# leave the attribute unspecified.
+testedwith = b'ships-with-hg-core'
+
+
+def prettyedge(before, edge, after):
+    if edge == b'~':
+        return b'\xE2\x95\xA7'  # U+2567 ╧
+    if edge == b'/':
+        return b'\xE2\x95\xB1'  # U+2571 ╱
+    if edge == b'-':
+        return b'\xE2\x94\x80'  # U+2500 ─
+    if edge == b'|':
+        return b'\xE2\x94\x82'  # U+2502 │
+    if edge == b':':
+        return b'\xE2\x94\x86'  # U+2506 ┆
+    if edge == b'\\':
+        return b'\xE2\x95\xB2'  # U+2572 ╲
+    if edge == b'+':
+        if before == b' ' and not after == b' ':
+            return b'\xE2\x94\x9C'  # U+251C ├
+        if after == b' ' and not before == b' ':
+            return b'\xE2\x94\xA4'  # U+2524 ┤
+        return b'\xE2\x94\xBC'  # U+253C ┼
+    return edge
+
+
+def convertedges(line):
+    line = b' %s ' % line
+    pretty = []
+    for idx in range(len(line) - 2):
+        pretty.append(
+            prettyedge(
+                line[idx : idx + 1],
+                line[idx + 1 : idx + 2],
+                line[idx + 2 : idx + 3],
+            )
+        )
+    return b''.join(pretty)
+
+
+def getprettygraphnode(orig, *args, **kwargs):
+    node = orig(*args, **kwargs)
+    if node == b'o':
+        return b'\xE2\x97\x8B'  # U+25CB ○
+    if node == b'@':
+        return b'\xE2\x97\x89'  # U+25C9 ◉
+    if node == b'%':
+        return b'\xE2\x97\x8D'  # U+25CE ◎
+    if node == b'*':
+        return b'\xE2\x88\x97'  # U+2217 ∗
+    if node == b'x':
+        return b'\xE2\x97\x8C'  # U+25CC ◌
+    if node == b'_':
+        return b'\xE2\x95\xA4'  # U+2564 ╤
+    return node
+
+
+def outputprettygraph(orig, ui, graph, *args, **kwargs):
+    (edges, text) = zip(*graph)
+    graph = zip([convertedges(e) for e in edges], text)
+    return orig(ui, graph, *args, **kwargs)
+
+
+def extsetup(ui):
+    if ui.plain(b'graph'):
+        return
+
+    if encoding.encoding != b'UTF-8':
+        ui.warn(_(b'beautifygraph: unsupported encoding, UTF-8 required\n'))
+        return
+
+    if 'A' in encoding._wide:
+        ui.warn(
+            _(
+                b'beautifygraph: unsupported terminal settings, '
+                b'monospace narrow text required\n'
+            )
+        )
+        return
+
+    extensions.wrapfunction(graphmod, b'outputgraph', outputprettygraph)
+    extensions.wrapfunction(templatekw, b'getgraphnode', getprettygraphnode)
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                        usr/lib/python3/dist-packages/hgext/blackbox.py                                                     0000644 0000000 0000000 00000015315 14355257011 020234  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        # blackbox.py - log repository events to a file for post-mortem debugging
+#
+# Copyright 2010 Nicolas Dumazet
+# Copyright 2013 Facebook, Inc.
+#
+# This software may be used and distributed according to the terms of the
+# GNU General Public License version 2 or any later version.
+
+"""log repository events to a blackbox for debugging
+
+Logs event information to .hg/blackbox.log to help debug and diagnose problems.
+The events that get logged can be configured via the blackbox.track and
+blackbox.ignore config keys.
+
+Examples::
+
+  [blackbox]
+  track = *
+  ignore = pythonhook
+  # dirty is *EXPENSIVE* (slow);
+  # each log entry indicates `+` if the repository is dirty, like :hg:`id`.
+  dirty = True
+  # record the source of log messages
+  logsource = True
+
+  [blackbox]
+  track = command, commandfinish, commandexception, exthook, pythonhook
+
+  [blackbox]
+  track = incoming
+
+  [blackbox]
+  # limit the size of a log file
+  maxsize = 1.5 MB
+  # rotate up to N log files when the current one gets too big
+  maxfiles = 3
+
+  [blackbox]
+  # Include microseconds in log entries with %f (see Python function
+  # datetime.datetime.strftime)
+  date-format = %Y-%m-%d @ %H:%M:%S.%f
+
+"""
+
+
+import re
+
+from mercurial.i18n import _
+from mercurial.node import hex
+
+from mercurial import (
+    encoding,
+    loggingutil,
+    registrar,
+)
+from mercurial.utils import (
+    dateutil,
+    procutil,
+)
+
+# Note for extension authors: ONLY specify testedwith = 'ships-with-hg-core' for
+# extensions which SHIP WITH MERCURIAL. Non-mainline extensions should
+# be specifying the version(s) of Mercurial they are tested with, or
+# leave the attribute unspecified.
+testedwith = b'ships-with-hg-core'
+
+cmdtable = {}
+command = registrar.command(cmdtable)
+
+configtable = {}
+configitem = registrar.configitem(configtable)
+
+configitem(
+    b'blackbox',
+    b'dirty',
+    default=False,
+)
+configitem(
+    b'blackbox',
+    b'maxsize',
+    default=b'1 MB',
+)
+configitem(
+    b'blackbox',
+    b'logsource',
+    default=False,
+)
+configitem(
+    b'blackbox',
+    b'maxfiles',
+    default=7,
+)
+configitem(
+    b'blackbox',
+    b'track',
+    default=lambda: [b'*'],
+)
+configitem(
+    b'blackbox',
+    b'ignore',
+    default=lambda: [b'chgserver', b'cmdserver', b'extension'],
+)
+configitem(b'blackbox', b'date-format', default=b'')
+
+_lastlogger = loggingutil.proxylogger()
+
+
+class blackboxlogger:
+    def __init__(self, ui, repo):
+        self._repo = repo
+        self._trackedevents = set(ui.configlist(b'blackbox', b'track'))
+        self._ignoredevents = set(ui.configlist(b'blackbox', b'ignore'))
+        self._maxfiles = ui.configint(b'blackbox', b'maxfiles')
+        self._maxsize = ui.configbytes(b'blackbox', b'maxsize')
+        self._inlog = False
+
+    def tracked(self, event):
+        return (
+            b'*' in self._trackedevents and event not in self._ignoredevents
+        ) or event in self._trackedevents
+
+    def log(self, ui, event, msg, opts):
+        # self._log() -> ctx.dirty() may create new subrepo instance, which
+        # ui is derived from baseui. So the recursion guard in ui.log()
+        # doesn't work as it's local to the ui instance.
+        if self._inlog:
+            return
+        self._inlog = True
+        try:
+            self._log(ui, event, msg, opts)
+        finally:
+            self._inlog = False
+
+    def _log(self, ui, event, msg, opts):
+        default = ui.configdate(b'devel', b'default-date')
+        dateformat = ui.config(b'blackbox', b'date-format')
+        if dateformat:
+            date = dateutil.datestr(default, dateformat)
+        else:
+            # We want to display milliseconds (more precision seems
+            # unnecessary).  Since %.3f is not supported, use %f and truncate
+            # microseconds.
+            date = dateutil.datestr(default, b'%Y-%m-%d %H:%M:%S.%f')[:-3]
+        user = procutil.getuser()
+        pid = b'%d' % procutil.getpid()
+        changed = b''
+        ctx = self._repo[None]
+        parents = ctx.parents()
+        rev = b'+'.join([hex(p.node()) for p in parents])
+        if ui.configbool(b'blackbox', b'dirty') and ctx.dirty(
+            missing=True, merge=False, branch=False
+        ):
+            changed = b'+'
+        if ui.configbool(b'blackbox', b'logsource'):
+            src = b' [%s]' % event
+        else:
+            src = b''
+        try:
+            fmt = b'%s %s @%s%s (%s)%s> %s'
+            args = (date, user, rev, changed, pid, src, msg)
+            with loggingutil.openlogfile(
+                ui,
+                self._repo.vfs,
+                name=b'blackbox.log',
+                maxfiles=self._maxfiles,
+                maxsize=self._maxsize,
+            ) as fp:
+                fp.write(fmt % args)
+        except (IOError, OSError) as err:
+            # deactivate this to avoid failed logging again
+            self._trackedevents.clear()
+            ui.debug(
+                b'warning: cannot write to blackbox.log: %s\n'
+                % encoding.strtolocal(err.strerror)
+            )
+            return
+        _lastlogger.logger = self
+
+
+def uipopulate(ui):
+    ui.setlogger(b'blackbox', _lastlogger)
+
+
+def reposetup(ui, repo):
+    # During 'hg pull' a httppeer repo is created to represent the remote repo.
+    # It doesn't have a .hg directory to put a blackbox in, so we don't do
+    # the blackbox setup for it.
+    if not repo.local():
+        return
+
+    # Since blackbox.log is stored in the repo directory, the logger should be
+    # instantiated per repository.
+    logger = blackboxlogger(ui, repo)
+    ui.setlogger(b'blackbox', logger)
+
+    # Set _lastlogger even if ui.log is not called. This gives blackbox a
+    # fallback place to log
+    if _lastlogger.logger is None:
+        _lastlogger.logger = logger
+
+    repo._wlockfreeprefix.add(b'blackbox.log')
+
+
+@command(
+    b'blackbox',
+    [
+        (b'l', b'limit', 10, _(b'the number of events to show')),
+    ],
+    _(b'hg blackbox [OPTION]...'),
+    helpcategory=command.CATEGORY_MAINTENANCE,
+    helpbasic=True,
+)
+def blackbox(ui, repo, *revs, **opts):
+    """view the recent repository events"""
+
+    if not repo.vfs.exists(b'blackbox.log'):
+        return
+
+    limit = opts.get('limit')
+    fp = repo.vfs(b'blackbox.log', b'r')
+    lines = fp.read().split(b'\n')
+
+    count = 0
+    output = []
+    for line in reversed(lines):
+        if count >= limit:
+            break
+
+        # count the commands by matching lines like:
+        # 2013/01/23 19:13:36 root>
+        # 2013/01/23 19:13:36 root (1234)>
+        # 2013/01/23 19:13:36 root @0000000000000000000000000000000000000000 (1234)>
+        # 2013-01-23 19:13:36.000 root @0000000000000000000000000000000000000000 (1234)>
+        if re.match(
+            br'^\d{4}[-/]\d{2}[-/]\d{2} \d{2}:\d{2}:\d{2}(.\d*)? .*> .*', line
+        ):
+            count += 1
+        output.append(line)
+
+    ui.status(b'\n'.join(reversed(output)))
+                                                                                                                                                                                                                                                                                                                   usr/lib/python3/dist-packages/hgext/bookflow.py                                                     0000644 0000000 0000000 00000007266 14355257011 020277  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        """implements bookmark-based branching (EXPERIMENTAL)
+
+ - Disables creation of new branches (config: enable_branches=False).
+ - Requires an active bookmark on commit (config: require_bookmark=True).
+ - Doesn't move the active bookmark on update, only on commit.
+ - Requires '--rev' for moving an existing bookmark.
+ - Protects special bookmarks (config: protect=@).
+
+ flow related commands
+
+    :hg book NAME: create a new bookmark
+    :hg book NAME -r REV: move bookmark to revision (fast-forward)
+    :hg up|co NAME: switch to bookmark
+    :hg push -B .: push active bookmark
+"""
+
+from mercurial.i18n import _
+from mercurial import (
+    bookmarks,
+    commands,
+    error,
+    extensions,
+    registrar,
+)
+
+MY_NAME = b'bookflow'
+
+configtable = {}
+configitem = registrar.configitem(configtable)
+
+configitem(MY_NAME, b'protect', [b'@'])
+configitem(MY_NAME, b'require-bookmark', True)
+configitem(MY_NAME, b'enable-branches', False)
+
+cmdtable = {}
+command = registrar.command(cmdtable)
+
+
+def commit_hook(ui, repo, **kwargs):
+    active = repo._bookmarks.active
+    if active:
+        if active in ui.configlist(MY_NAME, b'protect'):
+            raise error.Abort(
+                _(b'cannot commit, bookmark %s is protected') % active
+            )
+        if not cwd_at_bookmark(repo, active):
+            raise error.Abort(
+                _(
+                    b'cannot commit, working directory out of sync with active bookmark'
+                ),
+                hint=_(b"run 'hg up %s'") % active,
+            )
+    elif ui.configbool(MY_NAME, b'require-bookmark', True):
+        raise error.Abort(_(b'cannot commit without an active bookmark'))
+    return 0
+
+
+def bookmarks_update(orig, repo, parents, node):
+    if len(parents) == 2:
+        # called during commit
+        return orig(repo, parents, node)
+    else:
+        # called during update
+        return False
+
+
+def bookmarks_addbookmarks(
+    orig, repo, tr, names, rev=None, force=False, inactive=False
+):
+    if not rev:
+        marks = repo._bookmarks
+        for name in names:
+            if name in marks:
+                raise error.Abort(
+                    _(
+                        b"bookmark %s already exists, to move use the --rev option"
+                    )
+                    % name
+                )
+    return orig(repo, tr, names, rev, force, inactive)
+
+
+def commands_commit(orig, ui, repo, *args, **opts):
+    commit_hook(ui, repo)
+    return orig(ui, repo, *args, **opts)
+
+
+def commands_pull(orig, ui, repo, *args, **opts):
+    rc = orig(ui, repo, *args, **opts)
+    active = repo._bookmarks.active
+    if active and not cwd_at_bookmark(repo, active):
+        ui.warn(
+            _(
+                b"working directory out of sync with active bookmark, run "
+                b"'hg up %s'"
+            )
+            % active
+        )
+    return rc
+
+
+def commands_branch(orig, ui, repo, label=None, **opts):
+    if label and not opts.get('clean') and not opts.get('rev'):
+        raise error.Abort(
+            _(
+                b"creating named branches is disabled and you should use bookmarks"
+            ),
+            hint=b"see 'hg help bookflow'",
+        )
+    return orig(ui, repo, label, **opts)
+
+
+def cwd_at_bookmark(repo, mark):
+    mark_id = repo._bookmarks[mark]
+    cur_id = repo.lookup(b'.')
+    return cur_id == mark_id
+
+
+def uisetup(ui):
+    extensions.wrapfunction(bookmarks, b'update', bookmarks_update)
+    extensions.wrapfunction(bookmarks, b'addbookmarks', bookmarks_addbookmarks)
+    extensions.wrapcommand(commands.table, b'commit', commands_commit)
+    extensions.wrapcommand(commands.table, b'pull', commands_pull)
+    if not ui.configbool(MY_NAME, b'enable-branches'):
+        extensions.wrapcommand(commands.table, b'branch', commands_branch)
+                                                                                                                                                                                                                                                                                                                                          usr/lib/python3/dist-packages/hgext/bugzilla.py                                                     0000644 0000000 0000000 00000123112 14374730616 020263  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        # bugzilla.py - bugzilla integration for mercurial
+#
+# Copyright 2006 Vadim Gelfer <vadim.gelfer@gmail.com>
+# Copyright 2011-4 Jim Hague <jim.hague@acm.org>
+#
+# This software may be used and distributed according to the terms of the
+# GNU General Public License version 2 or any later version.
+
+'''hooks for integrating with the Bugzilla bug tracker
+
+This hook extension adds comments on bugs in Bugzilla when changesets
+that refer to bugs by Bugzilla ID are seen. The comment is formatted using
+the Mercurial template mechanism.
+
+The bug references can optionally include an update for Bugzilla of the
+hours spent working on the bug. Bugs can also be marked fixed.
+
+Four basic modes of access to Bugzilla are provided:
+
+1. Access via the Bugzilla REST-API. Requires bugzilla 5.0 or later.
+
+2. Access via the Bugzilla XMLRPC interface. Requires Bugzilla 3.4 or later.
+
+3. Check data via the Bugzilla XMLRPC interface and submit bug change
+   via email to Bugzilla email interface. Requires Bugzilla 3.4 or later.
+
+4. Writing directly to the Bugzilla database. Only Bugzilla installations
+   using MySQL are supported. Requires Python MySQLdb.
+
+Writing directly to the database is susceptible to schema changes, and
+relies on a Bugzilla contrib script to send out bug change
+notification emails. This script runs as the user running Mercurial,
+must be run on the host with the Bugzilla install, and requires
+permission to read Bugzilla configuration details and the necessary
+MySQL user and password to have full access rights to the Bugzilla
+database. For these reasons this access mode is now considered
+deprecated, and will not be updated for new Bugzilla versions going
+forward. Only adding comments is supported in this access mode.
+
+Access via XMLRPC needs a Bugzilla username and password to be specified
+in the configuration. Comments are added under that username. Since the
+configuration must be readable by all Mercurial users, it is recommended
+that the rights of that user are restricted in Bugzilla to the minimum
+necessary to add comments. Marking bugs fixed requires Bugzilla 4.0 and later.
+
+Access via XMLRPC/email uses XMLRPC to query Bugzilla, but sends
+email to the Bugzilla email interface to submit comments to bugs.
+The From: address in the email is set to the email address of the Mercurial

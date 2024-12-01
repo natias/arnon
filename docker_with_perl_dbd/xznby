@@ -1,0 +1,1000 @@
+# warn_forbidden ($WHERE, $WORD, %FORBIDDEN)
+# ------------------------------------------
+# $WORD is forbidden.  Warn with a dedicated error message if in
+# %FORBIDDEN, otherwise a simple 'error: possibly undefined macro'
+# will do.
+my $first_warn_forbidden = 1;
+sub warn_forbidden ($$%)
+{
+  my ($where, $word, %forbidden) = @_;
+  my $message;
+
+  for my $re (sort keys %forbidden)
+    {
+      if ($word =~ $re)
+	{
+	  $message = $forbidden{$re};
+	  last;
+	}
+    }
+  $message ||= "possibly undefined macro: $word";
+  warn "$where: error: $message\n";
+  if ($first_warn_forbidden)
+    {
+      warn <<EOF;
+      If this token and others are legitimate, please use m4_pattern_allow.
+      See the Autoconf documentation.
+EOF
+      $first_warn_forbidden = 0;
+    }
+}
+
+
+# handle_output ($REQ, $OUTPUT)
+# -----------------------------
+# Run m4 on the input files, perform quadrigraphs substitution, check for
+# forbidden tokens, and save into $OUTPUT.
+sub handle_output ($$)
+{
+  my ($req, $output) = @_;
+
+  verb "creating $output";
+
+  # Load the forbidden/allowed patterns.
+  handle_traces ($req, "$tmp/patterns",
+		 ('m4_pattern_forbid' => 'forbid:$1:$2',
+		  'm4_pattern_allow'  => 'allow:$1'));
+  my @patterns = new Autom4te::XFile ("$tmp/patterns", "<")->getlines;
+  chomp @patterns;
+  my %forbidden =
+    map { /^forbid:([^:]+):.+$/ => /^forbid:[^:]+:(.+)$/ } @patterns;
+  my $forbidden = join ('|', map { /^forbid:([^:]+)/ } @patterns) || "^\$";
+  my $allowed   = join ('|', map { /^allow:([^:]+)/  } @patterns) || "^\$";
+
+  verb "forbidden tokens: $forbidden";
+  verb "forbidden token : $_ => $forbidden{$_}"
+    foreach (sort keys %forbidden);
+  verb "allowed   tokens: $allowed";
+
+  # Read the (cached) raw M4 output, produce the actual result.
+  # If we are writing to a regular file, replace it atomically.
+  my $scratchfile;
+  my $out;
+  if ($output eq '-')
+    {
+      # Don't just make $out be STDOUT, because then we would close STDOUT,
+      # which we already do in END.
+      $out = new Autom4te::XFile ('>&STDOUT');
+    }
+  elsif (-e $output && ! -f $output)
+    {
+      $out = new Autom4te::XFile ($output, '>');
+    }
+  else
+    {
+      my (undef, $outdir, undef) = fileparse ($output);
+
+      use File::Temp qw (tempfile);
+      ($out, $scratchfile) = tempfile (UNLINK => 0, DIR => $outdir);
+      fatal "cannot create a file in $outdir: $!"
+        unless $out;
+
+      # File::Temp doesn't give us access to 3-arg open(2), unfortunately.
+      chmod (oct ($mode) & ~(umask), $scratchfile)
+        or fatal "setting mode of " . $scratchfile . ": $!";
+    }
+
+  my $in = new Autom4te::XFile ($ocache . $req->id, "<");
+
+  my %prohibited;
+  my $res;
+  while ($_ = $in->getline)
+    {
+      s/\s+$//;
+      s/__oline__/$./g;
+      s/\@<:\@/[/g;
+      s/\@:>\@/]/g;
+      s/\@\{:\@/(/g;
+      s/\@:\}\@/)/g;
+      s/\@S\|\@/\$/g;
+      s/\@%:\@/#/g;
+
+      $res = $_;
+
+      # Don't complain in comments.  Well, until we have something
+      # better, don't consider '#include' etc. are comments.
+      s/\#.*//
+	unless /^\#\s*(if|include|endif|ifdef|ifndef|define)\b/;
+      foreach (split (/\W+/))
+	{
+	  $prohibited{$_} = $.
+	    if !/^$/ && /$forbidden/o && !/$allowed/o
+               && ! exists $prohibited{$_};
+	}
+
+      # Performed *last*: the empty quadrigraph.
+      $res =~ s/\@&t\@//g;
+
+      print $out "$res\n";
+    }
+
+  $out->close();
+  # Always update the file, even if it didn't change;
+  # Automake relies on this.
+  update_file ($scratchfile, $output, 1)
+    if defined $scratchfile;
+
+  # If no forbidden words, we're done.
+  return
+    if ! %prohibited;
+
+  # Locate the forbidden words in the last input file.
+  # This is unsatisfying but...
+  $exit_code = 1;
+  if ($ARGV[$#ARGV] ne '-')
+    {
+      my $prohibited = '\b(' . join ('|', keys %prohibited) . ')\b';
+      my $file = new Autom4te::XFile ($ARGV[$#ARGV], "<");
+
+      while ($_ = $file->getline)
+	{
+	  # Don't complain in comments.  Well, until we have something
+	  # better, don't consider '#include' etc. to be comments.
+	  s/\#.*//
+	    unless /^\#(if|include|endif|ifdef|ifndef|define)\b/;
+
+	  # Complain once per word, but possibly several times per line.
+	  while (/$prohibited/)
+	    {
+	      my $word = $1;
+	      warn_forbidden ("$ARGV[$#ARGV]:$.", $word, %forbidden);
+	      delete $prohibited{$word};
+	      # If we're done, exit.
+	      return
+		if ! %prohibited;
+	      $prohibited = '\b(' . join ('|', keys %prohibited) . ')\b';
+	    }
+	}
+    }
+  warn_forbidden ("$output:$prohibited{$_}", $_, %forbidden)
+    foreach (sort { $prohibited{$a} <=> $prohibited{$b} } keys %prohibited);
+}
+
+
+## --------------------- ##
+## Handling the traces.  ##
+## --------------------- ##
+
+
+# $M4_MACRO
+# trace_format_to_m4 ($FORMAT)
+# ----------------------------
+# Convert a trace $FORMAT into a M4 trace processing macro's body.
+sub trace_format_to_m4 ($)
+{
+  my ($format) = @_;
+  my $underscore = $_;
+  my %escape = (# File name.
+		'f' => '$1',
+		# Line number.
+		'l' => '$2',
+		# Depth.
+		'd' => '$3',
+		# Name (also available as $0).
+		'n' => '$4',
+		# Escaped dollar.
+		'$' => '$');
+
+  my $res = '';
+  $_ = $format;
+  while ($_)
+    {
+      # $n -> $(n + 4)
+      if (s/^\$(\d+)//)
+	{
+	  $res .= "\$" . ($1 + 4);
+	}
+      # $x, no separator given.
+      elsif (s/^\$([fldn\$])//)
+	{
+	  $res .= $escape{$1};
+	}
+      # $.x or ${sep}x.
+      elsif (s/^\$\{([^}]*)\}([@*%])//
+	    || s/^\$(.?)([@*%])//)
+	{
+	  # $@, list of quoted effective arguments.
+	  if ($2 eq '@')
+	    {
+	      $res .= ']at_at([' . ($1 ? $1 : ',') . '], $@)[';
+	    }
+	  # $*, list of unquoted effective arguments.
+	  elsif ($2 eq '*')
+	    {
+	      $res .= ']at_star([' . ($1 ? $1 : ',') . '], $@)[';
+	    }
+	  # $%, list of flattened unquoted effective arguments.
+	  elsif ($2 eq '%')
+	    {
+	      $res .= ']at_percent([' . ($1 ? $1 : ':') . '], $@)[';
+	    }
+	}
+      elsif (/^(\$.)/)
+	{
+	  error "invalid escape: $1";
+	}
+      else
+	{
+	  s/^([^\$]+)//;
+	  $res .= $1;
+	}
+    }
+
+  $_ = $underscore;
+  return '[[' . $res . ']]';
+}
+
+
+# handle_traces($REQ, $OUTPUT, %TRACE)
+# ------------------------------------
+# We use M4 itself to process the traces.  But to avoid name clashes when
+# processing the traces, the builtins are disabled, and moved into 'at_'.
+# Actually, all the low level processing macros are in 'at_' (and '_at_').
+# To avoid clashes between user macros and 'at_' macros, the macros which
+# implement tracing are in 'AT_'.
+#
+# Having $REQ is needed to neutralize the macros which have been traced,
+# but are not wanted now.
+sub handle_traces ($$%)
+{
+  my ($req, $output, %trace) = @_;
+
+  verb "formatting traces for '$output': " . join (', ', sort keys %trace);
+
+  # Processing the traces.
+  my $trace_m4 = new Autom4te::XFile ("$tmp/traces.m4", ">");
+
+  $_ = <<'EOF';
+  divert(-1)
+  changequote([, ])
+  # _at_MODE(SEPARATOR, ELT1, ELT2...)
+  # ----------------------------------
+  # List the elements, separating then with SEPARATOR.
+  # MODE can be:
+  #  'at'       -- the elements are enclosed in brackets.
+  #  'star'     -- the elements are listed as are.
+  #  'percent'  -- the elements are 'flattened': spaces are singled out,
+  #                and no new line remains.
+  define([_at_at],
+  [at_ifelse([$#], [1], [],
+	     [$#], [2], [[[$2]]],
+	     [[[$2]][$1]$0([$1], at_shift(at_shift($@)))])])
+
+  define([_at_percent],
+  [at_ifelse([$#], [1], [],
+	     [$#], [2], [at_flatten([$2])],
+	     [at_flatten([$2])[$1]$0([$1], at_shift(at_shift($@)))])])
+
+  define([_at_star],
+  [at_ifelse([$#], [1], [],
+	     [$#], [2], [[$2]],
+	     [[$2][$1]$0([$1], at_shift(at_shift($@)))])])
+
+  # FLATTEN quotes its result.
+  # Note that the second pattern is 'newline, tab or space'.  Don't lose
+  # the tab!
+  define([at_flatten],
+  [at_patsubst(at_patsubst([[[$1]]], [\\\n]), [[\n\t ]+], [ ])])
+
+  define([at_args],    [at_shift(at_shift(at_shift(at_shift(at_shift($@)))))])
+  define([at_at],      [_$0([$1], at_args($@))])
+  define([at_percent], [_$0([$1], at_args($@))])
+  define([at_star],    [_$0([$1], at_args($@))])
+
+EOF
+  s/^  //mg;s/\\t/\t/mg;s/\\n/\n/mg;
+  print $trace_m4 $_;
+
+  # If you trace 'define', then on 'define([m4_exit], defn([m4exit])' you
+  # will produce
+  #
+  #    AT_define([m4sugar.m4], [115], [1], [define], [m4_exit], <m4exit>)
+  #
+  # Since '<m4exit>' is not quoted, the outer m4, when processing
+  # 'trace.m4' will exit prematurely.  Hence, move all the builtins to
+  # the 'at_' name space.
+
+  print $trace_m4 "# Copy the builtins.\n";
+  map { print $trace_m4 "define([at_$_], defn([$_]))\n" } @m4_builtin;
+  print $trace_m4 "\n";
+
+  print $trace_m4 "# Disable them.\n";
+  map { print $trace_m4 "at_undefine([$_])\n" } @m4_builtin;
+  print $trace_m4 "\n";
+
+
+  # Neutralize traces: we don't want traces of cached requests (%REQUEST).
+  print $trace_m4
+   "## -------------------------------------- ##\n",
+   "## By default neutralize all the traces.  ##\n",
+   "## -------------------------------------- ##\n",
+   "\n";
+  print $trace_m4 "at_define([AT_$_], [at_dnl])\n"
+    foreach (sort keys %{$req->macro});
+  print $trace_m4 "\n";
+
+  # Implement traces for current requests (%TRACE).
+  print $trace_m4
+    "## ------------------------- ##\n",
+    "## Trace processing macros.  ##\n",
+    "## ------------------------- ##\n",
+    "\n";
+  foreach (sort keys %trace)
+    {
+      # Trace request can be embed \n.
+      (my $comment = "Trace $_:$trace{$_}") =~ s/^/\# /;
+      print $trace_m4 "$comment\n";
+      print $trace_m4 "at_define([AT_$_],\n";
+      print $trace_m4 trace_format_to_m4 ($trace{$_}) . ")\n\n";
+    }
+  print $trace_m4 "\n";
+
+  # Reenable output.
+  print $trace_m4 "at_divert(0)at_dnl\n";
+
+  # Transform the traces from m4 into an m4 input file.
+  # Typically, transform:
+  #
+  # | m4trace:configure.ac:3: -1- AC_SUBST([exec_prefix], [NONE])
+  #
+  # into
+  #
+  # | AT_AC_SUBST([configure.ac], [3], [1], [AC_SUBST], [exec_prefix], [NONE])
+  #
+  # Pay attention that the file name might include colons, if under DOS
+  # for instance, so we don't use '[^:]+'.
+  my $traces = new Autom4te::XFile ($tcache . $req->id, "<");
+  while ($_ = $traces->getline)
+    {
+      # Trace with arguments, as the example above.  We don't try
+      # to match the trailing parenthesis as it might be on a
+      # separate line.
+      s{^m4trace:(.+):(\d+): -(\d+)- ([^(]+)\((.*)$}
+       {AT_$4([$1], [$2], [$3], [$4], $5};
+      # Traces without arguments, always on a single line.
+      s{^m4trace:(.+):(\d+): -(\d+)- ([^)]*)\n$}
+       {AT_$4([$1], [$2], [$3], [$4])\n};
+      print $trace_m4 "$_";
+    }
+  $trace_m4->close;
+
+  my $in = new Autom4te::XFile ("$m4 " . shell_quote ("$tmp/traces.m4") . " |");
+  my $out = new Autom4te::XFile;
+  if ($output eq '-')
+    {
+      $out->open (">$output");
+    }
+  else
+    {
+      $out->open ($output, ">");
+    }
+
+  # This is dubious: should we really transform the quadrigraphs in
+  # traces?  It might break balanced [ ] etc. in the output.  The
+  # consensus seems to be that traces are more useful this way.
+  while ($_ = $in->getline)
+    {
+      # It makes no sense to try to transform __oline__.
+      s/\@<:\@/[/g;
+      s/\@:>\@/]/g;
+      s/\@\{:\@/(/g;
+      s/\@:\}\@/)/g;
+      s/\@S\|\@/\$/g;
+      s/\@%:\@/#/g;
+      s/\@&t\@//g;
+      print $out $_;
+    }
+}
+
+
+# $BOOL
+# up_to_date ($REQ)
+# -----------------
+# Are the cache files of $REQ up to date?
+# $REQ is 'valid' if it corresponds to the request and exists, which
+# does not mean it is up to date.  It is up to date if, in addition,
+# its files are younger than its dependencies.
+sub up_to_date ($)
+{
+  my ($req) = @_;
+
+  return 0
+    if ! $req->valid;
+
+  my $tfile = $tcache . $req->id;
+  my $ofile = $ocache . $req->id;
+
+  # We can't answer properly if the traces are not computed since we
+  # need to know what other files were included.  Actually, if any of
+  # the cache files is missing, we are not up to date.
+  return 0
+    if ! -f $tfile || ! -f $ofile;
+
+  # The youngest of the cache files must be older than the oldest of
+  # the dependencies.
+  # FIXME: These timestamps have only 1-second resolution.
+  # Time::HiRes fixes this, but assumes Perl 5.8 or later.
+  my $tmtime = mtime ($tfile);
+  my $omtime = mtime ($ofile);
+  my ($file, $mtime) = ($tmtime < $omtime
+			? ($ofile, $omtime) : ($tfile, $tmtime));
+
+  # stdin is always out of date.
+  if (grep { $_ eq '-' } @ARGV)
+    { return 0 }
+
+  # We depend at least upon the arguments.
+  foreach my $dep (@ARGV)
+    {
+      if ($mtime < mtime ($dep))
+	{
+	  verb "up_to_date ($file): outdated: $dep";
+	  return 0;
+	}
+    }
+
+  # Files may include others.  We can use traces since we just checked
+  # if they are available.
+  handle_traces ($req, "$tmp/dependencies",
+		 ('include'    => '$1',
+		  'm4_include' => '$1'));
+  my $deps = new Autom4te::XFile ("$tmp/dependencies", "<");
+  while ($_ = $deps->getline)
+    {
+      chomp;
+      my $dep = find_file ("$_?", @include);
+      # If a file which used to be included is no longer there, then
+      # don't say it's missing (it might no longer be included).  But
+      # of course, that causes the output to be outdated (as if the
+      # timestamp of that missing file was newer).
+      return 0
+	if ! $dep;
+      if ($mtime < mtime ($dep))
+	{
+	  verb "up_to_date ($file): outdated: $dep";
+	  return 0;
+	}
+    }
+
+  verb "up_to_date ($file): up to date";
+  return 1;
+}
+
+
+## ---------- ##
+## Freezing.  ##
+## ---------- ##
+
+# freeze ($OUTPUT)
+# ----------------
+sub freeze ($)
+{
+  my ($output) = @_;
+
+  # When processing the file with diversion disabled, there must be no
+  # output but comments and empty lines.
+  my $result = xqx ("$m4"
+		    . ' --fatal-warning'
+		    . join (' --include=', '', map { shell_quote ($_) } @include)
+		    . ' --define=divert'
+		    . " " . files_to_options (@ARGV)
+		    . ' </dev/null');
+  $result =~ s/#.*\n//g;
+  $result =~ s/^\n//mg;
+
+  fatal "freezing produced output:\n$result"
+    if $result;
+
+  # If freezing produces output, something went wrong: a bad 'divert',
+  # or an improper paren etc.
+  xsystem ("$m4"
+	   . ' --fatal-warning'
+	   . join (' --include=', '', map { shell_quote ($_) } @include)
+	   . " --freeze-state=" . shell_quote ($output)
+	   . " " . files_to_options (@ARGV)
+	   . ' </dev/null');
+}
+
+## -------------- ##
+## Main program.  ##
+## -------------- ##
+
+mktmpdir ('am4t');
+load_configuration ($ENV{'AUTOM4TE_CFG'} || "$pkgdatadir/autom4te.cfg");
+load_configuration ("$ENV{'HOME'}/.autom4te.cfg")
+  if exists $ENV{'HOME'} && -f "$ENV{'HOME'}/.autom4te.cfg";
+load_configuration (".autom4te.cfg")
+  if -f ".autom4te.cfg";
+parse_args;
+
+# Freezing does not involve the cache.
+if ($freeze)
+  {
+    freeze ($output);
+    exit $exit_code;
+  }
+
+# Ensure the cache directory exists.
+if (! mkdir ($cache, 0755))
+  {
+    # Snapshot $! immediately, the next few operations may clobber it.
+    my $eexist = $!{EEXIST};
+    my $errmsg = "$!";
+
+    # If mkdir failed with EEXIST, that means the *name* $cache
+    # already exists, but it might be the wrong kind of file.
+    if (! $eexist || ! -d $cache)
+      {
+        require Cwd;
+        my $cwd = Cwd::cwd();
+        fatal "cannot create $cache in $cwd: $errmsg";
+      }
+  }
+
+# Open the index for update, and lock it.  autom4te handles several
+# files, but the index is the first and last file to be updated, so
+# locking it is sufficient.
+$icache_file = new Autom4te::XFile $icache, O_RDWR|O_CREAT;
+$icache_file->lock (LOCK_EX)
+  if ($flock_implemented eq "yes");
+
+# Read the cache index if available and older than autom4te itself.
+# If autom4te is younger, then some structures such as C4che might
+# have changed, which would corrupt its processing.
+Autom4te::C4che->load ($icache_file)
+  if (-f $icache && mtime ($icache) > mtime ($0)
+      && Autom4te::C4che->good_version ($icache_file, '2.71'));
+
+# Add the new trace requests.
+my $req = Autom4te::C4che->request ('input' => \@ARGV,
+				    'path'  => \@include,
+				    'macro' => [keys %trace, @preselect]);
+
+# If $REQ's cache files are not up to date, or simply if the user
+# discarded them (-f), declare it invalid.
+$req->valid (0)
+  if $force || ! up_to_date ($req);
+
+# We now know whether we can trust the Request object.  Say it.
+verb "the trace request object is:\n" . $req->marshall;
+
+# We need to run M4 if (i) the user wants it (--force), (ii) $REQ is
+# invalid.
+handle_m4 ($req, keys %{$req->macro})
+  if $force || ! $req->valid;
+
+# Issue the warnings each time autom4te was run.
+my $separator = "\n" . ('-' x 25) . " END OF WARNING " . ('-' x 25) . "\n\n";
+handle_traces ($req, "$tmp/warnings",
+	       ('_m4_warn' => "\$1::\$f:\$l::\$2::\$3$separator"));
+# Swallow excessive newlines.
+for (split (/\n*$separator\n*/o, contents ("$tmp/warnings")))
+{
+  # The message looks like:
+  # | syntax::input.as:5::ouch
+  # | ::input.as:4: baz is expanded from...
+  # | input.as:2: bar is expanded from...
+  # | input.as:3: foo is expanded from...
+  # | input.as:5: the top level
+  # In particular, m4_warn guarantees that either $stackdump is empty, or
+  # it consists of lines where only the last line ends in "top level".
+  my ($cat, $loc, $msg, $stacktrace) = split ('::', $_, 4);
+  # There might not have been a stacktrace.
+  $stacktrace = '' unless defined $stacktrace;
+  msg $cat, $loc, $msg,
+    partial => ($stacktrace =~ /top level$/) + 0;
+  for (split /\n/, $stacktrace)
+    {
+      my ($loc, $trace) = split (': ', $_, 2);
+      msg $cat, $loc, $trace, partial => ($trace !~ /top level$/) + 0;
+    }
+}
+
+# Now output...
+if (%trace)
+  {
+    # Always produce traces, since even if the output is young enough,
+    # there is no guarantee that the traces use the same *format*
+    # (e.g., '-t FOO:foo' and '-t FOO:bar' are both using the same M4
+    # traces, hence the M4 traces cache is usable, but its formatting
+    # will yield different results).
+    handle_traces ($req, $output, %trace);
+  }
+else
+  {
+    # Actual M4 expansion, if the user wants it, or if $output is old
+    # (STDOUT is pretty old).
+    handle_output ($req, $output)
+      if $force || mtime ($output) < mtime ($ocache . $req->id);
+  }
+
+# If we ran up to here, the cache is valid.
+$req->valid (1);
+Autom4te::C4che->save ($icache_file, '2.71');
+
+exit $exit_code;
+
+### Setup "GNU" style for perl-mode and cperl-mode.
+## Local Variables:
+## perl-indent-level: 2
+## perl-continued-statement-offset: 2
+## perl-continued-brace-offset: 0
+## perl-brace-offset: 0
+## perl-brace-imaginary-offset: 0
+## perl-label-offset: -2
+## cperl-indent-level: 2
+## cperl-brace-offset: 0
+## cperl-continued-brace-offset: 0
+## cperl-label-offset: -2
+## cperl-extra-newline-before-brace: t
+## cperl-merge-trailing-else: nil
+## cperl-continued-statement-offset: 2
+## End:
+                                                                                                                                                                                                                                                                                                                             usr/bin/automake                                                                                    0000777 0000000 0000000 00000000000 14215102164 017433  2/etc/alternatives/automake                                                                          ustar 00                                                                0000000 0000000                                                                                                                                                                        usr/bin/automake-1.16                                                                               0000755 0000000 0000000 00000777647 14215102164 012774  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        #!/usr/bin/perl
+# automake - create Makefile.in from Makefile.am            -*- perl -*-
+# Generated from bin/automake.in; do not edit by hand.
+# Copyright (C) 1994-2021 Free Software Foundation, Inc.
+
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 2, or (at your option)
+# any later version.
+
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+# Originally written by David Mackenzie <djm@gnu.ai.mit.edu>.
+# Perl reimplementation by Tom Tromey <tromey@redhat.com>, and
+# Alexandre Duret-Lutz <adl@gnu.org>.
+
+package Automake;
+
+use 5.006;
+use strict;
+use warnings FATAL => 'all';
+
+BEGIN
+{
+  unshift (@INC, '/usr/share/automake-1.16')
+    unless $ENV{AUTOMAKE_UNINSTALLED};
+
+  # Override SHELL.  This is required on DJGPP so that system() uses
+  # bash, not COMMAND.COM which doesn't quote arguments properly.
+  # Other systems aren't expected to use $SHELL when Automake
+  # runs, but it should be safe to drop the "if DJGPP" guard if
+  # it turns up other systems need the same thing.  After all,
+  # if SHELL is used, ./configure's SHELL is always better than
+  # the user's SHELL (which may be something like tcsh).
+  $ENV{'SHELL'} = '/bin/sh' if exists $ENV{'DJDIR'};
+}
+
+use Carp;
+use File::Basename;
+use File::Spec;
+
+use Automake::Config;
+BEGIN
+{
+  if ($perl_threads)
+    {
+      require threads;
+      import threads;
+      require Thread::Queue;
+      import Thread::Queue;
+    }
+}
+use Automake::General;
+use Automake::XFile;
+use Automake::Channels;
+use Automake::ChannelDefs;
+use Automake::Configure_ac;
+use Automake::FileUtils;
+use Automake::Location;
+use Automake::Condition qw/TRUE FALSE/;
+use Automake::DisjConditions;
+use Automake::Options;
+use Automake::Variable;
+use Automake::VarDef;
+use Automake::Rule;
+use Automake::RuleDef;
+use Automake::Wrap 'makefile_wrap';
+use Automake::Language;
+
+## ----------------------- ##
+## Subroutine prototypes.  ##
+## ----------------------- ##
+
+sub append_exeext (&$);
+sub check_gnits_standards ();
+sub check_gnu_standards ();
+sub check_trailing_slash ($\$);
+sub check_typos ();
+sub define_files_variable ($\@$$);
+sub define_standard_variables ();
+sub define_verbose_libtool ();
+sub define_verbose_texinfo ();
+sub do_check_merge_target ();
+sub get_number_of_threads ();
+sub handle_compile ();
+sub handle_data ();
+sub handle_dist ();
+sub handle_emacs_lisp ();
+sub handle_factored_dependencies ();
+sub handle_footer ();
+sub handle_gettext ();
+sub handle_headers ();
+sub handle_install ();
+sub handle_java ();
+sub handle_languages ();
+sub handle_libraries ();
+sub handle_libtool ();
+sub handle_ltlibraries ();
+sub handle_makefiles_serial ();
+sub handle_man_pages ();
+sub handle_minor_options ();
+sub handle_options ();
+sub handle_programs ();
+sub handle_python ();
+sub handle_scripts ();
+sub handle_silent ();
+sub handle_subdirs ();
+sub handle_tags ();
+sub handle_targets ();
+sub handle_tests ();
+sub handle_tests_dejagnu ();
+sub handle_texinfo ();
+sub handle_user_recursion ();
+sub initialize_per_input ();
+sub lang_lex_finish ();
+sub lang_sub_obj ();
+sub lang_vala_finish ();
+sub lang_yacc_finish ();
+sub locate_aux_dir ();
+sub parse_arguments ();
+sub scan_aclocal_m4 ();
+sub scan_autoconf_files ();
+sub silent_flag ();
+sub transform ($\%);
+sub transform_token ($\%$);
+sub usage ();
+sub version ();
+sub yacc_lex_finish_helper ();
+
+## ----------- ##
+## Constants.  ##
+## ----------- ##
+
+# Some regular expressions.  One reason to put them here is that it
+# makes indentation work better in Emacs.
+
+# Writing singled-quoted-$-terminated regexes is a pain because
+# perl-mode thinks of $' as the ${'} variable (instead of a $ followed
+# by a closing quote.  Letting perl-mode think the quote is not closed
+# leads to all sort of misindentations.  On the other hand, defining
+# regexes as double-quoted strings is far less readable.  So usually
+# we will write:
+#
+#  $REGEX = '^regex_value' . "\$";
+
+my $IGNORE_PATTERN = '^\s*##([^#\n].*)?\n';
+my $WHITE_PATTERN = '^\s*' . "\$";
+my $COMMENT_PATTERN = '^#';
+my $TARGET_PATTERN='[$a-zA-Z0-9_.@%][-.a-zA-Z0-9_(){}/$+@%]*';
+# A rule has three parts: a list of targets, a list of dependencies,
+# and optionally actions.
+my $RULE_PATTERN =
+  "^($TARGET_PATTERN(?:(?:\\\\\n|\\s)+$TARGET_PATTERN)*) *:([^=].*|)\$";
+
+# Only recognize leading spaces, not leading tabs.  If we recognize
+# leading tabs here then we need to make the reader smarter, because
+# otherwise it will think rules like 'foo=bar; \' are errors.
+my $ASSIGNMENT_PATTERN = '^ *([^ \t=:+]*)\s*([:+]?)=\s*(.*)' . "\$";
+# This pattern recognizes a Gnits version id and sets $1 if the
+# release is an alpha release.  We also allow a suffix which can be
+# used to extend the version number with a "fork" identifier.
+my $GNITS_VERSION_PATTERN = '\d+\.\d+([a-z]|\.\d+)?(-[A-Za-z0-9]+)?';
+
+my $IF_PATTERN = '^if\s+(!?)\s*([A-Za-z][A-Za-z0-9_]*)\s*(?:#.*)?' . "\$";
+my $ELSE_PATTERN =
+  '^else(?:\s+(!?)\s*([A-Za-z][A-Za-z0-9_]*))?\s*(?:#.*)?' . "\$";
+my $ENDIF_PATTERN =
+  '^endif(?:\s+(!?)\s*([A-Za-z][A-Za-z0-9_]*))?\s*(?:#.*)?' . "\$";
+my $PATH_PATTERN = '(\w|[+/.-])+';
+# This will pass through anything not of the prescribed form.
+my $INCLUDE_PATTERN = ('^include\s+'
+		       . '((\$\(top_srcdir\)/' . $PATH_PATTERN . ')'
+		       . '|(\$\(srcdir\)/' . $PATH_PATTERN . ')'
+		       . '|([^/\$]' . $PATH_PATTERN . '))\s*(#.*)?' . "\$");
+
+# Directories installed during 'install-exec' phase.
+my $EXEC_DIR_PATTERN =
+  '^(?:bin|sbin|libexec|sysconf|localstate|lib|pkglib|.*exec.*)' . "\$";
+
+# Values for AC_CANONICAL_*
+use constant AC_CANONICAL_BUILD  => 1;
+use constant AC_CANONICAL_HOST   => 2;
+use constant AC_CANONICAL_TARGET => 3;
+
+# Values indicating when something should be cleaned.
+use constant MOSTLY_CLEAN     => 0;
+use constant CLEAN            => 1;
+use constant DIST_CLEAN       => 2;
+use constant MAINTAINER_CLEAN => 3;
+
+# Libtool files.
+my @libtool_files = qw(ltmain.sh config.guess config.sub);
+# ltconfig appears here for compatibility with old versions of libtool.
+my @libtool_sometimes = qw(ltconfig ltcf-c.sh ltcf-cxx.sh ltcf-gcj.sh);
+
+# Top-level files that can be foo.md instead of foo.  We assume that all
+# but THANKS are required at strictness level gnu.
+my @toplevelmd_ok = qw(AUTHORS ChangeLog INSTALL NEWS README THANKS);
+
+# Commonly found files we look for and automatically include in DISTFILES.
+my @common_files =
+    (qw(ABOUT-GNU ABOUT-NLS BACKLOG COPYING
+        COPYING.DOC COPYING.LIB COPYING.LESSER TODO
+	ar-lib compile config.guess config.rpath
+	config.sub depcomp install-sh libversion.in mdate-sh
+	missing mkinstalldirs py-compile texinfo.tex ylwrap),
+     @libtool_files, @libtool_sometimes);
+
+# Commonly used files we auto-include, but only sometimes.  This list
+# is used for the --help output only.
+my @common_sometimes =
+  qw(aclocal.m4 acconfig.h config.h.top config.h.bot configure
+     configure.ac configure.in stamp-vti);
+
+# Standard directories from the GNU Coding Standards, and additional
+# pkg* directories from Automake.  Stored in a hash for fast member check.
+my %standard_prefix =
+    map { $_ => 1 } (qw(bin data dataroot doc dvi exec html include info
+			lib libexec lisp locale localstate man man1 man2
+			man3 man4 man5 man6 man7 man8 man9 oldinclude pdf
+			pkgdata pkginclude pkglib pkglibexec ps sbin
+			sharedstate sysconf));
+
+# Copyright on generated Makefile.ins.
+my $gen_copyright = "\
+# Copyright (C) 1994-$RELEASE_YEAR Free Software Foundation, Inc.
+
+# This Makefile.in is free software; the Free Software Foundation
+# gives unlimited permission to copy and/or distribute it,
+# with or without modifications, as long as this notice is preserved.
+
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY, to the extent permitted by law; without
+# even the implied warranty of MERCHANTABILITY or FITNESS FOR A
+# PARTICULAR PURPOSE.
+";
+
+# These constants are returned by the lang_*_rewrite functions.
+# LANG_SUBDIR means that the resulting object file should be in a
+# subdir if the source file is.  In this case the file name cannot
+# have '..' components.
+use constant LANG_IGNORE  => 0;
+use constant LANG_PROCESS => 1;
+use constant LANG_SUBDIR  => 2;
+
+# These are used when keeping track of whether an object can be built
+# by two different paths.
+use constant COMPILE_LIBTOOL  => 1;
+use constant COMPILE_ORDINARY => 2;
+
+# We can't always associate a location to a variable or a rule,
+# when it's defined by Automake.  We use INTERNAL in this case.
+use constant INTERNAL => new Automake::Location;
+
+# Serialization keys for message queues.
+use constant QUEUE_MESSAGE   => "msg";
+use constant QUEUE_CONF_FILE => "conf file";
+use constant QUEUE_LOCATION  => "location";
+use constant QUEUE_STRING    => "string";
+
+## ---------------------------------- ##
+## Variables related to the options.  ##
+## ---------------------------------- ##
+
+# TRUE if we should always generate Makefile.in.
+my $force_generation = 1;
+
+# From the Perl manual.
+my $symlink_exists = (eval 'symlink ("", "");', $@ eq '');
+
+# TRUE if missing standard files should be installed.
+my $add_missing = 0;
+
+# TRUE if we should copy missing files; otherwise symlink if possible.
+my $copy_missing = 0;
+
+# TRUE if we should always update files that we know about.
+my $force_missing = 0;
+
+
+## ---------------------------------------- ##
+## Variables filled during files scanning.  ##
+## ---------------------------------------- ##
+
+# Name of the configure.ac file.
+my $configure_ac;
+
+# Files found by scanning configure.ac for LIBOBJS.
+my %libsources = ();
+
+# Names used in AC_CONFIG_HEADERS call.
+my @config_headers = ();
+
+# Names used in AC_CONFIG_LINKS call.
+my @config_links = ();
+
+# List of Makefile.am's to process, and their corresponding outputs.
+my @input_files = ();
+my %output_files = ();
+
+# Complete list of Makefile.am's that exist.
+my @configure_input_files = ();
+
+# List of files in AC_CONFIG_FILES/AC_OUTPUT without Makefile.am's,
+# and their outputs.
+my @other_input_files = ();
+# Where each AC_CONFIG_FILES/AC_OUTPUT/AC_CONFIG_LINK/AC_CONFIG_HEADERS
+# appears.  The keys are the files created by these macros.
+my %ac_config_files_location = ();
+# The condition under which AC_CONFIG_FOOS appears.
+my %ac_config_files_condition = ();
+
+# Directory to search for configure-required files.  This
+# will be computed by locate_aux_dir() and can be set using
+# AC_CONFIG_AUX_DIR in configure.ac.
+# $CONFIG_AUX_DIR is the 'raw' directory, valid only in the source-tree.
+my $config_aux_dir = '';
+my $config_aux_dir_set_in_configure_ac = 0;
+# $AM_CONFIG_AUX_DIR is prefixed with $(top_srcdir), so it can be used
+# in Makefiles.
+my $am_config_aux_dir = '';
+
+# Directory to search for AC_LIBSOURCE files, as set by AC_CONFIG_LIBOBJ_DIR
+# in configure.ac.
+my $config_libobj_dir = '';
+
+# Whether AM_GNU_GETTEXT has been seen in configure.ac.
+my $seen_gettext = 0;
+# Whether AM_GNU_GETTEXT([external]) is used.
+my $seen_gettext_external = 0;
+# Where AM_GNU_GETTEXT appears.
+my $ac_gettext_location;
+# Whether AM_GNU_GETTEXT_INTL_SUBDIR has been seen.
+my $seen_gettext_intl = 0;
+
+# The arguments of the AM_EXTRA_RECURSIVE_TARGETS call (if any).
+my @extra_recursive_targets = ();
+
+# Lists of tags supported by Libtool.
+my %libtool_tags = ();
+# 1 if Libtool uses LT_SUPPORTED_TAG.  If it does, then it also
+# uses AC_REQUIRE_AUX_FILE.
+my $libtool_new_api = 0;
+
+# Most important AC_CANONICAL_* macro seen so far.
+my $seen_canonical = 0;
+
+# Where AM_MAINTAINER_MODE appears.
+my $seen_maint_mode;
+
+# Actual version we've seen.
+my $package_version = '';

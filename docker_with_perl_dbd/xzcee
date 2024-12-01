@@ -1,0 +1,1000 @@
+}
+
+# Discard deferred writes, but retain old deferred writing mode
+sub _discard {
+  my $self = shift;
+  %{$self->{deferred}} = ();
+  $self->{deferred_s}  = 0;
+  $self->{deferred_max}  = -1;
+  $self->{cache}->set_limit($self->{memory});
+}
+
+# Deferred writing is enabled, either explicitly ($self->{defer})
+# or automatically ($self->{autodeferring})
+sub _is_deferring {
+  my $self = shift;
+  $self->{defer} || $self->{autodeferring};
+}
+
+# The largest record number of any deferred record
+sub _defer_max {
+  my $self = shift;
+  return $self->{deferred_max} if defined $self->{deferred_max};
+  my $max = -1;
+  for my $key (keys %{$self->{deferred}}) {
+    $max = $key if $key > $max;
+  }
+  $self->{deferred_max} = $max;
+  $max;
+}
+
+################################################################
+#
+# Matters related to autodeferment
+#
+
+# Get/set autodefer option
+sub autodefer {
+  my $self = shift;
+  if (@_) {
+    my $old = $self->{autodefer};
+    $self->{autodefer} = shift;
+    if ($old) {
+      $self->_stop_autodeferring;
+      @{$self->{ad_history}} = ();
+    }
+    $old;
+  } else {
+    $self->{autodefer};
+  }
+}
+
+# The user is trying to store record #$n Record that in the history,
+# and then enable (or disable) autodeferment if that seems useful.
+# Note that it's OK for $n to be a non-number, as long as the function
+# is prepared to deal with that.  Nobody else looks at the ad_history.
+#
+# Now, what does the ad_history mean, and what is this function doing?
+# Essentially, the idea is to enable autodeferring when we see that the
+# user has made three consecutive STORE calls to three consecutive records.
+# ("Three" is actually ->{autodefer_threshhold}.)
+# A STORE call for record #$n inserts $n into the autodefer history,
+# and if the history contains three consecutive records, we enable 
+# autodeferment.  An ad_history of [X, Y] means that the most recent
+# STOREs were for records X, X+1, ..., Y, in that order.  
+#
+# Inserting a nonconsecutive number erases the history and starts over.
+#
+# Performing a special operation like SPLICE erases the history.
+#
+# There's one special case: CLEAR means that CLEAR was just called.
+# In this case, we prime the history with [-2, -1] so that if the next
+# write is for record 0, autodeferring goes on immediately.  This is for
+# the common special case of "@a = (...)".
+#
+sub _annotate_ad_history {
+  my ($self, $n) = @_;
+  return unless $self->{autodefer}; # feature is disabled
+  return if $self->{defer};     # already in explicit defer mode
+  return unless $self->{offsets}[-1] >= $self->{autodefer_filelen_threshhold};
+
+  local *H = $self->{ad_history};
+  if ($n eq 'CLEAR') {
+    @H = (-2, -1);              # prime the history with fake records
+    $self->_stop_autodeferring;
+  } elsif ($n =~ /^\d+$/) {
+    if (@H == 0) {
+      @H =  ($n, $n);
+    } else {                    # @H == 2
+      if ($H[1] == $n-1) {      # another consecutive record
+        $H[1]++;
+        if ($H[1] - $H[0] + 1 >= $self->{autodefer_threshhold}) {
+          $self->{autodeferring} = 1;
+        }
+      } else {                  # nonconsecutive- erase and start over
+        @H = ($n, $n);
+        $self->_stop_autodeferring;
+      }
+    }
+  } else {                      # SPLICE or STORESIZE or some such
+    @H = ();
+    $self->_stop_autodeferring;
+  }
+}
+
+# If autodeferring was enabled, cut it out and discard the history
+sub _stop_autodeferring {
+  my $self = shift;
+  if ($self->{autodeferring}) {
+    $self->_flush;
+  }
+  $self->{autodeferring} = 0;
+}
+
+################################################################
+
+
+# This is NOT a method.  It is here for two reasons:
+#  1. To factor a fairly complicated block out of the constructor
+#  2. To provide access for the test suite, which need to be sure
+#     files are being written properly.
+sub _default_recsep {
+  my $recsep = $/;
+  if ($^O eq 'MSWin32') {       # Dos too?
+    # Windows users expect files to be terminated with \r\n
+    # But $/ is set to \n instead
+    # Note that this also transforms \n\n into \r\n\r\n.
+    # That is a feature.
+    $recsep =~ s/\n/\r\n/g;
+  }
+  $recsep;
+}
+
+# Utility function for _check_integrity
+sub _ci_warn {
+  my $msg = shift;
+  $msg =~ s/\n/\\n/g;
+  $msg =~ s/\r/\\r/g;
+  print "# $msg\n";
+}
+
+# Given a file, make sure the cache is consistent with the
+# file contents and the internal data structures are consistent with
+# each other.  Returns true if everything checks out, false if not
+#
+# The $file argument is no longer used.  It is retained for compatibility
+# with the existing test suite.
+sub _check_integrity {
+  my ($self, $file, $warn) = @_;
+  my $rsl = $self->{recseplen};
+  my $rs  = $self->{recsep};
+  my $good = 1; 
+  local *_;                     # local $_ does not work here
+  local $DIAGNOSTIC = 1;
+
+  if (not defined $rs) {
+    _ci_warn("recsep is undef!");
+    $good = 0;
+  } elsif ($rs eq "") {
+    _ci_warn("recsep is empty!");
+    $good = 0;
+  } elsif ($rsl != length $rs) {
+    my $ln = length $rs;
+    _ci_warn("recsep <$rs> has length $ln, should be $rsl");
+    $good = 0;
+  }
+
+  if (not defined $self->{offsets}[0]) {
+    _ci_warn("offset 0 is missing!");
+    $good = 0;
+
+  } elsif ($self->{offsets}[0] != 0) {
+    _ci_warn("rec 0: offset <$self->{offsets}[0]> s/b 0!");
+    $good = 0;
+  }
+
+  my $cached = 0;
+  {
+    local *F = $self->{fh};
+    seek F, 0, SEEK_SET;
+    local $. = 0;
+    local $/ = $rs;
+
+    while (<F>) {
+      my $n = $. - 1;
+      my $cached = $self->{cache}->_produce($n);
+      my $offset = $self->{offsets}[$.];
+      my $ao = tell F;
+      if (defined $offset && $offset != $ao) {
+        _ci_warn("rec $n: offset <$offset> actual <$ao>");
+        $good = 0;
+      }
+      if (defined $cached && $_ ne $cached && ! $self->{deferred}{$n}) {
+        $good = 0;
+        _ci_warn("rec $n: cached <$cached> actual <$_>");
+      }
+      if (defined $cached && substr($cached, -$rsl) ne $rs) {
+        $good = 0;
+        _ci_warn("rec $n in the cache is missing the record separator");
+      }
+      if (! defined $offset && $self->{eof}) {
+        $good = 0;
+        _ci_warn("The offset table was marked complete, but it is missing " .
+                 "element $.");
+      }
+    }
+    if (@{$self->{offsets}} > $.+1) {
+        $good = 0;
+        my $n = @{$self->{offsets}};
+        _ci_warn("The offset table has $n items, but the file has only $.");
+    }
+
+    my $deferring = $self->_is_deferring;
+    for my $n ($self->{cache}->ckeys) {
+      my $r = $self->{cache}->_produce($n);
+      $cached += length($r);
+      next if $n+1 <= $.;         # checked this already
+      _ci_warn("spurious caching of record $n");
+      $good = 0;
+    }
+    my $b = $self->{cache}->bytes;
+    if ($cached != $b) {
+      _ci_warn("cache size is $b, should be $cached");
+      $good = 0;
+    }
+  }
+
+  # That cache has its own set of tests
+  $good = 0 unless $self->{cache}->_check_integrity;
+
+  # Now let's check the deferbuffer
+  # Unless deferred writing is enabled, it should be empty
+  if (! $self->_is_deferring && %{$self->{deferred}}) {
+    _ci_warn("deferred writing disabled, but deferbuffer nonempty");
+    $good = 0;
+  }
+
+  # Any record in the deferbuffer should *not* be present in the readcache
+  my $deferred_s = 0;
+  while (my ($n, $r) = each %{$self->{deferred}}) {
+    $deferred_s += length($r);
+    if (defined $self->{cache}->_produce($n)) {
+      _ci_warn("record $n is in the deferbuffer *and* the readcache");
+      $good = 0;
+    }
+    if (substr($r, -$rsl) ne $rs) {
+      _ci_warn("rec $n in the deferbuffer is missing the record separator");
+      $good = 0;
+    }
+  }
+
+  # Total size of deferbuffer should match internal total
+  if ($deferred_s != $self->{deferred_s}) {
+    _ci_warn("buffer size is $self->{deferred_s}, should be $deferred_s");
+    $good = 0;
+  }
+
+  # Total size of deferbuffer should not exceed the specified limit
+  if ($deferred_s > $self->{dw_size}) {
+    _ci_warn("buffer size is $self->{deferred_s} which exceeds the limit " .
+             "of $self->{dw_size}");
+    $good = 0;
+  }
+
+  # Total size of cached data should not exceed the specified limit
+  if ($deferred_s + $cached > $self->{memory}) {
+    my $total = $deferred_s + $cached;
+    _ci_warn("total stored data size is $total which exceeds the limit " .
+             "of $self->{memory}");
+    $good = 0;
+  }
+
+  # Stuff related to autodeferment
+  if (!$self->{autodefer} && @{$self->{ad_history}}) {
+    _ci_warn("autodefer is disabled, but ad_history is nonempty");
+    $good = 0;
+  }
+  if ($self->{autodeferring} && $self->{defer}) {
+    _ci_warn("both autodeferring and explicit deferring are active");
+    $good = 0;
+  }
+  if (@{$self->{ad_history}} == 0) {
+    # That's OK, no additional tests required
+  } elsif (@{$self->{ad_history}} == 2) {
+    my @non_number = grep !/^-?\d+$/, @{$self->{ad_history}};
+    if (@non_number) {
+      my $msg;
+      { local $" = ')(';
+        $msg = "ad_history contains non-numbers (@{$self->{ad_history}})";
+      }
+      _ci_warn($msg);
+      $good = 0;
+    } elsif ($self->{ad_history}[1] < $self->{ad_history}[0]) {
+      _ci_warn("ad_history has nonsensical values @{$self->{ad_history}}");
+      $good = 0;
+    }
+  } else {
+    _ci_warn("ad_history has bad length <@{$self->{ad_history}}>");
+    $good = 0;
+  }
+
+  $good;
+}
+
+################################################################
+#
+# Tie::File::Cache
+#
+# Read cache
+
+package Tie::File::Cache;
+$Tie::File::Cache::VERSION = $Tie::File::VERSION;
+use Carp ':DEFAULT', 'confess';
+
+sub HEAP () { 0 }
+sub HASH () { 1 }
+sub MAX  () { 2 }
+sub BYTES() { 3 }
+#sub STAT () { 4 } # Array with request statistics for each record
+#sub MISS () { 5 } # Total number of cache misses
+#sub REQ  () { 6 } # Total number of cache requests 
+use strict 'vars';
+
+sub new {
+  my ($pack, $max) = @_;
+  local *_;
+  croak "missing argument to ->new" unless defined $max;
+  my $self = [];
+  bless $self => $pack;
+  @$self = (Tie::File::Heap->new($self), {}, $max, 0);
+  $self;
+}
+
+sub adj_limit {
+  my ($self, $n) = @_;
+  $self->[MAX] += $n;
+}
+
+sub set_limit {
+  my ($self, $n) = @_;
+  $self->[MAX] = $n;
+}
+
+# For internal use only
+# Will be called by the heap structure to notify us that a certain 
+# piece of data has moved from one heap element to another.
+# $k is the hash key of the item
+# $n is the new index into the heap at which it is stored
+# If $n is undefined, the item has been removed from the heap.
+sub _heap_move {
+  my ($self, $k, $n) = @_;
+  if (defined $n) {
+    $self->[HASH]{$k} = $n;
+  } else {
+    delete $self->[HASH]{$k};
+  }
+}
+
+sub insert {
+  my ($self, $key, $val) = @_;
+  local *_;
+  croak "missing argument to ->insert" unless defined $key;
+  unless (defined $self->[MAX]) {
+    confess "undefined max" ;
+  }
+  confess "undefined val" unless defined $val;
+  return if length($val) > $self->[MAX];
+
+#  if ($self->[STAT]) {
+#    $self->[STAT][$key] = 1;
+#    return;
+#  }
+
+  my $oldnode = $self->[HASH]{$key};
+  if (defined $oldnode) {
+    my $oldval = $self->[HEAP]->set_val($oldnode, $val);
+    $self->[BYTES] -= length($oldval);
+  } else {
+    $self->[HEAP]->insert($key, $val);
+  }
+  $self->[BYTES] += length($val);
+  $self->flush if $self->[BYTES] > $self->[MAX];
+}
+
+sub expire {
+  my $self = shift;
+  my $old_data = $self->[HEAP]->popheap;
+  return unless defined $old_data;
+  $self->[BYTES] -= length $old_data;
+  $old_data;
+}
+
+sub remove {
+  my ($self, @keys) = @_;
+  my @result;
+
+#  if ($self->[STAT]) {
+#    for my $key (@keys) {
+#      $self->[STAT][$key] = 0;
+#    }
+#    return;
+#  }
+
+  for my $key (@keys) {
+    next unless exists $self->[HASH]{$key};
+    my $old_data = $self->[HEAP]->remove($self->[HASH]{$key});
+    $self->[BYTES] -= length $old_data;
+    push @result, $old_data;
+  }
+  @result;
+}
+
+sub lookup {
+  my ($self, $key) = @_;
+  local *_;
+  croak "missing argument to ->lookup" unless defined $key;
+
+#  if ($self->[STAT]) {
+#    $self->[MISS]++  if $self->[STAT][$key]++ == 0;
+#    $self->[REQ]++;
+#    my $hit_rate = 1 - $self->[MISS] / $self->[REQ];
+#    # Do some testing to determine this threshhold
+#    $#$self = STAT - 1 if $hit_rate > 0.20; 
+#  }
+
+  if (exists $self->[HASH]{$key}) {
+    $self->[HEAP]->lookup($self->[HASH]{$key});
+  } else {
+    return;
+  }
+}
+
+# For internal use only
+sub _produce {
+  my ($self, $key) = @_;
+  my $loc = $self->[HASH]{$key};
+  return unless defined $loc;
+  $self->[HEAP][$loc][2];
+}
+
+# For internal use only
+sub _promote {
+  my ($self, $key) = @_;
+  $self->[HEAP]->promote($self->[HASH]{$key});
+}
+
+sub empty {
+  my ($self) = @_;
+  %{$self->[HASH]} = ();
+    $self->[BYTES] = 0;
+    $self->[HEAP]->empty;
+#  @{$self->[STAT]} = ();
+#    $self->[MISS] = 0;
+#    $self->[REQ] = 0;
+}
+
+sub is_empty {
+  my ($self) = @_;
+  keys %{$self->[HASH]} == 0;
+}
+
+sub update {
+  my ($self, $key, $val) = @_;
+  local *_;
+  croak "missing argument to ->update" unless defined $key;
+  if (length($val) > $self->[MAX]) {
+    my ($oldval) = $self->remove($key);
+    $self->[BYTES] -= length($oldval) if defined $oldval;
+  } elsif (exists $self->[HASH]{$key}) {
+    my $oldval = $self->[HEAP]->set_val($self->[HASH]{$key}, $val);
+    $self->[BYTES] += length($val);
+    $self->[BYTES] -= length($oldval) if defined $oldval;
+  } else {
+    $self->[HEAP]->insert($key, $val);
+    $self->[BYTES] += length($val);
+  }
+  $self->flush;
+}
+
+sub rekey {
+  my ($self, $okeys, $nkeys) = @_;
+  local *_;
+  my %map;
+  @map{@$okeys} = @$nkeys;
+  croak "missing argument to ->rekey" unless defined $nkeys;
+  croak "length mismatch in ->rekey arguments" unless @$nkeys == @$okeys;
+  my %adjusted;                 # map new keys to heap indices
+  # You should be able to cut this to one loop TODO XXX
+  for (0 .. $#$okeys) {
+    $adjusted{$nkeys->[$_]} = delete $self->[HASH]{$okeys->[$_]};
+  }
+  while (my ($nk, $ix) = each %adjusted) {
+    # @{$self->[HASH]}{keys %adjusted} = values %adjusted;
+    $self->[HEAP]->rekey($ix, $nk);
+    $self->[HASH]{$nk} = $ix;
+  }
+}
+
+sub ckeys {
+  my $self = shift;
+  my @a = keys %{$self->[HASH]};
+  @a;
+}
+
+# Return total amount of cached data
+sub bytes {
+  my $self = shift;
+  $self->[BYTES];
+}
+
+# Expire oldest item from cache until cache size is smaller than $max
+sub reduce_size_to {
+  my ($self, $max) = @_;
+  until ($self->[BYTES] <= $max) {
+    # Note that Tie::File::Cache::expire has been inlined here
+    my $old_data = $self->[HEAP]->popheap;
+    return unless defined $old_data;
+    $self->[BYTES] -= length $old_data;
+  }
+}
+
+# Why not just $self->reduce_size_to($self->[MAX])?
+# Try this when things stabilize   TODO XXX
+# If the cache is too full, expire the oldest records
+sub flush {
+  my $self = shift;
+  $self->reduce_size_to($self->[MAX]) if $self->[BYTES] > $self->[MAX];
+}
+
+# For internal use only
+sub _produce_lru {
+  my $self = shift;
+  $self->[HEAP]->expire_order;
+}
+
+BEGIN { *_ci_warn = \&Tie::File::_ci_warn }
+
+sub _check_integrity {          # For CACHE
+  my $self = shift;
+  my $good = 1;
+
+  # Test HEAP
+  $self->[HEAP]->_check_integrity or $good = 0;
+
+  # Test HASH
+  my $bytes = 0;
+  for my $k (keys %{$self->[HASH]}) {
+    if ($k ne '0' && $k !~ /^[1-9][0-9]*$/) {
+      $good = 0;
+      _ci_warn "Cache hash key <$k> is non-numeric";
+    }
+
+    my $h = $self->[HASH]{$k};
+    if (! defined $h) {
+      $good = 0;
+      _ci_warn "Heap index number for key $k is undefined";
+    } elsif ($h == 0) {
+      $good = 0;
+      _ci_warn "Heap index number for key $k is zero";
+    } else {
+      my $j = $self->[HEAP][$h];
+      if (! defined $j) {
+        $good = 0;
+        _ci_warn "Heap contents key $k (=> $h) are undefined";
+      } else {
+        $bytes += length($j->[2]);
+        if ($k ne $j->[1]) {
+          $good = 0;
+          _ci_warn "Heap contents key $k (=> $h) is $j->[1], should be $k";
+        }
+      }
+    }
+  }
+
+  # Test BYTES
+  if ($bytes != $self->[BYTES]) {
+    $good = 0;
+    _ci_warn "Total data in cache is $bytes, expected $self->[BYTES]";
+  }
+
+  # Test MAX
+  if ($bytes > $self->[MAX]) {
+    $good = 0;
+    _ci_warn "Total data in cache is $bytes, exceeds maximum $self->[MAX]";
+  }
+
+  return $good;
+}
+
+sub delink {
+  my $self = shift;
+  $self->[HEAP] = undef;        # Bye bye heap
+}
+
+################################################################
+#
+# Tie::File::Heap
+#
+# Heap data structure for use by cache LRU routines
+
+package Tie::File::Heap;
+use Carp ':DEFAULT', 'confess';
+$Tie::File::Heap::VERSION = $Tie::File::Cache::VERSION;
+sub SEQ () { 0 };
+sub KEY () { 1 };
+sub DAT () { 2 };
+
+sub new {
+  my ($pack, $cache) = @_;
+  die "$pack: Parent cache object $cache does not support _heap_move method"
+    unless eval { $cache->can('_heap_move') };
+  my $self = [[0,$cache,0]];
+  bless $self => $pack;
+}
+
+# Allocate a new sequence number, larger than all previously allocated numbers
+sub _nseq {
+  my $self = shift;
+  $self->[0][0]++;
+}
+
+sub _cache {
+  my $self = shift;
+  $self->[0][1];
+}
+
+sub _nelts {
+  my $self = shift;
+  $self->[0][2];
+}
+
+sub _nelts_inc {
+  my $self = shift;
+  ++$self->[0][2];
+}  
+
+sub _nelts_dec {
+  my $self = shift;
+  --$self->[0][2];
+}  
+
+sub is_empty {
+  my $self = shift;
+  $self->_nelts == 0;
+}
+
+sub empty {
+  my $self = shift;
+  $#$self = 0;
+  $self->[0][2] = 0;
+  $self->[0][0] = 0;            # might as well reset the sequence numbers
+}
+
+# notify the parent cache object that we moved something
+sub _heap_move {
+  my $self = shift;
+  $self->_cache->_heap_move(@_);
+}
+
+# Insert a piece of data into the heap with the indicated sequence number.
+# The item with the smallest sequence number is always at the top.
+# If no sequence number is specified, allocate a new one and insert the
+# item at the bottom.
+sub insert {
+  my ($self, $key, $data, $seq) = @_;
+  $seq = $self->_nseq unless defined $seq;
+  $self->_insert_new([$seq, $key, $data]);
+}
+
+# Insert a new, fresh item at the bottom of the heap
+sub _insert_new {
+  my ($self, $item) = @_;
+  my $i = @$self;
+  $i = int($i/2) until defined $self->[$i/2];
+  $self->[$i] = $item;
+  $self->[0][1]->_heap_move($self->[$i][KEY], $i);
+  $self->_nelts_inc;
+}
+
+# Insert [$data, $seq] pair at or below item $i in the heap.
+# If $i is omitted, default to 1 (the top element.)
+sub _insert {
+  my ($self, $item, $i) = @_;
+#  $self->_check_loc($i) if defined $i;
+  $i = 1 unless defined $i;
+  until (! defined $self->[$i]) {
+    if ($self->[$i][SEQ] > $item->[SEQ]) { # inserted item is older
+      ($self->[$i], $item) = ($item, $self->[$i]);
+      $self->[0][1]->_heap_move($self->[$i][KEY], $i);
+    }
+    # If either is undefined, go that way.  Otherwise, choose at random
+    my $dir;
+    $dir = 0 if !defined $self->[2*$i];
+    $dir = 1 if !defined $self->[2*$i+1];
+    $dir = int(rand(2)) unless defined $dir;
+    $i = 2*$i + $dir;
+  }
+  $self->[$i] = $item;
+  $self->[0][1]->_heap_move($self->[$i][KEY], $i);
+  $self->_nelts_inc;
+}
+
+# Remove the item at node $i from the heap, moving child items upwards.
+# The item with the smallest sequence number is always at the top.
+# Moving items upwards maintains this condition.
+# Return the removed item.  Return undef if there was no item at node $i.
+sub remove {
+  my ($self, $i) = @_;
+  $i = 1 unless defined $i;
+  my $top = $self->[$i];
+  return unless defined $top;
+  while (1) {
+    my $ii;
+    my ($L, $R) = (2*$i, 2*$i+1);
+
+    # If either is undefined, go the other way.
+    # Otherwise, go towards the smallest.
+    last unless defined $self->[$L] || defined $self->[$R];
+    $ii = $R if not defined $self->[$L];
+    $ii = $L if not defined $self->[$R];
+    unless (defined $ii) {
+      $ii = $self->[$L][SEQ] < $self->[$R][SEQ] ? $L : $R;
+    }
+
+    $self->[$i] = $self->[$ii]; # Promote child to fill vacated spot
+    $self->[0][1]->_heap_move($self->[$i][KEY], $i);
+    $i = $ii; # Fill new vacated spot
+  }
+  $self->[0][1]->_heap_move($top->[KEY], undef);
+  undef $self->[$i];
+  $self->_nelts_dec;
+  return $top->[DAT];
+}
+
+sub popheap {
+  my $self = shift;
+  $self->remove(1);
+}
+
+# set the sequence number of the indicated item to a higher number
+# than any other item in the heap, and bubble the item down to the
+# bottom.
+sub promote {
+  my ($self, $n) = @_;
+#  $self->_check_loc($n);
+  $self->[$n][SEQ] = $self->_nseq;
+  my $i = $n;
+  while (1) {
+    my ($L, $R) = (2*$i, 2*$i+1);
+    my $dir;
+    last unless defined $self->[$L] || defined $self->[$R];
+    $dir = $R unless defined $self->[$L];
+    $dir = $L unless defined $self->[$R];
+    unless (defined $dir) {
+      $dir = $self->[$L][SEQ] < $self->[$R][SEQ] ? $L : $R;
+    }
+    @{$self}[$i, $dir] = @{$self}[$dir, $i];
+    for ($i, $dir) {
+      $self->[0][1]->_heap_move($self->[$_][KEY], $_) if defined $self->[$_];
+    }
+    $i = $dir;
+  }
+}
+
+# Return item $n from the heap, promoting its LRU status
+sub lookup {
+  my ($self, $n) = @_;
+#  $self->_check_loc($n);
+  my $val = $self->[$n];
+  $self->promote($n);
+  $val->[DAT];
+}
+
+
+# Assign a new value for node $n, promoting it to the bottom of the heap
+sub set_val {
+  my ($self, $n, $val) = @_;
+#  $self->_check_loc($n);
+  my $oval = $self->[$n][DAT];
+  $self->[$n][DAT] = $val;
+  $self->promote($n);
+  return $oval;
+}
+
+# The hash key has changed for an item;
+# alter the heap's record of the hash key
+sub rekey {
+  my ($self, $n, $new_key) = @_;
+#  $self->_check_loc($n);
+  $self->[$n][KEY] = $new_key;
+}
+
+sub _check_loc {
+  my ($self, $n) = @_;
+  unless (1 || defined $self->[$n]) {
+    confess "_check_loc($n) failed";
+  }
+}
+
+BEGIN { *_ci_warn = \&Tie::File::_ci_warn }
+
+sub _check_integrity {
+  my $self = shift;
+  my $good = 1;
+  my %seq;
+
+  unless (eval {$self->[0][1]->isa("Tie::File::Cache")}) {
+    _ci_warn "Element 0 of heap corrupt";
+    $good = 0;
+  }
+  $good = 0 unless $self->_satisfies_heap_condition(1);
+  for my $i (2 .. $#{$self}) {
+    my $p = int($i/2);          # index of parent node
+    if (defined $self->[$i] && ! defined $self->[$p]) {
+      _ci_warn "Element $i of heap defined, but parent $p isn't";
+      $good = 0;
+    }
+
+    if (defined $self->[$i]) {
+      if ($seq{$self->[$i][SEQ]}) {
+        my $seq = $self->[$i][SEQ];
+        _ci_warn "Nodes $i and $seq{$seq} both have SEQ=$seq";
+        $good = 0;
+      } else {
+        $seq{$self->[$i][SEQ]} = $i;
+      }
+    }
+  }
+
+  return $good;
+}
+
+sub _satisfies_heap_condition {
+  my $self = shift;
+  my $n = shift || 1;
+  my $good = 1;
+  for (0, 1) {
+    my $c = $n*2 + $_;
+    next unless defined $self->[$c];
+    if ($self->[$n][SEQ] >= $self->[$c]) {
+      _ci_warn "Node $n of heap does not predate node $c";
+      $good = 0 ;
+    }
+    $good = 0 unless $self->_satisfies_heap_condition($c);
+  }
+  return $good;
+}
+
+# Return a list of all the values, sorted by expiration order
+sub expire_order {
+  my $self = shift;
+  my @nodes = sort {$a->[SEQ] <=> $b->[SEQ]} $self->_nodes;
+  map { $_->[KEY] } @nodes;
+}
+
+sub _nodes {
+  my $self = shift;
+  my $i = shift || 1;
+  return unless defined $self->[$i];
+  ($self->[$i], $self->_nodes($i*2), $self->_nodes($i*2+1));
+}
+
+1;
+
+__END__
+
+=head1 NAME
+
+Tie::File - Access the lines of a disk file via a Perl array
+
+=head1 SYNOPSIS
+
+ use Tie::File;
+
+ tie @array, 'Tie::File', filename or die ...;
+
+ $array[0] = 'blah';      # first line of the file is now 'blah'
+                            # (line numbering starts at 0)
+ print $array[42];        # display line 43 of the file
+
+ $n_recs = @array;        # how many records are in the file?
+ $#array -= 2;            # chop two records off the end
+
+
+ for (@array) {
+   s/PERL/Perl/g;        # Replace PERL with Perl everywhere in the file
+ }
+
+ # These are just like regular push, pop, unshift, shift, and splice
+ # Except that they modify the file in the way you would expect
+
+ push @array, new recs...;
+ my $r1 = pop @array;
+ unshift @array, new recs...;
+ my $r2 = shift @array;
+ @old_recs = splice @array, 3, 7, new recs...;
+
+ untie @array;            # all finished
+
+
+=head1 DESCRIPTION
+
+C<Tie::File> represents a regular text file as a Perl array.  Each
+element in the array corresponds to a record in the file.  The first
+line of the file is element 0 of the array; the second line is element
+1, and so on.
+
+The file is I<not> loaded into memory, so this will work even for
+gigantic files.
+
+Changes to the array are reflected in the file immediately.
+
+Lazy people and beginners may now stop reading the manual.
+
+=head2 C<recsep>
+
+What is a 'record'?  By default, the meaning is the same as for the
+C<E<lt>...E<gt>> operator: It's a string terminated by C<$/>, which is
+probably C<"\n">.  (Minor exception: on DOS and Win32 systems, a
+'record' is a string terminated by C<"\r\n">.)  You may change the
+definition of "record" by supplying the C<recsep> option in the C<tie>
+call:
+
+	tie @array, 'Tie::File', $file, recsep => 'es';
+
+This says that records are delimited by the string C<es>.  If the file
+contained the following data:
+
+	Curse these pesky flies!\n
+
+then the C<@array> would appear to have four elements:
+
+	"Curse th"
+	"e p"
+	"ky fli"
+	"!\n"
+
+An undefined value is not permitted as a record separator.  Perl's
+special "paragraph mode" semantics (E<agrave> la C<$/ = "">) are not
+emulated.
+
+Records read from the tied array do not have the record separator
+string on the end; this is to allow
+
+	$array[17] .= "extra";
+
+to work as expected.
+
+(See L<"autochomp">, below.)  Records stored into the array will have
+the record separator string appended before they are written to the
+file, if they don't have one already.  For example, if the record
+separator string is C<"\n">, then the following two lines do exactly
+the same thing:
+
+	$array[17] = "Cherry pie";
+	$array[17] = "Cherry pie\n";
+
+The result is that the contents of line 17 of the file will be
+replaced with "Cherry pie"; a newline character will separate line 17
+from line 18.  This means that this code will do nothing:
+
+	chomp $array[17];
+
+Because the C<chomp>ed value will have the separator reattached when
+it is written back to the file.  There is no way to create a file
+whose trailing record separator string is missing.
+
+Inserting records that I<contain> the record separator string is not
+supported by this module.  It will probably produce a reasonable
+result, but what this result will be may change in a future version.
+Use 'splice' to insert records or to replace one record with several.
+
+=head2 C<autochomp>
+
+Normally, array elements have the record separator removed, so that if
+the file contains the text
+
+	Gold
+	Frankincense
+	Myrrh
+
+the tied array will appear to contain C<("Gold", "Frankincense",
+"Myrrh")>.  If you set C<autochomp> to a false value, the record
+separator will not be removed.  If the file above was tied with
+
+	tie @gifts, "Tie::File", $gifts, autochomp => 0;
+
+then the array C<@gifts> would appear to contain C<("Gold\n",
+"Frankincense\n", "Myrrh\n")>, or (on Win32 systems) C<("Gold\r\n",
+"Frankincense\r\n", "Myrrh\r\n")>.
+
+=head2 C<mode>
+
+Normally, the specified file will be opened for read and write access,
+and will be created if it does not exist.  (That is, the flags
+C<O_RDWR | O_CREAT> are supplied in the C<open> call.)  If you want to
+change this, you may supply alternative flags in the C<mode> option.
+See L<Fcntl> for a listing of available flags.
+For example:
+
+	# open the file if it exists, but fail if it does not exist

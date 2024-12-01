@@ -1,0 +1,1000 @@
+        if _toolbool(ui, tool, b"gui"):
+            repo.ui.status(
+                _(b'running merge tool %s for file %s\n')
+                % (tool, uipathfn(fcd.path()))
+            )
+        if scriptfn is None:
+            cmd = toolpath + b' ' + args
+            repo.ui.debug(b'launching merge tool: %s\n' % cmd)
+            _describemerge(ui, repo, mynode, fcd, fca, fco, env, toolpath, args)
+            r = ui.system(
+                cmd, cwd=repo.root, environ=env, blockedtag=b'mergetool'
+            )
+        else:
+            repo.ui.debug(
+                b'launching python merge script: %s:%s\n' % (toolpath, scriptfn)
+            )
+            r = 0
+            try:
+                # avoid cycle cmdutil->merge->filemerge->extensions->cmdutil
+                from . import extensions
+
+                mod = extensions.loadpath(toolpath, b'hgmerge.%s' % tool)
+            except Exception:
+                raise error.Abort(
+                    _(b"loading python merge script failed: %s") % toolpath
+                )
+            mergefn = getattr(mod, scriptfn, None)
+            if mergefn is None:
+                raise error.Abort(
+                    _(b"%s does not have function: %s") % (toolpath, scriptfn)
+                )
+            argslist = procutil.shellsplit(args)
+            # avoid cycle cmdutil->merge->filemerge->hook->extensions->cmdutil
+            from . import hook
+
+            ret, raised = hook.pythonhook(
+                ui, repo, b"merge", toolpath, mergefn, {b'args': argslist}, True
+            )
+            if raised:
+                r = 1
+        repo.ui.debug(b'merge tool returned: %d\n' % r)
+        return True, r, False
+
+
+def _populate_label_detail(input, template):
+    """Applies the given template to the ctx and stores it in the input."""
+    ctx = input.fctx.changectx()
+    if ctx.node() is None:
+        ctx = ctx.p1()
+
+    props = {b'ctx': ctx}
+    templateresult = template.renderdefault(props)
+    input.label_detail = stringutil.firstline(templateresult)  # avoid '\n'
+
+
+def _populate_label_details(repo, inputs, tool=None):
+    """Populates the label details using the conflict marker template."""
+    ui = repo.ui
+    template = ui.config(b'command-templates', b'mergemarker')
+    if tool is not None:
+        template = _toolstr(ui, tool, b'mergemarkertemplate', template)
+    template = templater.unquotestring(template)
+    tres = formatter.templateresources(ui, repo)
+    tmpl = formatter.maketemplater(
+        ui, template, defaults=templatekw.keywords, resources=tres
+    )
+
+    for input in inputs:
+        _populate_label_detail(input, tmpl)
+
+
+def partextras(labels):
+    """Return a dictionary of extra labels for use in prompts to the user
+
+    Intended use is in strings of the form "(l)ocal%(l)s".
+    """
+    if labels is None:
+        return {
+            b"l": b"",
+            b"o": b"",
+        }
+
+    return {
+        b"l": b" [%s]" % labels[0],
+        b"o": b" [%s]" % labels[1],
+    }
+
+
+def _makebackup(repo, ui, fcd):
+    """Makes and returns a filectx-like object for ``fcd``'s backup file.
+
+    In addition to preserving the user's pre-existing modifications to `fcd`
+    (if any), the backup is used to undo certain premerges, confirm whether a
+    merge changed anything, and determine what line endings the new file should
+    have.
+
+    Backups only need to be written once since their content doesn't change
+    afterwards.
+    """
+    if fcd.isabsent():
+        return None
+    # TODO: Break this import cycle somehow. (filectx -> ctx -> fileset ->
+    # merge -> filemerge). (I suspect the fileset import is the weakest link)
+    from . import context
+
+    if isinstance(fcd, context.overlayworkingfilectx):
+        # If we're merging in-memory, we're free to put the backup anywhere.
+        fd, backup = pycompat.mkstemp(b'hg-merge-backup')
+        with os.fdopen(fd, 'wb') as f:
+            f.write(fcd.data())
+    else:
+        backup = scmutil.backuppath(ui, repo, fcd.path())
+        a = _workingpath(repo, fcd)
+        util.copyfile(a, backup)
+
+    return context.arbitraryfilectx(backup, repo=repo)
+
+
+@contextlib.contextmanager
+def _maketempfiles(files):
+    """Creates a temporary file for each (prefix, path, data) tuple in `files`,
+    so an external merge tool may use them.
+    """
+    tmproot = pycompat.mkdtemp(prefix=b'hgmerge-')
+
+    def maketempfrompath(prefix, path, data):
+        fullbase, ext = os.path.splitext(path)
+        pre = b"%s~%s" % (os.path.basename(fullbase), prefix)
+        name = os.path.join(tmproot, pre)
+        if ext:
+            name += ext
+        util.writefile(name, data)
+        return name
+
+    temp_files = []
+    for prefix, path, data in files:
+        temp_files.append(maketempfrompath(prefix, path, data))
+    try:
+        yield temp_files
+    finally:
+        shutil.rmtree(tmproot)
+
+
+def filemerge(repo, wctx, mynode, orig, fcd, fco, fca, labels=None):
+    """perform a 3-way merge in the working directory
+
+    mynode = parent node before merge
+    orig = original local filename before merge
+    fco = other file context
+    fca = ancestor file context
+    fcd = local file context for current/destination file
+
+    Returns whether the merge is complete, the return value of the merge, and
+    a boolean indicating whether the file was deleted from disk."""
+    ui = repo.ui
+    fd = fcd.path()
+    uipathfn = scmutil.getuipathfn(repo)
+    fduipath = uipathfn(fd)
+    binary = fcd.isbinary() or fco.isbinary() or fca.isbinary()
+    symlink = b'l' in fcd.flags() + fco.flags()
+    changedelete = fcd.isabsent() or fco.isabsent()
+    tool, toolpath = _picktool(repo, ui, fd, binary, symlink, changedelete)
+    scriptfn = None
+    if tool in internals and tool.startswith(b'internal:'):
+        # normalize to new-style names (':merge' etc)
+        tool = tool[len(b'internal') :]
+    if toolpath and toolpath.startswith(b'python:'):
+        invalidsyntax = False
+        if toolpath.count(b':') >= 2:
+            script, scriptfn = toolpath[7:].rsplit(b':', 1)
+            if not scriptfn:
+                invalidsyntax = True
+            # missing :callable can lead to spliting on windows drive letter
+            if b'\\' in scriptfn or b'/' in scriptfn:
+                invalidsyntax = True
+        else:
+            invalidsyntax = True
+        if invalidsyntax:
+            raise error.Abort(_(b"invalid 'python:' syntax: %s") % toolpath)
+        toolpath = script
+    ui.debug(
+        b"picked tool '%s' for %s (binary %s symlink %s changedelete %s)\n"
+        % (
+            tool,
+            fduipath,
+            pycompat.bytestr(binary),
+            pycompat.bytestr(symlink),
+            pycompat.bytestr(changedelete),
+        )
+    )
+
+    if tool in internals:
+        func = internals[tool]
+        mergetype = func.mergetype
+        onfailure = func.onfailure
+        precheck = func.precheck
+        isexternal = False
+    else:
+        if wctx.isinmemory():
+            func = _xmergeimm
+        else:
+            func = _xmerge
+        mergetype = fullmerge
+        onfailure = _(b"merging %s failed!\n")
+        precheck = None
+        isexternal = True
+
+    toolconf = tool, toolpath, binary, symlink, scriptfn
+
+    if not labels:
+        labels = [b'local', b'other']
+    if len(labels) < 3:
+        labels.append(b'base')
+    local = simplemerge.MergeInput(fcd, labels[0])
+    other = simplemerge.MergeInput(fco, labels[1])
+    base = simplemerge.MergeInput(fca, labels[2])
+    if mergetype == nomerge:
+        return func(
+            repo,
+            mynode,
+            local,
+            other,
+            base,
+            toolconf,
+        )
+
+    if orig != fco.path():
+        ui.status(
+            _(b"merging %s and %s to %s\n")
+            % (uipathfn(orig), uipathfn(fco.path()), fduipath)
+        )
+    else:
+        ui.status(_(b"merging %s\n") % fduipath)
+
+    ui.debug(b"my %s other %s ancestor %s\n" % (fcd, fco, fca))
+
+    if precheck and not precheck(repo, mynode, fcd, fco, fca, toolconf):
+        if onfailure:
+            if wctx.isinmemory():
+                raise error.InMemoryMergeConflictsError(
+                    b'in-memory merge does not support merge conflicts'
+                )
+            ui.warn(onfailure % fduipath)
+        return 1, False
+
+    backup = _makebackup(repo, ui, fcd)
+    r = 1
+    try:
+        internalmarkerstyle = ui.config(b'ui', b'mergemarkers')
+        if isexternal:
+            markerstyle = _toolstr(ui, tool, b'mergemarkers')
+        else:
+            markerstyle = internalmarkerstyle
+
+        if mergetype == fullmerge:
+            _run_partial_resolution_tools(repo, local, other, base)
+            # conflict markers generated by premerge will use 'detailed'
+            # settings if either ui.mergemarkers or the tool's mergemarkers
+            # setting is 'detailed'. This way tools can have basic labels in
+            # space-constrained areas of the UI, but still get full information
+            # in conflict markers if premerge is 'keep' or 'keep-merge3'.
+            labeltool = None
+            if markerstyle != b'basic':
+                # respect 'tool's mergemarkertemplate (which defaults to
+                # command-templates.mergemarker)
+                labeltool = tool
+            if internalmarkerstyle != b'basic' or markerstyle != b'basic':
+                _populate_label_details(
+                    repo, [local, other, base], tool=labeltool
+                )
+
+            r = _premerge(
+                repo,
+                local,
+                other,
+                base,
+                toolconf,
+            )
+            # we're done if premerge was successful (r is 0)
+            if not r:
+                return r, False
+
+            # Reset to basic labels
+            local.label_detail = None
+            other.label_detail = None
+            base.label_detail = None
+
+        if markerstyle != b'basic':
+            _populate_label_details(repo, [local, other, base], tool=tool)
+
+        needcheck, r, deleted = func(
+            repo,
+            mynode,
+            local,
+            other,
+            base,
+            toolconf,
+            backup,
+        )
+
+        if needcheck:
+            r = _check(repo, r, ui, tool, fcd, backup)
+
+        if r:
+            if onfailure:
+                if wctx.isinmemory():
+                    raise error.InMemoryMergeConflictsError(
+                        b'in-memory merge '
+                        b'does not support '
+                        b'merge conflicts'
+                    )
+                ui.warn(onfailure % fduipath)
+            _onfilemergefailure(ui)
+
+        return r, deleted
+    finally:
+        if not r and backup is not None:
+            backup.remove()
+
+
+def _run_partial_resolution_tools(repo, local, other, base):
+    """Runs partial-resolution tools on the three inputs and updates them."""
+    ui = repo.ui
+    if ui.configbool(b'merge', b'disable-partial-tools'):
+        return
+    # Tuples of (order, name, executable path, args)
+    tools = []
+    seen = set()
+    section = b"partial-merge-tools"
+    for k, v in ui.configitems(section):
+        name = k.split(b'.')[0]
+        if name in seen:
+            continue
+        patterns = ui.configlist(section, b'%s.patterns' % name, [])
+        is_match = True
+        if patterns:
+            m = match.match(
+                repo.root, b'', patterns, ctx=local.fctx.changectx()
+            )
+            is_match = m(local.fctx.path())
+        if is_match:
+            if ui.configbool(section, b'%s.disable' % name):
+                continue
+            order = ui.configint(section, b'%s.order' % name, 0)
+            executable = ui.config(section, b'%s.executable' % name, name)
+            args = ui.config(section, b'%s.args' % name)
+            tools.append((order, name, executable, args))
+
+    if not tools:
+        return
+    # Sort in configured order (first in tuple)
+    tools.sort()
+
+    files = [
+        (b"local", local.fctx.path(), local.text()),
+        (b"base", base.fctx.path(), base.text()),
+        (b"other", other.fctx.path(), other.text()),
+    ]
+
+    with _maketempfiles(files) as temppaths:
+        localpath, basepath, otherpath = temppaths
+
+        for order, name, executable, args in tools:
+            cmd = procutil.shellquote(executable)
+            replace = {
+                b'local': localpath,
+                b'base': basepath,
+                b'other': otherpath,
+            }
+            args = util.interpolate(
+                br'\$',
+                replace,
+                args,
+                lambda s: procutil.shellquote(util.localpath(s)),
+            )
+
+            cmd = b'%s %s' % (cmd, args)
+            r = ui.system(cmd, cwd=repo.root, blockedtag=b'partial-mergetool')
+            if r:
+                raise error.StateError(
+                    b'partial merge tool %s exited with code %d' % (name, r)
+                )
+            local_text = util.readfile(localpath)
+            other_text = util.readfile(otherpath)
+            if local_text == other_text:
+                # No need to run other tools if all conflicts have been resolved
+                break
+
+        local.set_text(local_text)
+        base.set_text(util.readfile(basepath))
+        other.set_text(other_text)
+
+
+def _haltmerge():
+    msg = _(b'merge halted after failed merge (see hg resolve)')
+    raise error.InterventionRequired(msg)
+
+
+def _onfilemergefailure(ui):
+    action = ui.config(b'merge', b'on-failure')
+    if action == b'prompt':
+        msg = _(b'continue merge operation (yn)?$$ &Yes $$ &No')
+        if ui.promptchoice(msg, 0) == 1:
+            _haltmerge()
+    if action == b'halt':
+        _haltmerge()
+    # default action is 'continue', in which case we neither prompt nor halt
+
+
+def hasconflictmarkers(data):
+    # Detect lines starting with a string of 7 identical characters from the
+    # subset Mercurial uses for conflict markers, followed by either the end of
+    # line or a space and some text. Note that using [<>=+|-]{7} would detect
+    # `<><><><><` as a conflict marker, which we don't want.
+    return bool(
+        re.search(
+            br"^([<>=+|-])\1{6}( .*)$",
+            data,
+            re.MULTILINE,
+        )
+    )
+
+
+def _check(repo, r, ui, tool, fcd, backup):
+    fd = fcd.path()
+    uipathfn = scmutil.getuipathfn(repo)
+
+    if not r and (
+        _toolbool(ui, tool, b"checkconflicts")
+        or b'conflicts' in _toollist(ui, tool, b"check")
+    ):
+        if hasconflictmarkers(fcd.data()):
+            r = 1
+
+    checked = False
+    if b'prompt' in _toollist(ui, tool, b"check"):
+        checked = True
+        if ui.promptchoice(
+            _(b"was merge of '%s' successful (yn)?$$ &Yes $$ &No")
+            % uipathfn(fd),
+            1,
+        ):
+            r = 1
+
+    if (
+        not r
+        and not checked
+        and (
+            _toolbool(ui, tool, b"checkchanged")
+            or b'changed' in _toollist(ui, tool, b"check")
+        )
+    ):
+        if backup is not None and not fcd.cmp(backup):
+            if ui.promptchoice(
+                _(
+                    b" output file %s appears unchanged\n"
+                    b"was merge successful (yn)?"
+                    b"$$ &Yes $$ &No"
+                )
+                % uipathfn(fd),
+                1,
+            ):
+                r = 1
+
+    if backup is not None and _toolbool(ui, tool, b"fixeol"):
+        _matcheol(_workingpath(repo, fcd), backup)
+
+    return r
+
+
+def _workingpath(repo, ctx):
+    return repo.wjoin(ctx.path())
+
+
+def loadinternalmerge(ui, extname, registrarobj):
+    """Load internal merge tool from specified registrarobj"""
+    for name, func in registrarobj._table.items():
+        fullname = b':' + name
+        internals[fullname] = func
+        internals[b'internal:' + name] = func
+        internalsdoc[fullname] = func
+
+        capabilities = sorted([k for k, v in func.capabilities.items() if v])
+        if capabilities:
+            capdesc = b"    (actual capabilities: %s)" % b', '.join(
+                capabilities
+            )
+            func.__doc__ = func.__doc__ + pycompat.sysstr(b"\n\n%s" % capdesc)
+
+    # to put i18n comments into hg.pot for automatically generated texts
+
+    # i18n: "binary" and "symlink" are keywords
+    # i18n: this text is added automatically
+    _(b"    (actual capabilities: binary, symlink)")
+    # i18n: "binary" is keyword
+    # i18n: this text is added automatically
+    _(b"    (actual capabilities: binary)")
+    # i18n: "symlink" is keyword
+    # i18n: this text is added automatically
+    _(b"    (actual capabilities: symlink)")
+
+
+# load built-in merge tools explicitly to setup internalsdoc
+loadinternalmerge(None, None, internaltool)
+
+# tell hggettext to extract docstrings from these functions:
+i18nfunctions = internals.values()
+                                                                                                                                                                                                                                                                                                                                                   usr/lib/python3/dist-packages/mercurial/fileset.py                                                  0000644 0000000 0000000 00000045004 14355257011 020744  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        # fileset.py - file set queries for mercurial
+#
+# Copyright 2010 Olivia Mackall <olivia@selenic.com>
+#
+# This software may be used and distributed according to the terms of the
+# GNU General Public License version 2 or any later version.
+
+
+import re
+
+from .i18n import _
+from .pycompat import getattr
+from . import (
+    error,
+    filesetlang,
+    match as matchmod,
+    mergestate as mergestatemod,
+    pycompat,
+    registrar,
+    scmutil,
+    util,
+)
+from .utils import stringutil
+
+# common weight constants
+_WEIGHT_CHECK_FILENAME = filesetlang.WEIGHT_CHECK_FILENAME
+_WEIGHT_READ_CONTENTS = filesetlang.WEIGHT_READ_CONTENTS
+_WEIGHT_STATUS = filesetlang.WEIGHT_STATUS
+_WEIGHT_STATUS_THOROUGH = filesetlang.WEIGHT_STATUS_THOROUGH
+
+# helpers for processing parsed tree
+getsymbol = filesetlang.getsymbol
+getstring = filesetlang.getstring
+_getkindpat = filesetlang.getkindpat
+getpattern = filesetlang.getpattern
+getargs = filesetlang.getargs
+
+
+def getmatch(mctx, x):
+    if not x:
+        raise error.ParseError(_(b"missing argument"))
+    return methods[x[0]](mctx, *x[1:])
+
+
+def getmatchwithstatus(mctx, x, hint):
+    keys = set(getstring(hint, b'status hint must be a string').split())
+    return getmatch(mctx.withstatus(keys), x)
+
+
+def stringmatch(mctx, x):
+    return mctx.matcher([x])
+
+
+def kindpatmatch(mctx, x, y):
+    return stringmatch(
+        mctx,
+        _getkindpat(
+            x, y, matchmod.allpatternkinds, _(b"pattern must be a string")
+        ),
+    )
+
+
+def patternsmatch(mctx, *xs):
+    allkinds = matchmod.allpatternkinds
+    patterns = [
+        getpattern(x, allkinds, _(b"pattern must be a string")) for x in xs
+    ]
+    return mctx.matcher(patterns)
+
+
+def andmatch(mctx, x, y):
+    xm = getmatch(mctx, x)
+    ym = getmatch(mctx.narrowed(xm), y)
+    return matchmod.intersectmatchers(xm, ym)
+
+
+def ormatch(mctx, *xs):
+    ms = [getmatch(mctx, x) for x in xs]
+    return matchmod.unionmatcher(ms)
+
+
+def notmatch(mctx, x):
+    m = getmatch(mctx, x)
+    return mctx.predicate(lambda f: not m(f), predrepr=(b'<not %r>', m))
+
+
+def minusmatch(mctx, x, y):
+    xm = getmatch(mctx, x)
+    ym = getmatch(mctx.narrowed(xm), y)
+    return matchmod.differencematcher(xm, ym)
+
+
+def listmatch(mctx, *xs):
+    raise error.ParseError(
+        _(b"can't use a list in this context"),
+        hint=_(b'see \'hg help "filesets.x or y"\''),
+    )
+
+
+def func(mctx, a, b):
+    funcname = getsymbol(a)
+    if funcname in symbols:
+        return symbols[funcname](mctx, b)
+
+    keep = lambda fn: getattr(fn, '__doc__', None) is not None
+
+    syms = [s for (s, fn) in symbols.items() if keep(fn)]
+    raise error.UnknownIdentifier(funcname, syms)
+
+
+# symbols are callable like:
+#  fun(mctx, x)
+# with:
+#  mctx - current matchctx instance
+#  x - argument in tree form
+symbols = filesetlang.symbols
+
+predicate = registrar.filesetpredicate(symbols)
+
+
+@predicate(b'modified()', callstatus=True, weight=_WEIGHT_STATUS)
+def modified(mctx, x):
+    """File that is modified according to :hg:`status`."""
+    # i18n: "modified" is a keyword
+    getargs(x, 0, 0, _(b"modified takes no arguments"))
+    s = set(mctx.status().modified)
+    return mctx.predicate(s.__contains__, predrepr=b'modified')
+
+
+@predicate(b'added()', callstatus=True, weight=_WEIGHT_STATUS)
+def added(mctx, x):
+    """File that is added according to :hg:`status`."""
+    # i18n: "added" is a keyword
+    getargs(x, 0, 0, _(b"added takes no arguments"))
+    s = set(mctx.status().added)
+    return mctx.predicate(s.__contains__, predrepr=b'added')
+
+
+@predicate(b'removed()', callstatus=True, weight=_WEIGHT_STATUS)
+def removed(mctx, x):
+    """File that is removed according to :hg:`status`."""
+    # i18n: "removed" is a keyword
+    getargs(x, 0, 0, _(b"removed takes no arguments"))
+    s = set(mctx.status().removed)
+    return mctx.predicate(s.__contains__, predrepr=b'removed')
+
+
+@predicate(b'deleted()', callstatus=True, weight=_WEIGHT_STATUS)
+def deleted(mctx, x):
+    """Alias for ``missing()``."""
+    # i18n: "deleted" is a keyword
+    getargs(x, 0, 0, _(b"deleted takes no arguments"))
+    s = set(mctx.status().deleted)
+    return mctx.predicate(s.__contains__, predrepr=b'deleted')
+
+
+@predicate(b'missing()', callstatus=True, weight=_WEIGHT_STATUS)
+def missing(mctx, x):
+    """File that is missing according to :hg:`status`."""
+    # i18n: "missing" is a keyword
+    getargs(x, 0, 0, _(b"missing takes no arguments"))
+    s = set(mctx.status().deleted)
+    return mctx.predicate(s.__contains__, predrepr=b'deleted')
+
+
+@predicate(b'unknown()', callstatus=True, weight=_WEIGHT_STATUS_THOROUGH)
+def unknown(mctx, x):
+    """File that is unknown according to :hg:`status`."""
+    # i18n: "unknown" is a keyword
+    getargs(x, 0, 0, _(b"unknown takes no arguments"))
+    s = set(mctx.status().unknown)
+    return mctx.predicate(s.__contains__, predrepr=b'unknown')
+
+
+@predicate(b'ignored()', callstatus=True, weight=_WEIGHT_STATUS_THOROUGH)
+def ignored(mctx, x):
+    """File that is ignored according to :hg:`status`."""
+    # i18n: "ignored" is a keyword
+    getargs(x, 0, 0, _(b"ignored takes no arguments"))
+    s = set(mctx.status().ignored)
+    return mctx.predicate(s.__contains__, predrepr=b'ignored')
+
+
+@predicate(b'clean()', callstatus=True, weight=_WEIGHT_STATUS)
+def clean(mctx, x):
+    """File that is clean according to :hg:`status`."""
+    # i18n: "clean" is a keyword
+    getargs(x, 0, 0, _(b"clean takes no arguments"))
+    s = set(mctx.status().clean)
+    return mctx.predicate(s.__contains__, predrepr=b'clean')
+
+
+@predicate(b'tracked()')
+def tracked(mctx, x):
+    """File that is under Mercurial control."""
+    # i18n: "tracked" is a keyword
+    getargs(x, 0, 0, _(b"tracked takes no arguments"))
+    return mctx.predicate(mctx.ctx.__contains__, predrepr=b'tracked')
+
+
+@predicate(b'binary()', weight=_WEIGHT_READ_CONTENTS)
+def binary(mctx, x):
+    """File that appears to be binary (contains NUL bytes)."""
+    # i18n: "binary" is a keyword
+    getargs(x, 0, 0, _(b"binary takes no arguments"))
+    return mctx.fpredicate(
+        lambda fctx: fctx.isbinary(), predrepr=b'binary', cache=True
+    )
+
+
+@predicate(b'exec()')
+def exec_(mctx, x):
+    """File that is marked as executable."""
+    # i18n: "exec" is a keyword
+    getargs(x, 0, 0, _(b"exec takes no arguments"))
+    ctx = mctx.ctx
+    return mctx.predicate(lambda f: ctx.flags(f) == b'x', predrepr=b'exec')
+
+
+@predicate(b'symlink()')
+def symlink(mctx, x):
+    """File that is marked as a symlink."""
+    # i18n: "symlink" is a keyword
+    getargs(x, 0, 0, _(b"symlink takes no arguments"))
+    ctx = mctx.ctx
+    return mctx.predicate(lambda f: ctx.flags(f) == b'l', predrepr=b'symlink')
+
+
+@predicate(b'resolved()', weight=_WEIGHT_STATUS)
+def resolved(mctx, x):
+    """File that is marked resolved according to :hg:`resolve -l`."""
+    # i18n: "resolved" is a keyword
+    getargs(x, 0, 0, _(b"resolved takes no arguments"))
+    if mctx.ctx.rev() is not None:
+        return mctx.never()
+    ms = mergestatemod.mergestate.read(mctx.ctx.repo())
+    return mctx.predicate(
+        lambda f: f in ms and ms[f] == b'r', predrepr=b'resolved'
+    )
+
+
+@predicate(b'unresolved()', weight=_WEIGHT_STATUS)
+def unresolved(mctx, x):
+    """File that is marked unresolved according to :hg:`resolve -l`."""
+    # i18n: "unresolved" is a keyword
+    getargs(x, 0, 0, _(b"unresolved takes no arguments"))
+    if mctx.ctx.rev() is not None:
+        return mctx.never()
+    ms = mergestatemod.mergestate.read(mctx.ctx.repo())
+    return mctx.predicate(
+        lambda f: f in ms and ms[f] == b'u', predrepr=b'unresolved'
+    )
+
+
+@predicate(b'hgignore()', weight=_WEIGHT_STATUS)
+def hgignore(mctx, x):
+    """File that matches the active .hgignore pattern."""
+    # i18n: "hgignore" is a keyword
+    getargs(x, 0, 0, _(b"hgignore takes no arguments"))
+    return mctx.ctx.repo().dirstate._ignore
+
+
+@predicate(b'portable()', weight=_WEIGHT_CHECK_FILENAME)
+def portable(mctx, x):
+    """File that has a portable name. (This doesn't include filenames with case
+    collisions.)
+    """
+    # i18n: "portable" is a keyword
+    getargs(x, 0, 0, _(b"portable takes no arguments"))
+    return mctx.predicate(
+        lambda f: util.checkwinfilename(f) is None, predrepr=b'portable'
+    )
+
+
+@predicate(b'grep(regex)', weight=_WEIGHT_READ_CONTENTS)
+def grep(mctx, x):
+    """File contains the given regular expression."""
+    try:
+        # i18n: "grep" is a keyword
+        r = re.compile(getstring(x, _(b"grep requires a pattern")))
+    except re.error as e:
+        raise error.ParseError(
+            _(b'invalid match pattern: %s') % stringutil.forcebytestr(e)
+        )
+    return mctx.fpredicate(
+        lambda fctx: r.search(fctx.data()),
+        predrepr=(b'grep(%r)', r.pattern),
+        cache=True,
+    )
+
+
+def _sizetomax(s):
+    try:
+        s = s.strip().lower()
+        for k, v in util._sizeunits:
+            if s.endswith(k):
+                # max(4k) = 5k - 1, max(4.5k) = 4.6k - 1
+                n = s[: -len(k)]
+                inc = 1.0
+                if b"." in n:
+                    inc /= 10 ** len(n.split(b".")[1])
+                return int((float(n) + inc) * v) - 1
+        # no extension, this is a precise value
+        return int(s)
+    except ValueError:
+        raise error.ParseError(_(b"couldn't parse size: %s") % s)
+
+
+def sizematcher(expr):
+    """Return a function(size) -> bool from the ``size()`` expression"""
+    expr = expr.strip()
+    if b'-' in expr:  # do we have a range?
+        a, b = expr.split(b'-', 1)
+        a = util.sizetoint(a)
+        b = util.sizetoint(b)
+        return lambda x: x >= a and x <= b
+    elif expr.startswith(b"<="):
+        a = util.sizetoint(expr[2:])
+        return lambda x: x <= a
+    elif expr.startswith(b"<"):
+        a = util.sizetoint(expr[1:])
+        return lambda x: x < a
+    elif expr.startswith(b">="):
+        a = util.sizetoint(expr[2:])
+        return lambda x: x >= a
+    elif expr.startswith(b">"):
+        a = util.sizetoint(expr[1:])
+        return lambda x: x > a
+    else:
+        a = util.sizetoint(expr)
+        b = _sizetomax(expr)
+        return lambda x: x >= a and x <= b
+
+
+@predicate(b'size(expression)', weight=_WEIGHT_STATUS)
+def size(mctx, x):
+    """File size matches the given expression. Examples:
+
+    - size('1k') - files from 1024 to 2047 bytes
+    - size('< 20k') - files less than 20480 bytes
+    - size('>= .5MB') - files at least 524288 bytes
+    - size('4k - 1MB') - files from 4096 bytes to 1048576 bytes
+    """
+    # i18n: "size" is a keyword
+    expr = getstring(x, _(b"size requires an expression"))
+    m = sizematcher(expr)
+    return mctx.fpredicate(
+        lambda fctx: m(fctx.size()), predrepr=(b'size(%r)', expr), cache=True
+    )
+
+
+@predicate(b'encoding(name)', weight=_WEIGHT_READ_CONTENTS)
+def encoding(mctx, x):
+    """File can be successfully decoded with the given character
+    encoding. May not be useful for encodings other than ASCII and
+    UTF-8.
+    """
+
+    # i18n: "encoding" is a keyword
+    enc = getstring(x, _(b"encoding requires an encoding name"))
+
+    def encp(fctx):
+        d = fctx.data()
+        try:
+            d.decode(pycompat.sysstr(enc))
+            return True
+        except LookupError:
+            raise error.Abort(_(b"unknown encoding '%s'") % enc)
+        except UnicodeDecodeError:
+            return False
+
+    return mctx.fpredicate(encp, predrepr=(b'encoding(%r)', enc), cache=True)
+
+
+@predicate(b'eol(style)', weight=_WEIGHT_READ_CONTENTS)
+def eol(mctx, x):
+    """File contains newlines of the given style (dos, unix, mac). Binary
+    files are excluded, files with mixed line endings match multiple
+    styles.
+    """
+
+    # i18n: "eol" is a keyword
+    enc = getstring(x, _(b"eol requires a style name"))
+
+    def eolp(fctx):
+        if fctx.isbinary():
+            return False
+        d = fctx.data()
+        if (enc == b'dos' or enc == b'win') and b'\r\n' in d:
+            return True
+        elif enc == b'unix' and re.search(b'(?<!\r)\n', d):
+            return True
+        elif enc == b'mac' and re.search(b'\r(?!\n)', d):
+            return True
+        return False
+
+    return mctx.fpredicate(eolp, predrepr=(b'eol(%r)', enc), cache=True)
+
+
+@predicate(b'copied()')
+def copied(mctx, x):
+    """File that is recorded as being copied."""
+    # i18n: "copied" is a keyword
+    getargs(x, 0, 0, _(b"copied takes no arguments"))
+
+    def copiedp(fctx):
+        p = fctx.parents()
+        return p and p[0].path() != fctx.path()
+
+    return mctx.fpredicate(copiedp, predrepr=b'copied', cache=True)
+
+
+@predicate(b'revs(revs, pattern)', weight=_WEIGHT_STATUS)
+def revs(mctx, x):
+    """Evaluate set in the specified revisions. If the revset match multiple
+    revs, this will return file matching pattern in any of the revision.
+    """
+    # i18n: "revs" is a keyword
+    r, x = getargs(x, 2, 2, _(b"revs takes two arguments"))
+    # i18n: "revs" is a keyword
+    revspec = getstring(r, _(b"first argument to revs must be a revision"))
+    repo = mctx.ctx.repo()
+    revs = scmutil.revrange(repo, [revspec])
+
+    matchers = []
+    for r in revs:
+        ctx = repo[r]
+        mc = mctx.switch(ctx.p1(), ctx)
+        matchers.append(getmatch(mc, x))
+    if not matchers:
+        return mctx.never()
+    if len(matchers) == 1:
+        return matchers[0]
+    return matchmod.unionmatcher(matchers)
+
+
+@predicate(b'status(base, rev, pattern)', weight=_WEIGHT_STATUS)
+def status(mctx, x):
+    """Evaluate predicate using status change between ``base`` and
+    ``rev``. Examples:
+
+    - ``status(3, 7, added())`` - matches files added from "3" to "7"
+    """
+    repo = mctx.ctx.repo()
+    # i18n: "status" is a keyword
+    b, r, x = getargs(x, 3, 3, _(b"status takes three arguments"))
+    # i18n: "status" is a keyword
+    baseerr = _(b"first argument to status must be a revision")
+    baserevspec = getstring(b, baseerr)
+    if not baserevspec:
+        raise error.ParseError(baseerr)
+    reverr = _(b"second argument to status must be a revision")
+    revspec = getstring(r, reverr)
+    if not revspec:
+        raise error.ParseError(reverr)
+    basectx, ctx = scmutil.revpair(repo, [baserevspec, revspec])
+    mc = mctx.switch(basectx, ctx)
+    return getmatch(mc, x)
+
+
+@predicate(b'subrepo([pattern])')
+def subrepo(mctx, x):
+    """Subrepositories whose paths match the given pattern."""
+    # i18n: "subrepo" is a keyword
+    getargs(x, 0, 1, _(b"subrepo takes at most one argument"))
+    ctx = mctx.ctx
+    sstate = ctx.substate
+    if x:
+        pat = getpattern(
+            x,
+            matchmod.allpatternkinds,
+            # i18n: "subrepo" is a keyword
+            _(b"subrepo requires a pattern or no arguments"),
+        )
+        fast = not matchmod.patkind(pat)
+        if fast:
+
+            def m(s):
+                return s == pat
+
+        else:
+            m = matchmod.match(ctx.repo().root, b'', [pat], ctx=ctx)
+        return mctx.predicate(
+            lambda f: f in sstate and m(f), predrepr=(b'subrepo(%r)', pat)
+        )
+    else:
+        return mctx.predicate(sstate.__contains__, predrepr=b'subrepo')
+
+
+methods = {
+    b'withstatus': getmatchwithstatus,
+    b'string': stringmatch,
+    b'symbol': stringmatch,

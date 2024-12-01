@@ -1,0 +1,1000 @@
+                    b'committeractions cannot define both '
+                    b'messagedifferent and messagealways'
+                )
+            )
+
+        dropcommitter = b'dropcommitter' in committeractions
+        replaceauthor = b'replaceauthor' in committeractions
+
+        if dropcommitter and replaceauthor:
+            raise error.Abort(
+                _(
+                    b'committeractions cannot define both '
+                    b'dropcommitter and replaceauthor'
+                )
+            )
+
+        if dropcommitter and messagealways:
+            raise error.Abort(
+                _(
+                    b'committeractions cannot define both '
+                    b'dropcommitter and messagealways'
+                )
+            )
+
+        if not messagedifferent and not messagealways:
+            messagedifferent = b'committer:'
+
+        self.committeractions = {
+            b'dropcommitter': dropcommitter,
+            b'replaceauthor': replaceauthor,
+            b'messagedifferent': messagedifferent,
+            b'messagealways': messagealways,
+        }
+
+    def after(self):
+        for f in self.catfilepipe:
+            f.close()
+
+    def getheads(self):
+        if not self.revs:
+            output, status = self.gitrun(
+                b'rev-parse', b'--branches', b'--remotes'
+            )
+            heads = output.splitlines()
+            if status:
+                raise error.Abort(_(b'cannot retrieve git heads'))
+        else:
+            heads = []
+            for rev in self.revs:
+                rawhead, ret = self.gitrun(b'rev-parse', b'--verify', rev)
+                heads.append(rawhead[:-1])
+                if ret:
+                    raise error.Abort(_(b'cannot retrieve git head "%s"') % rev)
+        return heads
+
+    def catfile(self, rev, ftype):
+        if rev == sha1nodeconstants.nullhex:
+            raise IOError
+        self.catfilepipe[0].write(rev + b'\n')
+        self.catfilepipe[0].flush()
+        info = self.catfilepipe[1].readline().split()
+        if info[1] != ftype:
+            raise error.Abort(
+                _(b'cannot read %r object at %s')
+                % (pycompat.bytestr(ftype), rev)
+            )
+        size = int(info[2])
+        data = self.catfilepipe[1].read(size)
+        if len(data) < size:
+            raise error.Abort(
+                _(b'cannot read %r object at %s: unexpected size')
+                % (ftype, rev)
+            )
+        # read the trailing newline
+        self.catfilepipe[1].read(1)
+        return data
+
+    def getfile(self, name, rev):
+        if rev == sha1nodeconstants.nullhex:
+            return None, None
+        if name == b'.hgsub':
+            data = b'\n'.join([m.hgsub() for m in self.submoditer()])
+            mode = b''
+        elif name == b'.hgsubstate':
+            data = b'\n'.join([m.hgsubstate() for m in self.submoditer()])
+            mode = b''
+        else:
+            data = self.catfile(rev, b"blob")
+            mode = self.modecache[(name, rev)]
+        return data, mode
+
+    def submoditer(self):
+        null = sha1nodeconstants.nullhex
+        for m in sorted(self.submodules, key=lambda p: p.path):
+            if m.node != null:
+                yield m
+
+    def parsegitmodules(self, content):
+        """Parse the formatted .gitmodules file, example file format:
+        [submodule "sub"]\n
+        \tpath = sub\n
+        \turl = git://giturl\n
+        """
+        self.submodules = []
+        c = config.config()
+        # Each item in .gitmodules starts with whitespace that cant be parsed
+        c.parse(
+            b'.gitmodules',
+            b'\n'.join(line.strip() for line in content.split(b'\n')),
+        )
+        for sec in c.sections():
+            # turn the config object into a real dict
+            s = dict(c.items(sec))
+            if b'url' in s and b'path' in s:
+                self.submodules.append(submodule(s[b'path'], b'', s[b'url']))
+
+    def retrievegitmodules(self, version):
+        modules, ret = self.gitrun(
+            b'show', b'%s:%s' % (version, b'.gitmodules')
+        )
+        if ret:
+            # This can happen if a file is in the repo that has permissions
+            # 160000, but there is no .gitmodules file.
+            self.ui.warn(
+                _(b"warning: cannot read submodules config file in %s\n")
+                % version
+            )
+            return
+
+        try:
+            self.parsegitmodules(modules)
+        except error.ParseError:
+            self.ui.warn(
+                _(b"warning: unable to parse .gitmodules in %s\n") % version
+            )
+            return
+
+        for m in self.submodules:
+            node, ret = self.gitrun(b'rev-parse', b'%s:%s' % (version, m.path))
+            if ret:
+                continue
+            m.node = node.strip()
+
+    def getchanges(self, version, full):
+        if full:
+            raise error.Abort(_(b"convert from git does not support --full"))
+        self.modecache = {}
+        cmd = (
+            [b'diff-tree', b'-z', b'--root', b'-m', b'-r']
+            + self.simopt
+            + [version]
+        )
+        output, status = self.gitrun(*cmd)
+        if status:
+            raise error.Abort(_(b'cannot read changes in %s') % version)
+        changes = []
+        copies = {}
+        seen = set()
+        entry = None
+        subexists = [False]
+        subdeleted = [False]
+        difftree = output.split(b'\x00')
+        lcount = len(difftree)
+        i = 0
+
+        skipsubmodules = self.ui.configbool(b'convert', b'git.skipsubmodules')
+
+        def add(entry, f, isdest):
+            seen.add(f)
+            h = entry[3]
+            p = entry[1] == b"100755"
+            s = entry[1] == b"120000"
+            renamesource = not isdest and entry[4][0] == b'R'
+
+            if f == b'.gitmodules':
+                if skipsubmodules:
+                    return
+
+                subexists[0] = True
+                if entry[4] == b'D' or renamesource:
+                    subdeleted[0] = True
+                    changes.append((b'.hgsub', sha1nodeconstants.nullhex))
+                else:
+                    changes.append((b'.hgsub', b''))
+            elif entry[1] == b'160000' or entry[0] == b':160000':
+                if not skipsubmodules:
+                    subexists[0] = True
+            else:
+                if renamesource:
+                    h = sha1nodeconstants.nullhex
+                self.modecache[(f, h)] = (p and b"x") or (s and b"l") or b""
+                changes.append((f, h))
+
+        while i < lcount:
+            l = difftree[i]
+            i += 1
+            if not entry:
+                if not l.startswith(b':'):
+                    continue
+                entry = tuple(pycompat.bytestr(p) for p in l.split())
+                continue
+            f = l
+            if entry[4][0] == b'C':
+                copysrc = f
+                copydest = difftree[i]
+                i += 1
+                f = copydest
+                copies[copydest] = copysrc
+            if f not in seen:
+                add(entry, f, False)
+            # A file can be copied multiple times, or modified and copied
+            # simultaneously. So f can be repeated even if fdest isn't.
+            if entry[4][0] == b'R':
+                # rename: next line is the destination
+                fdest = difftree[i]
+                i += 1
+                if fdest not in seen:
+                    add(entry, fdest, True)
+                    # .gitmodules isn't imported at all, so it being copied to
+                    # and fro doesn't really make sense
+                    if f != b'.gitmodules' and fdest != b'.gitmodules':
+                        copies[fdest] = f
+            entry = None
+
+        if subexists[0]:
+            if subdeleted[0]:
+                changes.append((b'.hgsubstate', sha1nodeconstants.nullhex))
+            else:
+                self.retrievegitmodules(version)
+                changes.append((b'.hgsubstate', b''))
+        return (changes, copies, set())
+
+    def getcommit(self, version):
+        c = self.catfile(version, b"commit")  # read the commit hash
+        end = c.find(b"\n\n")
+        message = c[end + 2 :]
+        message = self.recode(message)
+        l = c[:end].splitlines()
+        parents = []
+        author = committer = None
+        extra = {}
+        for e in l[1:]:
+            n, v = e.split(b" ", 1)
+            if n == b"author":
+                p = v.split()
+                tm, tz = p[-2:]
+                author = b" ".join(p[:-2])
+                if author[0] == b"<":
+                    author = author[1:-1]
+                author = self.recode(author)
+            if n == b"committer":
+                p = v.split()
+                tm, tz = p[-2:]
+                committer = b" ".join(p[:-2])
+                if committer[0] == b"<":
+                    committer = committer[1:-1]
+                committer = self.recode(committer)
+            if n == b"parent":
+                parents.append(v)
+            if n in self.copyextrakeys:
+                extra[n] = v
+
+        if self.committeractions[b'dropcommitter']:
+            committer = None
+        elif self.committeractions[b'replaceauthor']:
+            author = committer
+
+        if committer:
+            messagealways = self.committeractions[b'messagealways']
+            messagedifferent = self.committeractions[b'messagedifferent']
+            if messagealways:
+                message += b'\n%s %s\n' % (messagealways, committer)
+            elif messagedifferent and author != committer:
+                message += b'\n%s %s\n' % (messagedifferent, committer)
+
+        tzs, tzh, tzm = tz[-5:-4] + b"1", tz[-4:-2], tz[-2:]
+        tz = -int(tzs) * (int(tzh) * 3600 + int(tzm))
+        date = tm + b" " + (b"%d" % tz)
+        saverev = self.ui.configbool(b'convert', b'git.saverev')
+
+        c = common.commit(
+            parents=parents,
+            date=date,
+            author=author,
+            desc=message,
+            rev=version,
+            extra=extra,
+            saverev=saverev,
+        )
+        return c
+
+    def numcommits(self):
+        output, ret = self.gitrunlines(b'rev-list', b'--all')
+        if ret:
+            raise error.Abort(
+                _(b'cannot retrieve number of commits in %s') % self.path
+            )
+        return len(output)
+
+    def gettags(self):
+        tags = {}
+        alltags = {}
+        output, status = self.gitrunlines(b'ls-remote', b'--tags', self.path)
+
+        if status:
+            raise error.Abort(_(b'cannot read tags from %s') % self.path)
+        prefix = b'refs/tags/'
+
+        # Build complete list of tags, both annotated and bare ones
+        for line in output:
+            line = line.strip()
+            if line.startswith(b"error:") or line.startswith(b"fatal:"):
+                raise error.Abort(_(b'cannot read tags from %s') % self.path)
+            node, tag = line.split(None, 1)
+            if not tag.startswith(prefix):
+                continue
+            alltags[tag[len(prefix) :]] = node
+
+        # Filter out tag objects for annotated tag refs
+        for tag in alltags:
+            if tag.endswith(b'^{}'):
+                tags[tag[:-3]] = alltags[tag]
+            else:
+                if tag + b'^{}' in alltags:
+                    continue
+                else:
+                    tags[tag] = alltags[tag]
+
+        return tags
+
+    def getchangedfiles(self, version, i):
+        changes = []
+        if i is None:
+            output, status = self.gitrunlines(
+                b'diff-tree', b'--root', b'-m', b'-r', version
+            )
+            if status:
+                raise error.Abort(_(b'cannot read changes in %s') % version)
+            for l in output:
+                if b"\t" not in l:
+                    continue
+                m, f = l[:-1].split(b"\t")
+                changes.append(f)
+        else:
+            output, status = self.gitrunlines(
+                b'diff-tree',
+                b'--name-only',
+                b'--root',
+                b'-r',
+                version,
+                b'%s^%d' % (version, i + 1),
+                b'--',
+            )
+            if status:
+                raise error.Abort(_(b'cannot read changes in %s') % version)
+            changes = [f.rstrip(b'\n') for f in output]
+
+        return changes
+
+    def getbookmarks(self):
+        bookmarks = {}
+
+        # Handle local and remote branches
+        remoteprefix = self.ui.config(b'convert', b'git.remoteprefix')
+        reftypes = [
+            # (git prefix, hg prefix)
+            (b'refs/remotes/origin/', remoteprefix + b'/'),
+            (b'refs/heads/', b''),
+        ]
+
+        exclude = {
+            b'refs/remotes/origin/HEAD',
+        }
+
+        try:
+            output, status = self.gitrunlines(b'show-ref')
+            for line in output:
+                line = line.strip()
+                rev, name = line.split(None, 1)
+                # Process each type of branch
+                for gitprefix, hgprefix in reftypes:
+                    if not name.startswith(gitprefix) or name in exclude:
+                        continue
+                    name = b'%s%s' % (hgprefix, name[len(gitprefix) :])
+                    bookmarks[name] = rev
+        except Exception:
+            pass
+
+        return bookmarks
+
+    def checkrevformat(self, revstr, mapname=b'splicemap'):
+        """git revision string is a 40 byte hex"""
+        self.checkhexformat(revstr, mapname)
+                                                                                                                                                                                                               usr/lib/python3/dist-packages/hgext/convert/gnuarch.py                                              0000644 0000000 0000000 00000032037 14374730616 021566  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        # gnuarch.py - GNU Arch support for the convert extension
+#
+#  Copyright 2008, 2009 Aleix Conchillo Flaque <aleix@member.fsf.org>
+#  and others
+#
+# This software may be used and distributed according to the terms of the
+# GNU General Public License version 2 or any later version.
+
+import os
+import shutil
+import stat
+import tempfile
+
+from mercurial.i18n import _
+from mercurial import (
+    encoding,
+    error,
+    mail,
+    pycompat,
+    util,
+)
+from mercurial.utils import (
+    dateutil,
+    procutil,
+)
+from . import common
+
+
+class gnuarch_source(common.converter_source, common.commandline):
+    class gnuarch_rev:
+        def __init__(self, rev):
+            self.rev = rev
+            self.summary = b''
+            self.date = None
+            self.author = b''
+            self.continuationof = None
+            self.add_files = []
+            self.mod_files = []
+            self.del_files = []
+            self.ren_files = {}
+            self.ren_dirs = {}
+
+    def __init__(self, ui, repotype, path, revs=None):
+        super(gnuarch_source, self).__init__(ui, repotype, path, revs=revs)
+
+        if not os.path.exists(os.path.join(path, b'{arch}')):
+            raise common.NoRepo(
+                _(b"%s does not look like a GNU Arch repository") % path
+            )
+
+        # Could use checktool, but we want to check for baz or tla.
+        self.execmd = None
+        if procutil.findexe(b'baz'):
+            self.execmd = b'baz'
+        else:
+            if procutil.findexe(b'tla'):
+                self.execmd = b'tla'
+            else:
+                raise error.Abort(_(b'cannot find a GNU Arch tool') +
+                                  _(b' (try installing the %s package)') % b'tla')
+
+        common.commandline.__init__(self, ui, self.execmd)
+
+        self.path = os.path.realpath(path)
+        self.tmppath = None
+
+        self.treeversion = None
+        self.lastrev = None
+        self.changes = {}
+        self.parents = {}
+        self.tags = {}
+        self.encoding = encoding.encoding
+        self.archives = []
+
+    def before(self):
+        # Get registered archives
+        self.archives = [
+            i.rstrip(b'\n') for i in self.runlines0(b'archives', b'-n')
+        ]
+
+        if self.execmd == b'tla':
+            output = self.run0(b'tree-version', self.path)
+        else:
+            output = self.run0(b'tree-version', b'-d', self.path)
+        self.treeversion = output.strip()
+
+        # Get name of temporary directory
+        version = self.treeversion.split(b'/')
+        self.tmppath = os.path.join(
+            pycompat.fsencode(tempfile.gettempdir()), b'hg-%s' % version[1]
+        )
+
+        # Generate parents dictionary
+        self.parents[None] = []
+        treeversion = self.treeversion
+        child = None
+        while treeversion:
+            self.ui.status(_(b'analyzing tree version %s...\n') % treeversion)
+
+            archive = treeversion.split(b'/')[0]
+            if archive not in self.archives:
+                self.ui.status(
+                    _(
+                        b'tree analysis stopped because it points to '
+                        b'an unregistered archive %s...\n'
+                    )
+                    % archive
+                )
+                break
+
+            # Get the complete list of revisions for that tree version
+            output, status = self.runlines(
+                b'revisions', b'-r', b'-f', treeversion
+            )
+            self.checkexit(
+                status, b'failed retrieving revisions for %s' % treeversion
+            )
+
+            # No new iteration unless a revision has a continuation-of header
+            treeversion = None
+
+            for l in output:
+                rev = l.strip()
+                self.changes[rev] = self.gnuarch_rev(rev)
+                self.parents[rev] = []
+
+                # Read author, date and summary
+                catlog, status = self.run(b'cat-log', b'-d', self.path, rev)
+                if status:
+                    catlog = self.run0(b'cat-archive-log', rev)
+                self._parsecatlog(catlog, rev)
+
+                # Populate the parents map
+                self.parents[child].append(rev)
+
+                # Keep track of the current revision as the child of the next
+                # revision scanned
+                child = rev
+
+                # Check if we have to follow the usual incremental history
+                # or if we have to 'jump' to a different treeversion given
+                # by the continuation-of header.
+                if self.changes[rev].continuationof:
+                    treeversion = b'--'.join(
+                        self.changes[rev].continuationof.split(b'--')[:-1]
+                    )
+                    break
+
+                # If we reached a base-0 revision w/o any continuation-of
+                # header, it means the tree history ends here.
+                if rev[-6:] == b'base-0':
+                    break
+
+    def after(self):
+        self.ui.debug(b'cleaning up %s\n' % self.tmppath)
+        shutil.rmtree(self.tmppath, ignore_errors=True)
+
+    def getheads(self):
+        return self.parents[None]
+
+    def getfile(self, name, rev):
+        if rev != self.lastrev:
+            raise error.Abort(_(b'internal calling inconsistency'))
+
+        if not os.path.lexists(os.path.join(self.tmppath, name)):
+            return None, None
+
+        return self._getfile(name, rev)
+
+    def getchanges(self, rev, full):
+        if full:
+            raise error.Abort(_(b"convert from arch does not support --full"))
+        self._update(rev)
+        changes = []
+        copies = {}
+
+        for f in self.changes[rev].add_files:
+            changes.append((f, rev))
+
+        for f in self.changes[rev].mod_files:
+            changes.append((f, rev))
+
+        for f in self.changes[rev].del_files:
+            changes.append((f, rev))
+
+        for src in self.changes[rev].ren_files:
+            to = self.changes[rev].ren_files[src]
+            changes.append((src, rev))
+            changes.append((to, rev))
+            copies[to] = src
+
+        for src in self.changes[rev].ren_dirs:
+            to = self.changes[rev].ren_dirs[src]
+            chgs, cps = self._rendirchanges(src, to)
+            changes += [(f, rev) for f in chgs]
+            copies.update(cps)
+
+        self.lastrev = rev
+        return sorted(set(changes)), copies, set()
+
+    def getcommit(self, rev):
+        changes = self.changes[rev]
+        return common.commit(
+            author=changes.author,
+            date=changes.date,
+            desc=changes.summary,
+            parents=self.parents[rev],
+            rev=rev,
+        )
+
+    def gettags(self):
+        return self.tags
+
+    def _execute(self, cmd, *args, **kwargs):
+        cmdline = [self.execmd, cmd]
+        cmdline += args
+        cmdline = [procutil.shellquote(arg) for arg in cmdline]
+        bdevnull = pycompat.bytestr(os.devnull)
+        cmdline += [b'>', bdevnull, b'2>', bdevnull]
+        cmdline = b' '.join(cmdline)
+        self.ui.debug(cmdline, b'\n')
+        return os.system(pycompat.rapply(procutil.tonativestr, cmdline))
+
+    def _update(self, rev):
+        self.ui.debug(b'applying revision %s...\n' % rev)
+        changeset, status = self.runlines(b'replay', b'-d', self.tmppath, rev)
+        if status:
+            # Something went wrong while merging (baz or tla
+            # issue?), get latest revision and try from there
+            shutil.rmtree(self.tmppath, ignore_errors=True)
+            self._obtainrevision(rev)
+        else:
+            old_rev = self.parents[rev][0]
+            self.ui.debug(
+                b'computing changeset between %s and %s...\n' % (old_rev, rev)
+            )
+            self._parsechangeset(changeset, rev)
+
+    def _getfile(self, name, rev):
+        mode = os.lstat(os.path.join(self.tmppath, name)).st_mode
+        if stat.S_ISLNK(mode):
+            data = util.readlink(os.path.join(self.tmppath, name))
+            if mode:
+                mode = b'l'
+            else:
+                mode = b''
+        else:
+            data = util.readfile(os.path.join(self.tmppath, name))
+            mode = (mode & 0o111) and b'x' or b''
+        return data, mode
+
+    def _exclude(self, name):
+        exclude = [b'{arch}', b'.arch-ids', b'.arch-inventory']
+        for exc in exclude:
+            if name.find(exc) != -1:
+                return True
+        return False
+
+    def _readcontents(self, path):
+        files = []
+        contents = os.listdir(path)
+        while len(contents) > 0:
+            c = contents.pop()
+            p = os.path.join(path, c)
+            # os.walk could be used, but here we avoid internal GNU
+            # Arch files and directories, thus saving a lot time.
+            if not self._exclude(p):
+                if os.path.isdir(p):
+                    contents += [os.path.join(c, f) for f in os.listdir(p)]
+                else:
+                    files.append(c)
+        return files
+
+    def _rendirchanges(self, src, dest):
+        changes = []
+        copies = {}
+        files = self._readcontents(os.path.join(self.tmppath, dest))
+        for f in files:
+            s = os.path.join(src, f)
+            d = os.path.join(dest, f)
+            changes.append(s)
+            changes.append(d)
+            copies[d] = s
+        return changes, copies
+
+    def _obtainrevision(self, rev):
+        self.ui.debug(b'obtaining revision %s...\n' % rev)
+        output = self._execute(b'get', rev, self.tmppath)
+        self.checkexit(output)
+        self.ui.debug(b'analyzing revision %s...\n' % rev)
+        files = self._readcontents(self.tmppath)
+        self.changes[rev].add_files += files
+
+    def _stripbasepath(self, path):
+        if path.startswith(b'./'):
+            return path[2:]
+        return path
+
+    def _parsecatlog(self, data, rev):
+        try:
+            catlog = mail.parsebytes(data)
+
+            # Commit date
+            self.changes[rev].date = dateutil.datestr(
+                dateutil.strdate(catlog['Standard-date'], b'%Y-%m-%d %H:%M:%S')
+            )
+
+            # Commit author
+            self.changes[rev].author = self.recode(catlog['Creator'])
+
+            # Commit description
+            self.changes[rev].summary = b'\n\n'.join(
+                (
+                    self.recode(catlog['Summary']),
+                    self.recode(catlog.get_payload()),
+                )
+            )
+            self.changes[rev].summary = self.recode(self.changes[rev].summary)
+
+            # Commit revision origin when dealing with a branch or tag
+            if 'Continuation-of' in catlog:
+                self.changes[rev].continuationof = self.recode(
+                    catlog['Continuation-of']
+                )
+        except Exception:
+            raise error.Abort(_(b'could not parse cat-log of %s') % rev)
+
+    def _parsechangeset(self, data, rev):
+        for l in data:
+            l = l.strip()
+            # Added file (ignore added directory)
+            if l.startswith(b'A') and not l.startswith(b'A/'):
+                file = self._stripbasepath(l[1:].strip())
+                if not self._exclude(file):
+                    self.changes[rev].add_files.append(file)
+            # Deleted file (ignore deleted directory)
+            elif l.startswith(b'D') and not l.startswith(b'D/'):
+                file = self._stripbasepath(l[1:].strip())
+                if not self._exclude(file):
+                    self.changes[rev].del_files.append(file)
+            # Modified binary file
+            elif l.startswith(b'Mb'):
+                file = self._stripbasepath(l[2:].strip())
+                if not self._exclude(file):
+                    self.changes[rev].mod_files.append(file)
+            # Modified link
+            elif l.startswith(b'M->'):
+                file = self._stripbasepath(l[3:].strip())
+                if not self._exclude(file):
+                    self.changes[rev].mod_files.append(file)
+            # Modified file
+            elif l.startswith(b'M'):
+                file = self._stripbasepath(l[1:].strip())
+                if not self._exclude(file):
+                    self.changes[rev].mod_files.append(file)
+            # Renamed file (or link)
+            elif l.startswith(b'=>'):
+                files = l[2:].strip().split(b' ')
+                if len(files) == 1:
+                    files = l[2:].strip().split(b'\t')
+                src = self._stripbasepath(files[0])
+                dst = self._stripbasepath(files[1])
+                if not self._exclude(src) and not self._exclude(dst):
+                    self.changes[rev].ren_files[src] = dst
+            # Conversion from file to link or from link to file (modified)
+            elif l.startswith(b'ch'):
+                file = self._stripbasepath(l[2:].strip())
+                if not self._exclude(file):
+                    self.changes[rev].mod_files.append(file)
+            # Renamed directory
+            elif l.startswith(b'/>'):
+                dirs = l[2:].strip().split(b' ')
+                if len(dirs) == 1:
+                    dirs = l[2:].strip().split(b'\t')
+                src = self._stripbasepath(dirs[0])
+                dst = self._stripbasepath(dirs[1])
+                if not self._exclude(src) and not self._exclude(dst):
+                    self.changes[rev].ren_dirs[src] = dst
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 usr/lib/python3/dist-packages/hgext/convert/hg.py                                                   0000644 0000000 0000000 00000061053 14355257011 020525  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        # hg.py - hg backend for convert extension
+#
+#  Copyright 2005-2009 Olivia Mackall <olivia@selenic.com> and others
+#
+# This software may be used and distributed according to the terms of the
+# GNU General Public License version 2 or any later version.
+
+# Notes for hg->hg conversion:
+#
+# * Old versions of Mercurial didn't trim the whitespace from the ends
+#   of commit messages, but new versions do.  Changesets created by
+#   those older versions, then converted, may thus have different
+#   hashes for changesets that are otherwise identical.
+#
+# * Using "--config convert.hg.saverev=true" will make the source
+#   identifier to be stored in the converted revision. This will cause
+#   the converted revision to have a different identity than the
+#   source.
+
+import os
+import re
+import time
+
+from mercurial.i18n import _
+from mercurial.pycompat import open
+from mercurial.node import (
+    bin,
+    hex,
+    sha1nodeconstants,
+)
+from mercurial import (
+    bookmarks,
+    context,
+    error,
+    exchange,
+    hg,
+    lock as lockmod,
+    logcmdutil,
+    merge as mergemod,
+    mergestate,
+    phases,
+    util,
+)
+from mercurial.utils import dateutil
+
+stringio = util.stringio
+
+from . import common
+
+mapfile = common.mapfile
+NoRepo = common.NoRepo
+
+sha1re = re.compile(br'\b[0-9a-f]{12,40}\b')
+
+
+class mercurial_sink(common.converter_sink):
+    def __init__(self, ui, repotype, path):
+        common.converter_sink.__init__(self, ui, repotype, path)
+        self.branchnames = ui.configbool(b'convert', b'hg.usebranchnames')
+        self.clonebranches = ui.configbool(b'convert', b'hg.clonebranches')
+        self.tagsbranch = ui.config(b'convert', b'hg.tagsbranch')
+        self.lastbranch = None
+        if os.path.isdir(path) and len(os.listdir(path)) > 0:
+            try:
+                self.repo = hg.repository(self.ui, path)
+                if not self.repo.local():
+                    raise NoRepo(
+                        _(b'%s is not a local Mercurial repository') % path
+                    )
+            except error.RepoError as err:
+                ui.traceback()
+                raise NoRepo(err.args[0])
+        else:
+            try:
+                ui.status(_(b'initializing destination %s repository\n') % path)
+                self.repo = hg.repository(self.ui, path, create=True)
+                if not self.repo.local():
+                    raise NoRepo(
+                        _(b'%s is not a local Mercurial repository') % path
+                    )
+                self.created.append(path)
+            except error.RepoError:
+                ui.traceback()
+                raise NoRepo(
+                    _(b"could not create hg repository %s as sink") % path
+                )
+        self.lock = None
+        self.wlock = None
+        self.filemapmode = False
+        self.subrevmaps = {}
+
+    def before(self):
+        self.ui.debug(b'run hg sink pre-conversion action\n')
+        self.wlock = self.repo.wlock()
+        self.lock = self.repo.lock()
+
+    def after(self):
+        self.ui.debug(b'run hg sink post-conversion action\n')
+        if self.lock:
+            self.lock.release()
+        if self.wlock:
+            self.wlock.release()
+
+    def revmapfile(self):
+        return self.repo.vfs.join(b"shamap")
+
+    def authorfile(self):
+        return self.repo.vfs.join(b"authormap")
+
+    def setbranch(self, branch, pbranches):
+        if not self.clonebranches:
+            return
+
+        setbranch = branch != self.lastbranch
+        self.lastbranch = branch
+        if not branch:
+            branch = b'default'
+        pbranches = [(b[0], b[1] and b[1] or b'default') for b in pbranches]
+
+        branchpath = os.path.join(self.path, branch)
+        if setbranch:
+            self.after()
+            try:
+                self.repo = hg.repository(self.ui, branchpath)
+            except Exception:
+                self.repo = hg.repository(self.ui, branchpath, create=True)
+            self.before()
+
+        # pbranches may bring revisions from other branches (merge parents)
+        # Make sure we have them, or pull them.
+        missings = {}
+        for b in pbranches:
+            try:
+                self.repo.lookup(b[0])
+            except Exception:
+                missings.setdefault(b[1], []).append(b[0])
+
+        if missings:
+            self.after()
+            for pbranch, heads in sorted(missings.items()):
+                pbranchpath = os.path.join(self.path, pbranch)
+                prepo = hg.peer(self.ui, {}, pbranchpath)
+                self.ui.note(
+                    _(b'pulling from %s into %s\n') % (pbranch, branch)
+                )
+                exchange.pull(
+                    self.repo, prepo, heads=[prepo.lookup(h) for h in heads]
+                )
+            self.before()
+
+    def _rewritetags(self, source, revmap, data):
+        fp = stringio()
+        for line in data.splitlines():
+            s = line.split(b' ', 1)
+            if len(s) != 2:
+                self.ui.warn(_(b'invalid tag entry: "%s"\n') % line)
+                fp.write(b'%s\n' % line)  # Bogus, but keep for hash stability
+                continue
+            revid = revmap.get(source.lookuprev(s[0]))
+            if not revid:
+                if s[0] == sha1nodeconstants.nullhex:
+                    revid = s[0]
+                else:
+                    # missing, but keep for hash stability
+                    self.ui.warn(_(b'missing tag entry: "%s"\n') % line)
+                    fp.write(b'%s\n' % line)
+                    continue
+            fp.write(b'%s %s\n' % (revid, s[1]))
+        return fp.getvalue()
+
+    def _rewritesubstate(self, source, data):
+        fp = stringio()
+        for line in data.splitlines():
+            s = line.split(b' ', 1)
+            if len(s) != 2:
+                continue
+
+            revid = s[0]
+            subpath = s[1]
+            if revid != sha1nodeconstants.nullhex:
+                revmap = self.subrevmaps.get(subpath)
+                if revmap is None:
+                    revmap = mapfile(
+                        self.ui, self.repo.wjoin(subpath, b'.hg/shamap')
+                    )
+                    self.subrevmaps[subpath] = revmap
+
+                    # It is reasonable that one or more of the subrepos don't
+                    # need to be converted, in which case they can be cloned
+                    # into place instead of converted.  Therefore, only warn
+                    # once.
+                    msg = _(b'no ".hgsubstate" updates will be made for "%s"\n')
+                    if len(revmap) == 0:
+                        sub = self.repo.wvfs.reljoin(subpath, b'.hg')
+
+                        if self.repo.wvfs.exists(sub):
+                            self.ui.warn(msg % subpath)
+
+                newid = revmap.get(revid)
+                if not newid:
+                    if len(revmap) > 0:
+                        self.ui.warn(
+                            _(b"%s is missing from %s/.hg/shamap\n")
+                            % (revid, subpath)
+                        )
+                else:
+                    revid = newid
+
+            fp.write(b'%s %s\n' % (revid, subpath))
+
+        return fp.getvalue()
+
+    def _calculatemergedfiles(self, source, p1ctx, p2ctx):
+        """Calculates the files from p2 that we need to pull in when merging p1
+        and p2, given that the merge is coming from the given source.
+
+        This prevents us from losing files that only exist in the target p2 and
+        that don't come from the source repo (like if you're merging multiple
+        repositories together).
+        """
+        anc = [p1ctx.ancestor(p2ctx)]
+        # Calculate what files are coming from p2
+        # TODO: mresult.commitinfo might be able to get that info
+        mresult = mergemod.calculateupdates(
+            self.repo,
+            p1ctx,
+            p2ctx,
+            anc,
+            branchmerge=True,

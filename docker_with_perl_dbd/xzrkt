@@ -1,0 +1,1000 @@
+=cut
+
+sub reset_local_duplicates ()
+{
+  return _reset_duplicates %_local_duplicate_messages;
+}
+
+=item C<reset_global_duplicates ()>
+
+Reset local duplicate messages (see C<US_GLOBAL>), and
+return the number of messages that have been filtered out.
+
+=cut
+
+sub reset_global_duplicates ()
+{
+  return _reset_duplicates %_global_duplicate_messages;
+}
+
+sub _merge_options (\%%)
+{
+  my ($hash, %options) = @_;
+  local $_;
+
+  foreach (keys %options)
+    {
+      if (exists $hash->{$_})
+	{
+	  $hash->{$_} = $options{$_}
+	}
+      else
+	{
+	  confess "unknown option '$_'";
+	}
+    }
+  if ($hash->{'ordered'})
+    {
+      confess "fatal messages cannot be ordered"
+	if $hash->{'type'} eq 'fatal';
+      confess "backtrace cannot be output on ordered messages"
+	if $hash->{'backtrace'};
+    }
+}
+
+=item C<register_channel ($name, [%options])>
+
+Declare channel C<$name>, and override the default options
+with those listed in C<%options>.
+
+=cut
+
+sub register_channel ($;%)
+{
+  my ($name, %options) = @_;
+  my %channel_opts = %_default_options;
+  _merge_options %channel_opts, %options;
+  $channels{$name} = \%channel_opts;
+}
+
+=item C<exists_channel ($name)>
+
+Returns true iff channel C<$name> has been registered.
+
+=cut
+
+sub exists_channel ($)
+{
+  my ($name) = @_;
+  return exists $channels{$name};
+}
+
+=item C<channel_type ($name)>
+
+Returns the type of channel C<$name> if it has been registered.
+Returns the empty string otherwise.
+
+=cut
+
+sub channel_type ($)
+{
+  my ($name) = @_;
+  return $channels{$name}{'type'} if exists_channel $name;
+  return '';
+}
+
+# _format_sub_message ($LEADER, $MESSAGE)
+# ---------------------------------------
+# Split $MESSAGE at new lines and add $LEADER to each line.
+sub _format_sub_message ($$)
+{
+  my ($leader, $message) = @_;
+  return $leader . join ("\n" . $leader, split ("\n", $message)) . "\n";
+}
+
+# Store partial messages here. (See the 'partial' option.)
+our $partial = '';
+
+# _format_message ($LOCATION, $MESSAGE, %OPTIONS)
+# -----------------------------------------------
+# Format the message.  Return a string ready to print.
+sub _format_message ($$%)
+{
+  my ($location, $message, %opts) = @_;
+  my $msg = ($partial eq '' ? $opts{'header'} : '') . $message
+	    . ($opts{'partial'} ? '' : $opts{'footer'});
+  if (ref $location)
+    {
+      # If $LOCATION is a reference, assume it's an instance of the
+      # Autom4te::Location class and display contexts.
+      my $loc = $location->get || $me;
+      $msg = _format_sub_message ("$loc: ", $msg);
+      for my $pair ($location->get_contexts)
+	{
+	  $msg .= _format_sub_message ($pair->[0] . ":   ", $pair->[1]);
+	}
+    }
+  else
+    {
+      $location ||= $me;
+      $msg = _format_sub_message ("$location: ", $msg);
+    }
+  return $msg;
+}
+
+# _enqueue ($QUEUE, $KEY, $UNIQ_SCOPE, $TO_FILTER, $MSG, $FILE)
+# -------------------------------------------------------------
+# Push message on a queue, to be processed by another thread.
+sub _enqueue ($$$$$$)
+{
+  my ($queue, $key, $uniq_scope, $to_filter, $msg, $file) = @_;
+  $queue->enqueue ($key, $msg, $to_filter, $uniq_scope);
+  confess "message queuing works only for STDERR"
+    if $file ne \*STDERR;
+}
+
+# _dequeue ($QUEUE)
+# -----------------
+# Pop a message from a queue, and print, similarly to how
+# _print_message would do it.  Return 0 if the queue is
+# empty.  Note that the key has already been dequeued.
+sub _dequeue ($)
+{
+  my ($queue) = @_;
+  my $msg = $queue->dequeue || return 0;
+  my $to_filter = $queue->dequeue;
+  my $uniq_scope = $queue->dequeue;
+  my $file = \*STDERR;
+
+  if ($to_filter ne '')
+    {
+      # Do we want local or global uniqueness?
+      my $dups;
+      if ($uniq_scope == US_LOCAL)
+	{
+	  $dups = \%_local_duplicate_messages;
+	}
+      elsif ($uniq_scope == US_GLOBAL)
+	{
+	  $dups = \%_global_duplicate_messages;
+	}
+      else
+	{
+	  confess "unknown value for uniq_scope: " . $uniq_scope;
+	}
+
+      # Update the hash of messages.
+      if (exists $dups->{$to_filter})
+	{
+	  ++$dups->{$to_filter};
+	  return 1;
+	}
+      else
+	{
+	  $dups->{$to_filter} = 0;
+	}
+    }
+  print $file $msg;
+  return 1;
+}
+
+
+# _print_message ($LOCATION, $MESSAGE, %OPTIONS)
+# ----------------------------------------------
+# Format the message, check duplicates, and print it.
+sub _print_message ($$%)
+{
+  my ($location, $message, %opts) = @_;
+
+  return 0 if ($opts{'silent'});
+
+  my $msg = _format_message ($location, $message, %opts);
+  if ($opts{'partial'})
+    {
+      # Incomplete message.  Store, don't print.
+      $partial .= $msg;
+      return;
+    }
+  else
+    {
+      # Prefix with any partial message send so far.
+      $msg = $partial . $msg;
+      $partial = '';
+    }
+
+  msg ('note', '', 'warnings are treated as errors', uniq_scope => US_GLOBAL)
+    if ($opts{'type'} eq 'warning' && $warnings_are_errors);
+
+  # Check for duplicate message if requested.
+  my $to_filter;
+  if ($opts{'uniq_part'} ne UP_NONE)
+    {
+      # Which part of the error should we match?
+      if ($opts{'uniq_part'} eq UP_TEXT)
+	{
+	  $to_filter = $message;
+	}
+      elsif ($opts{'uniq_part'} eq UP_LOC_TEXT)
+	{
+	  $to_filter = $msg;
+	}
+      else
+	{
+	  $to_filter = $opts{'uniq_part'};
+	}
+
+      # Do we want local or global uniqueness?
+      my $dups;
+      if ($opts{'uniq_scope'} == US_LOCAL)
+	{
+	  $dups = \%_local_duplicate_messages;
+	}
+      elsif ($opts{'uniq_scope'} == US_GLOBAL)
+	{
+	  $dups = \%_global_duplicate_messages;
+	}
+      else
+	{
+	  confess "unknown value for uniq_scope: " . $opts{'uniq_scope'};
+	}
+
+      # Update the hash of messages.
+      if (exists $dups->{$to_filter})
+	{
+	  ++$dups->{$to_filter};
+	  return 0;
+	}
+      else
+	{
+	  $dups->{$to_filter} = 0;
+	}
+    }
+  my $file = $opts{'file'};
+  if ($opts{'ordered'} && $opts{'queue'})
+    {
+      _enqueue ($opts{'queue'}, $opts{'queue_key'}, $opts{'uniq_scope'},
+		$to_filter, $msg, $file);
+    }
+  else
+    {
+      print $file $msg;
+    }
+  return 1;
+}
+
+=item C<msg ($channel, $location, $message, [%options])>
+
+Emit a message on C<$channel>, overriding some options of the channel with
+those specified in C<%options>.  Obviously C<$channel> must have been
+registered with C<register_channel>.
+
+C<$message> is the text of the message, and C<$location> is a location
+associated to the message.
+
+For instance to complain about some unused variable C<mumble>
+declared at line 10 in F<foo.c>, one could do:
+
+  msg 'unused', 'foo.c:10', "unused variable 'mumble'";
+
+If channel C<unused> is not silent (and if this message is not a duplicate),
+the following would be output:
+
+  foo.c:10: unused variable 'mumble'
+
+C<$location> can also be an instance of C<Autom4te::Location>.  In this
+case, the stack of contexts will be displayed in addition.
+
+If C<$message> contains newline characters, C<$location> is prepended
+to each line.  For instance,
+
+  msg 'error', 'somewhere', "1st line\n2nd line";
+
+becomes
+
+  somewhere: 1st line
+  somewhere: 2nd line
+
+If C<$location> is an empty string, it is replaced by the name of the
+program.  Actually, if you don't use C<%options>, you can even
+elide the empty C<$location>.  Thus
+
+  msg 'fatal', '', 'fatal error';
+  msg 'fatal', 'fatal error';
+
+both print
+
+  progname: fatal error
+
+=cut
+
+
+# See buffer_messages() and flush_messages() below.
+our %buffering = ();	# The map of channel types to buffer.
+our @backlog = ();		# The buffer of messages.
+
+sub msg ($$;$%)
+{
+  my ($channel, $location, $message, %options) = @_;
+
+  if (! defined $message)
+    {
+      $message = $location;
+      $location = '';
+    }
+
+  confess "unknown channel $channel" unless exists $channels{$channel};
+
+  my %opts = %{$channels{$channel}};
+  _merge_options (%opts, %options);
+
+  if (exists $buffering{$opts{'type'}})
+    {
+      push @backlog, [$channel, $location->clone, $message, %options];
+      return;
+    }
+
+  # Print the message if needed.
+  if (_print_message ($location, $message, %opts))
+    {
+      # Adjust exit status.
+      if ($opts{'type'} eq 'error'
+	  || $opts{'type'} eq 'fatal'
+	  || ($opts{'type'} eq 'warning' && $warnings_are_errors))
+	{
+	  my $es = $opts{'exit_code'};
+	  $exit_code = $es if $es > $exit_code;
+	}
+
+      # Die on fatal messages.
+      confess if $opts{'backtrace'};
+      if ($opts{'type'} eq 'fatal')
+        {
+	  # flush messages explicitly here, needed in worker threads.
+	  STDERR->flush;
+	  exit $exit_code;
+	}
+    }
+}
+
+
+=item C<setup_channel ($channel, %options)>
+
+Override the options of C<$channel> with those specified by C<%options>.
+
+=cut
+
+sub setup_channel ($%)
+{
+  my ($name, %opts) = @_;
+  confess "unknown channel $name" unless exists $channels{$name};
+  _merge_options %{$channels{$name}}, %opts;
+}
+
+=item C<setup_channel_type ($type, %options)>
+
+Override the options of any channel of type C<$type>
+with those specified by C<%options>.
+
+=cut
+
+sub setup_channel_type ($%)
+{
+  my ($type, %opts) = @_;
+  foreach my $channel (keys %channels)
+    {
+      setup_channel $channel, %opts
+	if $channels{$channel}{'type'} eq $type;
+    }
+}
+
+=item C<dup_channel_setup ()>, C<drop_channel_setup ()>
+
+Sometimes it is necessary to make temporary modifications to channels.
+For instance one may want to disable a warning while processing a
+particular file, and then restore the initial setup.  These two
+functions make it easy: C<dup_channel_setup ()> saves a copy of the
+current configuration for later restoration by
+C<drop_channel_setup ()>.
+
+You can think of this as a stack of configurations whose first entry
+is the active one.  C<dup_channel_setup ()> duplicates the first
+entry, while C<drop_channel_setup ()> just deletes it.
+
+=cut
+
+our @_saved_channels = ();
+our @_saved_werrors = ();
+
+sub dup_channel_setup ()
+{
+  my %channels_copy;
+  foreach my $k1 (keys %channels)
+    {
+      $channels_copy{$k1} = {%{$channels{$k1}}};
+    }
+  push @_saved_channels, \%channels_copy;
+  push @_saved_werrors, $warnings_are_errors;
+}
+
+sub drop_channel_setup ()
+{
+  my $saved = pop @_saved_channels;
+  %channels = %$saved;
+  $warnings_are_errors = pop @_saved_werrors;
+}
+
+=item C<buffer_messages (@types)>, C<flush_messages ()>
+
+By default, when C<msg> is called, messages are processed immediately.
+
+Sometimes it is necessary to delay the output of messages.
+For instance you might want to make diagnostics before
+channels have been completely configured.
+
+After C<buffer_messages(@types)> has been called, messages sent with
+C<msg> to a channel whose type is listed in C<@types> will be stored in a
+list for later processing.
+
+This backlog of messages is processed when C<flush_messages> is
+called, with the current channel options (not the options in effect,
+at the time of C<msg>).  So for instance, if some channel was silenced
+in the meantime, messages to this channel will not be printed.
+
+C<flush_messages> cancels the effect of C<buffer_messages>.  Following
+calls to C<msg> are processed immediately as usual.
+
+=cut
+
+sub buffer_messages (@)
+{
+  foreach my $type (@_)
+    {
+      $buffering{$type} = 1;
+    }
+}
+
+sub flush_messages ()
+{
+  %buffering = ();
+  foreach my $args (@backlog)
+    {
+      &msg (@$args);
+    }
+  @backlog = ();
+}
+
+=item C<setup_channel_queue ($queue, $key)>
+
+Set the queue to fill for each channel that is ordered,
+and the key to use for serialization.
+
+=cut
+sub setup_channel_queue ($$)
+{
+  my ($queue, $key) = @_;
+  foreach my $channel (keys %channels)
+    {
+      setup_channel $channel, queue => $queue, queue_key => $key
+        if $channels{$channel}{'ordered'};
+    }
+}
+
+=item C<pop_channel_queue ($queue)>
+
+pop a message off the $queue; the key has already been popped.
+
+=cut
+sub pop_channel_queue ($)
+{
+  my ($queue) = @_;
+  return _dequeue ($queue);
+}
+
+=back
+
+=head1 SEE ALSO
+
+L<Autom4te::Location>
+
+=head1 HISTORY
+
+Written by Alexandre Duret-Lutz E<lt>F<adl@gnu.org>E<gt>.
+
+=cut
+
+1;
+                                                                                                                                                                                                                                                  usr/share/autoconf/Autom4te/Config.pm                                                               0000644 0000000 0000000 00000002621 14360564606 016255  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        #  -*- Perl -*-
+# Copyright (C) 2003-2021 Free Software Foundation, Inc.
+
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 2, or (at your option)
+# any later version.
+
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+package Autom4te::Config;
+
+# This is a stub version of Automake/Config.pm.
+# It defines only the variables that are necessary in order to fetch
+# Autom4te/ChannelDefs.pm from Automake/ChannelDefs.pm
+# (see build-aux/fetch.pl).
+# We would like to fetch Automake/Config.pm as well,
+# but that file is generated when automake is built,
+# and autoconf's build machinery is not prepared to do that.
+# Revisit after 2.70.
+
+use 5.006;
+use strict;
+use warnings FATAL => 'all';
+
+use Exporter;
+
+our @ISA = qw (Exporter);
+our @EXPORT = qw ($PACKAGE_BUGREPORT $perl_threads);
+
+# this must be kept in sync with configure.ac
+our $PACKAGE_BUGREPORT = 'bug-autoconf@gnu.org';
+
+# autom4te currently has no use for threads
+our $perl_threads = 0;
+
+1;
+                                                                                                               usr/share/autoconf/Autom4te/Configure_ac.pm                                                         0000644 0000000 0000000 00000005652 14360564606 017443  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        # Copyright (C) 2003-2020 Free Software Foundation, Inc.
+
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 2, or (at your option)
+# any later version.
+
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+###############################################################
+# The main copy of this file is in Automake's git repository. #
+# Updates should be sent to automake-patches@gnu.org.         #
+###############################################################
+
+package Autom4te::Configure_ac;
+
+use 5.006;
+use strict;
+use warnings FATAL => 'all';
+
+use Exporter;
+
+use Autom4te::ChannelDefs;
+use Autom4te::Channels;
+
+our @ISA = qw (Exporter);
+our @EXPORT = qw (&find_configure_ac &require_configure_ac);
+
+=head1 NAME
+
+Autom4te::Configure_ac - Locate configure.ac or configure.in.
+
+=head1 SYNOPSIS
+
+  use Autom4te::Configure_ac;
+
+  # Try to locate configure.in or configure.ac in the current
+  # directory.  It may be absent.  Complain if both files exist.
+  my $file_name = find_configure_ac;
+
+  # Likewise, but bomb out if the file does not exist.
+  my $file_name = require_configure_ac;
+
+  # Likewise, but in $dir.
+  my $file_name = find_configure_ac ($dir);
+  my $file_name = require_configure_ac ($dir);
+
+=over 4
+
+=back
+
+=head2 Functions
+
+=over 4
+
+=item C<$configure_ac = find_configure_ac ([$directory])>
+
+Find a F<configure.ac> or F<configure.in> file in C<$directory>,
+defaulting to the current directory.  Complain if both files are present.
+Return the name of the file found, or the former if neither is present.
+
+=cut
+
+sub find_configure_ac (;@)
+{
+  my ($directory) = @_;
+  $directory ||= '.';
+  my $configure_ac =
+    File::Spec->canonpath (File::Spec->catfile ($directory, 'configure.ac'));
+  my $configure_in =
+    File::Spec->canonpath (File::Spec->catfile ($directory, 'configure.in'));
+
+  if (-f $configure_in)
+    {
+      msg ('obsolete', "autoconf input should be named 'configure.ac'," .
+                       " not 'configure.in'");
+      if (-f $configure_ac)
+	{
+	  msg ('unsupported',
+	       "'$configure_ac' and '$configure_in' both present.\n"
+	       . "proceeding with '$configure_ac'");
+          return $configure_ac
+	}
+      else
+        {
+          return $configure_in;
+        }
+    }
+  return $configure_ac;
+}
+
+
+=item C<$configure_ac = require_configure_ac ([$directory])>
+
+Like C<find_configure_ac>, but fail if neither is present.
+
+=cut
+
+sub require_configure_ac (;$)
+{
+  my $res = find_configure_ac (@_);
+  fatal "'configure.ac' is required" unless -f $res;
+  return $res
+}
+
+1;
+                                                                                      usr/share/autoconf/Autom4te/FileUtils.pm                                                            0000644 0000000 0000000 00000020737 14360564606 016760  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        # Copyright (C) 2003-2020 Free Software Foundation, Inc.
+
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 2, or (at your option)
+# any later version.
+
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+###############################################################
+# The main copy of this file is in Automake's git repository. #
+# Updates should be sent to automake-patches@gnu.org.         #
+###############################################################
+
+package Autom4te::FileUtils;
+
+=head1 NAME
+
+Autom4te::FileUtils - handling files
+
+=head1 SYNOPSIS
+
+  use Autom4te::FileUtils
+
+=head1 DESCRIPTION
+
+This perl module provides various general purpose file handling functions.
+
+=cut
+
+use 5.006;
+use strict;
+use warnings FATAL => 'all';
+
+use Exporter;
+use File::stat;
+use IO::File;
+
+use Autom4te::Channels;
+use Autom4te::ChannelDefs;
+
+our @ISA = qw (Exporter);
+our @EXPORT = qw (&contents
+		  &find_file &mtime
+		  &update_file
+		  &xsystem &xsystem_hint &xqx
+		  &dir_has_case_matching_file &reset_dir_cache
+		  &set_dir_cache_file);
+
+=over 4
+
+=item C<find_file ($file_name, @include)>
+
+Return the first path for a C<$file_name> in the C<include>s.
+
+We match exactly the behavior of GNU M4: first look in the current
+directory (which includes the case of absolute file names), and then,
+if the file name is not absolute, look in C<@include>.
+
+If the file is flagged as optional (ends with C<?>), then return undef
+if absent, otherwise exit with error.
+
+=cut
+
+# $FILE_NAME
+# find_file ($FILE_NAME, @INCLUDE)
+# --------------------------------
+sub find_file ($@)
+{
+  use File::Spec;
+
+  my ($file_name, @include) = @_;
+  my $optional = 0;
+
+  $optional = 1
+    if $file_name =~ s/\?$//;
+
+  return File::Spec->canonpath ($file_name)
+    if -e $file_name;
+
+  if (!File::Spec->file_name_is_absolute ($file_name))
+    {
+      foreach my $path (@include)
+	{
+	  return File::Spec->canonpath (File::Spec->catfile ($path, $file_name))
+	    if -e File::Spec->catfile ($path, $file_name)
+	}
+    }
+
+  fatal "$file_name: no such file or directory"
+    unless $optional;
+  return undef;
+}
+
+=item C<mtime ($file)>
+
+Return the mtime of C<$file>.  Missing files, or C<-> standing for
+C<STDIN> or C<STDOUT> are "obsolete", i.e., as old as possible.
+
+=cut
+
+# $MTIME
+# MTIME ($FILE)
+# -------------
+sub mtime ($)
+{
+  my ($file) = @_;
+
+  return 0
+    if $file eq '-' || ! -f $file;
+
+  my $stat = stat ($file)
+    or fatal "cannot stat $file: $!";
+
+  return $stat->mtime;
+}
+
+
+=item C<update_file ($from, $to, [$force])>
+
+Rename C<$from> as C<$to>, preserving C<$to> timestamp if it has not
+changed, unless C<$force> is true (defaults to false).  Recognize
+C<$to> = C<-> standing for C<STDIN>.  C<$from> is always
+removed/renamed.
+
+=cut
+
+# &update_file ($FROM, $TO; $FORCE)
+# ---------------------------------
+sub update_file ($$;$)
+{
+  my ($from, $to, $force) = @_;
+  $force = 0
+    unless defined $force;
+  my $SIMPLE_BACKUP_SUFFIX = $ENV{'SIMPLE_BACKUP_SUFFIX'} || '~';
+  use File::Compare;
+  use File::Copy;
+
+  if ($to eq '-')
+    {
+      my $in = new IO::File $from, "<";
+      my $out = new IO::File (">-");
+      while ($_ = $in->getline)
+	{
+	  print $out $_;
+	}
+      $in->close;
+      unlink ($from) || fatal "cannot remove $from: $!";
+      return;
+    }
+
+  if (!$force && -f "$to" && compare ("$from", "$to") == 0)
+    {
+      # File didn't change, so don't update its mod time.
+      msg 'note', "'$to' is unchanged";
+      unlink ($from)
+        or fatal "cannot remove $from: $!";
+      return
+    }
+
+  if (-f "$to")
+    {
+      # Back up and install the new one.
+      move ("$to",  "$to$SIMPLE_BACKUP_SUFFIX")
+	or fatal "cannot backup $to: $!";
+      move ("$from", "$to")
+	or fatal "cannot rename $from as $to: $!";
+      msg 'note', "'$to' is updated";
+    }
+  else
+    {
+      move ("$from", "$to")
+	or fatal "cannot rename $from as $to: $!";
+      msg 'note', "'$to' is created";
+    }
+}
+
+
+=item C<handle_exec_errors ($command, [$expected_exit_code = 0], [$hint])>
+
+Display an error message for C<$command>, based on the content of
+C<$?> and C<$!>.  Be quiet if the command exited normally
+with C<$expected_exit_code>.  If C<$hint> is given, display that as well
+if the command failed to run at all.
+
+=cut
+
+sub handle_exec_errors ($;$$)
+{
+  my ($command, $expected, $hint) = @_;
+  $expected = 0 unless defined $expected;
+  if (defined $hint)
+    {
+      $hint = "\n" . $hint;
+    }
+  else
+    {
+      $hint = '';
+    }
+
+  $command = (split (' ', $command))[0];
+  if ($!)
+    {
+      fatal "failed to run $command: $!" . $hint;
+    }
+  else
+    {
+      use POSIX qw (WIFEXITED WEXITSTATUS WIFSIGNALED WTERMSIG);
+
+      if (WIFEXITED ($?))
+	{
+	  my $status = WEXITSTATUS ($?);
+	  # Propagate exit codes.
+	  fatal ('',
+		 "$command failed with exit status: $status",
+		 exit_code => $status)
+	    unless $status == $expected;
+	}
+      elsif (WIFSIGNALED ($?))
+	{
+	  my $signal = WTERMSIG ($?);
+	  fatal "$command terminated by signal: $signal";
+	}
+      else
+	{
+	  fatal "$command exited abnormally";
+	}
+    }
+}
+
+=item C<xqx ($command)>
+
+Same as C<qx> (but in scalar context), but fails on errors.
+
+=cut
+
+# xqx ($COMMAND)
+# --------------
+sub xqx ($)
+{
+  my ($command) = @_;
+
+  verb "running: $command";
+
+  $! = 0;
+  my $res = `$command`;
+  handle_exec_errors $command
+    if $?;
+
+  return $res;
+}
+
+
+=item C<xsystem (@argv)>
+
+Same as C<system>, but fails on errors, and reports the C<@argv>
+in verbose mode.
+
+=cut
+
+sub xsystem (@)
+{
+  my (@command) = @_;
+
+  verb "running: @command";
+
+  $! = 0;
+  handle_exec_errors "@command"
+    if system @command;
+}
+
+
+=item C<xsystem_hint ($msg, @argv)>
+
+Same as C<xsystem>, but allows to pass a hint that will be displayed
+in case the command failed to run at all.
+
+=cut
+
+sub xsystem_hint (@)
+{
+  my ($hint, @command) = @_;
+
+  verb "running: @command";
+
+  $! = 0;
+  handle_exec_errors "@command", 0, $hint
+    if system @command;
+}
+
+
+=item C<contents ($file_name)>
+
+Return the contents of C<$file_name>.
+
+=cut
+
+# contents ($FILE_NAME)
+# ---------------------
+sub contents ($)
+{
+  my ($file) = @_;
+  verb "reading $file";
+  local $/;			# Turn on slurp-mode.
+  my $f = new Autom4te::XFile $file, "<";
+  my $contents = $f->getline;
+  $f->close;
+  return $contents;
+}
+
+
+=item C<dir_has_case_matching_file ($DIRNAME, $FILE_NAME)>
+
+Return true iff $DIR contains a file name that matches $FILE_NAME case
+insensitively.
+
+We need to be cautious on case-insensitive case-preserving file
+systems (e.g. Mac OS X's HFS+).  On such systems C<-f 'Foo'> and C<-f
+'foO'> answer the same thing.  Hence if a package distributes its own
+F<CHANGELOG> file, but has no F<ChangeLog> file, automake would still
+try to distribute F<ChangeLog> (because it thinks it exists) in
+addition to F<CHANGELOG>, although it is impossible for these two
+files to be in the same directory (the two file names designate the
+same file).
+
+=cut
+
+our %_directory_cache;
+sub dir_has_case_matching_file ($$)
+{
+  # Note that print File::Spec->case_tolerant returns 0 even on MacOS
+  # X (with Perl v5.8.1-RC3 at least), so do not try to shortcut this
+  # function using that.
+

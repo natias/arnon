@@ -1,0 +1,1000 @@
+        $CPAN::Frontend->mywarn("CPAN::Meta::Requirements $whynot\n");
+        my $before = "";
+        if ($self->{CALLED_FOR}){
+            if ($self->{CALLED_FOR} =~
+                /^(
+                     CPAN::Meta::Requirements
+                 |CPAN::DistnameInfo
+                 |version
+                 |parent
+                 |ExtUtils::MakeMaker
+                 |Test::Harness
+                 )$/x) {
+                $CPAN::Frontend->mywarn("Please install CPAN::Meta::Requirements ".
+                    "as soon as possible; it is needed for a reliable operation of ".
+                    "the cpan shell; setting requirements to nil for '$1' for now ".
+                    "to prevent deadlock during bootstrapping\n");
+                return;
+            }
+            $before = " before $self->{CALLED_FOR}";
+        }
+        $CPAN::Frontend->mydie("Please install CPAN::Meta::Requirements manually$before");
+    }
+    my $merged = CPAN::Meta::Requirements->new;
+    my $prefs_depends = $self->prefs->{depends}||{};
+    my $feature_depends = $self->_feature_depends();
+    if ($slot eq "configure_requires_later") {
+        for my $hash (  $self->configure_requires,
+                        $prefs_depends->{configure_requires},
+                        $feature_depends->{configure_requires},
+        ) {
+            $merged->add_requirements(
+                CPAN::Meta::Requirements->from_string_hash($hash)
+            );
+        }
+        if (-f "Build.PL"
+            && ! -f File::Spec->catfile($self->{build_dir},"Makefile.PL")
+            && ! @{[ $merged->required_modules ]}
+            && ! $CPAN::META->has_inst("Module::Build")
+           ) {
+            $CPAN::Frontend->mywarn(
+              "  Warning: CPAN.pm discovered Module::Build as undeclared prerequisite.\n".
+              "  Adding it now as such.\n"
+            );
+            $CPAN::Frontend->mysleep(5);
+            $merged->add_minimum( "Module::Build" => 0 );
+            delete $self->{writemakefile};
+        }
+        $prereq_pm = {}; # configure_requires defined as "b"
+    } elsif ($slot eq "later") {
+        my $prereq_pm_0 = $self->prereq_pm || {};
+        for my $reqtype (qw(requires build_requires opt_requires opt_build_requires)) {
+            $prereq_pm->{$reqtype} = {%{$prereq_pm_0->{$reqtype}||{}}}; # copy to not pollute it
+            for my $dep ($prefs_depends,$feature_depends) {
+                for my $k (keys %{$dep->{$reqtype}||{}}) {
+                    $prereq_pm->{$reqtype}{$k} = $dep->{$reqtype}{$k};
+                }
+            }
+        }
+        # XXX what about optional_req|breq? -- xdg, 2012-04-01
+        for my $hash (
+            $prereq_pm->{requires},
+            $prereq_pm->{build_requires},
+            $prereq_pm->{opt_requires},
+            $prereq_pm->{opt_build_requires},
+
+        ) {
+            $merged->add_requirements(
+                CPAN::Meta::Requirements->from_string_hash($hash)
+            );
+        }
+    } else {
+        die "Panic: illegal slot '$slot'";
+    }
+    return ($merged->as_string_hash, $prereq_pm);
+}
+
+#-> sub CPAN::Distribution::unsat_prereq ;
+# return ([Foo,"r"],[Bar,"b"]) for normal modules
+# return ([perl=>5.008]) if we need a newer perl than we are running under
+# (sorry for the inconsistency, it was an accident)
+sub unsat_prereq {
+    my($self,$slot) = @_;
+    my($merged_hash,$prereq_pm) = $self->prereqs_for_slot($slot);
+    my(@need);
+    unless ($CPAN::META->has_usable("CPAN::Meta::Requirements")) {
+        $CPAN::Frontend->mywarn("CPAN::Meta::Requirements not available, please install as soon as possible, trying to continue with severly limited capabilities\n");
+        return;
+    }
+    my $merged = CPAN::Meta::Requirements->from_string_hash($merged_hash);
+    my @merged = sort $merged->required_modules;
+    CPAN->debug("all merged_prereqs[@merged]") if $CPAN::DEBUG;
+  NEED: for my $need_module ( @merged ) {
+        my $need_version = $merged->requirements_for_module($need_module);
+        my($available_version,$inst_file,$available_file,$nmo);
+        if ($need_module eq "perl") {
+            $available_version = $];
+            $available_file = CPAN::find_perl();
+        } else {
+            if (CPAN::_sqlite_running()) {
+                CPAN::Index->reload;
+                $CPAN::SQLite->search("CPAN::Module",$need_module);
+            }
+            $nmo = $CPAN::META->instance("CPAN::Module",$need_module);
+            $inst_file = $nmo->inst_file || '';
+            $available_file = $nmo->available_file || '';
+            $available_version = $nmo->available_version;
+            if ($nmo->uptodate) {
+                my $accepts = eval {
+                    $merged->accepts_module($need_module, $available_version);
+                };
+                unless ($accepts) {
+                    my $rq = $merged->requirements_for_module( $need_module );
+                    $CPAN::Frontend->mywarn(
+                        "Warning: Version '$available_version' of ".
+                        "'$need_module' is up to date but does not ".
+                        "fulfill requirements ($rq). I will continue, ".
+                        "but chances to succeed are low.\n");
+                }
+                next NEED;
+            }
+
+            # if they have not specified a version, we accept any
+            # installed one; in that case inst_file is always
+            # sufficient and available_file is sufficient on
+            # both build_requires and configure_requires
+            my $sufficient = $inst_file ||
+                ( exists $prereq_pm->{requires}{$need_module} ? 0 : $available_file );
+            if ( $sufficient
+                and ( # a few quick short circuits
+                     not defined $need_version
+                     or $need_version eq '0'    # "==" would trigger warning when not numeric
+                     or $need_version eq "undef"
+                    )) {
+                unless ($nmo->inst_deprecated) {
+                    next NEED;
+                }
+            }
+        }
+
+        # We only want to install prereqs if either they're not installed
+        # or if the installed version is too old. We cannot omit this
+        # check, because if 'force' is in effect, nobody else will check.
+        # But we don't want to accept a deprecated module installed as part
+        # of the Perl core, so we continue if the available file is the installed
+        # one and is deprecated
+
+        if ( $available_file ) {
+            my $fulfills_all_version_rqs = $self->_fulfills_all_version_rqs
+                (
+                 $need_module,
+                 $available_file,
+                 $available_version,
+                 $need_version,
+                );
+            if ( $inst_file
+                       && $available_file eq $inst_file
+                       && $nmo->inst_deprecated
+                     ) {
+                # continue installing as a prereq. we really want that
+                # because the deprecated module may spit out warnings
+                # and third party did not know until today. Only one
+                # exception is OK, because CPANPLUS is special after
+                # all:
+                if ( $fulfills_all_version_rqs and
+                     $nmo->id =~ /^CPANPLUS(?:::Dist::Build)$/
+                   ) {
+                    # here we have an available version that is good
+                    # enough although deprecated (preventing circular
+                    # loop CPANPLUS => CPANPLUS::Dist::Build RT#83042)
+                    next NEED;
+                }
+            } elsif (
+                $self->{reqtype} # e.g. maybe we came via goto?
+                && $self->{reqtype} =~ /^(r|c)$/
+                && (   exists $prereq_pm->{requires}{$need_module}
+                    || exists $prereq_pm->{opt_requires}{$need_module} )
+                && $nmo
+                && !$inst_file
+            ) {
+                # continue installing as a prereq; this may be a
+                # distro we already used when it was a build_requires
+                # so we did not install it. But suddenly somebody
+                # wants it as a requires
+                my $need_distro = $nmo->distribution;
+                if ($need_distro->{install} && $need_distro->{install}->failed && $need_distro->{install}->text =~ /is only/) {
+                    my $id = $need_distro->pretty_id;
+                    $CPAN::Frontend->myprint("Promoting $id from build_requires to requires due $need_module\n");
+                    delete $need_distro->{install}; # promote to another installation attempt
+                    $need_distro->{reqtype} = "r";
+                    $need_distro->install;
+                    next NEED;
+                }
+            }
+            else {
+                next NEED if $fulfills_all_version_rqs;
+            }
+        }
+
+        if ($need_module eq "perl") {
+            return ["perl", $need_version];
+        }
+        $self->{sponsored_mods}{$need_module} ||= 0;
+        CPAN->debug("need_module[$need_module]s/s/n[$self->{sponsored_mods}{$need_module}]") if $CPAN::DEBUG;
+        if (my $sponsoring = $self->{sponsored_mods}{$need_module}++) {
+            # We have already sponsored it and for some reason it's still
+            # not available. So we do ... what??
+
+            # if we push it again, we have a potential infinite loop
+
+            # The following "next" was a very problematic construct.
+            # It helped a lot but broke some day and had to be
+            # replaced.
+
+            # We must be able to deal with modules that come again and
+            # again as a prereq and have themselves prereqs and the
+            # queue becomes long but finally we would find the correct
+            # order. The RecursiveDependency check should trigger a
+            # die when it's becoming too weird. Unfortunately removing
+            # this next breaks many other things.
+
+            # The bug that brought this up is described in Todo under
+            # "5.8.9 cannot install Compress::Zlib"
+
+            # next; # this is the next that had to go away
+
+            # The following "next NEED" are fine and the error message
+            # explains well what is going on. For example when the DBI
+            # fails and consequently DBD::SQLite fails and now we are
+            # processing CPAN::SQLite. Then we must have a "next" for
+            # DBD::SQLite. How can we get it and how can we identify
+            # all other cases we must identify?
+
+            my $do = $nmo->distribution;
+            next NEED unless $do; # not on CPAN
+            if (CPAN::Version->vcmp($need_version, $nmo->ro->{CPAN_VERSION}) > 0){
+                $CPAN::Frontend->mywarn("Warning: Prerequisite ".
+                                        "'$need_module => $need_version' ".
+                                        "for '$self->{ID}' seems ".
+                                        "not available according to the indices\n"
+                                       );
+                next NEED;
+            }
+          NOSAYER: for my $nosayer (
+                                    "unwrapped",
+                                    "writemakefile",
+                                    "signature_verify",
+                                    "make",
+                                    "make_test",
+                                    "install",
+                                    "make_clean",
+                                   ) {
+                if ($do->{$nosayer}) {
+                    my $selfid = $self->pretty_id;
+                    my $did = $do->pretty_id;
+                    if (UNIVERSAL::can($do->{$nosayer},"failed") ?
+                        $do->{$nosayer}->failed :
+                        $do->{$nosayer} =~ /^NO/) {
+                        if ($nosayer eq "make_test"
+                            &&
+                            $do->{make_test}{COMMANDID} != $CPAN::CurrentCommandId
+                           ) {
+                            next NOSAYER;
+                        }
+                        ### XXX  don't complain about missing optional deps -- xdg, 2012-04-01
+                        if ($self->is_locally_optional($prereq_pm, $need_module)) {
+                            # don't complain about failing optional prereqs
+                        }
+                        else {
+                            $CPAN::Frontend->mywarn("Warning: Prerequisite ".
+                                                    "'$need_module => $need_version' ".
+                                                    "for '$selfid' failed when ".
+                                                    "processing '$did' with ".
+                                                    "'$nosayer => $do->{$nosayer}'. Continuing, ".
+                                                    "but chances to succeed are limited.\n"
+                                                );
+                            $CPAN::Frontend->mysleep($sponsoring/10);
+                        }
+                        next NEED;
+                    } else { # the other guy succeeded
+                        if ($nosayer =~ /^(install|make_test)$/) {
+                            # we had this with
+                            # DMAKI/DateTime-Calendar-Chinese-0.05.tar.gz
+                            # in 2007-03 for 'make install'
+                            # and 2008-04: #30464 (for 'make test')
+                            # $CPAN::Frontend->mywarn("Warning: Prerequisite ".
+                            #                         "'$need_module => $need_version' ".
+                            #                         "for '$selfid' already built ".
+                            #                         "but the result looks suspicious. ".
+                            #                         "Skipping another build attempt, ".
+                            #                         "to prevent looping endlessly.\n"
+                            #                        );
+                            next NEED;
+                        }
+                    }
+                }
+            }
+        }
+        my $needed_as;
+        if (0) {
+        } elsif (exists $prereq_pm->{requires}{$need_module}
+            || exists $prereq_pm->{opt_requires}{$need_module}
+        ) {
+            $needed_as = "r";
+        } elsif ($slot eq "configure_requires_later") {
+            # in ae872487d5 we said: C< we have not yet run the
+            # {Build,Makefile}.PL, we must presume "r" >; but the
+            # meta.yml standard says C< These dependencies are not
+            # required after the distribution is installed. >; so now
+            # we change it back to "b" and care for the proper
+            # promotion later.
+            $needed_as = "b";
+        } else {
+            $needed_as = "b";
+        }
+        # here need to flag as optional for recommends/suggests
+        # -- xdg, 2012-04-01
+        $self->debug(sprintf "%s manadory?[%s]",
+                     $self->pretty_id,
+                     $self->{mandatory})
+            if $CPAN::DEBUG;
+        my $optional = !$self->{mandatory}
+            || $self->is_locally_optional($prereq_pm, $need_module);
+        push @need, [$need_module,$needed_as,$optional];
+    }
+    my @unfolded = map { "[".join(",",@$_)."]" } @need;
+    CPAN->debug("returning from unsat_prereq[@unfolded]") if $CPAN::DEBUG;
+    @need;
+}
+
+sub _fulfills_all_version_rqs {
+    my($self,$need_module,$available_file,$available_version,$need_version) = @_;
+    my(@all_requirements) = split /\s*,\s*/, $need_version;
+    local($^W) = 0;
+    my $ok = 0;
+  RQ: for my $rq (@all_requirements) {
+        if ($rq =~ s|>=\s*||) {
+        } elsif ($rq =~ s|>\s*||) {
+            # 2005-12: one user
+            if (CPAN::Version->vgt($available_version,$rq)) {
+                $ok++;
+            }
+            next RQ;
+        } elsif ($rq =~ s|!=\s*||) {
+            # 2005-12: no user
+            if (CPAN::Version->vcmp($available_version,$rq)) {
+                $ok++;
+                next RQ;
+            } else {
+                $ok=0;
+                last RQ;
+            }
+        } elsif ($rq =~ m|<=?\s*|) {
+            # 2005-12: no user
+            $CPAN::Frontend->mywarn("Downgrading not supported (rq[$rq])\n");
+            $ok++;
+            next RQ;
+        } elsif ($rq =~ s|==\s*||) {
+            # 2009-07: ELLIOTJS/Perl-Critic-1.099_002.tar.gz
+            if (CPAN::Version->vcmp($available_version,$rq)) {
+                $ok=0;
+                last RQ;
+            } else {
+                $ok++;
+                next RQ;
+            }
+        }
+        if (! CPAN::Version->vgt($rq, $available_version)) {
+            $ok++;
+        }
+        CPAN->debug(sprintf("need_module[%s]available_file[%s]".
+                            "available_version[%s]rq[%s]ok[%d]",
+                            $need_module,
+                            $available_file,
+                            $available_version,
+                            CPAN::Version->readable($rq),
+                            $ok,
+                           )) if $CPAN::DEBUG;
+    }
+    my $ret = $ok == @all_requirements;
+    CPAN->debug(sprintf("need_module[%s]ok[%s]all_requirements[%d]",$need_module, $ok, scalar @all_requirements)) if $CPAN::DEBUG;
+    return $ret;
+}
+
+#-> sub CPAN::Distribution::read_meta
+# read any sort of meta files, return CPAN::Meta object if no errors
+sub read_meta {
+    my($self) = @_;
+    my $meta_file = $self->pick_meta_file
+        or return;
+
+    return unless $CPAN::META->has_usable("CPAN::Meta");
+    my $meta = eval { CPAN::Meta->load_file($meta_file)}
+        or return;
+
+    # Very old EU::MM could have wrong META
+    if ($meta_file eq 'META.yml'
+        && $meta->generated_by =~ /ExtUtils::MakeMaker version ([\d\._]+)/
+    ) {
+        my $eummv = do { local $^W = 0; $1+0; };
+        return if $eummv < 6.2501;
+    }
+
+    return $meta;
+}
+
+#-> sub CPAN::Distribution::read_yaml ;
+# XXX This should be DEPRECATED -- dagolden, 2011-02-05
+sub read_yaml {
+    my($self) = @_;
+    my $meta_file = $self->pick_meta_file('\.yml$');
+    $self->debug("meta_file[$meta_file]") if $CPAN::DEBUG;
+    return unless $meta_file;
+    my $yaml;
+    eval { $yaml = $self->parse_meta_yml($meta_file) };
+    if ($@ or ! $yaml) {
+        return undef; # if we die, then we cannot read YAML's own META.yml
+    }
+    # not "authoritative"
+    if (defined $yaml && (! ref $yaml || ref $yaml ne "HASH")) {
+        $CPAN::Frontend->mywarn("META.yml does not seem to be conforming, cannot use it.\n");
+        $yaml = undef;
+    }
+    $self->debug(sprintf "yaml[%s]", $yaml || "UNDEF")
+        if $CPAN::DEBUG;
+    $self->debug($yaml) if $CPAN::DEBUG && $yaml;
+    # MYMETA.yml is static and authoritative by definition
+    if ( $meta_file =~ /MYMETA\.yml/ ) {
+      return $yaml;
+    }
+    # META.yml is authoritative only if dynamic_config is defined and false
+    if ( defined $yaml->{dynamic_config} && ! $yaml->{dynamic_config} ) {
+      return $yaml;
+    }
+    # otherwise, we can't use what we found
+    return undef;
+}
+
+#-> sub CPAN::Distribution::configure_requires ;
+sub configure_requires {
+    my($self) = @_;
+    return unless my $meta_file = $self->pick_meta_file('^META');
+    if (my $meta_obj = $self->read_meta) {
+        my $prereqs = $meta_obj->effective_prereqs;
+        my $cr = $prereqs->requirements_for(qw/configure requires/);
+        return $cr ? $cr->as_string_hash : undef;
+    }
+    else {
+        my $yaml = eval { $self->parse_meta_yml($meta_file) };
+        return $yaml->{configure_requires};
+    }
+}
+
+#-> sub CPAN::Distribution::prereq_pm ;
+sub prereq_pm {
+    my($self) = @_;
+    return unless $self->{writemakefile}  # no need to have succeeded
+                                          # but we must have run it
+        || $self->{modulebuild};
+    unless ($self->{build_dir}) {
+        return;
+    }
+    # no Makefile/Build means configuration aborted, so don't look for prereqs
+    my $makefile  = File::Spec->catfile($self->{build_dir}, $^O eq 'VMS' ? 'descrip.mms' : 'Makefile');
+    my $buildfile = File::Spec->catfile($self->{build_dir}, $^O eq 'VMS' ? 'Build.com' : 'Build');
+    return unless   -f $makefile || -f $buildfile;
+    CPAN->debug(sprintf "writemakefile[%s]modulebuild[%s]",
+                $self->{writemakefile}||"",
+                $self->{modulebuild}||"",
+               ) if $CPAN::DEBUG;
+    my($req,$breq, $opt_req, $opt_breq);
+    my $meta_obj = $self->read_meta;
+    # META/MYMETA is only authoritative if dynamic_config is false
+    if ($meta_obj && ! $meta_obj->dynamic_config) {
+        my $prereqs = $meta_obj->effective_prereqs;
+        my $requires = $prereqs->requirements_for(qw/runtime requires/);
+        my $build_requires = $prereqs->requirements_for(qw/build requires/);
+        my $test_requires = $prereqs->requirements_for(qw/test requires/);
+        # XXX we don't yet distinguish build vs test, so merge them for now
+        $build_requires->add_requirements($test_requires);
+        $req = $requires->as_string_hash;
+        $breq = $build_requires->as_string_hash;
+
+        # XXX assemble optional_req && optional_breq from recommends/suggests
+        # depending on corresponding policies -- xdg, 2012-04-01
+        CPAN->use_inst("CPAN::Meta::Requirements");
+        my $opt_runtime = CPAN::Meta::Requirements->new;
+        my $opt_build   = CPAN::Meta::Requirements->new;
+        if ( $CPAN::Config->{recommends_policy} ) {
+            $opt_runtime->add_requirements( $prereqs->requirements_for(qw/runtime recommends/));
+            $opt_build->add_requirements(   $prereqs->requirements_for(qw/build recommends/));
+            $opt_build->add_requirements(   $prereqs->requirements_for(qw/test  recommends/));
+
+        }
+        if ( $CPAN::Config->{suggests_policy} ) {
+            $opt_runtime->add_requirements( $prereqs->requirements_for(qw/runtime suggests/));
+            $opt_build->add_requirements(   $prereqs->requirements_for(qw/build suggests/));
+            $opt_build->add_requirements(   $prereqs->requirements_for(qw/test  suggests/));
+        }
+        $opt_req = $opt_runtime->as_string_hash;
+        $opt_breq = $opt_build->as_string_hash;
+    }
+    elsif (my $yaml = $self->read_yaml) { # often dynamic_config prevents a result here
+        $req =  $yaml->{requires} || {};
+        $breq =  $yaml->{build_requires} || {};
+        if ( $CPAN::Config->{recommends_policy} ) {
+            $opt_req = $yaml->{recommends} || {};
+        }
+        undef $req unless ref $req eq "HASH" && %$req;
+        if ($req) {
+            if ($yaml->{generated_by} &&
+                $yaml->{generated_by} =~ /ExtUtils::MakeMaker version ([\d\._]+)/) {
+                my $eummv = do { local $^W = 0; $1+0; };
+                if ($eummv < 6.2501) {
+                    # thanks to Slaven for digging that out: MM before
+                    # that could be wrong because it could reflect a
+                    # previous release
+                    undef $req;
+                }
+            }
+            my $areq;
+            my $do_replace;
+            foreach my $k (sort keys %{$req||{}}) {
+                my $v = $req->{$k};
+                next unless defined $v;
+                if ($v =~ /\d/) {
+                    $areq->{$k} = $v;
+                } elsif ($k =~ /[A-Za-z]/ &&
+                         $v =~ /[A-Za-z]/ &&
+                         $CPAN::META->exists("CPAN::Module",$v)
+                        ) {
+                    $CPAN::Frontend->mywarn("Suspicious key-value pair in META.yml's ".
+                                            "requires hash: $k => $v; I'll take both ".
+                                            "key and value as a module name\n");
+                    $CPAN::Frontend->mysleep(1);
+                    $areq->{$k} = 0;
+                    $areq->{$v} = 0;
+                    $do_replace++;
+                }
+            }
+            $req = $areq if $do_replace;
+        }
+    }
+    else {
+        $CPAN::Frontend->mywarnonce("Could not read metadata file. Falling back to other ".
+                                    "methods to determine prerequisites\n");
+    }
+
+    unless ($req || $breq) {
+        my $build_dir;
+        unless ( $build_dir = $self->{build_dir} ) {
+            return;
+        }
+        my $makefile = File::Spec->catfile($build_dir,"Makefile");
+        my $fh;
+        if (-f $makefile
+            and
+            $fh = FileHandle->new("<$makefile\0")) {
+            CPAN->debug("Getting prereq from Makefile") if $CPAN::DEBUG;
+            local($/) = "\n";
+            while (<$fh>) {
+                last if /MakeMaker post_initialize section/;
+                my($p) = m{^[\#]
+                           \s+PREREQ_PM\s+=>\s+(.+)
+                       }x;
+                next unless $p;
+                # warn "Found prereq expr[$p]";
+
+                #  Regexp modified by A.Speer to remember actual version of file
+                #  PREREQ_PM hash key wants, then add to
+                while ( $p =~ m/(?:\s)([\w\:]+)=>(q\[.*?\]|undef),?/g ) {
+                    my($m,$n) = ($1,$2);
+                    # When a prereq is mentioned twice: let the bigger
+                    # win; usual culprit is that they declared
+                    # build_requires separately from requires; see
+                    # rt.cpan.org #47774
+                    my($prevn);
+                    if ( defined $req->{$m} ) {
+                        $prevn = $req->{$m};
+                    }
+                    if ($n =~ /^q\[(.*?)\]$/) {
+                        $n = $1;
+                    }
+                    if (!$prevn || CPAN::Version->vlt($prevn, $n)){
+                        $req->{$m} = $n;
+                    }
+                }
+                last;
+            }
+        }
+    }
+    unless ($req || $breq) {
+        my $build_dir = $self->{build_dir} or die "Panic: no build_dir?";
+        my $buildfile = File::Spec->catfile($build_dir,"Build");
+        if (-f $buildfile) {
+            CPAN->debug("Found '$buildfile'") if $CPAN::DEBUG;
+            my $build_prereqs = File::Spec->catfile($build_dir,"_build","prereqs");
+            if (-f $build_prereqs) {
+                CPAN->debug("Getting prerequisites from '$build_prereqs'") if $CPAN::DEBUG;
+                my $content = do { local *FH;
+                                   open FH, $build_prereqs
+                                       or $CPAN::Frontend->mydie("Could not open ".
+                                                                 "'$build_prereqs': $!");
+                                   local $/;
+                                   <FH>;
+                               };
+                my $bphash = eval $content;
+                if ($@) {
+                } else {
+                    $req  = $bphash->{requires} || +{};
+                    $breq = $bphash->{build_requires} || +{};
+                }
+            }
+        }
+    }
+    # XXX needs to be adapted for optional_req & optional_breq -- xdg, 2012-04-01
+    if ($req || $breq || $opt_req || $opt_breq ) {
+        return $self->{prereq_pm} = {
+           requires => $req,
+           build_requires => $breq,
+           opt_requires => $opt_req,
+           opt_build_requires => $opt_breq,
+       };
+    }
+}
+
+#-> sub CPAN::Distribution::shortcut_test ;
+# return values: undef means don't shortcut; 0 means shortcut as fail;
+# and 1 means shortcut as success
+sub shortcut_test {
+    my ($self) = @_;
+
+    $self->debug("checking badtestcnt[$self->{ID}]") if $CPAN::DEBUG;
+    $self->{badtestcnt} ||= 0;
+    if ($self->{badtestcnt} > 0) {
+        require Data::Dumper;
+        CPAN->debug(sprintf "NOREPEAT[%s]", Data::Dumper::Dumper($self)) if $CPAN::DEBUG;
+        return $self->goodbye("Won't repeat unsuccessful test during this command");
+    }
+
+    for my $slot ( qw/later configure_requires_later/ ) {
+        $self->debug("checking $slot slot[$self->{ID}]") if $CPAN::DEBUG;
+        return $self->success($self->{$slot})
+        if $self->{$slot};
+    }
+
+    $self->debug("checking if tests passed[$self->{ID}]") if $CPAN::DEBUG;
+    if ( $self->{make_test} ) {
+        if (
+            UNIVERSAL::can($self->{make_test},"failed") ?
+            $self->{make_test}->failed :
+            $self->{make_test} =~ /^NO/
+        ) {
+            if (
+                UNIVERSAL::can($self->{make_test},"commandid")
+                &&
+                $self->{make_test}->commandid == $CPAN::CurrentCommandId
+            ) {
+                return $self->goodbye("Has already been tested within this command");
+            }
+        } else {
+            # if global "is_tested" has been cleared, we need to mark this to
+            # be added to PERL5LIB if not already installed
+            if ($self->tested_ok_but_not_installed) {
+                $CPAN::META->is_tested($self->{build_dir},$self->{make_test}{TIME});
+            }
+            return $self->success("Has already been tested successfully");
+        }
+    }
+
+    if ($self->{notest}) {
+        $self->{make_test} = CPAN::Distrostatus->new("YES");
+        return $self->success("Skipping test because of notest pragma");
+    }
+
+    return undef; # no shortcut
+}
+
+#-> sub CPAN::Distribution::_exe_files ;
+sub _exe_files {
+    my($self) = @_;
+    return unless $self->{writemakefile}  # no need to have succeeded
+                                          # but we must have run it
+        || $self->{modulebuild};
+    unless ($self->{build_dir}) {
+        return;
+    }
+    CPAN->debug(sprintf "writemakefile[%s]modulebuild[%s]",
+                $self->{writemakefile}||"",
+                $self->{modulebuild}||"",
+               ) if $CPAN::DEBUG;
+    my $build_dir;
+    unless ( $build_dir = $self->{build_dir} ) {
+        return;
+    }
+    my $makefile = File::Spec->catfile($build_dir,"Makefile");
+    my $fh;
+    my @exe_files;
+    if (-f $makefile
+        and
+        $fh = FileHandle->new("<$makefile\0")) {
+        CPAN->debug("Getting exefiles from Makefile") if $CPAN::DEBUG;
+        local($/) = "\n";
+        while (<$fh>) {
+            last if /MakeMaker post_initialize section/;
+            my($p) = m{^[\#]
+                       \s+EXE_FILES\s+=>\s+\[(.+)\]
+                  }x;
+            next unless $p;
+            # warn "Found exefiles expr[$p]";
+            my @p = split /,\s*/, $p;
+            for my $p2 (@p) {
+                if ($p2 =~ /^q\[(.+)\]/) {
+                    push @exe_files, $1;
+                }
+            }
+        }
+    }
+    return \@exe_files if @exe_files;
+    my $buildparams = File::Spec->catfile($build_dir,"_build","build_params");
+    if (-f $buildparams) {
+        CPAN->debug("Found '$buildparams'") if $CPAN::DEBUG;
+        my $x = do $buildparams;
+        for my $sf ($x->[2]{script_files}) {
+            if (my $reftype = ref $sf) {
+                if ($reftype eq "ARRAY") {
+                    push @exe_files, @$sf;
+                }
+                elsif ($reftype eq "HASH") {
+                    push @exe_files, keys %$sf;
+                }
+                else {
+                    $CPAN::Frontend->mywarn("Invalid reftype $reftype for Build.PL 'script_files'\n");
+                }
+            }
+            elsif (defined $sf) {
+                push @exe_files, $sf;
+            }
+        }
+    }
+    return \@exe_files;
+}
+
+#-> sub CPAN::Distribution::test ;
+sub test {
+    my($self) = @_;
+
+    $self->pre_test();
+
+    if (exists $self->{cleanup_after_install_done}) {
+        $self->post_test();
+        return $self->make;
+    }
+
+    $self->debug("checking goto id[$self->{ID}]") if $CPAN::DEBUG;
+    if (my $goto = $self->prefs->{goto}) {
+        $self->post_test();
+        return $self->goto($goto);
+    }
+
+    unless ($self->make){
+        $self->post_test();
+        return;
+    }
+
+    if ( defined( my $sc = $self->shortcut_test ) ) {
+        $self->post_test();
+        return $sc;
+    }
+
+    if ($CPAN::Signal) {
+        delete $self->{force_update};
+        $self->post_test();
+        return;
+    }
+    # warn "XDEBUG: checking for notest: $self->{notest} $self";
+    my $make = $self->{modulebuild} ? "Build" : "make";
+
+    local $ENV{PERL5LIB} = defined($ENV{PERL5LIB})
+                           ? $ENV{PERL5LIB}
+                           : ($ENV{PERLLIB} || "");
+
+    local $ENV{PERL5OPT} = defined $ENV{PERL5OPT} ? $ENV{PERL5OPT} : "";
+    local $ENV{PERL_USE_UNSAFE_INC} =
+        exists $ENV{PERL_USE_UNSAFE_INC} && defined $ENV{PERL_USE_UNSAFE_INC}
+        ? $ENV{PERL_USE_UNSAFE_INC} : 1; # test
+    $CPAN::META->set_perl5lib;
+    local $ENV{MAKEFLAGS}; # protect us from outer make calls
+    local $ENV{PERL_MM_USE_DEFAULT} = 1 if $CPAN::Config->{use_prompt_default};
+    local $ENV{NONINTERACTIVE_TESTING} = 1 if $CPAN::Config->{use_prompt_default};
+
+    if ($run_allow_installing_within_test) {
+        my($allow_installing, $why) = $self->_allow_installing;
+        if (! $allow_installing) {
+            $CPAN::Frontend->mywarn("Testing/Installation stopped: $why\n");
+            $self->introduce_myself;
+            $self->{make_test} = CPAN::Distrostatus->new("NO -- testing/installation stopped due $why");
+            $CPAN::Frontend->mywarn("  [testing] -- NOT OK\n");
+            delete $self->{force_update};
+            $self->post_test();
+            return;
+        }
+    }
+    $CPAN::Frontend->myprint(sprintf "Running %s test for %s\n", $make, $self->pretty_id);
+
+    my $builddir = $self->dir or
+        $CPAN::Frontend->mydie("PANIC: Cannot determine build directory\n");
+
+    unless (chdir $builddir) {
+        $CPAN::Frontend->mywarn("Couldn't chdir to '$builddir': $!");
+        $self->post_test();
+        return;
+    }
+
+    $self->debug("Changed directory to $self->{build_dir}")
+        if $CPAN::DEBUG;
+
+    if ($^O eq 'MacOS') {
+        Mac::BuildTools::make_test($self);
+        $self->post_test();
+        return;
+    }
+
+    if ($self->{modulebuild}) {
+        my $thm = CPAN::Shell->expand("Module","Test::Harness");
+        my $v = $thm->inst_version;
+        if (CPAN::Version->vlt($v,2.62)) {
+            # XXX Eric Wilhelm reported this as a bug: klapperl:
+            # Test::Harness 3.0 self-tests, so that should be 'unless
+            # installing Test::Harness'
+            unless ($self->id eq $thm->distribution->id) {
+                $CPAN::Frontend->mywarn(qq{The version of your Test::Harness is only
+  '$v', you need at least '2.62'. Please upgrade your Test::Harness.\n});
+                $self->{make_test} = CPAN::Distrostatus->new("NO Test::Harness too old");
+                $self->post_test();
+                return;
+            }
+        }
+    }
+
+    if ( ! $self->{force_update}  ) {
+        # bypass actual tests if "trust_test_report_history" and have a report
+        my $have_tested_fcn;
+        if (   $CPAN::Config->{trust_test_report_history}
+            && $CPAN::META->has_inst("CPAN::Reporter::History")
+            && ( $have_tested_fcn = CPAN::Reporter::History->can("have_tested" ))) {
+            if ( my @reports = $have_tested_fcn->( dist => $self->base_id ) ) {
+                # Do nothing if grade was DISCARD
+                if ( $reports[-1]->{grade} =~ /^(?:PASS|UNKNOWN)$/ ) {
+                    $self->{make_test} = CPAN::Distrostatus->new("YES");
+                    # if global "is_tested" has been cleared, we need to mark this to
+                    # be added to PERL5LIB if not already installed
+                    if ($self->tested_ok_but_not_installed) {
+                        $CPAN::META->is_tested($self->{build_dir},$self->{make_test}{TIME});
+                    }
+                    $CPAN::Frontend->myprint("Found prior test report -- OK\n");
+                    $self->post_test();
+                    return;
+                }
+                elsif ( $reports[-1]->{grade} =~ /^(?:FAIL|NA)$/ ) {
+                    $self->{make_test} = CPAN::Distrostatus->new("NO");
+                    $self->{badtestcnt}++;
+                    $CPAN::Frontend->mywarn("Found prior test report -- NOT OK\n");
+                    $self->post_test();
+                    return;
+                }
+            }
+        }
+    }
+
+    my $system;
+    my $prefs_test = $self->prefs->{test};
+    if (my $commandline
+        = exists $prefs_test->{commandline} ? $prefs_test->{commandline} : "") {
+        $system = $commandline;
+        $ENV{PERL} = CPAN::find_perl();
+    } elsif ($self->{modulebuild}) {
+        $system = sprintf "%s test", $self->_build_command();
+        unless (-e "Build" || ($^O eq 'VMS' && -e "Build.com")) {
+            my $id = $self->pretty_id;
+            $CPAN::Frontend->mywarn("Alert: no 'Build' file found while trying to test '$id'");
+        }
+    } else {
+        $system = join " ", $self->_make_command(), "test";
+    }
+    my $make_test_arg = $self->_make_phase_arg("test");
+    $system = sprintf("%s%s",
+                      $system,
+                      $make_test_arg ? " $make_test_arg" : "",
+                     );
+    my($tests_ok);
+    my $test_env;
+    if ($self->prefs->{test}) {
+        $test_env = $self->prefs->{test}{env};
+    }
+    local @ENV{keys %$test_env} = values %$test_env if $test_env;
+    my $expect_model = $self->_prefs_with_expect("test");
+    my $want_expect = 0;
+    if ( $expect_model && @{$expect_model->{talk}} ) {
+        my $can_expect = $CPAN::META->has_inst("Expect");
+        if ($can_expect) {
+            $want_expect = 1;
+        } else {
+            $CPAN::Frontend->mywarn("Expect not installed, falling back to ".
+                                    "testing without\n");
+        }
+    }
+
+ FORK: {
+        my $pid = fork;
+        if (! defined $pid) { # contention
+            warn "Contention '$!', sleeping 2";
+            sleep 2;
+            redo FORK;
+        } elsif ($pid) { # parent
+            if ($^O eq "MSWin32") {
+                wait;
+            } else {
+            SUPERVISE: while (waitpid($pid, WNOHANG) <= 0) {
+                    if ($CPAN::Signal) {
+                        kill 9, -$pid;
+                    }
+                    sleep 1;
+                }
+            }
+            $tests_ok = !$?;
+        } else { # child
+            POSIX::setsid() unless $^O eq "MSWin32";
+            my $c_ok;
+            $|=1;
+            if ($want_expect) {
+                if ($self->_should_report('test')) {
+                    $CPAN::Frontend->mywarn("Reporting via CPAN::Reporter is currently ".
+                        "not supported when distroprefs specify ".
+                        "an interactive test\n");
+                }
+                $c_ok = $self->_run_via_expect($system,'test',$expect_model) == 0;
+            } elsif ( $self->_should_report('test') ) {
+                $c_ok = CPAN::Reporter::test($self, $system);
+            } else {
+                $c_ok = system($system) == 0;
+            }
+            exit !$c_ok;
+        }
+    } # FORK
+
+    $self->introduce_myself;
+    my $but = $self->_make_test_illuminate_prereqs();
+    if ( $tests_ok ) {
+        if ($but) {
+            $CPAN::Frontend->mywarn("Tests succeeded but $but\n");
+            $self->{make_test} = CPAN::Distrostatus->new("NO $but");
+            $self->store_persistent_state;
+            $self->post_test();
+            return $self->goodbye("[dependencies] -- NA");
+        }
+        $CPAN::Frontend->myprint("  $system -- OK\n");
+        $self->{make_test} = CPAN::Distrostatus->new("YES");
+        $CPAN::META->is_tested($self->{build_dir},$self->{make_test}{TIME});
+        # probably impossible to need the next line because badtestcnt
+        # has a lifespan of one command
+        delete $self->{badtestcnt};
+    } else {
+        if ($but) {
+            $but .= "; additionally test harness failed";
+            $CPAN::Frontend->mywarn("$but\n");
+            $self->{make_test} = CPAN::Distrostatus->new("NO $but");
+        } elsif ( $self->{force_update} ) {
+            $self->{make_test} = CPAN::Distrostatus->new(
+                "NO but failure ignored because 'force' in effect"
+            );
+        } elsif ($CPAN::Signal) {
+            $self->{make_test} = CPAN::Distrostatus->new("NO -- Interrupted");
+        } else {
+            $self->{make_test} = CPAN::Distrostatus->new("NO");
+        }
+        $self->{badtestcnt}++;
+        $CPAN::Frontend->mywarn("  $system -- NOT OK\n");
+        CPAN::Shell->optprint
+              ("hint",
+               sprintf
+               ("//hint// to see the cpan-testers results for installing this module, try:
+  reports %s\n",
+                $self->pretty_id));
+    }
+    $self->store_persistent_state;
+
+    $self->post_test();
+
+    return $self->{force_update} ? 1 : !! $tests_ok;
+}
+
+sub _make_test_illuminate_prereqs {
+    my($self) = @_;
+    my @prereq;
+
+    # local $CPAN::DEBUG = 16; # Distribution
+    for my $m (sort keys %{$self->{sponsored_mods}}) {
+        next unless $self->{sponsored_mods}{$m} > 0;
+        my $m_obj = CPAN::Shell->expand("Module",$m) or next;
+        # XXX we need available_version which reflects

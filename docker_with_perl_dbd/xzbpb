@@ -1,0 +1,1000 @@
+}
+
+# convert config value to array reference, if needed
+sub config_to_multi {
+	my $val = shift;
+
+	return ref($val) ? $val : (defined($val) ? [ $val ] : []);
+}
+
+sub git_get_project_config {
+	my ($key, $type) = @_;
+
+	return unless defined $git_dir;
+
+	# key sanity check
+	return unless ($key);
+	# only subsection, if exists, is case sensitive,
+	# and not lowercased by 'git config -z -l'
+	if (my ($hi, $mi, $lo) = ($key =~ /^([^.]*)\.(.*)\.([^.]*)$/)) {
+		$lo =~ s/_//g;
+		$key = join(".", lc($hi), $mi, lc($lo));
+		return if ($lo =~ /\W/ || $hi =~ /\W/);
+	} else {
+		$key = lc($key);
+		$key =~ s/_//g;
+		return if ($key =~ /\W/);
+	}
+	$key =~ s/^gitweb\.//;
+
+	# type sanity check
+	if (defined $type) {
+		$type =~ s/^--//;
+		$type = undef
+			unless ($type eq 'bool' || $type eq 'int');
+	}
+
+	# get config
+	if (!defined $config_file ||
+	    $config_file ne "$git_dir/config") {
+		%config = git_parse_project_config('gitweb');
+		$config_file = "$git_dir/config";
+	}
+
+	# check if config variable (key) exists
+	return unless exists $config{"gitweb.$key"};
+
+	# ensure given type
+	if (!defined $type) {
+		return $config{"gitweb.$key"};
+	} elsif ($type eq 'bool') {
+		# backward compatibility: 'git config --bool' returns true/false
+		return config_to_bool($config{"gitweb.$key"}) ? 'true' : 'false';
+	} elsif ($type eq 'int') {
+		return config_to_int($config{"gitweb.$key"});
+	}
+	return $config{"gitweb.$key"};
+}
+
+# get hash of given path at given ref
+sub git_get_hash_by_path {
+	my $base = shift;
+	my $path = shift || return undef;
+	my $type = shift;
+
+	$path =~ s,/+$,,;
+
+	open my $fd, "-|", git_cmd(), "ls-tree", $base, "--", $path
+		or die_error(500, "Open git-ls-tree failed");
+	my $line = <$fd>;
+	close $fd or return undef;
+
+	if (!defined $line) {
+		# there is no tree or hash given by $path at $base
+		return undef;
+	}
+
+	#'100644 blob 0fa3f3a66fb6a137f6ec2c19351ed4d807070ffa	panic.c'
+	$line =~ m/^([0-9]+) (.+) ($oid_regex)\t/;
+	if (defined $type && $type ne $2) {
+		# type doesn't match
+		return undef;
+	}
+	return $3;
+}
+
+# get path of entry with given hash at given tree-ish (ref)
+# used to get 'from' filename for combined diff (merge commit) for renames
+sub git_get_path_by_hash {
+	my $base = shift || return;
+	my $hash = shift || return;
+
+	local $/ = "\0";
+
+	open my $fd, "-|", git_cmd(), "ls-tree", '-r', '-t', '-z', $base
+		or return undef;
+	while (my $line = <$fd>) {
+		chomp $line;
+
+		#'040000 tree 595596a6a9117ddba9fe379b6b012b558bac8423	gitweb'
+		#'100644 blob e02e90f0429be0d2a69b76571101f20b8f75530f	gitweb/README'
+		if ($line =~ m/(?:[0-9]+) (?:.+) $hash\t(.+)$/) {
+			close $fd;
+			return $1;
+		}
+	}
+	close $fd;
+	return undef;
+}
+
+## ......................................................................
+## git utility functions, directly accessing git repository
+
+# get the value of config variable either from file named as the variable
+# itself in the repository ($GIT_DIR/$name file), or from gitweb.$name
+# configuration variable in the repository config file.
+sub git_get_file_or_project_config {
+	my ($path, $name) = @_;
+
+	$git_dir = "$projectroot/$path";
+	open my $fd, '<', "$git_dir/$name"
+		or return git_get_project_config($name);
+	my $conf = <$fd>;
+	close $fd;
+	if (defined $conf) {
+		chomp $conf;
+	}
+	return $conf;
+}
+
+sub git_get_project_description {
+	my $path = shift;
+	return git_get_file_or_project_config($path, 'description');
+}
+
+sub git_get_project_category {
+	my $path = shift;
+	return git_get_file_or_project_config($path, 'category');
+}
+
+
+# supported formats:
+# * $GIT_DIR/ctags/<tagname> file (in 'ctags' subdirectory)
+#   - if its contents is a number, use it as tag weight,
+#   - otherwise add a tag with weight 1
+# * $GIT_DIR/ctags file, each line is a tag (with weight 1)
+#   the same value multiple times increases tag weight
+# * `gitweb.ctag' multi-valued repo config variable
+sub git_get_project_ctags {
+	my $project = shift;
+	my $ctags = {};
+
+	$git_dir = "$projectroot/$project";
+	if (opendir my $dh, "$git_dir/ctags") {
+		my @files = grep { -f $_ } map { "$git_dir/ctags/$_" } readdir($dh);
+		foreach my $tagfile (@files) {
+			open my $ct, '<', $tagfile
+				or next;
+			my $val = <$ct>;
+			chomp $val if $val;
+			close $ct;
+
+			(my $ctag = $tagfile) =~ s#.*/##;
+			if ($val =~ /^\d+$/) {
+				$ctags->{$ctag} = $val;
+			} else {
+				$ctags->{$ctag} = 1;
+			}
+		}
+		closedir $dh;
+
+	} elsif (open my $fh, '<', "$git_dir/ctags") {
+		while (my $line = <$fh>) {
+			chomp $line;
+			$ctags->{$line}++ if $line;
+		}
+		close $fh;
+
+	} else {
+		my $taglist = config_to_multi(git_get_project_config('ctag'));
+		foreach my $tag (@$taglist) {
+			$ctags->{$tag}++;
+		}
+	}
+
+	return $ctags;
+}
+
+# return hash, where keys are content tags ('ctags'),
+# and values are sum of weights of given tag in every project
+sub git_gather_all_ctags {
+	my $projects = shift;
+	my $ctags = {};
+
+	foreach my $p (@$projects) {
+		foreach my $ct (keys %{$p->{'ctags'}}) {
+			$ctags->{$ct} += $p->{'ctags'}->{$ct};
+		}
+	}
+
+	return $ctags;
+}
+
+sub git_populate_project_tagcloud {
+	my $ctags = shift;
+
+	# First, merge different-cased tags; tags vote on casing
+	my %ctags_lc;
+	foreach (keys %$ctags) {
+		$ctags_lc{lc $_}->{count} += $ctags->{$_};
+		if (not $ctags_lc{lc $_}->{topcount}
+		    or $ctags_lc{lc $_}->{topcount} < $ctags->{$_}) {
+			$ctags_lc{lc $_}->{topcount} = $ctags->{$_};
+			$ctags_lc{lc $_}->{topname} = $_;
+		}
+	}
+
+	my $cloud;
+	my $matched = $input_params{'ctag'};
+	if (eval { require HTML::TagCloud; 1; }) {
+		$cloud = HTML::TagCloud->new;
+		foreach my $ctag (sort keys %ctags_lc) {
+			# Pad the title with spaces so that the cloud looks
+			# less crammed.
+			my $title = esc_html($ctags_lc{$ctag}->{topname});
+			$title =~ s/ /&nbsp;/g;
+			$title =~ s/^/&nbsp;/g;
+			$title =~ s/$/&nbsp;/g;
+			if (defined $matched && $matched eq $ctag) {
+				$title = qq(<span class="match">$title</span>);
+			}
+			$cloud->add($title, href(project=>undef, ctag=>$ctag),
+			            $ctags_lc{$ctag}->{count});
+		}
+	} else {
+		$cloud = {};
+		foreach my $ctag (keys %ctags_lc) {
+			my $title = esc_html($ctags_lc{$ctag}->{topname}, -nbsp=>1);
+			if (defined $matched && $matched eq $ctag) {
+				$title = qq(<span class="match">$title</span>);
+			}
+			$cloud->{$ctag}{count} = $ctags_lc{$ctag}->{count};
+			$cloud->{$ctag}{ctag} =
+				$cgi->a({-href=>href(project=>undef, ctag=>$ctag)}, $title);
+		}
+	}
+	return $cloud;
+}
+
+sub git_show_project_tagcloud {
+	my ($cloud, $count) = @_;
+	if (ref $cloud eq 'HTML::TagCloud') {
+		return $cloud->html_and_css($count);
+	} else {
+		my @tags = sort { $cloud->{$a}->{'count'} <=> $cloud->{$b}->{'count'} } keys %$cloud;
+		return
+			'<div id="htmltagcloud"'.($project ? '' : ' align="center"').'>' .
+			join (', ', map {
+				$cloud->{$_}->{'ctag'}
+			} splice(@tags, 0, $count)) .
+			'</div>';
+	}
+}
+
+sub git_get_project_url_list {
+	my $path = shift;
+
+	$git_dir = "$projectroot/$path";
+	open my $fd, '<', "$git_dir/cloneurl"
+		or return wantarray ?
+		@{ config_to_multi(git_get_project_config('url')) } :
+		   config_to_multi(git_get_project_config('url'));
+	my @git_project_url_list = map { chomp; $_ } <$fd>;
+	close $fd;
+
+	return wantarray ? @git_project_url_list : \@git_project_url_list;
+}
+
+sub git_get_projects_list {
+	my $filter = shift || '';
+	my $paranoid = shift;
+	my @list;
+
+	if (-d $projects_list) {
+		# search in directory
+		my $dir = $projects_list;
+		# remove the trailing "/"
+		$dir =~ s!/+$!!;
+		my $pfxlen = length("$dir");
+		my $pfxdepth = ($dir =~ tr!/!!);
+		# when filtering, search only given subdirectory
+		if ($filter && !$paranoid) {
+			$dir .= "/$filter";
+			$dir =~ s!/+$!!;
+		}
+
+		File::Find::find({
+			follow_fast => 1, # follow symbolic links
+			follow_skip => 2, # ignore duplicates
+			dangling_symlinks => 0, # ignore dangling symlinks, silently
+			wanted => sub {
+				# global variables
+				our $project_maxdepth;
+				our $projectroot;
+				# skip project-list toplevel, if we get it.
+				return if (m!^[/.]$!);
+				# only directories can be git repositories
+				return unless (-d $_);
+				# need search permission
+				return unless (-x $_);
+				# don't traverse too deep (Find is super slow on os x)
+				# $project_maxdepth excludes depth of $projectroot
+				if (($File::Find::name =~ tr!/!!) - $pfxdepth > $project_maxdepth) {
+					$File::Find::prune = 1;
+					return;
+				}
+
+				my $path = substr($File::Find::name, $pfxlen + 1);
+				# paranoidly only filter here
+				if ($paranoid && $filter && $path !~ m!^\Q$filter\E/!) {
+					next;
+				}
+				# we check related file in $projectroot
+				if (check_export_ok("$projectroot/$path")) {
+					push @list, { path => $path };
+					$File::Find::prune = 1;
+				}
+			},
+		}, "$dir");
+
+	} elsif (-f $projects_list) {
+		# read from file(url-encoded):
+		# 'git%2Fgit.git Linus+Torvalds'
+		# 'libs%2Fklibc%2Fklibc.git H.+Peter+Anvin'
+		# 'linux%2Fhotplug%2Fudev.git Greg+Kroah-Hartman'
+		open my $fd, '<', $projects_list or return;
+	PROJECT:
+		while (my $line = <$fd>) {
+			chomp $line;
+			my ($path, $owner) = split ' ', $line;
+			$path = unescape($path);
+			$owner = unescape($owner);
+			if (!defined $path) {
+				next;
+			}
+			# if $filter is rpovided, check if $path begins with $filter
+			if ($filter && $path !~ m!^\Q$filter\E/!) {
+				next;
+			}
+			if (check_export_ok("$projectroot/$path")) {
+				my $pr = {
+					path => $path
+				};
+				if ($owner) {
+					$pr->{'owner'} = to_utf8($owner);
+				}
+				push @list, $pr;
+			}
+		}
+		close $fd;
+	}
+	return @list;
+}
+
+# written with help of Tree::Trie module (Perl Artistic License, GPL compatible)
+# as side effects it sets 'forks' field to list of forks for forked projects
+sub filter_forks_from_projects_list {
+	my $projects = shift;
+
+	my %trie; # prefix tree of directories (path components)
+	# generate trie out of those directories that might contain forks
+	foreach my $pr (@$projects) {
+		my $path = $pr->{'path'};
+		$path =~ s/\.git$//;      # forks of 'repo.git' are in 'repo/' directory
+		next if ($path =~ m!/$!); # skip non-bare repositories, e.g. 'repo/.git'
+		next unless ($path);      # skip '.git' repository: tests, git-instaweb
+		next unless (-d "$projectroot/$path"); # containing directory exists
+		$pr->{'forks'} = [];      # there can be 0 or more forks of project
+
+		# add to trie
+		my @dirs = split('/', $path);
+		# walk the trie, until either runs out of components or out of trie
+		my $ref = \%trie;
+		while (scalar @dirs &&
+		       exists($ref->{$dirs[0]})) {
+			$ref = $ref->{shift @dirs};
+		}
+		# create rest of trie structure from rest of components
+		foreach my $dir (@dirs) {
+			$ref = $ref->{$dir} = {};
+		}
+		# create end marker, store $pr as a data
+		$ref->{''} = $pr if (!exists $ref->{''});
+	}
+
+	# filter out forks, by finding shortest prefix match for paths
+	my @filtered;
+ PROJECT:
+	foreach my $pr (@$projects) {
+		# trie lookup
+		my $ref = \%trie;
+	DIR:
+		foreach my $dir (split('/', $pr->{'path'})) {
+			if (exists $ref->{''}) {
+				# found [shortest] prefix, is a fork - skip it
+				push @{$ref->{''}{'forks'}}, $pr;
+				next PROJECT;
+			}
+			if (!exists $ref->{$dir}) {
+				# not in trie, cannot have prefix, not a fork
+				push @filtered, $pr;
+				next PROJECT;
+			}
+			# If the dir is there, we just walk one step down the trie.
+			$ref = $ref->{$dir};
+		}
+		# we ran out of trie
+		# (shouldn't happen: it's either no match, or end marker)
+		push @filtered, $pr;
+	}
+
+	return @filtered;
+}
+
+# note: fill_project_list_info must be run first,
+# for 'descr_long' and 'ctags' to be filled
+sub search_projects_list {
+	my ($projlist, %opts) = @_;
+	my $tagfilter  = $opts{'tagfilter'};
+	my $search_re = $opts{'search_regexp'};
+
+	return @$projlist
+		unless ($tagfilter || $search_re);
+
+	# searching projects require filling to be run before it;
+	fill_project_list_info($projlist,
+	                       $tagfilter  ? 'ctags' : (),
+	                       $search_re ? ('path', 'descr') : ());
+	my @projects;
+ PROJECT:
+	foreach my $pr (@$projlist) {
+
+		if ($tagfilter) {
+			next unless ref($pr->{'ctags'}) eq 'HASH';
+			next unless
+				grep { lc($_) eq lc($tagfilter) } keys %{$pr->{'ctags'}};
+		}
+
+		if ($search_re) {
+			next unless
+				$pr->{'path'} =~ /$search_re/ ||
+				$pr->{'descr_long'} =~ /$search_re/;
+		}
+
+		push @projects, $pr;
+	}
+
+	return @projects;
+}
+
+our $gitweb_project_owner = undef;
+sub git_get_project_list_from_file {
+
+	return if (defined $gitweb_project_owner);
+
+	$gitweb_project_owner = {};
+	# read from file (url-encoded):
+	# 'git%2Fgit.git Linus+Torvalds'
+	# 'libs%2Fklibc%2Fklibc.git H.+Peter+Anvin'
+	# 'linux%2Fhotplug%2Fudev.git Greg+Kroah-Hartman'
+	if (-f $projects_list) {
+		open(my $fd, '<', $projects_list);
+		while (my $line = <$fd>) {
+			chomp $line;
+			my ($pr, $ow) = split ' ', $line;
+			$pr = unescape($pr);
+			$ow = unescape($ow);
+			$gitweb_project_owner->{$pr} = to_utf8($ow);
+		}
+		close $fd;
+	}
+}
+
+sub git_get_project_owner {
+	my $project = shift;
+	my $owner;
+
+	return undef unless $project;
+	$git_dir = "$projectroot/$project";
+
+	if (!defined $gitweb_project_owner) {
+		git_get_project_list_from_file();
+	}
+
+	if (exists $gitweb_project_owner->{$project}) {
+		$owner = $gitweb_project_owner->{$project};
+	}
+	if (!defined $owner){
+		$owner = git_get_project_config('owner');
+	}
+	if (!defined $owner) {
+		$owner = get_file_owner("$git_dir");
+	}
+
+	return $owner;
+}
+
+sub git_get_last_activity {
+	my ($path) = @_;
+	my $fd;
+
+	$git_dir = "$projectroot/$path";
+	open($fd, "-|", git_cmd(), 'for-each-ref',
+	     '--format=%(committer)',
+	     '--sort=-committerdate',
+	     '--count=1',
+	     map { "refs/$_" } get_branch_refs ()) or return;
+	my $most_recent = <$fd>;
+	close $fd or return;
+	if (defined $most_recent &&
+	    $most_recent =~ / (\d+) [-+][01]\d\d\d$/) {
+		my $timestamp = $1;
+		my $age = time - $timestamp;
+		return ($age, age_string($age));
+	}
+	return (undef, undef);
+}
+
+# Implementation note: when a single remote is wanted, we cannot use 'git
+# remote show -n' because that command always work (assuming it's a remote URL
+# if it's not defined), and we cannot use 'git remote show' because that would
+# try to make a network roundtrip. So the only way to find if that particular
+# remote is defined is to walk the list provided by 'git remote -v' and stop if
+# and when we find what we want.
+sub git_get_remotes_list {
+	my $wanted = shift;
+	my %remotes = ();
+
+	open my $fd, '-|' , git_cmd(), 'remote', '-v';
+	return unless $fd;
+	while (my $remote = <$fd>) {
+		chomp $remote;
+		$remote =~ s!\t(.*?)\s+\((\w+)\)$!!;
+		next if $wanted and not $remote eq $wanted;
+		my ($url, $key) = ($1, $2);
+
+		$remotes{$remote} ||= { 'heads' => () };
+		$remotes{$remote}{$key} = $url;
+	}
+	close $fd or return;
+	return wantarray ? %remotes : \%remotes;
+}
+
+# Takes a hash of remotes as first parameter and fills it by adding the
+# available remote heads for each of the indicated remotes.
+sub fill_remote_heads {
+	my $remotes = shift;
+	my @heads = map { "remotes/$_" } keys %$remotes;
+	my @remoteheads = git_get_heads_list(undef, @heads);
+	foreach my $remote (keys %$remotes) {
+		$remotes->{$remote}{'heads'} = [ grep {
+			$_->{'name'} =~ s!^$remote/!!
+			} @remoteheads ];
+	}
+}
+
+sub git_get_references {
+	my $type = shift || "";
+	my %refs;
+	# 5dc01c595e6c6ec9ccda4f6f69c131c0dd945f8c refs/tags/v2.6.11
+	# c39ae07f393806ccf406ef966e9a15afc43cc36a refs/tags/v2.6.11^{}
+	open my $fd, "-|", git_cmd(), "show-ref", "--dereference",
+		($type ? ("--", "refs/$type") : ()) # use -- <pattern> if $type
+		or return;
+
+	while (my $line = <$fd>) {
+		chomp $line;
+		if ($line =~ m!^($oid_regex)\srefs/($type.*)$!) {
+			if (defined $refs{$1}) {
+				push @{$refs{$1}}, $2;
+			} else {
+				$refs{$1} = [ $2 ];
+			}
+		}
+	}
+	close $fd or return;
+	return \%refs;
+}
+
+sub git_get_rev_name_tags {
+	my $hash = shift || return undef;
+
+	open my $fd, "-|", git_cmd(), "name-rev", "--tags", $hash
+		or return;
+	my $name_rev = <$fd>;
+	close $fd;
+
+	if ($name_rev =~ m|^$hash tags/(.*)$|) {
+		return $1;
+	} else {
+		# catches also '$hash undefined' output
+		return undef;
+	}
+}
+
+## ----------------------------------------------------------------------
+## parse to hash functions
+
+sub parse_date {
+	my $epoch = shift;
+	my $tz = shift || "-0000";
+
+	my %date;
+	my @months = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec");
+	my @days = ("Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat");
+	my ($sec, $min, $hour, $mday, $mon, $year, $wday, $yday) = gmtime($epoch);
+	$date{'hour'} = $hour;
+	$date{'minute'} = $min;
+	$date{'mday'} = $mday;
+	$date{'day'} = $days[$wday];
+	$date{'month'} = $months[$mon];
+	$date{'rfc2822'}   = sprintf "%s, %d %s %4d %02d:%02d:%02d +0000",
+	                     $days[$wday], $mday, $months[$mon], 1900+$year, $hour ,$min, $sec;
+	$date{'mday-time'} = sprintf "%d %s %02d:%02d",
+	                     $mday, $months[$mon], $hour ,$min;
+	$date{'iso-8601'}  = sprintf "%04d-%02d-%02dT%02d:%02d:%02dZ",
+	                     1900+$year, 1+$mon, $mday, $hour ,$min, $sec;
+
+	my ($tz_sign, $tz_hour, $tz_min) =
+		($tz =~ m/^([-+])(\d\d)(\d\d)$/);
+	$tz_sign = ($tz_sign eq '-' ? -1 : +1);
+	my $local = $epoch + $tz_sign*((($tz_hour*60) + $tz_min)*60);
+	($sec, $min, $hour, $mday, $mon, $year, $wday, $yday) = gmtime($local);
+	$date{'hour_local'} = $hour;
+	$date{'minute_local'} = $min;
+	$date{'tz_local'} = $tz;
+	$date{'iso-tz'} = sprintf("%04d-%02d-%02d %02d:%02d:%02d %s",
+	                          1900+$year, $mon+1, $mday,
+	                          $hour, $min, $sec, $tz);
+	return %date;
+}
+
+sub hide_mailaddrs_if_private {
+	my $line = shift;
+	return $line unless gitweb_check_feature('email-privacy');
+	$line =~ s/<[^@>]+@[^>]+>/<redacted>/g;
+	return $line;
+}
+
+sub parse_tag {
+	my $tag_id = shift;
+	my %tag;
+	my @comment;
+
+	open my $fd, "-|", git_cmd(), "cat-file", "tag", $tag_id or return;
+	$tag{'id'} = $tag_id;
+	while (my $line = <$fd>) {
+		chomp $line;
+		if ($line =~ m/^object ($oid_regex)$/) {
+			$tag{'object'} = $1;
+		} elsif ($line =~ m/^type (.+)$/) {
+			$tag{'type'} = $1;
+		} elsif ($line =~ m/^tag (.+)$/) {
+			$tag{'name'} = $1;
+		} elsif ($line =~ m/^tagger (.*) ([0-9]+) (.*)$/) {
+			$tag{'author'} = hide_mailaddrs_if_private($1);
+			$tag{'author_epoch'} = $2;
+			$tag{'author_tz'} = $3;
+			if ($tag{'author'} =~ m/^([^<]+) <([^>]*)>/) {
+				$tag{'author_name'}  = $1;
+				$tag{'author_email'} = $2;
+			} else {
+				$tag{'author_name'} = $tag{'author'};
+			}
+		} elsif ($line =~ m/--BEGIN/) {
+			push @comment, $line;
+			last;
+		} elsif ($line eq "") {
+			last;
+		}
+	}
+	push @comment, <$fd>;
+	$tag{'comment'} = \@comment;
+	close $fd or return;
+	if (!defined $tag{'name'}) {
+		return
+	};
+	return %tag
+}
+
+sub parse_commit_text {
+	my ($commit_text, $withparents) = @_;
+	my @commit_lines = split '\n', $commit_text;
+	my %co;
+
+	pop @commit_lines; # Remove '\0'
+
+	if (! @commit_lines) {
+		return;
+	}
+
+	my $header = shift @commit_lines;
+	if ($header !~ m/^$oid_regex/) {
+		return;
+	}
+	($co{'id'}, my @parents) = split ' ', $header;
+	while (my $line = shift @commit_lines) {
+		last if $line eq "\n";
+		if ($line =~ m/^tree ($oid_regex)$/) {
+			$co{'tree'} = $1;
+		} elsif ((!defined $withparents) && ($line =~ m/^parent ($oid_regex)$/)) {
+			push @parents, $1;
+		} elsif ($line =~ m/^author (.*) ([0-9]+) (.*)$/) {
+			$co{'author'} = hide_mailaddrs_if_private(to_utf8($1));
+			$co{'author_epoch'} = $2;
+			$co{'author_tz'} = $3;
+			if ($co{'author'} =~ m/^([^<]+) <([^>]*)>/) {
+				$co{'author_name'}  = $1;
+				$co{'author_email'} = $2;
+			} else {
+				$co{'author_name'} = $co{'author'};
+			}
+		} elsif ($line =~ m/^committer (.*) ([0-9]+) (.*)$/) {
+			$co{'committer'} = hide_mailaddrs_if_private(to_utf8($1));
+			$co{'committer_epoch'} = $2;
+			$co{'committer_tz'} = $3;
+			if ($co{'committer'} =~ m/^([^<]+) <([^>]*)>/) {
+				$co{'committer_name'}  = $1;
+				$co{'committer_email'} = $2;
+			} else {
+				$co{'committer_name'} = $co{'committer'};
+			}
+		}
+	}
+	if (!defined $co{'tree'}) {
+		return;
+	};
+	$co{'parents'} = \@parents;
+	$co{'parent'} = $parents[0];
+
+	foreach my $title (@commit_lines) {
+		$title =~ s/^    //;
+		if ($title ne "") {
+			$co{'title'} = chop_str($title, 80, 5);
+			$co{'title_short'} = chop_str($title, 50, 5);
+			last;
+		}
+	}
+	if (! defined $co{'title'} || $co{'title'} eq "") {
+		$co{'title'} = $co{'title_short'} = '(no commit message)';
+	}
+	# remove added spaces, redact e-mail addresses if applicable.
+	foreach my $line (@commit_lines) {
+		$line =~ s/^    //;
+		$line = hide_mailaddrs_if_private($line);
+	}
+	$co{'comment'} = \@commit_lines;
+
+	my $age = time - $co{'committer_epoch'};
+	$co{'age'} = $age;
+	$co{'age_string'} = age_string($age);
+	my ($sec, $min, $hour, $mday, $mon, $year, $wday, $yday) = gmtime($co{'committer_epoch'});
+	if ($age > 60*60*24*7*2) {
+		$co{'age_string_date'} = sprintf "%4i-%02u-%02i", 1900 + $year, $mon+1, $mday;
+		$co{'age_string_age'} = $co{'age_string'};
+	} else {
+		$co{'age_string_date'} = $co{'age_string'};
+		$co{'age_string_age'} = sprintf "%4i-%02u-%02i", 1900 + $year, $mon+1, $mday;
+	}
+	return %co;
+}
+
+sub parse_commit {
+	my ($commit_id) = @_;
+	my %co;
+
+	local $/ = "\0";
+
+	open my $fd, "-|", git_cmd(), "rev-list",
+		"--parents",
+		"--header",
+		"--max-count=1",
+		$commit_id,
+		"--",
+		or die_error(500, "Open git-rev-list failed");
+	%co = parse_commit_text(<$fd>, 1);
+	close $fd;
+
+	return %co;
+}
+
+sub parse_commits {
+	my ($commit_id, $maxcount, $skip, $filename, @args) = @_;
+	my @cos;
+
+	$maxcount ||= 1;
+	$skip ||= 0;
+
+	local $/ = "\0";
+
+	open my $fd, "-|", git_cmd(), "rev-list",
+		"--header",
+		@args,
+		("--max-count=" . $maxcount),
+		("--skip=" . $skip),
+		@extra_options,
+		$commit_id,
+		"--",
+		($filename ? ($filename) : ())
+		or die_error(500, "Open git-rev-list failed");
+	while (my $line = <$fd>) {
+		my %co = parse_commit_text($line);
+		push @cos, \%co;
+	}
+	close $fd;
+
+	return wantarray ? @cos : \@cos;
+}
+
+# parse line of git-diff-tree "raw" output
+sub parse_difftree_raw_line {
+	my $line = shift;
+	my %res;
+
+	# ':100644 100644 03b218260e99b78c6df0ed378e59ed9205ccc96d 3b93d5e7cc7f7dd4ebed13a5cc1a4ad976fc94d8 M	ls-files.c'
+	# ':100644 100644 7f9281985086971d3877aca27704f2aaf9c448ce bc190ebc71bbd923f2b728e505408f5e54bd073a M	rev-tree.c'
+	if ($line =~ m/^:([0-7]{6}) ([0-7]{6}) ($oid_regex) ($oid_regex) (.)([0-9]{0,3})\t(.*)$/) {
+		$res{'from_mode'} = $1;
+		$res{'to_mode'} = $2;
+		$res{'from_id'} = $3;
+		$res{'to_id'} = $4;
+		$res{'status'} = $5;
+		$res{'similarity'} = $6;
+		if ($res{'status'} eq 'R' || $res{'status'} eq 'C') { # renamed or copied
+			($res{'from_file'}, $res{'to_file'}) = map { unquote($_) } split("\t", $7);
+		} else {
+			$res{'from_file'} = $res{'to_file'} = $res{'file'} = unquote($7);
+		}
+	}
+	# '::100755 100755 100755 60e79ca1b01bc8b057abe17ddab484699a7f5fdb 94067cc5f73388f33722d52ae02f44692bc07490 94067cc5f73388f33722d52ae02f44692bc07490 MR	git-gui/git-gui.sh'
+	# combined diff (for merge commit)
+	elsif ($line =~ s/^(::+)((?:[0-7]{6} )+)((?:$oid_regex )+)([a-zA-Z]+)\t(.*)$//) {
+		$res{'nparents'}  = length($1);
+		$res{'from_mode'} = [ split(' ', $2) ];
+		$res{'to_mode'} = pop @{$res{'from_mode'}};
+		$res{'from_id'} = [ split(' ', $3) ];
+		$res{'to_id'} = pop @{$res{'from_id'}};
+		$res{'status'} = [ split('', $4) ];
+		$res{'to_file'} = unquote($5);
+	}
+	# 'c512b523472485aef4fff9e57b229d9d243c967f'
+	elsif ($line =~ m/^($oid_regex)$/) {
+		$res{'commit'} = $1;
+	}
+
+	return wantarray ? %res : \%res;
+}
+
+# wrapper: return parsed line of git-diff-tree "raw" output
+# (the argument might be raw line, or parsed info)
+sub parsed_difftree_line {
+	my $line_or_ref = shift;
+
+	if (ref($line_or_ref) eq "HASH") {
+		# pre-parsed (or generated by hand)
+		return $line_or_ref;
+	} else {
+		return parse_difftree_raw_line($line_or_ref);
+	}
+}
+
+# parse line of git-ls-tree output
+sub parse_ls_tree_line {
+	my $line = shift;
+	my %opts = @_;
+	my %res;
+
+	if ($opts{'-l'}) {
+		#'100644 blob 0fa3f3a66fb6a137f6ec2c19351ed4d807070ffa   16717	panic.c'
+		$line =~ m/^([0-9]+) (.+) ($oid_regex) +(-|[0-9]+)\t(.+)$/s;
+
+		$res{'mode'} = $1;
+		$res{'type'} = $2;
+		$res{'hash'} = $3;
+		$res{'size'} = $4;
+		if ($opts{'-z'}) {
+			$res{'name'} = $5;
+		} else {
+			$res{'name'} = unquote($5);
+		}
+	} else {
+		#'100644 blob 0fa3f3a66fb6a137f6ec2c19351ed4d807070ffa	panic.c'
+		$line =~ m/^([0-9]+) (.+) ($oid_regex)\t(.+)$/s;
+
+		$res{'mode'} = $1;
+		$res{'type'} = $2;
+		$res{'hash'} = $3;
+		if ($opts{'-z'}) {
+			$res{'name'} = $4;
+		} else {
+			$res{'name'} = unquote($4);
+		}
+	}
+
+	return wantarray ? %res : \%res;
+}
+
+# generates _two_ hashes, references to which are passed as 2 and 3 argument
+sub parse_from_to_diffinfo {
+	my ($diffinfo, $from, $to, @parents) = @_;
+
+	if ($diffinfo->{'nparents'}) {
+		# combined diff
+		$from->{'file'} = [];
+		$from->{'href'} = [];
+		fill_from_file_info($diffinfo, @parents)
+			unless exists $diffinfo->{'from_file'};
+		for (my $i = 0; $i < $diffinfo->{'nparents'}; $i++) {
+			$from->{'file'}[$i] =
+				defined $diffinfo->{'from_file'}[$i] ?
+				        $diffinfo->{'from_file'}[$i] :
+				        $diffinfo->{'to_file'};
+			if ($diffinfo->{'status'}[$i] ne "A") { # not new (added) file
+				$from->{'href'}[$i] = href(action=>"blob",
+				                           hash_base=>$parents[$i],
+				                           hash=>$diffinfo->{'from_id'}[$i],
+				                           file_name=>$from->{'file'}[$i]);
+			} else {
+				$from->{'href'}[$i] = undef;
+			}
+		}
+	} else {
+		# ordinary (not combined) diff
+		$from->{'file'} = $diffinfo->{'from_file'};
+		if ($diffinfo->{'status'} ne "A") { # not new (added) file
+			$from->{'href'} = href(action=>"blob", hash_base=>$hash_parent,
+			                       hash=>$diffinfo->{'from_id'},
+			                       file_name=>$from->{'file'});
+		} else {
+			delete $from->{'href'};
+		}
+	}
+
+	$to->{'file'} = $diffinfo->{'to_file'};
+	if (!is_deleted($diffinfo)) { # file exists in result
+		$to->{'href'} = href(action=>"blob", hash_base=>$hash,
+		                     hash=>$diffinfo->{'to_id'},
+		                     file_name=>$to->{'file'});
+	} else {
+		delete $to->{'href'};
+	}
+}
+
+## ......................................................................
+## parse to array of hashes functions
+
+sub git_get_heads_list {
+	my ($limit, @classes) = @_;
+	@classes = get_branch_refs() unless @classes;
+	my @patterns = map { "refs/$_" } @classes;
+	my @headslist;
+
+	open my $fd, '-|', git_cmd(), 'for-each-ref',
+		($limit ? '--count='.($limit+1) : ()),
+		'--sort=-HEAD', '--sort=-committerdate',
+		'--format=%(objectname) %(refname) %(subject)%00%(committer)',
+		@patterns
+		or return;
+	while (my $line = <$fd>) {
+		my %ref_item;
+
+		chomp $line;
+		my ($refinfo, $committerinfo) = split(/\0/, $line);
+		my ($hash, $name, $title) = split(' ', $refinfo, 3);
+		my ($committer, $epoch, $tz) =
+			($committerinfo =~ /^(.*) ([0-9]+) (.*)$/);
+		$ref_item{'fullname'}  = $name;
+		my $strip_refs = join '|', map { quotemeta } get_branch_refs();
+		$name =~ s!^refs/($strip_refs|remotes)/!!;
+		$ref_item{'name'} = $name;
+		# for refs neither in 'heads' nor 'remotes' we want to
+		# show their ref dir
+		my $ref_dir = (defined $1) ? $1 : '';
+		if ($ref_dir ne '' and $ref_dir ne 'heads' and $ref_dir ne 'remotes') {
+		    $ref_item{'name'} .= ' (' . $ref_dir . ')';
+		}
+
+		$ref_item{'id'}    = $hash;
+		$ref_item{'title'} = $title || '(no commit message)';
+		$ref_item{'epoch'} = $epoch;
+		if ($epoch) {
+			$ref_item{'age'} = age_string(time - $ref_item{'epoch'});
+		} else {
+			$ref_item{'age'} = "unknown";
+		}
+
+		push @headslist, \%ref_item;
+	}
+	close $fd;
+
+	return wantarray ? @headslist : \@headslist;

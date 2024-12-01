@@ -1,0 +1,1000 @@
+        }
+
+        /* if method was a 'func' then try falling back to real 'func' method */
+        if (!imp_msv && (ima_flags & IMA_FUNC_REDIRECT)) {
+            imp_msv = (SV*)gv_fetchmethod_autoload(DBIc_IMP_STASH(imp_xxh), "func", FALSE);
+            if (imp_msv) {
+                /* driver does have func method so undo the earlier 'func' stack changes */
+                PUSHs(sv_2mortal(newSVpv(meth_name,0)));
+                PUTBACK;
+                ++items;
+                meth_name = "func";
+                meth_type = methtype_ordinary;
+            }
+        }
+
+        if (trace_level >= (is_nested_call ? 4 : 2)) {
+            PerlIO *logfp = DBILOGFP;
+            /* Full pkg method name (or just meth_name for ANON CODE)   */
+            const char *imp_meth_name = (imp_msv && isGV(imp_msv)) ? GvNAME(imp_msv) : meth_name;
+            HV *imp_stash = DBIc_IMP_STASH(imp_xxh);
+            PerlIO_printf(logfp, "%c   -> %s ",
+                    call_depth>1 ? '0'+call_depth-1 : (PL_dirty?'!':' '), imp_meth_name);
+            if (imp_meth_name[0] == 'A' && strEQ(imp_meth_name,"AUTOLOAD"))
+                    PerlIO_printf(logfp, "\"%s\" ", meth_name);
+            if (imp_msv && isGV(imp_msv) && GvSTASH(imp_msv) != imp_stash)
+                PerlIO_printf(logfp, "in %s ", HvNAME(GvSTASH(imp_msv)));
+            PerlIO_printf(logfp, "for %s (%s", HvNAME(imp_stash),
+                        SvPV_nolen(orig_h));
+            if (h != orig_h)    /* show inner handle to aid tracing */
+                 PerlIO_printf(logfp, "~0x%lx", (long)SvRV(h));
+            else PerlIO_printf(logfp, "~INNER");
+            for(i=1; i<items; ++i) {
+                PerlIO_printf(logfp," %s",
+                    (ima && i==ima->hidearg) ? "****" : neatsvpv(ST(i),0));
+            }
+#ifdef DBI_USE_THREADS
+            PerlIO_printf(logfp, ") thr#%p\n", (void*)DBIc_THR_USER(imp_xxh));
+#else
+            PerlIO_printf(logfp, ")\n");
+#endif
+            PerlIO_flush(logfp);
+        }
+
+        if (!imp_msv || ! ((meth_cv = GvCV(imp_msv))) ) {
+            if (PL_dirty || is_DESTROY) {
+                outitems = 0;
+                goto post_dispatch;
+            }
+            if (ima_flags & IMA_NOT_FOUND_OKAY) {
+                outitems = 0;
+                goto post_dispatch;
+            }
+            croak("Can't locate DBI object method \"%s\" via package \"%s\"",
+                meth_name, HvNAME(DBIc_IMP_STASH(imp_xxh)));
+        }
+
+        PUSHMARK(mark);  /* mark arguments again so we can pass them on */
+
+        /* Note: the handle on the stack is still an object blessed into a
+         * DBI::* class and not the DBD::*::* class whose method is being
+         * invoked. This is correct and should be largely transparent.
+         */
+
+        /* SHORT-CUT ALERT! */
+        if (use_xsbypass && CvISXSUB(meth_cv) && CvXSUB(meth_cv)) {
+
+            /* If we are calling an XSUB we jump directly to its C code and
+             * bypass perl_call_sv(), pp_entersub() etc. This is fast.
+             * This code is based on a small section of pp_entersub().
+             */
+            (void)(*CvXSUB(meth_cv))(aTHXo_ meth_cv); /* Call the C code directly */
+
+            if (gimme == G_SCALAR) {    /* Enforce sanity in scalar context */
+                if (ax != PL_stack_sp - PL_stack_base ) { /* outitems != 1 */
+                    ST(0) =
+                        (ax > PL_stack_sp - PL_stack_base)
+                            ? &PL_sv_undef  /* outitems == 0 */
+                            : *PL_stack_sp; /* outitems > 1 */
+                    PL_stack_sp = PL_stack_base + ax;
+                }
+                outitems = 1;
+            }
+            else {
+                outitems = PL_stack_sp - (PL_stack_base + ax - 1);
+            }
+
+        }
+        else {
+            /* sv_dump(imp_msv); */
+            outitems = call_sv((SV*)meth_cv,
+                (is_DESTROY ? gimme | G_EVAL | G_KEEPERR : gimme) );
+        }
+
+        XSprePUSH; /* reset SP to base of stack frame */
+
+#ifdef DBI_save_hv_fetch_ent
+        if (meth_type == methtype_FETCH)
+            PL_hv_fetch_ent_mh = save_mh;       /* see start of block */
+#endif
+    }
+
+    post_dispatch:
+
+    if (is_DESTROY && DBI_IS_LAST_HANDLE(h)) { /* if destroying _this_ handle */
+        SV *lhp = DBIc_PARENT_H(imp_xxh);
+        if (lhp && SvROK(lhp)) {
+            DBI_SET_LAST_HANDLE(lhp);
+        }
+        else {
+            DBI_UNSET_LAST_HANDLE;
+        }
+    }
+
+    if (keep_error) {
+        /* if we didn't clear err before the call, check to see if a new error
+         * or warning has been recorded. If so, turn off keep_error so it gets acted on
+         */
+        if (DBIc_ErrCount(imp_xxh) > ErrCount || err_hash(aTHX_ imp_xxh) != keep_error) {
+            keep_error = 0;
+        }
+    }
+
+    err_sv = DBIc_ERR(imp_xxh);
+
+    if (trace_level >= (is_nested_call ? 3 : 1)) {
+        PerlIO *logfp = DBILOGFP;
+        const int is_fetch  = (meth_type == methtype_fetch_star && DBIc_TYPE(imp_xxh)==DBIt_ST);
+        const IV row_count = (is_fetch) ? DBIc_ROW_COUNT((imp_sth_t*)imp_xxh) : 0;
+        if (is_fetch && row_count>=2 && trace_level<=4 && SvOK(ST(0))) {
+            /* skip the 'middle' rows to reduce output */
+            goto skip_meth_return_trace;
+        }
+        if (SvOK(err_sv)) {
+            PerlIO_printf(logfp, "    %s %s %s %s (err#%ld)\n", (keep_error) ? "  " : "!!",
+                SvTRUE(err_sv) ? "ERROR:" : strlen(SvPV_nolen(err_sv)) ? "warn:" : "info:",
+                neatsvpv(err_sv,0), neatsvpv(DBIc_ERRSTR(imp_xxh),0), (long)DBIc_ErrCount(imp_xxh));
+        }
+        PerlIO_printf(logfp,"%c%c  <%c %s",
+                    (call_depth > 1)  ? '0'+call_depth-1 : (PL_dirty?'!':' '),
+                    (DBIc_is(imp_xxh, DBIcf_TaintIn|DBIcf_TaintOut)) ? 'T' : ' ',
+                    (qsv) ? '>' : '-',
+                    meth_name);
+        if (trace_level==1 && (items>=2||is_DESTROY)) { /* make level 1 more useful */
+            /* we only have the first two parameters available here */
+            if (is_DESTROY) /* show handle as first arg to DESTROY */
+                /* want to show outer handle so trace makes sense       */
+                /* but outer handle has been destroyed so we fake it    */
+                PerlIO_printf(logfp,"(%s=HASH(0x%p)", HvNAME(SvSTASH(SvRV(orig_h))), (void*)DBIc_MY_H(imp_xxh));
+            else
+                PerlIO_printf(logfp,"(%s", neatsvpv(st1,0));
+            if (items >= 3)
+                PerlIO_printf(logfp,", %s", neatsvpv(st2,0));
+            PerlIO_printf(logfp,"%s)", (items > 3) ? ", ..." : "");
+        }
+
+        if (gimme & G_LIST)
+             PerlIO_printf(logfp,"= (");
+        else PerlIO_printf(logfp,"=");
+        for(i=0; i < outitems; ++i) {
+            SV *s = ST(i);
+            if ( SvROK(s) && SvTYPE(SvRV(s))==SVt_PVAV) {
+                AV *av = (AV*)SvRV(s);
+                int avi;
+                int avi_last = SvIV(DBIS->neatsvpvlen) / 10;
+                if (avi_last < 39)
+                    avi_last = 39;
+                PerlIO_printf(logfp, " [");
+                for (avi=0; avi <= AvFILL(av); ++avi) {
+                    PerlIO_printf(logfp, " %s",  neatsvpv(AvARRAY(av)[avi],0));
+                    if (avi >= avi_last && AvFILL(av) - avi > 1) {
+                        PerlIO_printf(logfp, " ... %ld others skipped", AvFILL(av) - avi);
+                        break;
+                    }
+                }
+                PerlIO_printf(logfp, " ]");
+            }
+            else {
+                PerlIO_printf(logfp, " %s",  neatsvpv(s,0));
+                if ( SvROK(s) && SvTYPE(SvRV(s))==SVt_PVHV && !SvOBJECT(SvRV(s)) )
+                    PerlIO_printf(logfp, "%ldkeys", (long)HvKEYS(SvRV(s)));
+            }
+        }
+        if (gimme & G_LIST) {
+            PerlIO_printf(logfp," ) [%d items]", outitems);
+        }
+        if (is_fetch && row_count) {
+            PerlIO_printf(logfp," row%"IVdf, row_count);
+        }
+        if (qsv) /* flag as quick and peek at the first arg (still on the stack) */
+            PerlIO_printf(logfp," (%s from cache)", neatsvpv(st1,0));
+        else if (!imp_msv)
+            PerlIO_printf(logfp," (not implemented)");
+        /* XXX add flag to show pid here? */
+        /* add file and line number information */
+        PerlIO_puts(logfp, log_where(0, 0, " at ", "\n", 1, (trace_level >= 3), (trace_level >= 4)));
+    skip_meth_return_trace:
+        PerlIO_flush(logfp);
+    }
+
+    if (ima_flags & IMA_END_WORK) { /* commit() or rollback() */
+        /* XXX does not consider if the method call actually worked or not */
+        DBIc_off(imp_xxh, DBIcf_Executed);
+
+        if (DBIc_has(imp_xxh, DBIcf_BegunWork)) {
+            DBIc_off(imp_xxh, DBIcf_BegunWork);
+            if (!DBIc_has(imp_xxh, DBIcf_AutoCommit)) {
+                /* We only get here if the driver hasn't implemented their own code     */
+                /* for begin_work, or has but hasn't correctly turned AutoCommit        */
+                /* back on in their commit or rollback code. So we have to do it.       */
+                /* This is bad because it'll probably trigger a spurious commit()       */
+                /* and may mess up the error handling below for the commit/rollback     */
+                PUSHMARK(SP);
+                XPUSHs(h);
+                XPUSHs(sv_2mortal(newSVpv("AutoCommit",0)));
+                XPUSHs(&PL_sv_yes);
+                PUTBACK;
+                call_method("STORE", G_VOID);
+                MSPAGAIN;
+            }
+        }
+    }
+
+    if (PL_tainting
+        && DBIc_is(imp_xxh, DBIcf_TaintOut)   /* taint checks requested */
+        /* XXX this would taint *everything* being returned from *any*  */
+        /* method that doesn't have IMA_NO_TAINT_OUT set.               */
+        /* DISABLED: just tainting fetched data in get_fbav seems ok    */
+        && 0/* XXX disabled*/ /* !(ima_flags & IMA_NO_TAINT_OUT) */
+    ) {
+        dTHR;
+        TAINT; /* affects sv_setsv()'s within same perl statement */
+        for(i=0; i < outitems; ++i) {
+            I32 avi;
+            char *p;
+            SV *s;
+            SV *agg = ST(i);
+            if ( !SvROK(agg) )
+                continue;
+            agg = SvRV(agg);
+#define DBI_OUT_TAINTABLE(s) (!SvREADONLY(s) && !SvTAINTED(s))
+            switch (SvTYPE(agg)) {
+            case SVt_PVAV:
+                for(avi=0; avi <= AvFILL((AV*)agg); ++avi) {
+                    s = AvARRAY((AV*)agg)[avi];
+                    if (DBI_OUT_TAINTABLE(s))
+                        SvTAINTED_on(s);
+                }
+                break;
+            case SVt_PVHV:
+                hv_iterinit((HV*)agg);
+                while( (s = hv_iternextsv((HV*)agg, &p, &avi)) ) {
+                    if (DBI_OUT_TAINTABLE(s))
+                        SvTAINTED_on(s);
+                }
+                break;
+            default:
+                if (DBIc_WARN(imp_xxh)) {
+                    PerlIO_printf(DBILOGFP,"Don't know how to taint contents of returned %s (type %d)\n",
+                        neatsvpv(agg,0), (int)SvTYPE(agg));
+                }
+            }
+        }
+    }
+
+    /* if method returned a new handle, and that handle has an error on it
+     * then copy the error up into the parent handle
+     */
+    if (ima_flags & IMA_IS_FACTORY && SvROK(ST(0))) {
+        SV *h_new = ST(0);
+        D_impdata(imp_xxh_new, imp_xxh_t, h_new);
+        if (SvOK(DBIc_ERR(imp_xxh_new))) {
+            set_err_sv(h, imp_xxh, DBIc_ERR(imp_xxh_new), DBIc_ERRSTR(imp_xxh_new), DBIc_STATE(imp_xxh_new), &PL_sv_no);
+        }
+    }
+
+    if (   !keep_error                  /* is a new err/warn/info               */
+        && !is_nested_call              /* skip nested (internal) calls         */
+        && (
+               /* is an error and has RaiseError|PrintError|HandleError set     */
+           (SvTRUE(err_sv) && DBIc_has(imp_xxh, DBIcf_RaiseError|DBIcf_PrintError|DBIcf_HandleError))
+               /* is a warn (not info) and has RaiseWarn|PrintWarn set          */
+        || (  SvOK(err_sv) && strlen(SvPV_nolen(err_sv)) && DBIc_has(imp_xxh, DBIcf_RaiseWarn|DBIcf_PrintWarn))
+        )
+    ) {
+        SV *msg;
+        SV **statement_svp = NULL;
+        const int is_warning = (!SvTRUE(err_sv) && strlen(SvPV_nolen(err_sv))==1);
+        const char *err_meth_name = meth_name;
+        char intro[200];
+
+        if (meth_type == methtype_set_err) {
+            SV **sem_svp = hv_fetch((HV*)SvRV(h), "dbi_set_err_method", 18, GV_ADDWARN);
+            if (SvOK(*sem_svp))
+                err_meth_name = SvPV_nolen(*sem_svp);
+        }
+
+        /* XXX change to vsprintf into sv directly */
+        sprintf(intro,"%s %s %s: ", HvNAME(DBIc_IMP_STASH(imp_xxh)), err_meth_name,
+            SvTRUE(err_sv) ? "failed" : is_warning ? "warning" : "information");
+        msg = sv_2mortal(newSVpv(intro,0));
+        if (SvOK(DBIc_ERRSTR(imp_xxh)))
+            sv_catsv(msg, DBIc_ERRSTR(imp_xxh));
+        else
+            sv_catpvf(msg, "(err=%s, errstr=undef, state=%s)",
+                neatsvpv(DBIc_ERR(imp_xxh),0), neatsvpv(DBIc_STATE(imp_xxh),0) );
+
+        if (    DBIc_has(imp_xxh, DBIcf_ShowErrorStatement)
+            && !is_unrelated_to_Statement
+            && (DBIc_TYPE(imp_xxh) == DBIt_ST || ima_flags & IMA_SHOW_ERR_STMT)
+            && (statement_svp = hv_fetch((HV*)SvRV(h), "Statement", 9, 0))
+            &&  statement_svp && SvOK(*statement_svp)
+        ) {
+            SV **svp = 0;
+            sv_catpv(msg, " [for Statement \"");
+            sv_catsv(msg, *statement_svp);
+
+            /* fetch from tied outer handle to trigger FETCH magic  */
+            /* could add DBIcf_ShowErrorParams (default to on?)         */
+            if (!(ima_flags & IMA_HIDE_ERR_PARAMVALUES)) {
+                svp = hv_fetch((HV*)DBIc_MY_H(imp_xxh),"ParamValues",11,FALSE);
+                if (svp && SvMAGICAL(*svp))
+                    mg_get(*svp); /* XXX may recurse, may croak. could use eval */
+            }
+            if (svp && SvRV(*svp) && SvTYPE(SvRV(*svp)) == SVt_PVHV && HvKEYS(SvRV(*svp))>0 ) {
+                SV *param_values_sv = sv_2mortal(_join_hash_sorted((HV*)SvRV(*svp), "=",1, ", ",2, 1, -1));
+                sv_catpv(msg, "\" with ParamValues: ");
+                sv_catsv(msg, param_values_sv);
+                sv_catpvn(msg, "]", 1);
+            }
+            else {
+                sv_catpv(msg, "\"]");
+            }
+        }
+
+        if (0) {
+            COP *cop = dbi_caller_cop();
+            if (cop && (CopLINE(cop) != CopLINE(PL_curcop) || CopFILEGV(cop) != CopFILEGV(PL_curcop))) {
+                dbi_caller_string(msg, cop, " called via ", 1, 0);
+            }
+        }
+
+        hook_svp = NULL;
+        if (   (SvTRUE(err_sv) || (is_warning && DBIc_has(imp_xxh, DBIcf_RaiseWarn)))
+            &&  DBIc_has(imp_xxh, DBIcf_HandleError)
+            && (hook_svp = hv_fetch((HV*)SvRV(h),"HandleError",11,0))
+            &&  hook_svp && SvOK(*hook_svp)
+        ) {
+            dSP;
+            PerlIO *logfp = DBILOGFP;
+            IV items;
+            SV *status;
+            SV *result; /* point to result SV that's pointed to by the stack */
+            if (outitems) {
+                result = *(sp-outitems+1);
+                if (SvREADONLY(result)) {
+                    *(sp-outitems+1) = result = sv_2mortal(newSVsv(result));
+                }
+            }
+            else {
+                result = sv_newmortal();
+            }
+            if (trace_level)
+                PerlIO_printf(logfp,"    -> HandleError on %s via %s%s%s%s\n",
+                    neatsvpv(h,0), neatsvpv(*hook_svp,0),
+                    (!outitems ? "" : " ("),
+                    (!outitems ? "" : neatsvpv(result ,0)),
+                    (!outitems ? "" : ")")
+                );
+            PUSHMARK(SP);
+            XPUSHs(msg);
+            XPUSHs(sv_2mortal(newRV_inc((SV*)DBIc_MY_H(imp_xxh))));
+            XPUSHs( result );
+            PUTBACK;
+            items = call_sv(*hook_svp, G_SCALAR);
+            MSPAGAIN;
+            status = (items) ? POPs : &PL_sv_undef;
+            PUTBACK;
+            if (trace_level)
+                PerlIO_printf(logfp,"    <- HandleError= %s%s%s%s\n",
+                    neatsvpv(status,0),
+                    (!outitems ? "" : " ("),
+                    (!outitems ? "" : neatsvpv(result,0)),
+                    (!outitems ? "" : ")")
+                );
+            if (!SvTRUE(status)) /* handler says it didn't handle it, so... */
+                hook_svp = 0;  /* pretend we didn't have a handler...     */
+        }
+
+        if (profile_t1) { /* see also dbi_profile() call a few lines below */
+            SV *statement_sv = (is_unrelated_to_Statement) ? &PL_sv_no : &PL_sv_undef;
+            dbi_profile(h, imp_xxh, statement_sv, imp_msv ? imp_msv : (SV*)cv,
+                profile_t1, dbi_time());
+        }
+        if (!hook_svp && is_warning) {
+            if (DBIc_has(imp_xxh, DBIcf_PrintWarn))
+                warn_sv(msg);
+            if (DBIc_has(imp_xxh, DBIcf_RaiseWarn))
+                croak_sv(msg);
+        }
+        else if (!hook_svp && SvTRUE(err_sv)) {
+            if (DBIc_has(imp_xxh, DBIcf_PrintError))
+                warn_sv(msg);
+            if (DBIc_has(imp_xxh, DBIcf_RaiseError))
+                croak_sv(msg);
+        }
+    }
+    else if (profile_t1) { /* see also dbi_profile() call a few lines above */
+        SV *statement_sv = (is_unrelated_to_Statement) ? &PL_sv_no : &PL_sv_undef;
+        dbi_profile(h, imp_xxh, statement_sv, imp_msv ? imp_msv : (SV*)cv,
+                profile_t1, dbi_time());
+    }
+    XSRETURN(outitems);
+}
+
+
+
+/* -------------------------------------------------------------------- */
+
+/* comment and placeholder styles to accept and return */
+
+#define DBIpp_cm_cs 0x000001   /* C style */
+#define DBIpp_cm_hs 0x000002   /* #       */
+#define DBIpp_cm_dd 0x000004   /* --      */
+#define DBIpp_cm_br 0x000008   /* {}      */
+#define DBIpp_cm_dw 0x000010   /* '-- ' dash dash whitespace */
+#define DBIpp_cm_XX 0x00001F   /* any of the above */
+
+#define DBIpp_ph_qm 0x000100   /* ?       */
+#define DBIpp_ph_cn 0x000200   /* :1      */
+#define DBIpp_ph_cs 0x000400   /* :name   */
+#define DBIpp_ph_sp 0x000800   /* %s (as return only, not accept)    */
+#define DBIpp_ph_XX 0x000F00   /* any of the above */
+
+#define DBIpp_st_qq 0x010000   /* '' char escape */
+#define DBIpp_st_bs 0x020000   /* \  char escape */
+#define DBIpp_st_XX 0x030000   /* any of the above */
+
+#define DBIpp_L_BRACE '{'
+#define DBIpp_R_BRACE '}'
+#define PS_accept(flag)  DBIbf_has(ps_accept,(flag))
+#define PS_return(flag)  DBIbf_has(ps_return,(flag))
+
+SV *
+preparse(SV *dbh, const char *statement, IV ps_return, IV ps_accept, void *foo)
+{
+    dTHX;
+    D_imp_xxh(dbh);
+/*
+        The idea here is that ps_accept defines which constructs to
+        recognize (accept) as valid in the source string (other
+        constructs are ignored), and ps_return defines which
+        constructs are valid to return in the result string.
+
+        If a construct that is valid in the input is also valid in the
+        output then it's simply copied. If it's not valid in the output
+        then it's editied into one of the valid forms (ideally the most
+        'standard' and/or information preserving one).
+
+        For example, if ps_accept includes '--' style comments but
+        ps_return doesn't, but ps_return does include '#' style
+        comments then any '--' style comments would be rewritten as '#'
+        style comments.
+
+        Similarly for placeholders. DBD::Oracle, for example, would say
+        '?', ':1' and ':name' are all acceptable input, but only
+        ':name' should be returned.
+
+        (There's a tricky issue with the '--' comment style because it can
+        clash with valid syntax, i.e., "... set foo=foo--1 ..." so it
+        would be *bad* to misinterpret that as the start of a comment.
+        Perhaps we need a DBIpp_cm_dw (for dash-dash-whitespace) style
+        to allow for that.)
+
+        Also, we'll only support DBIpp_cm_br as an input style. And
+        even then, only with reluctance. We may (need to) drop it when
+        we add support for odbc escape sequences.
+*/
+    int idx = 1;
+
+    char in_quote = '\0';
+    char in_comment = '\0';
+    char rt_comment = '\0';
+    char *dest, *start;
+    const char *src;
+    const char *style = "", *laststyle = NULL;
+    SV *new_stmt_sv;
+
+    (void)foo;
+
+    if (!(ps_return | DBIpp_ph_XX)) { /* no return ph type specified */
+        ps_return |= ps_accept | DBIpp_ph_XX;   /* so copy from ps_accept */
+    }
+
+    /* XXX this allocation strategy won't work when we get to more advanced stuff */
+    new_stmt_sv = newSV(strlen(statement) * 3);
+    sv_setpv(new_stmt_sv,"");
+    src  = statement;
+    dest = SvPVX(new_stmt_sv);
+
+    while( *src )
+    {
+        if (*src == '%' && PS_return(DBIpp_ph_sp))
+            *dest++ = '%';
+
+        if (in_comment)
+        {
+             if (       (in_comment == '-' && (*src == '\n' || *(src+1) == '\0'))
+                ||      (in_comment == '#' && (*src == '\n' || *(src+1) == '\0'))
+                ||      (in_comment == DBIpp_L_BRACE && *src == DBIpp_R_BRACE) /* XXX nesting? */
+                ||      (in_comment == '/' && *src == '*' && *(src+1) == '/')
+             ) {
+                switch (rt_comment) {
+                case '/':       *dest++ = '*'; *dest++ = '/';   break;
+                case '-':       *dest++ = '\n';                 break;
+                case '#':       *dest++ = '\n';                 break;
+                case DBIpp_L_BRACE: *dest++ = DBIpp_R_BRACE;    break;
+                case '\0':      /* ensure deleting a comment doesn't join two tokens */
+                        if (in_comment=='/' || in_comment==DBIpp_L_BRACE)
+                            *dest++ = ' '; /* ('-' and '#' styles use the newline) */
+                        break;
+                }
+                if (in_comment == '/')
+                    src++;
+                src += (*src != '\n' || *(dest-1)=='\n') ? 1 : 0;
+                in_comment = '\0';
+                rt_comment = '\0';
+             }
+             else
+             if (rt_comment)
+                *dest++ = *src++;
+             else
+                src++;  /* delete (don't copy) the comment */
+             continue;
+        }
+
+        if (in_quote)
+        {
+            if (*src == in_quote) {
+                in_quote = 0;
+            }
+            *dest++ = *src++;
+            continue;
+        }
+
+        /* Look for comments */
+        if (*src == '-' && *(src+1) == '-' &&
+                (PS_accept(DBIpp_cm_dd) || (*(src+2) == ' ' && PS_accept(DBIpp_cm_dw)))
+        )
+        {
+            in_comment = *src;
+            src += 2;   /* skip past 2nd char of double char delimiters */
+            if (PS_return(DBIpp_cm_dd) || PS_return(DBIpp_cm_dw)) {
+                *dest++ = rt_comment = '-';
+                *dest++ = '-';
+                if (PS_return(DBIpp_cm_dw) && *src!=' ')
+                    *dest++ = ' '; /* insert needed white space */
+            }
+            else if (PS_return(DBIpp_cm_cs)) {
+                *dest++ = rt_comment = '/';
+                *dest++ = '*';
+            }
+            else if (PS_return(DBIpp_cm_hs)) {
+                *dest++ = rt_comment = '#';
+            }
+            else if (PS_return(DBIpp_cm_br)) {
+                *dest++ = rt_comment = DBIpp_L_BRACE;
+            }
+            continue;
+        }
+        else if (*src == '/' && *(src+1) == '*' && PS_accept(DBIpp_cm_cs))
+        {
+            in_comment = *src;
+            src += 2;   /* skip past 2nd char of double char delimiters */
+            if (PS_return(DBIpp_cm_cs)) {
+                *dest++ = rt_comment = '/';
+                *dest++ = '*';
+            }
+            else if (PS_return(DBIpp_cm_dd) || PS_return(DBIpp_cm_dw)) {
+                *dest++ = rt_comment = '-';
+                *dest++ = '-';
+                if (PS_return(DBIpp_cm_dw)) *dest++ = ' ';
+            }
+            else if (PS_return(DBIpp_cm_hs)) {
+                *dest++ = rt_comment = '#';
+            }
+            else if (PS_return(DBIpp_cm_br)) {
+                *dest++ = rt_comment = DBIpp_L_BRACE;
+            }
+            continue;
+        }
+        else if (*src == '#' && PS_accept(DBIpp_cm_hs))
+        {
+            in_comment = *src;
+            src++;
+            if (PS_return(DBIpp_cm_hs)) {
+                *dest++ = rt_comment = '#';
+            }
+            else if (PS_return(DBIpp_cm_dd) || PS_return(DBIpp_cm_dw)) {
+                *dest++ = rt_comment = '-';
+                *dest++ = '-';
+                if (PS_return(DBIpp_cm_dw)) *dest++ = ' ';
+            }
+            else if (PS_return(DBIpp_cm_cs)) {
+                *dest++ = rt_comment = '/';
+                *dest++ = '*';
+            }
+            else if (PS_return(DBIpp_cm_br)) {
+                *dest++ = rt_comment = DBIpp_L_BRACE;
+            }
+            continue;
+        }
+        else if (*src == DBIpp_L_BRACE && PS_accept(DBIpp_cm_br))
+        {
+            in_comment = *src;
+            src++;
+            if (PS_return(DBIpp_cm_br)) {
+                *dest++ = rt_comment = DBIpp_L_BRACE;
+            }
+            else if (PS_return(DBIpp_cm_dd) || PS_return(DBIpp_cm_dw)) {
+                *dest++ = rt_comment = '-';
+                *dest++ = '-';
+                if (PS_return(DBIpp_cm_dw)) *dest++ = ' ';
+            }
+            else if (PS_return(DBIpp_cm_cs)) {
+                *dest++ = rt_comment = '/';
+                *dest++ = '*';
+            }
+            else if (PS_return(DBIpp_cm_hs)) {
+                *dest++ = rt_comment = '#';
+            }
+            continue;
+        }
+
+       if (    !(*src==':' && (PS_accept(DBIpp_ph_cn) || PS_accept(DBIpp_ph_cs)))
+           &&  !(*src=='?' &&  PS_accept(DBIpp_ph_qm))
+       ){
+            if (*src == '\'' || *src == '"')
+                in_quote = *src;
+            *dest++ = *src++;
+            continue;
+        }
+
+        /* only here for : or ? outside of a comment or literal */
+
+        start = dest;                   /* save name inc colon  */
+        *dest++ = *src++;               /* copy and move past first char */
+
+        if (*start == '?')              /* X/Open Standard */
+        {
+            style = "?";
+
+            if (PS_return(DBIpp_ph_qm))
+                ;
+            else if (PS_return(DBIpp_ph_cn)) { /* '?' -> ':p1' (etc) */
+                sprintf(start,":p%d", idx++);
+                dest = start+strlen(start);
+            }
+            else if (PS_return(DBIpp_ph_sp)) { /* '?' -> '%s' */
+                   *start  = '%';
+                   *dest++ = 's';
+            }
+        }
+        else if (isDIGIT(*src)) {   /* :1 */
+            const int pln = atoi(src);
+            style = ":1";
+
+            if (PS_return(DBIpp_ph_cn)) { /* ':1'->':p1'  */
+                   idx = pln;
+                   *dest++ = 'p';
+                   while(isDIGIT(*src))
+                       *dest++ = *src++;
+            }
+            else if (PS_return(DBIpp_ph_qm) /* ':1' -> '?'  */
+                 ||  PS_return(DBIpp_ph_sp) /* ':1' -> '%s' */
+            ) {
+                   PS_return(DBIpp_ph_qm) ? sprintf(start,"?") : sprintf(start,"%%s");
+                   dest = start + strlen(start);
+                   if (pln != idx) {
+                        char buf[99];
+                        sprintf(buf, "preparse found placeholder :%d out of sequence, expected :%d", pln, idx);
+                        set_err_char(dbh, imp_xxh, "1", 1, buf, 0, "preparse");
+                        return &PL_sv_undef;
+                   }
+                   while(isDIGIT(*src)) src++;
+                   idx++;
+            }
+        }
+        else if (isALNUM(*src))         /* :name */
+        {
+            style = ":name";
+
+            if (PS_return(DBIpp_ph_cs)) {
+                ;
+            }
+            else if (PS_return(DBIpp_ph_qm) /* ':name' -> '?'  */
+                 ||  PS_return(DBIpp_ph_sp) /* ':name' -> '%s' */
+            ) {
+                PS_return(DBIpp_ph_qm) ? sprintf(start,"?") : sprintf(start,"%%s");
+                dest = start + strlen(start);
+                while (isALNUM(*src))   /* consume name, includes '_'   */
+                    src++;
+            }
+        }
+        /* perhaps ':=' PL/SQL construct */
+        else { continue; }
+
+        *dest = '\0';                   /* handy for debugging  */
+
+        if (laststyle && style != laststyle) {
+            char buf[99];
+            sprintf(buf, "preparse found mixed placeholder styles (%s / %s)", style, laststyle);
+            set_err_char(dbh, imp_xxh, "1", 1, buf, 0, "preparse");
+            return &PL_sv_undef;
+        }
+        laststyle = style;
+    }
+    *dest = '\0';
+
+    /* warn about probable parsing errors, but continue anyway (returning processed string) */
+    switch (in_quote)
+    {
+    case '\'':
+            set_err_char(dbh, imp_xxh, "1", 1, "preparse found unterminated single-quoted string", 0, "preparse");
+            break;
+    case '\"':
+            set_err_char(dbh, imp_xxh, "1", 1, "preparse found unterminated double-quoted string", 0, "preparse");
+            break;
+    }
+    switch (in_comment)
+    {
+    case DBIpp_L_BRACE:
+            set_err_char(dbh, imp_xxh, "1", 1, "preparse found unterminated bracketed {...} comment", 0, "preparse");
+            break;
+    case '/':
+            set_err_char(dbh, imp_xxh, "1", 1, "preparse found unterminated bracketed C-style comment", 0, "preparse");
+            break;
+    }
+
+    SvCUR_set(new_stmt_sv, strlen(SvPVX(new_stmt_sv)));
+    *SvEND(new_stmt_sv) = '\0';
+    return new_stmt_sv;
+}
+
+
+/* -------------------------------------------------------------------- */
+/* The DBI Perl interface (via XS) starts here. Currently these are     */
+/* all internal support functions. Note install_method and see DBI.pm   */
+
+#line 4472 "DBI.c"
+#ifndef PERL_UNUSED_VAR
+#  define PERL_UNUSED_VAR(var) if (0) var = var
+#endif
+
+#ifndef dVAR
+#  define dVAR		dNOOP
+#endif
+
+
+/* This stuff is not part of the API! You have been warned. */
+#ifndef PERL_VERSION_DECIMAL
+#  define PERL_VERSION_DECIMAL(r,v,s) (r*1000000 + v*1000 + s)
+#endif
+#ifndef PERL_DECIMAL_VERSION
+#  define PERL_DECIMAL_VERSION \
+	  PERL_VERSION_DECIMAL(PERL_REVISION,PERL_VERSION,PERL_SUBVERSION)
+#endif
+#ifndef PERL_VERSION_GE
+#  define PERL_VERSION_GE(r,v,s) \
+	  (PERL_DECIMAL_VERSION >= PERL_VERSION_DECIMAL(r,v,s))
+#endif
+#ifndef PERL_VERSION_LE
+#  define PERL_VERSION_LE(r,v,s) \
+	  (PERL_DECIMAL_VERSION <= PERL_VERSION_DECIMAL(r,v,s))
+#endif
+
+/* XS_INTERNAL is the explicit static-linkage variant of the default
+ * XS macro.
+ *
+ * XS_EXTERNAL is the same as XS_INTERNAL except it does not include
+ * "STATIC", ie. it exports XSUB symbols. You probably don't want that
+ * for anything but the BOOT XSUB.
+ *
+ * See XSUB.h in core!
+ */
+
+
+/* TODO: This might be compatible further back than 5.10.0. */
+#if PERL_VERSION_GE(5, 10, 0) && PERL_VERSION_LE(5, 15, 1)
+#  undef XS_EXTERNAL
+#  undef XS_INTERNAL
+#  if defined(__CYGWIN__) && defined(USE_DYNAMIC_LOADING)
+#    define XS_EXTERNAL(name) __declspec(dllexport) XSPROTO(name)
+#    define XS_INTERNAL(name) STATIC XSPROTO(name)
+#  endif
+#  if defined(__SYMBIAN32__)
+#    define XS_EXTERNAL(name) EXPORT_C XSPROTO(name)
+#    define XS_INTERNAL(name) EXPORT_C STATIC XSPROTO(name)
+#  endif
+#  ifndef XS_EXTERNAL
+#    if defined(HASATTRIBUTE_UNUSED) && !defined(__cplusplus)
+#      define XS_EXTERNAL(name) void name(pTHX_ CV* cv __attribute__unused__)
+#      define XS_INTERNAL(name) STATIC void name(pTHX_ CV* cv __attribute__unused__)
+#    else
+#      ifdef __cplusplus
+#        define XS_EXTERNAL(name) extern "C" XSPROTO(name)
+#        define XS_INTERNAL(name) static XSPROTO(name)
+#      else
+#        define XS_EXTERNAL(name) XSPROTO(name)
+#        define XS_INTERNAL(name) STATIC XSPROTO(name)
+#      endif
+#    endif
+#  endif
+#endif
+
+/* perl >= 5.10.0 && perl <= 5.15.1 */
+
+
+/* The XS_EXTERNAL macro is used for functions that must not be static
+ * like the boot XSUB of a module. If perl didn't have an XS_EXTERNAL
+ * macro defined, the best we can do is assume XS is the same.
+ * Dito for XS_INTERNAL.
+ */
+#ifndef XS_EXTERNAL
+#  define XS_EXTERNAL(name) XS(name)
+#endif
+#ifndef XS_INTERNAL
+#  define XS_INTERNAL(name) XS(name)
+#endif
+
+/* Now, finally, after all this mess, we want an ExtUtils::ParseXS
+ * internal macro that we're free to redefine for varying linkage due
+ * to the EXPORT_XSUB_SYMBOLS XS keyword. This is internal, use
+ * XS_EXTERNAL(name) or XS_INTERNAL(name) in your code if you need to!
+ */
+
+#undef XS_EUPXS
+#if defined(PERL_EUPXS_ALWAYS_EXPORT)
+#  define XS_EUPXS(name) XS_EXTERNAL(name)
+#else
+   /* default to internal */
+#  define XS_EUPXS(name) XS_INTERNAL(name)
+#endif
+
+#ifndef PERL_ARGS_ASSERT_CROAK_XS_USAGE
+#define PERL_ARGS_ASSERT_CROAK_XS_USAGE assert(cv); assert(params)
+
+/* prototype to pass -Wmissing-prototypes */
+STATIC void
+S_croak_xs_usage(const CV *const cv, const char *const params);
+
+STATIC void
+S_croak_xs_usage(const CV *const cv, const char *const params)
+{
+    const GV *const gv = CvGV(cv);
+
+    PERL_ARGS_ASSERT_CROAK_XS_USAGE;
+
+    if (gv) {
+        const char *const gvname = GvNAME(gv);
+        const HV *const stash = GvSTASH(gv);
+        const char *const hvname = stash ? HvNAME(stash) : NULL;
+
+        if (hvname)
+	    Perl_croak_nocontext("Usage: %s::%s(%s)", hvname, gvname, params);
+        else
+	    Perl_croak_nocontext("Usage: %s(%s)", gvname, params);
+    } else {
+        /* Pants. I don't think that it should be possible to get here. */
+	Perl_croak_nocontext("Usage: CODE(0x%" UVxf ")(%s)", PTR2UV(cv), params);
+    }
+}
+#undef  PERL_ARGS_ASSERT_CROAK_XS_USAGE
+
+#define croak_xs_usage        S_croak_xs_usage
+
+#endif
+
+/* NOTE: the prototype of newXSproto() is different in versions of perls,
+ * so we define a portable version of newXSproto()
+ */
+#ifdef newXS_flags
+#define newXSproto_portable(name, c_impl, file, proto) newXS_flags(name, c_impl, file, proto, 0)
+#else
+#define newXSproto_portable(name, c_impl, file, proto) (PL_Sv=(SV*)newXS(name, c_impl, file), sv_setpv(PL_Sv, proto), (CV*)PL_Sv)
+#endif /* !defined(newXS_flags) */
+
+#if PERL_VERSION_LE(5, 21, 5)
+#  define newXS_deffile(a,b) Perl_newXS(aTHX_ a,b,file)
+#else
+#  define newXS_deffile(a,b) Perl_newXS_deffile(aTHX_ a,b)
+#endif
+
+#line 4616 "DBI.c"
+
+XS_EUPXS(XS_DBI_constant); /* prototype to pass -Wmissing-prototypes */
+XS_EUPXS(XS_DBI_constant)
+{
+    dVAR; dXSARGS;
+    dXSI32;
+    if (items != 0)
+       croak_xs_usage(cv,  "");
+    {
+	I32	RETVAL;
+	dXSTARG;
+#line 4570 "DBI.xs"
+    RETVAL = ix;
+#line 4630 "DBI.c"
+	XSprePUSH;
+	PUSHi((IV)RETVAL);
+    }
+    XSRETURN(1);
+}
+
+
+XS_EUPXS(XS_DBI__clone_dbis); /* prototype to pass -Wmissing-prototypes */
+XS_EUPXS(XS_DBI__clone_dbis)
+{
+    dVAR; dXSARGS;
+    if (items != 0)
+       croak_xs_usage(cv,  "");
+    {
+#line 4578 "DBI.xs"
+    dMY_CXT;
+    dbistate_t * parent_dbis = DBIS;
+
+    (void)cv;
+    {
+        MY_CXT_CLONE;
+    }
+    dbi_bootinit(parent_dbis);
+#line 4654 "DBI.c"
+    }
+    XSRETURN_EMPTY;
+}
+
+
+XS_EUPXS(XS_DBI__new_handle); /* prototype to pass -Wmissing-prototypes */
+XS_EUPXS(XS_DBI__new_handle)
+{
+    dVAR; dXSARGS;
+    if (items != 5)
+       croak_xs_usage(cv,  "class, parent, attr_ref, imp_datasv, imp_class");
+    PERL_UNUSED_VAR(ax); /* -Wall */
+    SP -= items;
+    {
+	SV *	class = ST(0)
+;
+	SV *	parent = ST(1)
+;
+	SV *	attr_ref = ST(2)
+;
+	SV *	imp_datasv = ST(3)
+;
+	SV *	imp_class = ST(4)
+;
+#line 4596 "DBI.xs"
+    dMY_CXT;
+    HV *outer;
+    SV *outer_ref;
+    HV *class_stash = gv_stashsv(class, GV_ADDWARN);
+
+    if (DBIS_TRACE_LEVEL >= 5) {
+        PerlIO_printf(DBILOGFP, "    New %s (for %s, parent=%s, id=%s)\n",
+            neatsvpv(class,0), SvPV_nolen(imp_class), neatsvpv(parent,0), neatsvpv(imp_datasv,0));
+        PERL_UNUSED_VAR(cv);
+    }
+
+    (void)hv_store((HV*)SvRV(attr_ref), "ImplementorClass", 16, SvREFCNT_inc(imp_class), 0);
+
+    /* make attr into inner handle by blessing it into class */
+    sv_bless(attr_ref, class_stash);
+    /* tie new outer hash to inner handle */
+    outer = newHV(); /* create new hash to be outer handle */
+    outer_ref = newRV_noinc((SV*)outer);
+    /* make outer hash into a handle by blessing it into class */
+    sv_bless(outer_ref, class_stash);
+    /* tie outer handle to inner handle */
+    sv_magic((SV*)outer, attr_ref, PERL_MAGIC_tied, Nullch, 0);
+
+    dbih_setup_handle(aTHX_ outer_ref, SvPV_nolen(imp_class), parent, SvOK(imp_datasv) ? imp_datasv : Nullsv);
+
+    /* return outer handle, plus inner handle if not in scalar context */
+    sv_2mortal(outer_ref);
+    EXTEND(SP, 2);
+    PUSHs(outer_ref);
+    if (GIMME_V != G_SCALAR) {
+        PUSHs(attr_ref);
+    }
+#line 4712 "DBI.c"
+	PUTBACK;
+	return;
+    }
+}
+
+
+XS_EUPXS(XS_DBI__setup_handle); /* prototype to pass -Wmissing-prototypes */
+XS_EUPXS(XS_DBI__setup_handle)
+{
+    dVAR; dXSARGS;
+    if (items != 4)

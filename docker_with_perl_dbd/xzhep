@@ -1,0 +1,1000 @@
+		last if not $_ or eof;
+	}
+	error("could not find Source: line in control file.") if not defined($sourcepackage);
+	if (%bd_fields) {
+		my ($dh_compat_bd, $final_level);
+		my %field2addon_type = (
+			'build-depends' => 'both',
+			'build-depends-arch' => 'arch',
+			'build-depends-indep' => 'indep',
+		);
+		for my $field (sort(keys(%bd_fields))) {
+			my $value = join(' ', @{$bd_fields{$field}});
+			$value =~ s/^\s*//;
+			$value =~ s/\s*(?:,\s*)?$//;
+			for my $dep (split(/\s*,\s*/, $value)) {
+				if ($dep =~ m/^debhelper-compat\s*[(]\s*=\s*(${PKGVERSION_REGEX})\s*[)]$/) {
+					my $version = $1;
+					if ($version =~m/^(\d+)\D.*$/) {
+						my $guessed_compat = $1;
+						warning("Please use the compat level as the exact version rather than the full version.");
+						warning("  Perhaps you meant: debhelper-compat (= ${guessed_compat})");
+						if ($field ne 'build-depends') {
+							warning(" * Also, please move the declaration to Build-Depends (it was found in ${field})");
+						}
+						error("Invalid compat level ${version}, derived from relation: ${dep}");
+					}
+					$final_level = $version;
+					error("Duplicate debhelper-compat build-dependency: ${dh_compat_bd} vs. ${dep}") if $dh_compat_bd;
+					error("The debhelper-compat build-dependency must be in the Build-Depends field (not $field)")
+						if $field ne 'build-depends';
+					$dh_compat_bd = $dep;
+				} elsif ($dep =~ m/^debhelper-compat\s*(?:\S.*)?$/) {
+					my $clevel = "${\MAX_COMPAT_LEVEL}";
+					eval {
+						require Debian::Debhelper::Dh_Version;
+						$clevel = $Debian::Debhelper::Dh_Version::version;
+					};
+					$clevel =~ s/^\d+\K\D.*$//;
+					warning("Found invalid debhelper-compat relation: ${dep}");
+					warning(" * Please format the relation as (example): debhelper-compat (= ${clevel})");
+					warning(" * Note that alternatives, architecture restrictions, build-profiles etc. are not supported.");
+					if ($field ne 'build-depends') {
+						warning(" * Also, please move the declaration to Build-Depends (it was found in ${field})");
+					}
+					warning(" * If this is not possible, then please remove the debhelper-compat relation and insert the");
+					warning("   compat level into the file debian/compat.  (E.g. \"echo ${clevel} > debian/compat\")");
+					error("Could not parse desired debhelper compat level from relation: $dep");
+				}
+				# Build-Depends on dh-sequence-<foo> OR dh-sequence-<foo> (<op> <version>)
+				if ($PARSE_DH_SEQUENCE_INFO and $dep =~ m/^dh-sequence-(${PKGNAME_REGEX})\s*(?:[(]\s*(?:[<>]?=|<<|>>)\s*(?:${PKGVERSION_REGEX})\s*[)])?(\s*[^\|]+[]>]\s*)?$/) {
+					my $sequence = $1;
+					my $has_profile_or_arch_restriction = $2 ? 1 : 0;
+					my $addon_type = $field2addon_type{$field};
+					if (not defined($field)) {
+						warning("Cannot map ${field} to an add-on type (like \"both\", \"indep\" or \"arch\")");
+						error("Internal error: Cannot satisfy dh sequence add-on request for sequence ${sequence} via ${field}.");
+					}
+					if (defined($dh_bd_sequences{$sequence})) {
+						error("Saw $dep multiple times (last time in $field).  However dh only support that build-"
+							. 'dependency at most once across all Build-Depends(-Arch|-Indep) fields');
+					}
+					if ($has_profile_or_arch_restriction) {
+						require Dpkg::Deps;
+						my $dpkg_dep = Dpkg::Deps::deps_parse($dep, build_profiles => \@profiles, build_dep => 1,
+							reduce_restrictions => 1);
+						# If dpkg reduces it to nothing, then it was not relevant for us after all
+						next if not $dpkg_dep;
+					}
+					$dh_bd_sequences{$sequence} = $addon_type;
+				}
+			}
+		}
+		$compat_from_bd = $final_level // -1;
+	} else {
+		$compat_from_bd = -1;
+	}
+
+	%seen_fields = ();
+	$field_name = undef;
+
+	while (<$fd>) {
+		chomp;
+		s/\s+$//;
+		if (m/^\#/) {
+			# Skip unless EOF for the special case where the last line
+			# is a comment line directly after the last stanza.  In
+			# that case we need to "commit" the last stanza as well or
+			# we end up omitting the last package.
+			next if not eof;
+			$_  = '';
+		}
+
+		if (/^\s/) {
+			# Continuation line
+			if (not %seen_fields) {
+				error("Continuation line seen outside stanza in debian/control (line $.)");
+			}
+			s/^\s[.]?//;
+			$field_values{$field_name} .= ' ' . $_;
+			# Ensure it is not completely empty or the code below will assume the paragraph ended
+			$_ = '.' if not $_;
+		} elsif (not $_ and not %seen_fields) {
+			# Ignore empty lines before first stanza
+			next;
+		} elsif ($_) {
+			my ($value);
+			if (m/^($DEB822_FIELD_REGEX):\s*(.*)/o) {
+				($field_name, $value) = (lc($1), $2);
+				if (exists($seen_fields{$field_name})) {
+					my $first_time = $seen_fields{$field_name};
+					error("${field_name}-field appears twice in the same stanza of debian/control. " .
+						  "First time on line $first_time, second time: $.");
+				}
+
+				if ($field_name =~ m/^(?:x[bc]*-)?package-type$/) {
+					# Normalize variants into the main "Package-Type" field
+					$field_name = 'package-type';
+					if (exists($seen_fields{$field_name})) {
+						my $package = _strip_spaces($field_values{'package'} // '');
+						my $help = "(issue seen prior \"Package\"-field)";
+						$help = "for package ${package}" if $package;
+						error("Multiple definitions of (X-)Package-Type in line $. ${help}");
+					}
+				}
+				$seen_fields{$field_name} = $.;
+				$field_values{$field_name} = $value;
+				$bd_field_value = undef;
+			} else {
+				# Invalid file
+				error("Parse error in debian/control, line $., read: $_");
+			}
+		}
+		if (!$_ or eof) { # end of stanza.
+			if (%field_values) {
+				my $package = _strip_spaces($field_values{'package'} // '');
+				my $build_profiles = $field_values{'build-profiles'};
+				my $included_in_build_profile = 1;
+				my $arch = _strip_spaces($field_values{'architecture'} // '');
+				my $cross_type = _strip_spaces($field_values{'x-dh-build-for-type'} // 'host');
+
+				# Detect duplicate package names in the same control file.
+				if ($package eq '') {
+					error("Binary paragraph ending on line $. is missing mandatory \"Package\"-field");
+				}
+				if (! $seen{$package}) {
+					$seen{$package}=1;
+				} else {
+					error("debian/control has a duplicate entry for $package");
+				}
+				if ($package !~ $valid_pkg_re) {
+					error('Package-field must be a valid package name, ' .
+						  "got: \"${package}\", should match \"${valid_pkg_re}\"");
+				}
+				if ($cross_type ne 'host' and $cross_type ne 'target') {
+					error("Unknown value of X-DH-Build-For-Type \"$cross_type\" for package $package");
+				}
+
+				$package_types{$package} = _strip_spaces($field_values{'package-type'} // 'deb');
+				$package_arches{$package} = $arch;
+				$package_multiarches{$package} = _strip_spaces($field_values{'multi-arch'} // '');
+				$package_sections{$package} = _strip_spaces($field_values{'section'} // $source_section);
+				$package_cross_type{$package} = $cross_type;
+				push(@{$packages_by_type{'all-listed-in-control-file'}}, $package);
+
+				if (defined($build_profiles)) {
+					eval {
+						# rely on libdpkg-perl providing the parsing functions
+						# because if we work on a package with a Build-Profiles
+						# field, then a high enough version of dpkg-dev is needed
+						# anyways
+						require Dpkg::BuildProfiles;
+						my @restrictions = Dpkg::BuildProfiles::parse_build_profiles($build_profiles);
+						if (@restrictions) {
+							$included_in_build_profile = Dpkg::BuildProfiles::evaluate_restriction_formula(
+								\@restrictions,
+								\@profiles);
+						}
+					};
+					if ($@) {
+						error("The control file has a Build-Profiles field. Requires libdpkg-perl >= 1.17.14");
+					}
+				}
+
+				if ($included_in_build_profile) {
+					if ($arch eq 'all') {
+						push(@{$packages_by_type{'indep'}}, $package);
+						push(@{$packages_by_type{'both'}}, $package);
+					} else {
+						my $included = 0;
+						$included = 1 if $arch eq 'any';
+						if (not $included) {
+							my $desired_arch = hostarch();
+							if ($cross_type eq 'target') {
+								$cross_target_arch //= dpkg_architecture_value('DEB_TARGET_ARCH');
+								$desired_arch = $cross_target_arch;
+							}
+							$included = 1 if samearch($desired_arch, $arch);
+						}
+						if ($included) {
+								push(@{$packages_by_type{'arch'}}, $package);
+								push(@{$packages_by_type{'both'}}, $package);
+						}
+					}
+				}
+			}
+			%field_values = ();
+			%seen_fields = ();
+		}
+	}
+	close($fd);
+}
+
+# Return true if we should use root.
+# - Takes an optional keyword; if passed, this will return true if the keyword is listed in R^3 (Rules-Requires-Root)
+# - If the optional keyword is omitted or not present in R^3 and R^3 is not 'binary-targets', then returns false
+# - Returns true otherwise (i.e. keyword is in R^3 or R^3 is 'binary-targets')
+sub should_use_root {
+	my ($keyword) = @_;
+	my $rrr_env = $ENV{'DEB_RULES_REQUIRES_ROOT'} // 'binary-targets';
+	$rrr_env =~ s/^\s++//;
+	$rrr_env =~ s/\s++$//;
+	return 0 if $rrr_env eq 'no';
+	return 1 if $rrr_env eq 'binary-targets';
+	return 0 if not defined($keyword);
+
+	state %rrr = map { $_ => 1 } split(' ', $rrr_env);
+	return 1 if exists($rrr{$keyword});
+	return 0;
+}
+
+# Returns the "gain root command" as a list suitable for passing as a part of the command to "doit()"
+sub gain_root_cmd {
+	my $raw_cmd = $ENV{DEB_GAIN_ROOT_CMD};
+	return if not defined($raw_cmd) or $raw_cmd =~ m/^\s*+$/;
+	return split(' ', $raw_cmd);
+}
+
+sub root_requirements {
+	my $rrr_env = $ENV{'DEB_RULES_REQUIRES_ROOT'} // 'binary-targets';
+	$rrr_env =~ s/^\s++//;
+	$rrr_env =~ s/\s++$//;
+	return 'none' if $rrr_env eq 'no';
+	return 'legacy-root' if $rrr_env eq 'binary-targets';
+	return 'targeted-promotion';
+}
+
+# Returns the arch a package will build for.
+#
+# Deprecated: please switch to the more descriptive
+# package_binary_arch function instead.
+sub package_arch {
+	my $package=shift;
+	return package_binary_arch($package);
+}
+
+# Returns the architecture going into the resulting .deb, i.e. the
+# host architecture or "all".
+sub package_binary_arch {
+	my $package=shift;
+
+	if (! exists $package_arches{$package}) {
+		warning "package $package is not in control info";
+		return hostarch();
+	}
+	return 'all' if $package_arches{$package} eq 'all';
+	return dpkg_architecture_value('DEB_TARGET_ARCH') if package_cross_type($package) eq 'target';
+	return hostarch();
+}
+
+# Returns the Architecture: value which the package declared.
+sub package_declared_arch {
+	my $package=shift;
+
+	if (! exists $package_arches{$package}) {
+		warning "package $package is not in control info";
+		return hostarch();
+	}
+	return $package_arches{$package};
+}
+
+# Returns whether the package specified Architecture: all
+sub package_is_arch_all {
+	my $package=shift;
+
+	if (! exists $package_arches{$package}) {
+		warning "package $package is not in control info";
+		return hostarch();
+	}
+	return $package_arches{$package} eq 'all';
+}
+
+# Returns the multiarch value of a package.
+sub package_multiarch {
+	my $package=shift;
+
+	# Test the architecture field instead, as it is common for a
+	# package to not have a multi-arch value.
+	if (! exists $package_arches{$package}) {
+		warning "package $package is not in control info";
+		# The only sane default
+		return 'no';
+	}
+	return $package_multiarches{$package} // 'no';
+}
+
+# Returns the (raw) section value of a package (possibly including component).
+sub package_section {
+	my ($package) = @_;
+
+	# Test the architecture field instead, as it is common for a
+	# package to not have a multi-arch value.
+	if (! exists $package_sections{$package}) {
+		warning "package $package is not in control info";
+		return 'unknown';
+	}
+	return $package_sections{$package} // 'unknown';
+}
+
+sub package_cross_type {
+	my ($package) = @_;
+
+	# Test the architecture field instead, as it is common for a
+	# package to not have a multi-arch value.
+	if (! exists $package_cross_type{$package}) {
+		warning "package $package is not in control info";
+		return 'host';
+	}
+	return $package_cross_type{$package} // 'host';
+}
+
+sub package_type {
+	my ($package) = @_;
+
+	if (! exists $package_types{$package}) {
+		warning "package $package is not in control info";
+		return DEFAULT_PACKAGE_TYPE;
+	}
+	return $package_types{$package};
+}
+
+# Return true if a given package is really a udeb.
+sub is_udeb {
+	my $package=shift;
+	
+	return package_type($package) eq 'udeb';
+}
+
+
+sub process_pkg {
+	my ($package) = @_;
+	state %packages_to_process = map { $_ => 1 } @{$dh{DOPACKAGES}};
+	return $packages_to_process{$package} // 0;
+}
+
+# Only useful for dh(1)
+sub bd_dh_sequences {
+	# Use $sourcepackage as check because %dh_bd_sequence can be empty
+	# after running getpackages().
+	getpackages() if not defined($sourcepackage);
+	return \%dh_bd_sequences;
+}
+
+sub _concat_slurp_script_files {
+	my (@files) = @_;
+	my $res = '';
+	for my $file (@files) {
+		open(my $fd, '<', $file) or error("open($file) failed: $!");
+		my $f = join('', <$fd>);
+		close($fd);
+		$res .= $f;
+	}
+	return $res;
+}
+
+sub _substitution_generator {
+	my ($input) = @_;
+	my $cache = {};
+	return sub {
+		my ($orig_key) = @_;
+		return $cache->{$orig_key} if exists($cache->{$orig_key});
+		my $value = exists($input->{$orig_key}) ? $input->{$orig_key} : undef;
+		if (not defined($value)) {
+			if ($orig_key =~ m/^DEB_(?:BUILD|HOST|TARGET)_/) {
+				$value = dpkg_architecture_value($orig_key);
+			} elsif ($orig_key =~ m{^ENV[.](\S+)$}) {
+				$value = $ENV{$1} // '';
+			}
+		} elsif (ref($value) eq 'CODE') {
+			$value = $value->($orig_key);
+		} elsif ($value =~ s/^@//) {
+			$value = _concat_slurp_script_files($value);
+		}
+		$cache->{$orig_key} = $value;
+		return $value;
+	};
+}
+
+sub debhelper_script_per_package_subst {
+	my ($package, $provided_subst) = @_;
+	my %vars = %{$provided_subst};
+	$vars{'PACKAGE'} = $package if not exists($vars{'PACKAGE'});
+	for my $var (keys(%{$provided_subst})) {
+		if ($var !~ $Debian::Debhelper::Dh_Lib::MAINTSCRIPT_TOKEN_REGEX) {
+			warning("User defined token ${var} does not match ${Debian::Debhelper::Dh_Lib::MAINTSCRIPT_TOKEN_REGEX}");
+			error("Invalid provided token ${var}: It cannot be substituted as it does not follow the token name rules");
+		}
+		if ($var =~ m/^pkg[.]\Q${package}\E[.](.+)$/) {
+			my $new_key = $1;
+			$vars{$new_key} = $provided_subst->{$var};
+		}
+	}
+	return \%vars;
+}
+
+
+# Handles #DEBHELPER# substitution in a script; also can generate a new
+# script from scratch if none exists but there is a .debhelper file for it.
+sub debhelper_script_subst {
+	my ($package, $script, $extra_vars) = @_;
+
+	my $tmp=tmpdir($package);
+	my $ext=pkgext($package);
+	my $file=pkgfile($package,$script);
+	my %variables = defined($extra_vars) ? %{$extra_vars} : ();
+	my $service_script = generated_file($package, "${script}.service", 0);
+	my @generated_scripts = ("debian/$ext$script.debhelper", $service_script);
+	my $subst;
+	@generated_scripts = grep { -f } @generated_scripts;
+	if ($script eq 'prerm' or $script eq 'postrm') {
+		@generated_scripts = reverse(@generated_scripts);
+	}
+	if (not exists($variables{'DEBHELPER'})) {
+		$variables{'DEBHELPER'} = sub {
+			return _concat_slurp_script_files(@generated_scripts);
+		};
+	}
+	$subst = _substitution_generator(\%variables);
+
+	if ($file ne '') {
+		if ($dh{VERBOSE}) {
+			verbose_print('cp -f ' . escape_shell($file) . " $tmp/DEBIAN/$script");
+			verbose_print("[META] Replace #TOKEN#s in \"$tmp/DEBIAN/$script\"");
+		}
+		if (not $dh{NO_ACT}) {
+			my $regex = qr{#(${MAINTSCRIPT_TOKEN_REGEX})#}o;
+			open(my $out_fd, '>', "$tmp/DEBIAN/$script") or error("open($tmp/DEBIAN/$script) failed: $!");
+			open(my $in_fd, '<', $file) or error("open($file) failed: $!");
+			while (my $line = <$in_fd>) {
+				$line =~ s{$regex}{$subst->($1) // "#${1}#"}ge;
+				print {$out_fd} $line;
+			}
+			close($in_fd);
+			close($out_fd) or error("close($tmp/DEBIAN/$script) failed: $!");
+		}
+		reset_perm_and_owner('0755', "$tmp/DEBIAN/$script");
+	}
+	elsif (@generated_scripts) {
+		if ($dh{VERBOSE}) {
+			verbose_print(q{printf '#!/bin/sh\nset -e\n' > } . "$tmp/DEBIAN/$script");
+			verbose_print("cat @generated_scripts >> $tmp/DEBIAN/$script");
+		}
+		if (not $dh{NO_ACT}) {
+			open(my $out_fd, '>', "$tmp/DEBIAN/$script") or error("open($tmp/DEBIAN/$script): $!");
+			print {$out_fd} "#!/bin/sh\n";
+			print {$out_fd} "set -e\n";
+			for my $generated_script (@generated_scripts) {
+				open(my $in_fd, '<', $generated_script)
+					or error("open($generated_script) failed: $!");
+				while (my $line = <$in_fd>) {
+					print {$out_fd} $line;
+				}
+				close($in_fd);
+			}
+			close($out_fd) or error("close($tmp/DEBIAN/$script) failed: $!");
+		}
+		reset_perm_and_owner('0755', "$tmp/DEBIAN/$script");
+	}
+}
+
+sub rm_files {
+	my @files = @_;
+	verbose_print('rm -f ' . escape_shell(@files))
+		if $dh{VERBOSE};
+	return 1 if $dh{NO_ACT};
+	for my $file (@files) {
+		if (not unlink($file) and $! != ENOENT) {
+			error("unlink $file failed: $!");
+		}
+	}
+	return 1;
+}
+
+sub make_symlink_raw_target {
+	my ($src, $dest) = @_;
+	verbose_print('ln -s ' . escape_shell($src, $dest))
+		if $dh{VERBOSE};
+	return 1 if $dh{NO_ACT};
+	if (not symlink($src, $dest)) {
+		error("symlink($src, $dest) failed: $!");
+	}
+	return 1;
+}
+
+# make_symlink($dest, $src[, $tmp]) creates a symlink from  $dest -> $src.
+# if $tmp is given, $dest will be created within it.
+# Usually $tmp should be the value of tmpdir($package);
+sub make_symlink{
+	my $dest = shift;
+	my $src = _expand_path(shift);
+	my $tmp = shift;
+	$tmp = '' if not defined($tmp);
+
+	if ($dest =~ m{(?:^|/)*[.]{2}(?:/|$)}) {
+		error("Invalid destination/link name (contains \"..\"-segments): $dest");
+	}
+
+	$src =~ s{^(?:[.]/+)++}{};
+	$dest =~ s{^(?:[.]/+)++}{};
+
+	$src=~s:^/++::;
+	$dest=~s:^/++::;
+
+	if ($src eq $dest) {
+		warning("skipping link from $src to self");
+		return;
+	}
+
+
+
+	# Policy says that if the link is all within one toplevel
+	# directory, it should be relative. If it's between
+	# top level directories, leave it absolute.
+	my @src_dirs = grep { $_ ne '.' } split(m:/+:,$src);
+	my @dest_dirs = grep { $_ ne '.' } split(m:/+:,$dest);
+	if (@src_dirs > 0 && $src_dirs[0] eq $dest_dirs[0]) {
+		# Figure out how much of a path $src and $dest
+		# share in common.
+		my $x;
+		for ($x=0; $x < @src_dirs && $src_dirs[$x] eq $dest_dirs[$x]; $x++) {}
+		# Build up the new src.
+		$src="";
+		for (1..$#dest_dirs - $x) {
+			$src.="../";
+		}
+		for ($x .. $#src_dirs) {
+			$src.=$src_dirs[$_]."/";
+		}
+		if ($x > $#src_dirs && ! length $src) {
+			$src="."; # special case
+		}
+		$src=~s:/$::;
+	}
+	else {
+		# Make sure it's properly absolute.
+		$src="/$src";
+	}
+
+	my $full_dest = "$tmp/$dest";
+	if ( -l $full_dest ) {
+		# All ok - we can always replace a link, and target directory must exists
+	} elsif (-d _) {
+		# We cannot replace a directory though
+		error("link destination $full_dest is a directory");
+	} else {
+		# Make sure the directory the link will be in exists.
+		my $basedir=dirname($full_dest);
+		install_dir($basedir);
+	}
+	rm_files($full_dest);
+	make_symlink_raw_target($src, $full_dest);
+}
+
+# _expand_path expands all path "." and ".." components, but doesn't
+# resolve symbolic links.
+sub _expand_path {
+	my $start = @_ ? shift : '.';
+	my @pathname = split(m:/+:,$start);
+	my @respath;
+	for my $entry (@pathname) {
+		if ($entry eq '.' || $entry eq '') {
+			# Do nothing
+		}
+		elsif ($entry eq '..') {
+			if ($#respath == -1) {
+				# Do nothing
+			}
+			else {
+				pop @respath;
+			}
+		}
+		else {
+			push @respath, $entry;
+		}
+	}
+
+	my $result;
+	for my $entry (@respath) {
+		$result .= '/' . $entry;
+	}
+	if (! defined $result) {
+		$result="/"; # special case
+	}
+	return $result;
+}
+
+# Checks if make's jobserver is enabled via MAKEFLAGS, but
+# the FD used to communicate with it is actually not available.
+sub is_make_jobserver_unavailable {
+	if (exists $ENV{MAKEFLAGS} && 
+	    $ENV{MAKEFLAGS} =~ /(?:^|\s)--jobserver-(?:fds|auth)=(\d+)/) {
+		if (!open(my $in, "<&$1")) {
+			return 1; # unavailable
+		}
+		else {
+			close $in;
+			return 0; # available
+		}
+	}
+
+	return; # no jobserver specified
+}
+
+# Cleans out jobserver options from MAKEFLAGS.
+sub clean_jobserver_makeflags {
+	if (exists $ENV{MAKEFLAGS}) {
+		if ($ENV{MAKEFLAGS} =~ /(?:^|\s)--jobserver-(?:fds|auth)=\d+/) {
+			$ENV{MAKEFLAGS} =~ s/(?:^|\s)--jobserver-(?:fds|auth)=\S+//g;
+			$ENV{MAKEFLAGS} =~ s/(?:^|\s)-j\b//g;
+		}
+		delete $ENV{MAKEFLAGS} if $ENV{MAKEFLAGS} =~ /^\s*$/;
+	}
+}
+
+# If cross-compiling, returns appropriate cross version of command.
+sub cross_command {
+	my ($package, $command) = @_;
+	if (package_cross_type($package) eq 'target') {
+		if (dpkg_architecture_value("DEB_HOST_GNU_TYPE") ne dpkg_architecture_value("DEB_TARGET_GNU_TYPE")) {
+			return dpkg_architecture_value("DEB_TARGET_GNU_TYPE") . "-$command";
+		}
+	}
+	if (is_cross_compiling()) {
+		return dpkg_architecture_value("DEB_HOST_GNU_TYPE")."-$command";
+	}
+	else {
+		return $command;
+	}
+}
+
+# Returns the SOURCE_DATE_EPOCH ENV variable if set OR computes it
+# from the latest changelog entry, sets the SOURCE_DATE_EPOCH ENV
+# variable and returns the computed value.
+sub get_source_date_epoch {
+	return $ENV{SOURCE_DATE_EPOCH} if exists($ENV{SOURCE_DATE_EPOCH});
+	_parse_non_binnmu_date_epoch();
+	return $ENV{SOURCE_DATE_EPOCH};
+}
+
+{
+	my $_non_binnmu_date_epoch;
+
+	# Needed for dh_strip_nondeterminism - not exported by default because it is not likely
+	# to be useful beyond that one helper.
+	sub get_non_binnmu_date_epoch {
+		return $_non_binnmu_date_epoch if defined($_non_binnmu_date_epoch);
+		_parse_non_binnmu_date_epoch();
+		return $_non_binnmu_date_epoch;
+	}
+
+	sub _parse_non_binnmu_date_epoch {
+		eval { require Dpkg::Changelog::Debian };
+		if ($@) {
+			warning "unable to set SOURCE_DATE_EPOCH: $@";
+			return;
+		}
+		eval { require Time::Piece };
+		if ($@) {
+			warning "unable to set SOURCE_DATE_EPOCH: $@";
+			return;
+		}
+
+		my $changelog = Dpkg::Changelog::Debian->new(range => {"count" => 2});
+		$changelog->load("debian/changelog");
+
+		my $first_entry = $changelog->[0];
+		my $non_binnmu_entry = $first_entry;
+		my $optional_fields = $first_entry->get_optional_fields();
+		my $first_tt = $first_entry->get_timestamp();
+		$first_tt =~ s/\s*\([^\)]+\)\s*$//; # Remove the optional timezone codename
+		my $first_timestamp = Time::Piece->strptime($first_tt, "%a, %d %b %Y %T %z")->epoch;
+		my $non_binnmu_timestamp = $first_timestamp;
+		if (exists($optional_fields->{'Binary-Only'}) and lc($optional_fields->{'Binary-Only'}) eq 'yes') {
+			$non_binnmu_entry = $changelog->[1];
+			my $non_binnmu_options = $non_binnmu_entry->get_optional_fields();
+			if (exists($non_binnmu_options->{'Binary-Only'}) and lc($non_binnmu_options->{'Binary-Only'}) eq 'yes') {
+				error("internal error: Could not locate the first non-binnmu entry in the change (assumed it would be the second entry)");
+			}
+			my $non_binnmu_tt = $non_binnmu_entry->get_timestamp();
+			$non_binnmu_tt =~ s/\s*\([^\)]+\)\s*$//; # Remove the optional timezone codename
+			$non_binnmu_timestamp = Time::Piece->strptime($non_binnmu_tt, "%a, %d %b %Y %T %z")->epoch();
+		}
+
+		$ENV{SOURCE_DATE_EPOCH} = $first_timestamp if not exists($ENV{SOURCE_DATE_EPOCH});
+		$_non_binnmu_date_epoch = $non_binnmu_timestamp;
+		return;
+	}
+}
+
+# Setup the build ENV by setting dpkg-buildflags (via set_buildflags()) plus
+# cleaning up HOME (etc) in compat 13+
+sub setup_buildenv {
+	set_buildflags();
+	if (not compat(12)) {
+		setup_home_and_xdg_dirs();
+	}
+}
+
+sub setup_home_and_xdg_dirs {
+	require Cwd;
+	my $cwd = Cwd::getcwd();
+	my $home_dir = join('/', $cwd, generated_file('_source', 'home', 0));
+	my @paths = (
+		$home_dir,
+	);
+	my @clear_env = qw(
+		XDG_CACHE_HOME
+		XDG_CONFIG_DIRS
+		XDG_CONFIG_HOME
+		XDG_DATA_HOME
+		XDG_DATA_DIRS
+		XDG_RUNTIME_DIR
+	);
+	mkdirs(@paths);
+	for my $envname (@clear_env) {
+		delete($ENV{$envname});
+	}
+	$ENV{'HOME'} = $home_dir;
+	return;
+}
+
+sub reset_buildflags {
+	eval { require Dpkg::BuildFlags };
+	if ($@) {
+		warning "unable to load build flags: $@";
+		return;
+	}
+	delete($ENV{'DH_INTERNAL_BUILDFLAGS'});
+	my $buildflags = Dpkg::BuildFlags->new();
+	foreach my $flag ($buildflags->list()) {
+		next unless $flag =~ /^[A-Z]/; # Skip flags starting with lowercase
+		delete($ENV{$flag});
+	}
+}
+
+# Sets environment variables from dpkg-buildflags. Avoids changing
+# any existing environment variables.
+sub set_buildflags {
+	return if $ENV{DH_INTERNAL_BUILDFLAGS};
+	$ENV{DH_INTERNAL_BUILDFLAGS}=1;
+
+	# For the side effect of computing the SOURCE_DATE_EPOCH variable.
+	get_source_date_epoch();
+
+	return if compat(8);
+
+	# Export PERL_USE_UNSAFE_INC as a transitional step to allow us
+	# to remove . from @INC by default without breaking packages which
+	# rely on this [CVE-2016-1238]
+	$ENV{PERL_USE_UNSAFE_INC} = 1 if compat(10);
+
+	eval { require Dpkg::BuildFlags };
+	if ($@) {
+		warning "unable to load build flags: $@";
+		return;
+	}
+
+	my $buildflags = Dpkg::BuildFlags->new();
+	$buildflags->load_config();
+	foreach my $flag ($buildflags->list()) {
+		next unless $flag =~ /^[A-Z]/; # Skip flags starting with lowercase
+		if (! exists $ENV{$flag}) {
+			$ENV{$flag} = $buildflags->get($flag);
+		}
+	}
+}
+
+# Gets a DEB_BUILD_OPTIONS option, if set.
+sub get_buildoption {
+	my ($wanted, $default) = @_;
+
+	return $default if not exists($ENV{DEB_BUILD_OPTIONS});
+
+	foreach my $opt (split(/\s+/, $ENV{DEB_BUILD_OPTIONS})) {
+		# currently parallel= is the only one with a parameter
+		if ($opt =~ /^parallel=(-?\d+)$/ && $wanted eq 'parallel') {
+			return $1;
+		} elsif ($opt =~ m/^dherroron=(\S*)$/ && $wanted eq 'dherroron') {
+			my $value = $1;
+			if ($value ne 'obsolete-compat-levels') {
+				warning("Unknown value \"${value}\" as parameter for \"dherroron\" seen in DEB_BUILD_OPTIONS");
+			}
+			return $value;
+		} elsif ($opt eq $wanted) {
+			return 1;
+		}
+	}
+	return $default;
+}
+
+# Returns true if DEB_BUILD_PROFILES lists the given profile.
+sub is_build_profile_active {
+	my ($wanted) = @_;
+	return 0 if not exists($ENV{DEB_BUILD_PROFILES});
+	for my $prof (split(m/\s+/, $ENV{DEB_BUILD_PROFILES})) {
+		return 1 if $prof eq $wanted;
+	}
+	return 0;
+}
+
+
+# Called when an executable config file failed.  It provides a more helpful error message in
+# some cases (especially when the file was not intended to be executable).
+sub _executable_dh_config_file_failed {
+	my ($source, $err, $proc_err) = @_;
+	error("Error closing fd/process for ${source}: $err") if $err;
+	# The interpreter did not like the file for some reason.
+	# Lets check if the maintainer intended it to be
+	# executable.
+	if (not is_so_or_exec_elf_file($source) and not _has_shebang_line($source)) {
+		warning("${source} is marked executable but does not appear to an executable config.");
+		warning();
+		warning("If ${source} is intended to be an executable config file, please ensure it can");
+		warning("be run as a stand-alone script/program (e.g. \"./${source}\")");
+		warning("Otherwise, please remove the executable bit from the file (e.g. chmod -x \"${source}\")");
+		warning();
+		warning('Please see "Executable debhelper config files" in debhelper(7) for more information.');
+		warning();
+	}
+	$? = $proc_err;
+	error_exitcode("${source} (executable config)");
+	return;
+}
+
+
+# install a dh config file (e.g. debian/<pkg>.lintian-overrides) into
+# the package.  Under compat 9+ it may execute the file and use its
+# output instead.
+#
+# install_dh_config_file(SOURCE, TARGET)
+sub install_dh_config_file {
+	my ($source, $target) = @_;
+
+	if (!compat(8) and -x $source) {
+		my @sstat = stat(_) || error("cannot stat $source: $!");
+		open(my $tfd, '>', $target) || error("cannot open $target: $!");
+		chmod(0644, $tfd) || error("cannot chmod $target: $!");
+		open(my $sfd, '-|', $source) || error("cannot run $source: $!");
+		while (my $line = <$sfd>) {
+			print ${tfd} $line;
+		}
+		if (!close($sfd)) {
+			_executable_dh_config_file_failed($source, $!, $?);
+		}
+		close($tfd) || error("cannot close $target: $!");
+		# Set the mtime (and atime) to ensure reproducibility.
+		utime($sstat[9], $sstat[9], $target);
+	} else {
+		install_file($source, $target);
+	}
+	return 1;
+}
+
+sub restore_file_on_clean {
+	my ($file) = @_;
+	my $bucket_index = 'debian/.debhelper/bucket/index';
+	my $bucket_dir = 'debian/.debhelper/bucket/files';
+	my $checksum;
+	mkdirs($bucket_dir);
+	if ($file =~ m{^/}) {
+		error("restore_file_on_clean requires a path relative to the package dir");
+	}
+	$file =~ s{^\./}{}g;
+	$file =~ s{//++}{}g;
+	if ($file =~ m{^\.} or $file =~ m{/CVS/} or $file =~ m{/\.svn/}) {
+		# We do not want to smash a Vcs repository by accident.
+		warning("Attempt to store $file, which looks like a VCS file or");
+		warning("a hidden package file (like quilt's \".pc\" directory)");
+		error("This tool probably contains a bug.");
+	}
+	if (-l $file or not -f _) {
+		error("Cannot store $file: Can only store regular files (no symlinks, etc.)");
+	}
+	require Digest::SHA;
+
+	$checksum = Digest::SHA->new('256')->addfile($file, 'b')->hexdigest;
+
+	if (not $dh{NO_ACT}) {
+		my ($in_index);
+		open(my $fd, '+>>', $bucket_index)
+			or error("open($bucket_index, a+) failed: $!");
+		seek($fd, 0, 0);
+		while (my $line = <$fd>) {
+			my ($cs, $stored_file);
+			chomp($line);
+			($cs, $stored_file) = split(m/ /, $line, 2);
+			next if ($stored_file ne $file);
+			$in_index = 1;
+		}
+		if (not $in_index) {
+			# Copy and then rename so we always have the full copy of
+			# the file in the correct place (if any at all).
+			doit('cp', '-an', '--reflink=auto', $file, "${bucket_dir}/${checksum}.tmp");
+			rename_path("${bucket_dir}/${checksum}.tmp", "${bucket_dir}/${checksum}");
+			print {$fd} "${checksum} ${file}\n";
+		}
+		close($fd) or error("close($bucket_index) failed: $!");
+	}
+
+	return 1;
+}
+
+sub restore_all_files {
+	my ($clear_index) = @_;
+	my $bucket_index = 'debian/.debhelper/bucket/index';
+	my $bucket_dir = 'debian/.debhelper/bucket/files';
+
+	return if not -f $bucket_index;
+	open(my $fd, '<', $bucket_index)
+		or error("open($bucket_index) failed: $!");
+
+	while (my $line = <$fd>) {
+		my ($cs, $stored_file, $bucket_file);
+		chomp($line);
+		($cs, $stored_file) = split(m/ /, $line, 2);
+		$bucket_file = "${bucket_dir}/${cs}";
+		# Restore by copy and then rename.  This ensures that:
+		# 1) If dh_clean is interrupted, we can always do a full restore again
+		#    (otherwise, we would be missing some of the files and have to handle
+		#     that with scary warnings)
+		# 2) The file is always fully restored or in its "pre-restore" state.
+		doit('cp', '-an', '--reflink=auto', $bucket_file, "${bucket_file}.tmp");
+		rename_path("${bucket_file}.tmp", $stored_file);
+	}
+	close($fd);
+	rm_files($bucket_index) if $clear_index;
+	return;
+}
+
+sub open_gz {
+	my ($file) = @_;
+	my $fd;
+	eval {
+		require PerlIO::gzip;
+	};
+	if ($@) {
+		open($fd, '-|', 'gzip', '-dc', $file)
+		  or error("gzip -dc $file failed: $!");
+	} else {
+		# Pass ":unix" as well due to https://rt.cpan.org/Public/Bug/Display.html?id=114557
+		# Alternatively, we could ensure we always use "POSIX::_exit".  Unfortunately,
+		# loading POSIX is insanely slow.
+		open($fd, '<:unix:gzip', $file)
+		  or error("open $file [<:unix:gzip] failed: $!");
+	}
+	return $fd;
+}
+
+sub deprecated_functionality {
+	my ($warning_msg, $compat_removal, $removal_msg) = @_;
+	if (defined($compat_removal) and not compat($compat_removal - 1)) {
+		my $msg = $removal_msg // $warning_msg;
+		warning($msg);
+		error("This feature was removed in compat ${compat_removal}.");
+	} else {
+		warning($warning_msg);
+		warning("This feature will be removed in compat ${compat_removal}.")
+		  if defined($compat_removal);
+	}
+	return 1;
+}
+
+sub log_installed_files {
+	my ($package, @patterns) = @_;
+
+	return if $dh{NO_ACT};
+	my $tool = $TOOL_NAME;
+	if (ref($package) eq 'HASH') {
+		my $options = $package;
+		$tool = $options->{'tool_name'} // error('Missing mandatory "tool_name" option for log_installed_files');
+		$package = $options->{'package'} // error('Missing mandatory "package" option for log_installed_files');
+	}
+
+	my $log = generated_file($package, 'installed-by-' . $tool);
+	open(my $fh, '>>', $log) or error("open $log: $!");
+	for my $src (@patterns) {
+		print $fh "$src\n";
+	}
+	close($fh) or error("close $log: $!");
+
+	return 1;

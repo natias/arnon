@@ -1,0 +1,1000 @@
+        # there were no conficts, mergestate was not stored
+        node = repo[b'.'].hex()
+
+    repo.ui.status(_(b"aborting the merge, updating back to %s\n") % node[:12])
+    stats = mergemod.clean_update(repo[node])
+    assert stats.unresolvedcount == 0
+    _showstats(repo, stats)
+
+
+def _incoming(
+    displaychlist,
+    subreporecurse,
+    ui,
+    repo,
+    source,
+    opts,
+    buffered=False,
+    subpath=None,
+):
+    """
+    Helper for incoming / gincoming.
+    displaychlist gets called with
+        (remoterepo, incomingchangesetlist, displayer) parameters,
+    and is supposed to contain only code that can't be unified.
+    """
+    srcs = urlutil.get_pull_paths(repo, ui, [source])
+    srcs = list(srcs)
+    if len(srcs) != 1:
+        msg = _(b'for now, incoming supports only a single source, %d provided')
+        msg %= len(srcs)
+        raise error.Abort(msg)
+    path = srcs[0]
+    source, branches = urlutil.parseurl(path.rawloc, opts.get(b'branch'))
+    if subpath is not None:
+        subpath = urlutil.url(subpath)
+        if subpath.isabs():
+            source = bytes(subpath)
+        else:
+            p = urlutil.url(source)
+            if p.islocal():
+                normpath = os.path.normpath
+            else:
+                normpath = posixpath.normpath
+            p.path = normpath(b'%s/%s' % (p.path, subpath))
+            source = bytes(p)
+    other = peer(repo, opts, source)
+    cleanupfn = other.close
+    try:
+        ui.status(_(b'comparing with %s\n') % urlutil.hidepassword(source))
+        revs, checkout = addbranchrevs(repo, other, branches, opts.get(b'rev'))
+
+        if revs:
+            revs = [other.lookup(rev) for rev in revs]
+        other, chlist, cleanupfn = bundlerepo.getremotechanges(
+            ui, repo, other, revs, opts.get(b"bundle"), opts.get(b"force")
+        )
+
+        if not chlist:
+            ui.status(_(b"no changes found\n"))
+            return subreporecurse()
+        ui.pager(b'incoming')
+        displayer = logcmdutil.changesetdisplayer(
+            ui, other, opts, buffered=buffered
+        )
+        displaychlist(other, chlist, displayer)
+        displayer.close()
+    finally:
+        cleanupfn()
+    subreporecurse()
+    return 0  # exit code is zero since we found incoming changes
+
+
+def incoming(ui, repo, source, opts, subpath=None):
+    def subreporecurse():
+        ret = 1
+        if opts.get(b'subrepos'):
+            ctx = repo[None]
+            for subpath in sorted(ctx.substate):
+                sub = ctx.sub(subpath)
+                ret = min(ret, sub.incoming(ui, source, opts))
+        return ret
+
+    def display(other, chlist, displayer):
+        limit = logcmdutil.getlimit(opts)
+        if opts.get(b'newest_first'):
+            chlist.reverse()
+        count = 0
+        for n in chlist:
+            if limit is not None and count >= limit:
+                break
+            parents = [
+                p for p in other.changelog.parents(n) if p != repo.nullid
+            ]
+            if opts.get(b'no_merges') and len(parents) == 2:
+                continue
+            count += 1
+            displayer.show(other[n])
+
+    return _incoming(
+        display, subreporecurse, ui, repo, source, opts, subpath=subpath
+    )
+
+
+def _outgoing(ui, repo, dests, opts, subpath=None):
+    out = set()
+    others = []
+    for path in urlutil.get_push_paths(repo, ui, dests):
+        dest = path.pushloc or path.loc
+        if subpath is not None:
+            subpath = urlutil.url(subpath)
+            if subpath.isabs():
+                dest = bytes(subpath)
+            else:
+                p = urlutil.url(dest)
+                if p.islocal():
+                    normpath = os.path.normpath
+                else:
+                    normpath = posixpath.normpath
+                p.path = normpath(b'%s/%s' % (p.path, subpath))
+                dest = bytes(p)
+        branches = path.branch, opts.get(b'branch') or []
+
+        ui.status(_(b'comparing with %s\n') % urlutil.hidepassword(dest))
+        revs, checkout = addbranchrevs(repo, repo, branches, opts.get(b'rev'))
+        if revs:
+            revs = [repo[rev].node() for rev in logcmdutil.revrange(repo, revs)]
+
+        other = peer(repo, opts, dest)
+        try:
+            outgoing = discovery.findcommonoutgoing(
+                repo, other, revs, force=opts.get(b'force')
+            )
+            o = outgoing.missing
+            out.update(o)
+            if not o:
+                scmutil.nochangesfound(repo.ui, repo, outgoing.excluded)
+            others.append(other)
+        except:  # re-raises
+            other.close()
+            raise
+    # make sure this is ordered by revision number
+    outgoing_revs = list(out)
+    cl = repo.changelog
+    outgoing_revs.sort(key=cl.rev)
+    return outgoing_revs, others
+
+
+def _outgoing_recurse(ui, repo, dests, opts):
+    ret = 1
+    if opts.get(b'subrepos'):
+        ctx = repo[None]
+        for subpath in sorted(ctx.substate):
+            sub = ctx.sub(subpath)
+            ret = min(ret, sub.outgoing(ui, dests, opts))
+    return ret
+
+
+def _outgoing_filter(repo, revs, opts):
+    """apply revision filtering/ordering option for outgoing"""
+    limit = logcmdutil.getlimit(opts)
+    no_merges = opts.get(b'no_merges')
+    if opts.get(b'newest_first'):
+        revs.reverse()
+    if limit is None and not no_merges:
+        for r in revs:
+            yield r
+        return
+
+    count = 0
+    cl = repo.changelog
+    for n in revs:
+        if limit is not None and count >= limit:
+            break
+        parents = [p for p in cl.parents(n) if p != repo.nullid]
+        if no_merges and len(parents) == 2:
+            continue
+        count += 1
+        yield n
+
+
+def outgoing(ui, repo, dests, opts, subpath=None):
+    if opts.get(b'graph'):
+        logcmdutil.checkunsupportedgraphflags([], opts)
+    o, others = _outgoing(ui, repo, dests, opts, subpath=subpath)
+    ret = 1
+    try:
+        if o:
+            ret = 0
+
+            if opts.get(b'graph'):
+                revdag = logcmdutil.graphrevs(repo, o, opts)
+                ui.pager(b'outgoing')
+                displayer = logcmdutil.changesetdisplayer(
+                    ui, repo, opts, buffered=True
+                )
+                logcmdutil.displaygraph(
+                    ui, repo, revdag, displayer, graphmod.asciiedges
+                )
+            else:
+                ui.pager(b'outgoing')
+                displayer = logcmdutil.changesetdisplayer(ui, repo, opts)
+                for n in _outgoing_filter(repo, o, opts):
+                    displayer.show(repo[n])
+                displayer.close()
+        for oth in others:
+            cmdutil.outgoinghooks(ui, repo, oth, opts, o)
+            ret = min(ret, _outgoing_recurse(ui, repo, dests, opts))
+        return ret  # exit code is zero since we found outgoing changes
+    finally:
+        for oth in others:
+            oth.close()
+
+
+def verify(repo, level=None):
+    """verify the consistency of a repository"""
+    ret = verifymod.verify(repo, level=level)
+
+    # Broken subrepo references in hidden csets don't seem worth worrying about,
+    # since they can't be pushed/pulled, and --hidden can be used if they are a
+    # concern.
+
+    # pathto() is needed for -R case
+    revs = repo.revs(
+        b"filelog(%s)", util.pathto(repo.root, repo.getcwd(), b'.hgsubstate')
+    )
+
+    if revs:
+        repo.ui.status(_(b'checking subrepo links\n'))
+        for rev in revs:
+            ctx = repo[rev]
+            try:
+                for subpath in ctx.substate:
+                    try:
+                        ret = (
+                            ctx.sub(subpath, allowcreate=False).verify() or ret
+                        )
+                    except error.RepoError as e:
+                        repo.ui.warn(b'%d: %s\n' % (rev, e))
+            except Exception:
+                repo.ui.warn(
+                    _(b'.hgsubstate is corrupt in revision %s\n')
+                    % short(ctx.node())
+                )
+
+    return ret
+
+
+def remoteui(src, opts):
+    """build a remote ui from ui or repo and opts"""
+    if util.safehasattr(src, b'baseui'):  # looks like a repository
+        dst = src.baseui.copy()  # drop repo-specific config
+        src = src.ui  # copy target options from repo
+    else:  # assume it's a global ui object
+        dst = src.copy()  # keep all global options
+
+    # copy ssh-specific options
+    for o in b'ssh', b'remotecmd':
+        v = opts.get(o) or src.config(b'ui', o)
+        if v:
+            dst.setconfig(b"ui", o, v, b'copied')
+
+    # copy bundle-specific options
+    r = src.config(b'bundle', b'mainreporoot')
+    if r:
+        dst.setconfig(b'bundle', b'mainreporoot', r, b'copied')
+
+    # copy selected local settings to the remote ui
+    for sect in (b'auth', b'hostfingerprints', b'hostsecurity', b'http_proxy'):
+        for key, val in src.configitems(sect):
+            dst.setconfig(sect, key, val, b'copied')
+    v = src.config(b'web', b'cacerts')
+    if v:
+        dst.setconfig(b'web', b'cacerts', util.expandpath(v), b'copied')
+
+    return dst
+
+
+# Files of interest
+# Used to check if the repository has changed looking at mtime and size of
+# these files.
+foi = [
+    (b'spath', b'00changelog.i'),
+    (b'spath', b'phaseroots'),  # ! phase can change content at the same size
+    (b'spath', b'obsstore'),
+    (b'path', b'bookmarks'),  # ! bookmark can change content at the same size
+]
+
+
+class cachedlocalrepo:
+    """Holds a localrepository that can be cached and reused."""
+
+    def __init__(self, repo):
+        """Create a new cached repo from an existing repo.
+
+        We assume the passed in repo was recently created. If the
+        repo has changed between when it was created and when it was
+        turned into a cache, it may not refresh properly.
+        """
+        assert isinstance(repo, localrepo.localrepository)
+        self._repo = repo
+        self._state, self.mtime = self._repostate()
+        self._filtername = repo.filtername
+
+    def fetch(self):
+        """Refresh (if necessary) and return a repository.
+
+        If the cached instance is out of date, it will be recreated
+        automatically and returned.
+
+        Returns a tuple of the repo and a boolean indicating whether a new
+        repo instance was created.
+        """
+        # We compare the mtimes and sizes of some well-known files to
+        # determine if the repo changed. This is not precise, as mtimes
+        # are susceptible to clock skew and imprecise filesystems and
+        # file content can change while maintaining the same size.
+
+        state, mtime = self._repostate()
+        if state == self._state:
+            return self._repo, False
+
+        repo = repository(self._repo.baseui, self._repo.url())
+        if self._filtername:
+            self._repo = repo.filtered(self._filtername)
+        else:
+            self._repo = repo.unfiltered()
+        self._state = state
+        self.mtime = mtime
+
+        return self._repo, True
+
+    def _repostate(self):
+        state = []
+        maxmtime = -1
+        for attr, fname in foi:
+            prefix = getattr(self._repo, attr)
+            p = os.path.join(prefix, fname)
+            try:
+                st = os.stat(p)
+            except OSError:
+                st = os.stat(prefix)
+            state.append((st[stat.ST_MTIME], st.st_size))
+            maxmtime = max(maxmtime, st[stat.ST_MTIME])
+
+        return tuple(state), maxmtime
+
+    def copy(self):
+        """Obtain a copy of this class instance.
+
+        A new localrepository instance is obtained. The new instance should be
+        completely independent of the original.
+        """
+        repo = repository(self._repo.baseui, self._repo.origroot)
+        if self._filtername:
+            repo = repo.filtered(self._filtername)
+        else:
+            repo = repo.unfiltered()
+        c = cachedlocalrepo(repo)
+        c._state = self._state
+        c.mtime = self.mtime
+        return c
+                                                                                                                                                                                                                                                                                                                                                     usr/lib/python3/dist-packages/mercurial/hgweb/                                                      0000755 0000000 0000000 00000000000 14714551121 020026  5                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        usr/lib/python3/dist-packages/mercurial/hgweb/__init__.py                                           0000644 0000000 0000000 00000006340 14355257011 022144  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        # hgweb/__init__.py - web interface to a mercurial repository
+#
+# Copyright 21 May 2005 - (c) 2005 Jake Edge <jake@edge2.net>
+# Copyright 2005 Olivia Mackall <olivia@selenic.com>
+#
+# This software may be used and distributed according to the terms of the
+# GNU General Public License version 2 or any later version.
+
+
+import os
+
+from ..i18n import _
+
+from .. import (
+    error,
+    pycompat,
+)
+
+from ..utils import procutil
+
+# pytype: disable=pyi-error
+from . import (
+    hgweb_mod,
+    hgwebdir_mod,
+    server,
+)
+
+# pytype: enable=pyi-error
+
+
+def hgweb(config, name=None, baseui=None):
+    """create an hgweb wsgi object
+
+    config can be one of:
+    - repo object (single repo view)
+    - path to repo (single repo view)
+    - path to config file (multi-repo view)
+    - dict of virtual:real pairs (multi-repo view)
+    - list of virtual:real tuples (multi-repo view)
+    """
+
+    if isinstance(config, str):
+        raise error.ProgrammingError(
+            b'Mercurial only supports encoded strings: %r' % config
+        )
+    if (
+        (isinstance(config, bytes) and not os.path.isdir(config))
+        or isinstance(config, dict)
+        or isinstance(config, list)
+    ):
+        # create a multi-dir interface
+        return hgwebdir_mod.hgwebdir(config, baseui=baseui)
+    return hgweb_mod.hgweb(config, name=name, baseui=baseui)
+
+
+def hgwebdir(config, baseui=None):
+    return hgwebdir_mod.hgwebdir(config, baseui=baseui)
+
+
+class httpservice:
+    def __init__(self, ui, app, opts):
+        self.ui = ui
+        self.app = app
+        self.opts = opts
+
+    def init(self):
+        procutil.setsignalhandler()
+        self.httpd = server.create_server(self.ui, self.app)
+
+        if (
+            self.opts[b'port']
+            and not self.ui.verbose
+            and not self.opts[b'print_url']
+        ):
+            return
+
+        if self.httpd.prefix:
+            prefix = self.httpd.prefix.strip(b'/') + b'/'
+        else:
+            prefix = b''
+
+        port = ':%d' % self.httpd.port
+        if port == ':80':
+            port = ''
+
+        bindaddr = self.httpd.addr
+        if bindaddr == '0.0.0.0':
+            bindaddr = '*'
+        elif ':' in bindaddr:  # IPv6
+            bindaddr = '[%s]' % bindaddr
+
+        fqaddr = self.httpd.fqaddr
+        if ':' in fqaddr:
+            fqaddr = '[%s]' % fqaddr
+
+        url = b'http://%s%s/%s' % (
+            pycompat.sysbytes(fqaddr),
+            pycompat.sysbytes(port),
+            prefix,
+        )
+        if self.opts[b'print_url']:
+            self.ui.write(b'%s\n' % url)
+        else:
+            if self.opts[b'port']:
+                write = self.ui.status
+            else:
+                write = self.ui.write
+            write(
+                _(b'listening at %s (bound to %s:%d)\n')
+                % (url, pycompat.sysbytes(bindaddr), self.httpd.port)
+            )
+        self.ui.flush()  # avoid buffering of status message
+
+    def run(self):
+        self.httpd.serve_forever()
+
+
+def createapp(baseui, repo, webconf):
+    if webconf:
+        return hgwebdir_mod.hgwebdir(webconf, baseui=baseui)
+    else:
+        if not repo:
+            raise error.RepoError(
+                _(b"there is no Mercurial repository here (.hg not found)")
+            )
+        return hgweb_mod.hgweb(repo, baseui=baseui)
+                                                                                                                                                                                                                                                                                                usr/lib/python3/dist-packages/mercurial/hgweb/__pycache__/                                          0000755 0000000 0000000 00000000000 14714551122 022237  5                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        usr/lib/python3/dist-packages/mercurial/hgweb/__pycache__/__init__.cpython-311.pyc                  0000644 0000000 0000000 00000011227 14714551122 026503  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        §
+    	^µcà  ã                   óz   — d dl Z ddlmZ ddlmZmZ ddlmZ ddlmZm	Z	m
+Z
+ dd„Zdd	„Z G d
+„ d¦  «        Zd„ ZdS )é    Né   )Ú_)ÚerrorÚpycompat)Úprocutilé   )Ú	hgweb_modÚhgwebdir_modÚserverc                 óp  — t          | t          ¦  «        rt          j        d| z  ¦  «        ‚t          | t          ¦  «        rt
+          j                             | ¦  «        r*t          | t          ¦  «        st          | t          ¦  «        rt          j        | |¬¦  «        S t          j        | ||¬¦  «        S )a  create an hgweb wsgi object
+
+    config can be one of:
+    - repo object (single repo view)
+    - path to repo (single repo view)
+    - path to config file (multi-repo view)
+    - dict of virtual:real pairs (multi-repo view)
+    - list of virtual:real tuples (multi-repo view)
+    s+   Mercurial only supports encoded strings: %r©Úbaseui)Únamer   )Ú
+isinstanceÚstrr   ÚProgrammingErrorÚbytesÚosÚpathÚisdirÚdictÚlistr
+   Úhgwebdirr	   Úhgweb)Úconfigr   r   s      ú:/usr/lib/python3/dist-packages/mercurial/hgweb/__init__.pyr   r      s²   € õ &#ÑÔğ 
+İÔ$Ø:¸VÑCñ
+ô 
+ğ 	
+õ 
+FEÑ	"Ô	"ğ<İ+-¬7¯=ª=¸Ñ+@Ô+@ğ<åfdÑ#Ô#ğ<õ fdÑ#Ô#ğ<õ Ô$ V°FĞ;Ñ;Ô;Ğ;İŒ?˜6¨°VĞ<Ñ<Ô<Ğ<ó    c                 ó.   — t          j        | |¬¦  «        S )Nr   )r
+   r   )r   r   s     r   r   r   8   s   € İÔ  °Ğ7Ñ7Ô7Ğ7r   c                   ó    — e Zd Zd„ Zd„ Zd„ ZdS )Úhttpservicec                 ó0   — || _         || _        || _        d S ©N)ÚuiÚappÚopts)Úselfr#   r$   r%   s       r   Ú__init__zhttpservice.__init__=   s   € ØˆŒØˆŒØˆŒ	ˆ	ˆ	r   c                 óZ  — t          j        ¦   «          t          j        | j        | j        ¦  «        | _        | j        d         r| j        j        s| j        d         sd S | j        j	        r#| j        j	         
+                    d¦  «        dz   }nd}d| j        j        z  }|dk    rd}| j        j        }|dk    rd	}n	d
+|v rd|z  }| j        j        }d
+|v rd|z  }dt          j        |¦  «        t          j        |¦  «        |fz  }| j        d         r| j                             d|z  ¦  «         n`| j        d         r| j        j        }n| j        j        } |t%          d¦  «        |t          j        |¦  «        | j        j        fz  ¦  «         | j                             ¦   «          d S )Ns   ports	   print_urló   /r   z:%dz:80Ú z0.0.0.0Ú*ú:z[%s]s   http://%s%s/%ss   %s
+s!   listening at %s (bound to %s:%d)
+)r   Úsetsignalhandlerr   Úcreate_serverr#   r$   Úhttpdr%   ÚverboseÚprefixÚstripÚportÚaddrÚfqaddrr   ÚsysbytesÚwriteÚstatusr   Úflush)r&   r1   r3   Úbindaddrr5   Úurlr7   s          r   Úinitzhttpservice.initB   sÆ  € İÔ!Ñ#Ô#Ğ#İÔ)¨$¬'°4´8Ñ<Ô<ˆŒ
+ğ ŒIgÔğ	à”G”Oğ	ğ ”I˜lÔ+ğ	ğ
+ ˆFàŒ:Ôğ 	Ø”ZÔ&×,Ò,¨TÑ2Ô2°TÑ9ˆFˆFàˆFàt”z”Ñ&ˆØ5Š=ˆ=ØˆDà”:”?ˆØyÒ Ğ ØˆHˆHØHˆ_ˆ_Ø Ñ(ˆHà”Ô"ˆØ&ˆ=ˆ=Ø˜f‘_ˆFàİÔ˜fÑ%Ô%İÔ˜dÑ#Ô#Øğ#
+ñ 
+ˆğ
+ Œ9\Ô"ğ 
+	ØŒGMŠM˜' C™-Ñ(Ô(Ğ(Ğ(àŒy˜Ô!ğ &ØœœàœœØˆEİĞ7Ñ8Ô8ØÔ)¨(Ñ3Ô3°T´Z´_ĞEñFñô ğ ğ 	ŒŠ‰Œˆˆˆr   c                 ó8   — | j                              ¦   «          d S r"   )r/   Úserve_forever)r&   s    r   Úrunzhttpservice.runr   s   € ØŒ
+× Ò Ñ"Ô"Ğ"Ğ"Ğ"r   N)Ú__name__Ú
+__module__Ú__qualname__r'   r<   r?   © r   r   r    r    <   sB   € € € € € ğğ ğ ğ
+.ğ .ğ .ğ`#ğ #ğ #ğ #ğ #r   r    c                 ó¤   — |rt          j        || ¬¦  «        S |s!t          j        t	          d¦  «        ¦  «        ‚t          j        || ¬¦  «        S )Nr   s5   there is no Mercurial repository here (.hg not found))r
+   r   r   Ú	RepoErrorr   r	   r   )r   ÚrepoÚwebconfs      r   Ú	createapprH   v   s_   € Øğ 4İÔ$ W°VĞ<Ñ<Ô<Ğ<àğ 	İ”/İĞJÑKÔKñô ğ õ Œ˜t¨FĞ3Ñ3Ô3Ğ3r   )NNr"   )r   Úi18nr   r*   r   r   Úutilsr   r	   r
+   r   r   r   r    rH   rC   r   r   ú<module>rK      sú   ğğ 
+€	€	€	à Ğ Ğ Ğ Ğ Ğ ğğ ğ ğ ğ ğ ğ ğ ğ
+ Ğ Ğ Ğ Ğ Ğ ğğ ğ ğ ğ ğ ğ ğ ğ ğ ğ=ğ =ğ =ğ =ğ28ğ 8ğ 8ğ 8ğ7#ğ 7#ğ 7#ğ 7#ğ 7#ñ 7#ô 7#ğ 7#ğt4ğ 4ğ 4ğ 4ğ 4r                                                                                                                                                                                                                                                                                                                                                                            usr/lib/python3/dist-packages/mercurial/hgweb/__pycache__/common.cpython-311.pyc                    0000644 0000000 0000000 00000026713 14714551122 026242  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        §
+    	^µcl#  ã                   ó  — d dl Z d dlZd dlZd dlZd dlZddlmZmZ ddlm	Z	mZm
+Z
+mZ ej        ZdZdZdZdZd	Zd
+ZdZdZdZdZdZd„ Zd„ ZegZ G d„ de¦  «        Z G d„ d¦  «        Zd„ Zdd„Zd„ Z d„ Z!d„ Z"d„ Z#d d„Z$d„ Z%d„ Z&dS )!é    Né   )ÚgetattrÚopen)ÚencodingÚpycompatÚ	templaterÚutiléÈ   éÉ   i0  i  i‘  i“  i”  i•  i–  iŸ  iô  c                 ó   — |dgk    p||v S )zÒCheck if username is a member of userlist.
+
+    If userlist has a single '*' member, all users are considered members.
+    Can be overridden by extensions to provide more complex authorization
+    schemes.
+    ó   *© )ÚuiÚusernameÚuserlists      ú8/usr/lib/python3/dist-packages/mercurial/hgweb/common.pyÚismemberr   *   s   € ğ ˜vÒĞ5 ¨XĞ!5Ğ5ó    c                 ó¶  — |j         }|                      dd¦  «        }|r2|rt          | j        j        ||¦  «        rt          t          d¦  «        ‚|                      dd¦  «        }|r0t          | j        j        ||¦  «        st          t          d¦  «        ‚|dk    r| j        st          t          d¦  «        ‚|dk    s|€dS |dk    r#|j        d	k    rd
+}t          t          |¦  «        ‚n"|j        dk    rd}t          t          |¦  «        ‚|  
+                    dd¦  «        r |j        dk    rt          t          d¦  «        ‚|                      dd¦  «        }|r2|rt          | j        j        ||¦  «        rt          t          d¦  «        ‚|                      dd¦  «        }|rt          | j        j        ||¦  «        st          t          d¦  «        ‚dS )zšCheck permission for operation based on request data (including
+    authentication info). Return if op allowed, else raise an ErrorResponse
+    exception.ó   webs	   deny_reads   read not authorizeds
+   allow_reads   pulls   pull not authorizedNs   uploads   PUTs   upload requires PUT requests   POSTs   push requires POST requests   push_ssls   httpss   ssl requireds	   deny_pushs   push not authorizeds
+   allow-push)Ú
+remoteuserÚ
+configlistr   Úrepor   ÚErrorResponseÚHTTP_UNAUTHORIZEDÚ	allowpullÚmethodÚHTTP_METHOD_NOT_ALLOWEDÚ
+configboolÚ	urlschemeÚHTTP_FORBIDDEN)	ÚhgwebÚreqÚopÚuserÚ	deny_readÚ
+allow_readÚmsgÚdenyÚallows	            r   Ú
+checkauthzr+   4   s  € ğ
+ Œ>€Dà× Ò  ¨Ñ6Ô6€IØğ G˜$ğ G¥(¨5¬:¬=¸$À	Ñ"JÔ"Jğ GİÕ-Ğ/EÑFÔFĞFà×!Ò! &¨-Ñ8Ô8€JØğ G8 E¤J¤M°4¸ÑDÔDğ GİÕ-Ğ/EÑFÔFĞFà	ˆW‚}€}˜Uœ_€}İÕ-Ğ/EÑFÔFĞFØ	ˆwŠˆ˜"˜*Øˆğ 
+ˆY‚€ØŒ:˜ÒĞØ0ˆCİÕ 7¸Ñ=Ô=Ğ=ğ  ğ 
+ŒwÒ	Ğ	Ø+ˆİÕ3°SÑ9Ô9Ğ9ğ ×Ò˜ Ñ,Ô,ğ =°´À(Ò1JĞ1JİN¨OÑ<Ô<Ğ<à×Ò˜F LÑ1Ô1€DØğ GTğ GX e¤j¤m°T¸4Ñ@Ô@ğ GİÕ-Ğ/EÑFÔFĞFà×Ò˜V ]Ñ3Ô3€EØğ G•h˜uœzœ}¨d°EÑ:Ô:ğ GİÕ-Ğ/EÑFÔFĞFğGğ Gr   c                   ó   — e Zd Zdd„ZdS )r   Nc                 ó´   — |€t          |¦  «        }t                               | t          j        |¦  «        ¦  «         || _        |€g }|| _        || _        d S ©N)Ú_statusmessageÚ	ExceptionÚ__init__r   ÚsysstrÚcodeÚheadersÚmessage)Úselfr3   r5   r4   s       r   r1   zErrorResponse.__init__k   sW   € Øˆ?İ$ TÑ*Ô*ˆGİ×Ò˜4¥¤°Ñ!9Ô!9Ñ:Ô:Ğ:ØˆŒ	Øˆ?ØˆGØˆŒØˆŒˆˆr   )NN)Ú__name__Ú
+__module__Ú__qualname__r1   r   r   r   r   r   j   s(   € € € € € ğğ ğ ğ ğ ğ r   r   c                   ó&   — e Zd ZdZd„ Zdd„Zd„ ZdS )Úcontinuereadera.  File object wrapper to handle HTTP 100-continue.
+
+    This is used by servers so they automatically handle Expect: 100-continue
+    request headers. On first read of the request body, the 100 Continue
+    response is sent. This should trigger the client into actually sending
+    the request body.
+    c                 ó0   — || _         || _        d| _        d S )NF)ÚfÚ_writeÚ	continued)r6   r=   Úwrites      r   r1   zcontinuereader.__init__   s   € ØˆŒØˆŒØˆŒˆˆr   éÿÿÿÿc                 ó|   — | j         sd| _         |                      d¦  «         | j                             |¦  «        S )NTs   HTTP/1.1 100 Continue
+
+)r?   r>   r=   Úread)r6   Úamts     r   rC   zcontinuereader.read„   s:   € ØŒ~ğ 	:Ø!ˆDŒNØKŠKĞ8Ñ9Ô9Ğ9ØŒv{Š{˜3ÑÔĞr   c                 óB   — |dv rt          | j        |¦  «        S t          ‚)N)s   closes   readlines	   readliness   __iter__)r   r=   ÚAttributeError)r6   Úattrs     r   Ú__getattr__zcontinuereader.__getattr__Š   s&   € ØĞEĞEĞEİ˜4œ6 4Ñ(Ô(Ğ(İĞr   N)rA   )r7   r8   r9   Ú__doc__r1   rC   rH   r   r   r   r;   r;   v   sP   € € € € € ğğ ğğ ğ ğ
+ ğ  ğ  ğ  ğğ ğ ğ ğ r   r;   c                 ó€   — t           j        j        }t          j        |                     | d¦  «        d         ¦  «        S )N)ÚErrorzUnknown errorr   )Ú
+httpserverÚbasehttprequesthandlerÚ	responsesr   ÚbytesurlÚget)r3   rN   s     r   r/   r/      s2   € İÔ1Ô;€IİÔ˜YŸ]š]¨4Ğ1KÑLÔLÈQÔOÑPÔPĞPr   c                 ó.   — d| |pt          | ¦  «        fz  S )Ns   %d %s)r/   )r3   r5   s     r   ÚstatusmessagerR   •   s   € Øt˜WĞ<­°tÑ(<Ô(<Ğ=Ñ=Ğ=r   c                 óĞ   — t           j                             | |¦  «        }t           j                             |¦  «        rt          j        |¦  «        S t          j        | ¦  «        S )z%stat fn if it exists, spath otherwise)ÚosÚpathÚjoinÚexistsÚstat)ÚspathÚfnÚcl_paths      r   Úget_statr\   ™   sK   € åŒglŠl˜5 "Ñ%Ô%€Gİ	„w‡~‚~gÑÔğ İŒwwÑÔĞåŒwu‰~Œ~Ğr   c                 óB   — t          | d¦  «        t          j                 S )Ns   00changelog.i)r\   rX   ÚST_MTIME)rY   s    r   Ú	get_mtimer_   ¢   s   € İEĞ+Ñ,Ô,­T¬]Ô;Ğ;r   c                 óÆ   — |                       d¦  «        }|D ]H}|dt          j        t          j        fv s(t          j        |v st          j        t          j        |v r dS ŒIdS )z9Determine if a path is safe to use for filesystem access.ó   /r   NFT)Úsplitr   ÚoscurdirÚospardirÚossepÚosaltsep)rU   ÚpartsÚparts      r   Ú
+ispathsaferi   ¦   sk   € àJŠJtÑÔ€EØğ ğ ˆàS(Ô+­XÔ->Ğ?Ğ?Ğ?İŒ~ Ğ%Ğ%İÔ Ğ,İÔ! TĞ)Ğ)à55øàˆ4r   c                 ó’  — t          |¦  «        sdS |s7| pt          j        ¦   «         }| t          j                             |d¦  «        }t          j        j        |                     d¦  «         }t          j        t          j
+        t          j        |¦  «        ¦  «        d         pd¦  «        }t          j                             ||¦  «        }	 t          j        |¦  «         t          |d¦  «        5 }|                     ¦   «         }	ddd¦  «         n# 1 swxY w Y   n…# t          $ r t!          t"          d¦  «        ‚t$          $ rZ}
+|
+j        t&          j        k    rt!          t*          ¦  «        ‚t!          t"          t-          j        |
+j        ¦  «        ¦  «        ‚d}
+~
+ww xY w||j        d<   |                     |	¦  «         |S )	a+  return a file inside directory with guessed Content-Type header
+
+    fname always uses '/' as directory separator and isn't allowed to
+    contain unusual path components.
+    Content-Type is guessed using the mimetypes module.
+    Return an empty string if fname is illegal or file not found.
+
+    Ns   staticra   r   z
+text/plains   rbs   illegal filenames   Content-Type)ri   r   ÚtemplatedirrT   rU   rV   rb   r   ÚsysbytesÚ	mimetypesÚ
+guess_typeÚfsdecoderX   r   rC   Ú	TypeErrorr   ÚHTTP_SERVER_ERRORÚOSErrorÚerrnoÚENOENTÚHTTP_NOT_FOUNDr   Ú
+strtolocalÚstrerrorr4   Úsetbodybytes)ÚtemplatepathÚ	directoryÚfnameÚresÚtpÚfpathÚctrU   ÚfhÚdataÚerrs              r   Ú
+staticfilerƒ   µ   sä  € õ eÑÔğ Øˆàğ 4ØĞ4YÔ2Ñ4Ô4ˆØˆ>İœŸš R¨Ñ3Ô3ˆIåŒGŒL˜%Ÿ+š+ dÑ+Ô+Ğ,€Eİ	Ô	İÔXÔ.¨uÑ5Ô5Ñ6Ô6°qÔ9ĞJ¸]ñ
+ô 
+€Bõ Œ7<Š<˜	 5Ñ)Ô)€Dğİ
+Œ‰Œˆİ$˜ÑÔğ 	 "Ø—7’7‘9”9ˆDğ	ğ 	ğ 	ñ 	ô 	ğ 	ğ 	ğ 	ğ 	ğ 	ğ 	øøøğ 	ğ 	ğ 	ğ 	øøåğ Dğ Dğ DİÕ-Ğ/BÑCÔCĞCİğ ğ ğ ØŒ9œÒ$Ğ$İ¥Ñ/Ô/Ğ/åİ!¥8Ô#6°s´|Ñ#DÔ#Dñô ğ øøøøğ	øøøğ $&€C„KÑ Ø×ÒTÑÔĞØ€Js=   Ã$D# Ã6DÄD# ÄDÄD# ÄDÄD# Ä#(F%ÅAF Æ F%c              #   ór   K  — | r|r| |z   | z  }| |z   | z  dz  }nd}d}	 |V — |dz  }| r|| k    rd|z
+  }d}Œ)z5count parity of horizontal stripes for easier readingé   r   r   )ÚstripecountÚoffsetÚcountÚparitys       r   Ú	paritygenrŠ   Ş   s€   è è € àğ vğ à˜vÑ%¨Ñ4ˆØ Ñ&¨;Ñ6¸Ñ:ˆˆàˆØˆğØˆˆˆØ‰
+ˆØğ 	˜5 KÒ/Ğ/Ø˜‘ZˆFØˆEğr   c                 ót   —  | dd¦  «        p, | dd¦  «        p t           j                             d¦  «        pdS )z¾Return repo contact information or empty string.
+
+    web.contact is the primary source, but if that is not set, try
+    ui.username or $EMAIL as a fallback to display something useful.
+    r   s   contacts   uis   usernames   EMAILr   )r   ÚenvironrP   )Úconfigs    r   Úget_contactr   ï   sO   € ğ 	ˆˆvzÑ"Ô"ğ 	Øˆ6%˜Ñ%Ô%ğ	åÔ×Ò Ñ)Ô)ğ	ğ ğ	r   c                 óú   — ddl }|                      ddd¬¦  «        }d}|rXd|v rTt          j        |                     ¦   «         j        ¦  «                             d¦  «        }|                     d|¦  «        }||fS )	a  Obtain the Content-Security-Policy header and nonce value.
+
+    Returns a 2-tuple of the CSP header value and the nonce value.
+
+    First value is ``None`` if CSP isn't enabled. Second value is ``None``
+    if CSP isn't enabled or if the CSP header doesn't need a nonce.
+    r   Nr   s   cspF)Ú	untrusteds   %nonce%ó   =)Úuuidr   Úbase64Úurlsafe_b64encodeÚuuid4ÚbytesÚrstripÚreplace)r   r’   ÚcspÚnonces       r   Ú	cspvaluesr›   ı   sƒ   € ğ. €K€K€Kğ )Š)F˜F¨eˆ)Ñ
+4Ô
+4€CØ€Eà
+ğ -ˆz˜SĞ Ğ İÔ(¨¯ª©¬Ô);Ñ<Ô<×CÒCÀDÑIÔIˆØkŠk˜* eÑ,Ô,ˆàˆ:Ğr   r.   )r   )'r“   rs   rm   rT   rX   r   r   r   Ú r   r   r	   rL   ÚHTTP_OKÚHTTP_CREATEDÚHTTP_NOT_MODIFIEDÚHTTP_BAD_REQUESTr   r!   ru   r   ÚHTTP_NOT_ACCEPTABLEÚHTTP_UNSUPPORTED_MEDIA_TYPErq   r   r+   Ú	permhooksr0   r   r;   r/   rR   r\   r_   ri   rƒ   rŠ   r   r›   r   r   r   ú<module>r¤      sş  ğğ €€€Ø €€€Ø Ğ Ğ Ğ Ø 	€	€	€	Ø €€€ğğ ğ ğ ğ ğ ğ ğ ğğ ğ ğ ğ ğ ğ ğ ğ ğ ğ ğ ğ Œ_€
+à
+€Ø€ØĞ ØĞ ØĞ Ø€Ø€ØĞ ØĞ Ø!Ğ ØĞ ğ6ğ 6ğ 6ğ)Gğ )Gğ )Gğf ˆL€	ğ	ğ 	ğ 	ğ 	ğ 	Iñ 	ô 	ğ 	ğğ ğ ğ ğ ñ ô ğ ğ4Qğ Qğ Qğ
+>ğ >ğ >ğ >ğğ ğ ğ<ğ <ğ <ğğ ğ ğ&ğ &ğ &ğRğ ğ ğ ğ"ğ ğ ğ"ğ "ğ "ğ "ğ "r                                                        usr/lib/python3/dist-packages/mercurial/hgweb/__pycache__/hgweb_mod.cpython-311.pyc                 0000644 0000000 0000000 00000056710 14714551122 026705  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        §
+    	^µc×F  ã                   óî   — d dl Z d dlZddlmZmZmZmZmZ ddlm	Z	 ddl
+mZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZ ddl
+mZmZmZmZ d„ Z dd	„Z!dd„Z" G d„ d¦  «        Z# G d„ d¦  «        Z$d„ Z%dS )é    Né   )ÚErrorResponseÚHTTP_BAD_REQUESTÚ	cspvaluesÚ	permhooksÚstatusmessageé   )Úgetattr)ÚencodingÚerrorÚ
+extensionsÚ	formatterÚhgÚhookÚ	profilingÚpycompatÚ	registrarÚrepoviewÚtemplatefiltersÚ	templaterÚtemplateutilÚuiÚutilÚwireprotoserver)ÚrequestÚwebcommandsÚwebutilÚwsgicgic                 óv   — | j                              dd ¦  «         |dd¦  «        df}|t          ||¦  «        fS )Nó   styleó   webs   paper)ÚqsparamsÚgetÚ	_stylemap)ÚreqÚconfigfnÚtemplatepathÚstyless       ú;/usr/lib/python3/dist-packages/mercurial/hgweb/hgweb_mod.pyÚgetstyler*   1   sG   € àŒ×Ò˜ 4Ñ(Ô(Øˆ˜Ñ"Ô"Øğ€Fğ
+ •9˜V \Ñ2Ô2Ğ2Ğ2ó    c                 óV  — | D ]•}|rB|t           j        t           j        fv s(t           j        |v st           j        rt           j        |v rŒGt
+          j                             |d¦  «        d|z   df}|D ]%}t          j	        ||¦  «        \  }}|r	|||fc c S Œ&Œ–t          d|z  ¦  «        ‚)z´Return path to mapfile for a given style.
+
+    Searches mapfile in the following locations:
+    1. templatepath/style/map
+    2. templatepath/map-style
+    3. templatepath/map
+    s   maps   map-s   No hgweb templates found in %r)r   ÚoscurdirÚospardirÚossepÚosaltsepÚosÚpathÚjoinr   Útry_open_templateÚRuntimeError)r(   r2   ÚstyleÚ	locationsÚlocationÚmapfileÚfps          r)   r$   r$   :   sâ   € ğ ğ *ğ *ˆğ ğ	àÔ*­HÔ,=Ğ>Ğ>Ğ>İŒ~ Ğ&Ğ&İÔ ğ 'åÔ! UĞ*Ğ*àİ”W—\’\ %¨Ñ0Ô0°'¸E±/À6ĞJˆ	à!ğ 	*ğ 	*ˆHİ#Ô5°hÀÑEÔE‰KˆGRØğ *Ø˜g rĞ)Ğ)Ğ)Ğ)Ğ)Ğ)ğ*ğ	*õ
+ Ğ8¸4Ñ?Ñ
+@Ô
+@Ğ@r+   r+   c                 ó°  — |                       d¦  «        r
+| dd…         } |rd|z   | z   } | }|                     d¦  «        r
+|dd…         }g }| }dg|                     d¦  «        z   }t          |¦  «        D ]?}|r|s n8|                     ||dœ¦  «         t
+          j                             |¦  «        }Œ@t          j	        t          |¦  «        ¦  «        S )zÆReturn a 'URL breadcrumb' list
+
+    A 'URL breadcrumb' is a list of URL-name pairs,
+    corresponding to each of the path items on a URL.
+    This can be used to create path navigation entries.
+    ó   /Néÿÿÿÿr   r+   )ó   urló   name)
+ÚendswithÚ
+startswithÚsplitÚreversedÚappendr1   r2   Údirnamer   Úmappinglist)ÚurlÚprefixÚrelpathÚ
+breadcrumbÚurlelÚ	pathitemsÚpathels          r)   ÚmakebreadcrumbrN   W   sú   € ğ ‡|‚|DÑÔğ Ø#2#ŒhˆØğ "ØV‰m˜cÑ!ˆØ€GØ×Ò˜$ÑÔğ Ø˜!˜"˜"”+ˆà€JØ€EØ˜Ÿš dÑ+Ô+Ñ+€Iİ˜9Ñ%Ô%ğ 'ğ 'ˆØğ 	˜Uğ 	ØˆEØ×Ò 5°6Ğ:Ğ:Ñ;Ô;Ğ;İ”—’ Ñ&Ô&ˆˆİÔ#¥H¨ZÑ$8Ô$8Ñ9Ô9Ğ9r+   c                   óB   — e Zd ZdZd„ Zd„ Zd„ Zd„ Zd„ Zd„ Z	d„ Z
+d	„ Zd
+S )ÚrequestcontextzòHolds state/context for an individual request.
+
+    Servers can be multi-threaded. Holding state on the WSGI application
+    is prone to race conditions. Instances of this class exist to hold
+    mutable and race-free state for requests.
+    c                 óô  — || _         |j        | _        || _        || _        |                      dd¦  «        | _        |                      dd¦  «        | _        |                      dd¦  «        | _        |                      dd¦  «        | _        |  	                    dd¦  «        | _
+        |                      ddd¬	¦  «        | _        |j        | _        t          | j         j        ¦  «        \  | _        | _        d S )
+Nr!   s
+   maxchangess   stripess   maxshortchangess   maxfiless
+   allow-pulls	   templatesF©Ú	untrusted)ÚrepoÚreponamer%   ÚresÚ	configintÚ
+maxchangesÚstripecountÚmaxshortchangesÚmaxfilesÚ
+configboolÚ	allowpullÚconfigr'   Úwebsubtabler   r   ÚcspÚnonce)ÚselfÚapprT   r%   rV   s        r)   Ú__init__zrequestcontext.__init__y   sÒ   € ØˆŒ	ØœˆŒØˆŒØˆŒàŸ.š.¨°Ñ?Ô?ˆŒØŸ>š>¨&°*Ñ=Ô=ˆÔØ#Ÿ~š~¨fĞ6HÑIÔIˆÔØŸš v¨{Ñ;Ô;ˆŒØŸš¨°Ñ?Ô?ˆŒğ
+ !ŸKšK¨°È˜KÑNÔNˆÔğ œ?ˆÔå(¨¬¬Ñ6Ô6ÑˆŒ$”***r+   c                 ó\   — |                      dd¦  «          | j        j        j        |i |¤S ©NrS   T)Ú
+setdefaultrT   r   r^   ©rb   ÚargsÚkwargss      r)   r^   zrequestcontext.config”   s4   € Ø×Ò˜+ tÑ,Ô,Ğ,Ø"ˆtŒyŒ|Ô" DĞ3¨FĞ3Ğ3Ğ3r+   c                 ó\   — |                      dd¦  «          | j        j        j        |i |¤S rf   )rg   rT   r   r\   rh   s      r)   r\   zrequestcontext.configbool˜   ó4   € Ø×Ò˜+ tÑ,Ô,Ğ,Ø&ˆtŒyŒ|Ô&¨Ğ7°Ğ7Ğ7Ğ7r+   c                 ó\   — |                      dd¦  «          | j        j        j        |i |¤S rf   )rg   rT   r   rW   rh   s      r)   rW   zrequestcontext.configintœ   s4   € Ø×Ò˜+ tÑ,Ô,Ğ,Ø%ˆtŒyŒ|Ô% tĞ6¨vĞ6Ğ6Ğ6r+   c                 ó\   — |                      dd¦  «          | j        j        j        |i |¤S rf   )rg   rT   r   Ú
+configlistrh   s      r)   ro   zrequestcontext.configlist    rl   r+   c                 ó@   — t          j        | j        j        |¦  «        S ©N)r   ÚarchivelistrT   r   )rb   Únodeids     r)   rr   zrequestcontext.archivelist¤   s   € İÔ" 4¤9¤<°Ñ8Ô8Ğ8r+   c                 óÔ  ‡ — ‰                       dd¦  «        }‰                       dd¦  «        }‰                       dd¦  «        p|j                             d¦  «        dz   }|                     d¦  «        s|dz  }i }t	          |‰ j         ‰ j        ¦  «        \  }\  }}}	||d         k    r||d<   t          j        |d	¦  «        }
+‰ j        s6‰                       dd
+d¦  «        p|j        p|j        p‰ j	        j
+        ‰ _        i }t          j        |¦  «        } |dt          ¬¦  «        ˆ fd„¦   «         }|j        dz   ||||j        ‰ j        t          j        |
+t!          |j        ¦  «        |‰ j        dœ}t          j        |¦  «        } |dd¬¦  «        ˆ fd„¦   «         }t'          j        ‰ j	        j        ‰ j	        ¦  «        }t,          j                             ||	|||¬¦  «        S )Nr!   ó   logourló   logoimgó	   staticurlr<   s   /static/r   r    ó   ?r?   r+   s   websub)Úintypec                 ó8   •— t          j        | ‰j        ¦  «        S rq   )r   Úwebsubr_   )Útextrb   s    €r)   Úwebsubfilterz.requestcontext.templater.<locals>.websubfilterÉ   s   ø€ å"Ô)¨$°Ô0@ÑAÔAĞAr+   )r>   ru   rv   rw   s   urlbases   repoó   encodings   sessionvarss   pathdefr    s   nonceó   motd© )Úrequiresc              3   ó<   •K  — ‰                      dd¦  «        V — d S )Nr!   r   )r^   )ÚcontextÚmappingrb   s     €r)   Úmotdz&requestcontext.templater.<locals>.motdŞ   s'   øè è € à—+’+˜f gÑ.Ô.Ğ.Ğ.Ğ.Ğ.Ğ.r+   )r:   ÚfiltersÚdefaultsÚ	resources)r^   ÚapppathÚrstripr@   r*   r'   r   ÚsessionvarsrU   rT   Úrootr   ÚtemplatefilterÚbytesÚadvertisedbaseurlr   rN   ra   Útemplatekeywordr   Útemplateresourcesr   r   Úfrommapfile)rb   r%   ÚlogourlÚlogoimgÚ	staticurlÚvarsr(   r6   r9   r:   r‹   r†   r   r}   r‡   r   r…   Útress   `                 r)   r   zrequestcontext.templater§   sC  ø€ ğ —+’+˜f jÑ1Ô1ˆØ—+’+˜f jÑ1Ô1ˆàKŠK˜ Ñ-Ô-ğ 6ØŒ{×!Ò! $Ñ'Ô'¨+Ñ5ğ 	ğ ×!Ò! $Ñ'Ô'ğ 	Ø˜ÑˆIğ ˆİ'/Ø”˜dÔ/ñ(
+ô (
+Ñ$ˆÑ$˜ ğ F˜1”IÒĞØ"ˆD‰NåÔ)¨$°Ñ5Ô5ˆàŒ}ğ 	à—’˜F G¨SÑ1Ô1ğ "Ø”<ğ"à”;ğ"ğ ”9”>ğ	 ŒMğ ˆİ"Ô1°'Ñ:Ô:ˆà	ˆ˜	­%Ğ	0Ñ	0Ô	0ğ	Bğ 	Bğ 	Bğ 	Bñ 
+1Ô	0ğ	Bğ ”K $Ñ&ØØØ#ØÔ-Ø”]İ!Ô*Ø'İ& s¤{Ñ3Ô3ØØ”jğ
+ğ 
+ˆõ $Ô3°HÑ=Ô=ˆà	ˆ˜¨2Ğ	.Ñ	.Ô	.ğ	/ğ 	/ğ 	/ğ 	/ñ 
+/Ô	.ğ	/õ Ô*¨4¬9¬<¸¼ÑCÔCˆİÔ"×.Ò.Ø˜ G°hÈ$ğ /ñ 
+ô 
+ğ 	
+r+   c                 óÂ   — t          j        |¦  «        }| j                             | j                             ||¦  «        ¦  «         | j                             ¦   «         S )z=Helper function to send a response generated from a template.)r   ÚbyteskwargsrV   Ú
+setbodygenÚtmplÚgenerateÚsendresponse)rb   Únamerj   s      r)   Úsendtemplatezrequestcontext.sendtemplateç   sN   € åÔ% fÑ-Ô-ˆØŒ×Ò˜DœI×.Ò.¨t°VÑ<Ô<Ñ=Ô=Ğ=ØŒx×$Ò$Ñ&Ô&Ğ&r+   N)Ú__name__Ú
+__module__Ú__qualname__Ú__doc__rd   r^   r\   rW   ro   rr   r   rŸ   r€   r+   r)   rP   rP   q   s—   € € € € € ğğ ğ7ğ 7ğ 7ğ64ğ 4ğ 4ğ8ğ 8ğ 8ğ7ğ 7ğ 7ğ8ğ 8ğ 8ğ9ğ 9ğ 9ğ>
+ğ >
+ğ >
+ğ@'ğ 'ğ 'ğ 'ğ 'r+   rP   c                   ó^   — e Zd ZdZdd„Zd„ Zej        d„ ¦   «         Zd„ Z	d„ Z
+d„ Zd	„ Zd
+„ ZdS )Úhgweba*  HTTP server for individual repositories.
+
+    Instances of this class serve HTTP responses for a particular
+    repository.
+
+    Instances are typically used as WSGI applications.
+
+    Some servers are multi-threaded. On these servers, there may
+    be multiple active threads inside __call__.
+    Nc                 ó&  — t          |t          ¦  «        rs|r|                     ¦   «         }nFt          j                             ¦   «         }t          j        |¦  «         t          j        |¦  «         t          j
+        ||¦  «        }n|}|j                             dddd¦  «         |j                             dddd¦  «         |j                             dddd¦  «         |j                             dddd¦  «         |j                             dd|j        d¦  «         |j                             dd|j        d¦  «         |j                             ddd	d¦  «         |j                             ddd	d¦  «         |j                             d
+ddd¦  «         |j                             d
+ddd¦  «         t          j        |                      |¦  «        ¦  «        g| _        | j        d         | _        t%          j        d¦  «         || _        d S )Ns   uis   report_untrusteds   offs   hgwebs   nonttys   trues   forcecwds   signal-safe-locks   falses   progresss   disabler   T)Ú
+isinstancer   ÚcopyÚuimodr   Úloadr   ÚloadallÚ
+populateuir   Ú
+repositoryÚ	setconfigÚbaseuirŒ   ÚcachedlocalrepoÚ_webifyrepoÚ_reposÚ	_lastrepor   ÚredirectrU   )rb   rT   r   r¯   ÚuÚrs         r)   rd   zhgweb.__init__ú   sÛ  € İdEÑ"Ô"ğ 
+	Øğ )Ø—K’K‘M”Må”H—M’M‘O”OİÔ" 1Ñ%Ô%Ğ%İÔ% aÑ(Ô(Ğ(İ”˜a Ñ&Ô&ˆAˆAğ ˆAà	ŒŠuĞ1°6¸8ÑDÔDĞDØ	Œ×Ò˜5Ğ"5°v¸xÑHÔHĞHØ	ŒŠu˜i¨°(Ñ;Ô;Ğ;Ø	Œ×Ò˜5 )¨W°hÑ?Ô?Ğ?à	ŒŠu˜k¨1¬6°8Ñ<Ô<Ğ<Ø	Œ×Ò˜5 +¨q¬v°xÑ@Ô@Ğ@ğ
+ 	
+ŒŠuĞ1°8¸XÑFÔFĞFØ	Œ×Ò˜5Ğ"5°xÀÑJÔJĞJğ 	
+ŒŠ{ J°¸ÑBÔBĞBØ	Œ×Ò˜;¨
+°G¸XÑFÔFĞFİÔ)¨$×*:Ò*:¸1Ñ*=Ô*=Ñ>Ô>Ğ?ˆŒØœ QœˆŒİŒdÑÔĞØˆŒˆˆr+   c                 óV   — t          |¦  «        }t          j        |¦  «        | _        |S rq   )Ú
+getwebviewr   Ú
+getwebsubsr_   )rb   rT   s     r)   r±   zhgweb._webifyrepo  s'   € İ˜$ÑÔˆİ"Ô-¨dÑ3Ô3ˆÔØˆr+   c              #   óª  K  — | j         r1| j                              ¦   «         }|                     ¦   «         \  }}n0| j                             ¦   «         }|                     ¦   «         \  }}|r|                      |¦  «        }|| _        |j        | _        	 |V — | j                              |¦  «         dS # | j                              |¦  «         w xY w)a  Obtain a repo unique to the caller.
+
+        Internally we maintain a stack of cachedlocalrepo instances
+        to be handed out. If one is available, we pop it and return it,
+        ensuring it is up to date in the process. If one is not available,
+        we clone the most recently used repo instance and return it.
+
+        It is currently possible for the stack to grow without bounds
+        if the server allows infinite threads. However, servers should
+        have a thread limit, thus establishing our limit.
+        N)r²   ÚpopÚfetchr³   r¨   r±   ÚmtimerD   )rb   Úcachedr¶   Úcreateds       r)   Ú_obtainrepozhgweb._obtainrepo"  sË   è è € ğ Œ;ğ 	(Ø”[—_’_Ñ&Ô&ˆFØŸš™œ‰JˆAˆwˆwà”^×(Ò(Ñ*Ô*ˆFØŸš™œ‰JˆAˆwØğ 	$Ø× Ò  Ñ#Ô#ˆAàˆŒØ”\ˆŒ
+ğ	'ØˆGˆGˆGàŒK×Ò˜vÑ&Ô&Ğ&Ğ&Ğ&øˆDŒK×Ò˜vÑ&Ô&Ğ&Ğ&øøøs   ÂB6 Â6Cc                 ó²   — t           j                             dd¦  «                             d¦  «        st	          d¦  «        ‚t          j        | ¦  «         dS )zStart a server from CGI environment.
+
+        Modern servers should be using WSGI and should avoid this
+        method, if possible.
+        s   GATEWAY_INTERFACEr+   s   CGI/1.sJ   This function is only intended to be called while running as a CGI script.N)r   Úenvironr#   rA   r5   r   Úlaunch)rb   s    r)   Úrunz	hgweb.run?  sd   € õ Ô×#Ò#Ğ$8¸#Ñ>Ô>×IÒIØñ
+ô 
+ğ 	õ ğ9ñô ğ õ 	ŒtÑÔĞĞĞr+   c                 ó€   — t          j        |¦  «        }t          j        ||¦  «        }|                      ||¦  «        S )zSRun the WSGI application.
+
+        This may be called by multiple threads.
+        )Ú
+requestmodÚparserequestfromenvÚwsgiresponseÚrun_wsgi)rb   ÚenvÚrespondr%   rV   s        r)   Ú__call__zhgweb.__call__N  s:   € õ
+ Ô,¨SÑ1Ô1ˆİÔ% c¨7Ñ3Ô3ˆà}Š}˜S #Ñ&Ô&Ğ&r+   c              #   ó>  K  — |                       ¦   «         5 }|j                             dd¦  «        }t          j        |j        |¬¦  «        5  |                      |||¦  «        D ]}|V — Œ	 ddd¦  «         n# 1 swxY w Y   ddd¦  «         dS # 1 swxY w Y   dS )zÆInternal method to run the WSGI application.
+
+        This is typically only called by Mercurial. External consumers
+        should be using instances of this class as the WSGI application.
+        s	   profilings   enabled)ÚenabledN)rÀ   r   r\   r   ÚprofileÚ_runwsgi)rb   r%   rV   rT   rÏ   r¶   s         r)   rÉ   zhgweb.run_wsgiX  s.  è è € ğ ×ÒÑÔğ 	 4Ø”g×(Ò(¨°zÑBÔBˆGİÔ" 4¤7°GĞ<Ñ<Ô<ğ ğ ØŸš s¨C°Ñ6Ô6ğ ğ AØGGGGğğğ ğ ñ ô ğ ğ ğ ğ ğ ğ øøøğ ğ ğ ğ ğ	ğ 	ğ 	ñ 	ô 	ğ 	ğ 	ğ 	ğ 	ğ 	ğ 	ğ 	øøøğ 	ğ 	ğ 	ğ 	ğ 	ğ 	s5   —7BÁA:Á.BÁ:A>	Á>BÂA>	ÂBÂBÂBc                 ó@  — t          | |||¦  «        }|                     dd¦  «        t          _        |j        |j        j        _        |j        r|j        |j        d<   t          j
+        |||| j        ¦  «        }|r|                     ¦   «         S |j        |j        }n9|j                             d¦  «        d                              d¦  «        d         }|                     dd¦  «        }d	|j        vrÁ|r¾|d         rµ|                     d¦  «        }|                     d
+¦  «        }	|	dk    r|d |	…         |j        d<   ||	dz   d …         }t)          j        t,          |¦  «        r
+||j        d	<   |dk    rd                     |¦  «        |j        d<   np|r;|d         r3|                     d¦  «                             dd¦  «        }
+|
+|j        d<   |r1d|j        v r|j        d= |D ]}|j                             d|¦  «         Œ|j                             dd¦  «        }|dk    rd|v r
+d|j        d<   |dk    rx|j        d         }t6          j                             ¦   «         D ]L\  }}|d         }|                     |¦  «        r*|d t?          |¦  «         …         |j        d<   ||j        d<   ŒMn|j                             d	d¦  «        }	 |                      |¦  «        |_!        |j!         "                    ddt          j        i¦  «        }|dk    r|                      ||d ¦  «         |dk    r0|j!         "                    di ¦  «        |j        d	<   |j        d	         }| #                    dd¦  «        rƒ|j$        s|d| j%        z  }|j                             d¦  «        |k    rJd|_&        	 |j        d= n# tN          $ r Y nw xY w| (                    d¦  «         |                     ¦   «         S ||j        d <   |t,          j)        vrd!|z  }tU          tV          |¦  «        ‚d"|_&        ||j        d<    tY          t,          |¦  «        |¦  «        S # tZ          j.        tZ          j/        f$ r}ta          j1        |¦  «        }t)          j        |d#¦  «        r$te          |tZ          j3        ¦  «        s
+d$|j4        z  }d%|_&        ||j        d<   | 5                    d&|¬'¦  «        cY d }~S d }~wtZ          j6        tZ          j7        f$ rD}d(|_&        ||j        d<   | 5                    d&ta          j1        |¦  «        ¬'¦  «        cY d }~S d }~wtZ          j8        $ r7}d)|_&        ||j        d<   | 5                    d&|j9        ¬'¦  «        cY d }~S d }~wtT          $ r€}|j        D ]\  }}||j        |<   Œtu          |j;        ta          j1        |¦  «        ¦  «        |_&        ||j        d<   | 5                    d&ta          j1        |¦  «        ¬'¦  «        cY d }~S d }~ww xY w)*Nr!   r~   s   Content-Security-Policyó   &r   ó   ;r<   r	   s   cmdó   -r=   r    r   s   statics   files   %2Fs   nodes
+   User-Agentr+   s   revs	   mercurials   raws   archives   types   mimetypes   defaults   caches   W/"%d"s   If-None-Matchs   304 Not Modifieds   Content-Types   ETags   no such method: %ss   200 Script output followsr?   s   revision not found: %ss   404 Not Founds   error)r   s   500 Internal Server Errors   403 Forbidden)<rP   r^   r   ÚrawenvrT   r   rÂ   r`   Úheadersr   ÚhandlewsgirequestÚ
+check_permr   ÚdispatchpathÚquerystringÚ	partitionrB   r"   r»   Úrfindr   Úsafehasattrr   r3   ÚreplaceÚaddr#   r   ÚarchivespecsÚitemsr@   Úlenr   r›   Úrenderr\   ra   r½   ÚstatusÚKeyErrorÚsetbodybytesÚ__all__r   r   r
+   r   ÚLookupErrorÚRepoLookupErrorr   Úbytestrr§   ÚManifestLookupErrorr   rŸ   Ú	RepoErrorÚStorageErrorÚAbortÚmessager   Úcode)rb   r%   rV   rT   ÚrctxÚhandledÚqueryri   Úcmdr6   ÚnodeÚaÚuaÚfnÚtype_ÚspecÚextÚctypeÚtagÚmsgÚerrÚeÚkÚvs                           r)   rĞ   zhgweb._runwsgid  s’  € İ˜d D¨#¨sÑ3Ô3ˆğ !ŸKšK¨°Ñ<Ô<ÔØ"œzˆŒ	ŒÔàŒ8ğ 	?ğ 7;´hˆCŒKĞ2Ñ3å!Ô3Ø#s˜DœOñ
+ô 
+ˆğ ğ 	&Ø×#Ò#Ñ%Ô%Ğ%ğ ÔĞ'ØÔ$ˆEˆEà”O×-Ò-¨dÑ3Ô3°AÔ6×@Ò@ÀÑFÔFÀqÔIˆEğ {Š{˜4 Ñ#Ô#ˆØ˜œĞ%Ñ%¨$Ñ%°4¸´7Ñ%Ø—(’(˜1‘+”+ˆCØ—I’I˜d‘O”OˆEØ˜Š{ˆ{Ø),¨V¨e¨V¬”˜XÑ&Ø˜% !™)˜+˜+Ô&õ Ô¥¨SÑ1Ô1ğ +Ø'*”˜VÑ$àiÒĞØ(,¯	ª	°$©¬”˜WÑ%Ğ%àğ 1˜D œGğ 1ØŸ8š8 A™;œ;×.Ò.¨v°tÑ<Ô<DØ,0C”L Ñ)Øğ 5Ø #¤,Ğ.Ğ.ØœL¨Ğ1Ø!ğ 5ğ 5˜Øœ×(Ò(¨°!Ñ4Ô4Ğ4Ğ4à”—’ °Ñ4Ô4ˆBØfŠ}ˆ} °Ğ!3Ğ!3Ø)/”˜XÑ&àjÒ Ğ Ø”\ 'Ô*İ#*Ô#7×#=Ò#=Ñ#?Ô#?ğ 6ğ 6‘KE˜4Ø˜qœ'CØ—{’{ 3Ñ'Ô'ğ 6Ø02°;µc¸#±h´h°Y°;´˜œ WÑ-Ø05˜œ WÑ-øøà”,×"Ò" 6¨3Ñ/Ô/ˆCğA	JØŸš sÑ+Ô+ˆDŒIØ”I×$Ò$Ø˜k­8Ô+<Ğ=ñô ˆEğ
+ iÒĞØ—’  c¨4Ñ0Ô0Ğ0àcŠzˆzØ'+¤y×'7Ò'7¸
+ÀBÑ'GÔ'G”˜VÑ$Ø”l 6Ô*ğ Š˜v xÑ0Ô0ğ +¸¼ğ +Ø $¤*Ñ,Ø”;—?’?Ğ#3Ñ4Ô4¸Ò;Ğ;Ø!4C”JğØœK¨Ğ8Ğ8øİ#ğ ğ ğ Ø˜ğøøøğ ×$Ò$ SÑ)Ô)Ğ)Ø×+Ò+Ñ-Ô-Ğ-à'*”˜GÑ$à+Ô-Ğ-Ğ-Ø+¨cÑ1İ#Õ$4°cÑ:Ô:Ğ:ğ :”
+Ø/4”˜OÑ,Ø0•w{¨CÑ0Ô0°Ñ6Ô6Ğ6øåÔ!¥5Ô#8Ğ9ğ 		:ğ 		:ğ 		:İÔ" 3Ñ'Ô'ˆCİÔ  WÑ-Ô-ğ ;µjØ•UÔ.ñ7ô 7ğ ;ğ 0°#´(Ñ:à)ˆCŒJØ+0ˆCŒK˜Ñ(Ø×$Ò$ X°SĞ$Ñ9Ô9Ğ9Ğ9Ğ9Ğ9Ğ9Ğ9øøøøİ”¥Ô!3Ğ4ğ 	Jğ 	Jğ 	JØ5ˆCŒJØ+0ˆCŒK˜Ñ(Ø×$Ò$ XµXÔ5EÀaÑ5HÔ5HĞ$ÑIÔIĞIĞIĞIĞIĞIĞIøøøøİŒ{ğ 	@ğ 	@ğ 	@Ø)ˆCŒJØ+0ˆCŒK˜Ñ(Ø×$Ò$ X°Q´YĞ$Ñ?Ô?Ğ?Ğ?Ğ?Ğ?Ğ?Ğ?øøøøİğ 	Jğ 	Jğ 	JØœ	ğ #ğ #‘1Ø!"”˜A‘İ& q¤v­xÔ/?ÀÑ/BÔ/BÑCÔCˆCŒJØ+0ˆCŒK˜Ñ(Ø×$Ò$ XµXÔ5EÀaÑ5HÔ5HĞ$ÑIÔIĞIĞIĞIĞIĞIĞIøøøøğ	Jøøøs‚   ËC Q Î7O  Î?Q Ï 
+OÏ
+Q ÏOÏ+Q Ï9A Q ÑXÑ5A4S/Ó)XÓ/XÔ9UÕXÕXÕ,VÖ
+XÖXÖA5XØXØXc                 ó4   — t           D ]} ||||¦  «         Œd S rq   )r   )rb   rñ   r%   ÚopÚpermhooks        r)   rØ   zhgweb.check_permì  s2   € İ!ğ 	$ğ 	$ˆHØˆHT˜3 Ñ#Ô#Ğ#Ğ#ğ	$ğ 	$r+   )NN)r    r¡   r¢   r£   rd   r±   Ú
+contextlibÚcontextmanagerrÀ   rÄ   rÌ   rÉ   rĞ   rØ   r€   r+   r)   r¥   r¥   î   s³   € € € € € ğ	ğ 	ğ!ğ !ğ !ğ !ğFğ ğ ğ
+ Ôğ'ğ 'ñ Ôğ'ğ8ğ ğ ğ'ğ 'ğ 'ğ
+ğ 
+ğ 
+ğFJğ FJğ FJğP$ğ $ğ $ğ $ğ $r+   r¥   c                 óà   — | j                              ddd¬¦  «        }|dk    r|                      ¦   «         S |t          j        v r|                      |¦  «        S |                      d¦  «        S )a   The 'web.view' config controls changeset filter to hgweb. Possible
+    values are ``served``, ``visible`` and ``all``. Default is ``served``.
+    The ``served`` filter only shows changesets that can be pulled from the
+    hgweb instance.  The``visible`` filter includes secret changesets but
+    still excludes "hidden" one.
+
+    See the repoview module for details.
+
+    The option has been around undocumented since Mercurial 2.5, but no
+    user ever asked about it. So we better keep it undocumented for now.r!   s   viewTrR   s   alls   served)r   r^   Ú
+unfilteredr   ÚfiltertableÚfiltered)rT   Ú
+viewconfigs     r)   r¸   r¸   ñ  sj   € ğ ”—’ ¨¸4Ñ@Ô@€JØVÒĞØŠÑ Ô Ğ Ø	•xÔ+Ğ	+Ğ	+Ø}Š}˜ZÑ(Ô(Ğ(à}Š}˜YÑ'Ô'Ğ'r+   rq   )r+   )&r  r1   Úcommonr   r   r   r   r   r   r
+   Ú r   r   r   r   r   r   r   r   r   r   r   r   r   r©   r   r   r   rÆ   r   r   r   r*   r$   rN   rP   r¥   r¸   r€   r+   r)   ú<module>r     s  ğğ Ğ Ğ Ğ Ø 	€	€	€	ğğ ğ ğ ğ ğ ğ ğ ğ ğ ğ ğ ğ ğ ğ Ğ Ğ Ğ Ğ Ğ ğğ ğ ğ ğ ğ ğ ğ ğ ğ ğ ğ ğ ğ ğ ğ ğ ğ ğ ğ ğ ğ ğ ğ ğ ğ ğ ğ ğ ğ ğ ğ ğ ğ ğ ğ ğ&ğ ğ ğ ğ ğ ğ ğ ğ ğ ğ ğ ğ3ğ 3ğ 3ğAğ Ağ Ağ Ağ::ğ :ğ :ğ :ğ4z'ğ z'ğ z'ğ z'ğ z'ñ z'ô z'ğ z'ğz@$ğ @$ğ @$ğ @$ğ @$ñ @$ô @$ğ @$ğF(ğ (ğ (ğ (ğ (r+                                                           usr/lib/python3/dist-packages/mercurial/hgweb/__pycache__/hgwebdir_mod.cpython-311.pyc              0000644 0000000 0000000 00000066374 14714551122 027413  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        §
+    	^µc˜O  ã                   ó  — d dl Z d dlZd dlZddlmZ ddlmZmZmZm	Z	m
+Z
+mZmZmZmZ ddlmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZ ddlm Z m!Z"m#Z#m$Z$ ddl%m&Z& d	„ Z'd
+„ Z(d„ Z)d„ Z*dd„Z+d„ Z,	 dd„Z- G d„ d¦  «        Z.dS )é    Né   )Ú_é   )	ÚErrorResponseÚHTTP_SERVER_ERRORÚ	cspvaluesÚget_contactÚ	get_mtimeÚismemberÚ	paritygenÚ
+staticfileÚstatusmessage)ÚconfigitemsÚencodingÚerrorÚ
+extensionsÚhgÚpathutilÚ	profilingÚpycompatÚrcutilÚ	registrarÚscmutilÚ	templaterÚtemplateutilÚuiÚutil)Ú	hgweb_modÚrequestÚwebutilÚwsgicgi)Údateutilc                 ó   — d„ | D ¦   «         S )Nc                 óf   — g | ].\  }}t          j        |¦  «                             d ¦  «        |f‘Œ/S )ó   /)r   ÚpconvertÚstrip)Ú.0ÚnameÚpaths      ú>/usr/lib/python3/dist-packages/mercurial/hgweb/hgwebdir_mod.pyú
+<listcomp>zcleannames.<locals>.<listcomp>8   s9   € ĞLĞLĞL¹
+¸¸dTŒ]˜4Ñ Ô ×&Ò& tÑ,Ô,¨dĞ3ĞLĞLĞLó    © )Úitemss    r+   Ú
+cleannamesr0   7   s   € ØLĞLÀeĞLÑLÔLĞLr-   c                 ó¸  — g }t          | ¦  «        D ]Ç\  }}t          j                             |¦  «        \  }}	 dddœ|         }n'# t          $ r |                     ||f¦  «         Y ŒWw xY wt          j                             t          j        |¦  «        ¦  «        }t          j
+        |d|¬¦  «        } |                     t          ||| ¦  «        ¦  «         ŒÈ|S )NFT)ó   *s   **)Ú	followsymÚrecurse)r0   Úosr*   ÚsplitÚKeyErrorÚappendÚnormpathr   Úabspathr   Ú	walkreposÚextendÚurlrepos)ÚpathsÚreposÚprefixÚrootÚrootheadÚroottailr4   s          r+   Ú	findreposrD   ;   sç   € Ø€Eİ" 5Ñ)Ô)ğ 8ğ 8‰ˆİœWŸ]š]¨4Ñ0Ô0Ñˆ(ğ
+	Ø"¨4Ğ0Ğ0°Ô:ˆGˆGøİğ 	ğ 	ğ 	ØLŠL˜& $˜Ñ(Ô(Ğ(ØˆHğ	øøøõ ”7×#Ò#¥D¤L°Ñ$:Ô$:Ñ;Ô;ˆİÔ! (°dÀGĞLÑLÔLˆØŠ•X˜f h°Ñ6Ô6Ñ7Ô7Ğ7Ğ7Ø€Ls   ºAÁ!A*Á)A*c              #   ó  K  — |D ]z}t           j                             |¦  «        }| dz   t          j        |t          |¦  «        d…         ¦  «                             d¦  «        z                        d¦  «        |fV — Œ{dS )a’  yield url paths and filesystem paths from a list of repo paths
+
+    >>> conv = lambda seq: [(v, util.pconvert(p)) for v,p in seq]
+    >>> conv(urlrepos(b'hg', b'/opt', [b'/opt/r', b'/opt/r/r', b'/opt']))
+    [('hg/r', '/opt/r'), ('hg/r/r', '/opt/r/r'), ('hg', '/opt')]
+    >>> conv(urlrepos(b'', b'/opt', [b'/opt/r', b'/opt/r/r', b'/opt']))
+    [('r', '/opt/r'), ('r/r', '/opt/r/r'), ('', '/opt')]
+    r%   N)r5   r*   r9   r   r&   ÚlenÚlstripr'   )r@   rB   r>   r*   s       r+   r=   r=   N   s   è è € ğ ğ ğ ˆİŒw×Ò Ñ%Ô%ˆàT‰MDœM¨$­s°8©}¬}¨¨Ô*?Ñ@Ô@×GÒGÈÑMÔMÑMß
+Š%‰+Œ+tğğ 	ğ 	ğ 	ğ 	ğğ r-   c                 óÌ   — |j         }|                      ddd¬¦  «        }|r|rt          | ||¦  «        rdS |                      ddd¬¦  «        }|rt          | ||¦  «        rdS dS )ağ  Check allow_read and deny_read config options of a repo's ui object
+    to determine user permissions.  By default, with neither option set (or
+    both empty), allow all users to read the repo.  There are two ways a
+    user can be denied read access:  (1) deny_read is not empty, and the
+    user is unauthenticated or deny_read contains user (or *), and (2)
+    allow_read is not empty and the user is not in allow_read.  Return True
+    if user is allowed to read the repo, else return False.ó   webs	   deny_readT©Ú	untrustedFs
+   allow_read)Ú
+remoteuserÚ
+configlistr   )r   ÚreqÚuserÚ	deny_readÚ
+allow_reads        r+   ÚreadallowedrR   ^   s…   € ğ Œ>€Dà—’˜f l¸dÑCÔC€IØğ ˜$ğ ¥(¨2¨t°YÑ"?Ô"?ğ Øˆuà—’˜v }ÀÑEÔE€Jàğ  " d¨JÑ7Ô7ğ Øˆtàˆ5r-   r-   c              #   ó.	  ‡K  — |                       dd¦  «        }|                       dd¦  «        }t          ¦   «         }t          ¦   «         }|D ]E\  }}	|                     |¦  «        sŒ|t          |¦  «        d …         }d}
+d|v r|sŒ<|                     d¦  «        }|d         }|sn{||v rŒa||v rnqd}
+|}d                     |dd …         ¦  «        }|	d t          |¦  «         dz
+  …         }		 t          j        | |	¦  «         d}
+n# t          t          j
+        f$ r Y nw xY w|j                             d¦  «        |                     d¦  «        |                     d¦  «        g}dd                     d	„ |D ¦   «         ¦  «        z   dz   }|
+r	 t          |	¦  «        t          j        ¦   «         d         f}n# t           $ r Y Œxw xY wd
+d
+|dz   ||d
+d
+||d         |d         z
+  t#          j        g ¦  «        dt#          j        g d¬¦  «        dœ}|                     |¦  «         |V — ŒŞ|                      ¦   «         Št-          j        ¦   «         ru	 ‰                     t2          j                             |	dd¦  «        ¦  «         n?# t6          $ r2}‰                     t;          d¦  «        |	|fz  ¦  «         Y d }~Œrd }~ww xY wt<          j        fˆfd„	}‰                      ddd¬¦  «        rŒ¥tA          ‰|¦  «        sŒ·	 t          j        | |	¦  «        }nl# t          $ r) ‰                     t;          d¦  «        |	z  ¦  «         Y Œ t          j
+        $ r) ‰                     t;          d¦  «        |	z  ¦  «         Y Œ6w xY w	 t          |j!        ¦  «        t          j        ¦   «         d         f}n# t           $ r Y Œvw xY wtE          |¦  «        } |dd¦  «        }|                     |¦  «          |dd|¦  «        }‰ #                    ddd¬¦  «        }|pd| $                    ¦   «         pd||||pd| $                    ¦   «         pd||d         |d         z
+  tK          j&        ‰d|¦  «        d t#          j        |d¬¦  «        dœ}|V — ŒGd S )NrI   s   descends   collapseFr%   r   Tr   c              3   ó   K  — | ]}|¯|V — Œ	d S ©Nr.   )r(   Úps     r+   ú	<genexpr>z"rawindexentries.<locals>.<genexpr>£   s'   è è € Ğ5Ğ5 Q°1Ğ5˜qĞ5Ğ5Ğ5Ğ5Ğ5Ğ5r-   r-   s   label)r)   )ó   contacts   contact_sortó   names	   name_sortó   urló   descriptions   description_sortó
+   lastchanges   lastchange_sorts   archivess   isdirectoryó   labelss   .hgs   hgrcs   error reading %s/.hg/hgrc: %s
+c                 ó6   •— ‰                      | ||d¬¦  «        S )NTrJ   )Úconfig)Úsectionr)   ÚdefaultÚus      €r+   Úgetzrawindexentries.<locals>.getÊ   s   ø€ Ø—8’8˜G T¨7¸d8ÑCÔCĞCr-   s   hiddenrJ   s!   error accessing repository at %s
+r[   rY   r]   s   unknowns   tip)'Ú
+configboolÚsetÚ
+startswithrF   r6   Újoinr   Ú
+repositoryÚIOErrorr   Ú	RepoErrorÚapppathr'   r
+   r"   ÚmakedateÚOSErrorr   ÚmappinglistÚ
+hybridlistÚaddÚcopyr   Úuse_repo_hgrcÚ
+readconfigr5   r*   Ú	ExceptionÚwarnr   ÚuimodÚ_unsetrR   Úspathr	   rM   Úupperr    Úarchivelist)r   r?   rN   ÚsubdirÚdescendÚcollapseÚ	seenreposÚseendirsr)   r*   Ú	directoryÚ	namepartsÚrootnameÚ	discardedÚpartsÚurlÚdÚrowÚerc   ÚrÚcontactÚdescriptionÚlabelsrb   s                           @r+   Úrawindexentriesr   u   s^  øè è € ØmŠm˜F JÑ/Ô/€GØ}Š}˜V [Ñ1Ô1€Hİ‘”€Iİ‰uŒu€HØğ {ñ {‰
+ˆˆdàŠ˜vÑ&Ô&ğ 	ØØ•C˜‘K”KMMÔ"ˆØˆ	à4ˆ<ˆ<Øğ ØàŸ
+š
+ 4Ñ(Ô(ˆIØ  ”|ˆHàğ ØØ˜XĞ%Ğ%ØØ˜YĞ&Ğ&Øà 	Øğ !ŸIšI i°°°¤mÑ4Ô4	ğ Ğ1s 9™~œ~˜o°Ñ1Ğ1Ô2ğİ”M " dÑ+Ô+Ğ+Ø %IIøİ¥¤Ğ1ğ ğ ğ ØDğøøøğ ŒK×Ò˜dÑ#Ô#ØLŠL˜ÑÔØJŠJtÑÔğ
+ˆğ
+ T—Y’YĞ5Ğ5¨%Ğ5Ñ5Ô5Ñ5Ô5Ñ5¸Ñ<ˆğ ğ 	ğİ˜t‘_”_¥hÔ&7Ñ&9Ô&9¸!Ô&<Ğ=øİğ ğ ğ Ø‘ğøøøğ  Ø!$Ø ™Ø"ØØ #Ø%(Ø Ø$% a¤D¨1¨Q¬4¡Kİ)Ô5°bÑ9Ô9Ø $İ'Ô2°2¸HĞEÑEÔEğğ ˆCğ LŠL˜ÑÔĞØˆIˆIˆIÙàGŠG‰IŒIˆİÔÑ!Ô!ğ 	ğØ—’RœWŸ\š\¨$°¸Ñ@Ô@ÑAÔAĞAĞAøİğ ğ ğ Ø—’•qĞ;Ñ<Ô<ÀÀa¸yÑHÑIÔIĞIØ‘øøøøğøøøõ (-¤|ğ 	Dğ 	Dğ 	Dğ 	Dğ 	Dğ 	Dğ <Š<˜ 	°Tˆ<Ñ:Ô:ğ 	Ùå˜1˜cÑ"Ô"ğ 	Ùğ	İ”˜b $Ñ'Ô'ˆAˆAøİğ 	ğ 	ğ 	ØFŠF•1Ğ:Ñ;Ô;¸dÑBÑCÔCĞCØ‰HİŒğ 	ğ 	ğ 	ØFŠF•1Ğ:Ñ;Ô;¸dÑBÑCÔCĞCØ‰Hğ	øøøğ	İ˜1œ7Ñ#Ô#¥XÔ%6Ñ%8Ô%8¸Ô%;Ğ<ˆAˆAøİğ 	ğ 	ğ 	Ø‰Hğ	øøøõ ˜cÑ"Ô"ˆØc˜& .Ñ1Ô1ˆØŠdÑÔĞØˆs6˜7 DÑ)Ô)ˆØ—’˜f i¸4Ñ@Ô@ˆàĞ- :Ø$Ÿ]š]™_œ_Ğ:°
+ØØØØ'Ğ5¨:Ø!,×!2Ò!2Ñ!4Ô!4Ğ!B¸
+ØØ ! !¤ q¨¤t¡İ Ô,¨Q°¸Ñ<Ô<Ø İ#Ô.¨v¸HĞEÑEÔEğ
+ğ 
+ˆğ ˆ	ˆ	ˆ	‰	ğw{ğ {sf   Ã1D	Ä	D"Ä!D"Æ(F9Æ9
+GÇGÉ4J	Ê	
+KÊ'K Ë KÌLÌ/NÍ3NÎNÎ	-N7Î7
+OÏOc              #   óÖ   ‡K  — t          ||||¬¦  «        }d}	|r"|	||fk    rd|z  Št          |ˆfd„|¬¦  «        }t          |t          |¦  «        ¦  «        D ]\  }
+}||
+d<   |
+V — Œd S )N)r{   ©NFs   %s_sortc                 ó   •— | ‰         S rU   r.   )ÚxÚsortkeys    €r+   ú<lambda>z"_indexentriesgen.<locals>.<lambda>  s   ø€ ¨!¨G¬*€ r-   )ÚkeyÚreverses   parity)r   ÚsortedÚzipr   )Úcontextr   r?   rN   ÚstripecountÚ
+sortcolumnÚ
+descendingr{   ÚrowsÚsortdefaultr‡   Úparityr’   s               @r+   Ú_indexentriesgenrŸ   ø   s§   øè è € õ ˜2˜u c°&Ğ9Ñ9Ô9€Dà€Kàğ Jk j°*Ğ%=Ò=Ğ=Ø˜zÑ)ˆİdĞ 4Ğ 4Ğ 4Ğ 4¸jĞIÑIÔIˆå˜4¥¨;Ñ!7Ô!7Ñ8Ô8ğ ğ ‰ˆˆVØˆˆI‰Øˆ	ˆ	ˆ	ˆ	ğğ r-   Fc                 óJ   — | ||||||f}t          j        t          |¬¦  «        S )N)Úargs)r   ÚmappinggeneratorrŸ   )r   r?   rN   r™   rš   r›   r{   r¡   s           r+   Úindexentriesr£     s/   € ğ s˜K¨°ZÀĞH€DİÔ(Õ)9ÀĞEÑEÔEĞEr-   c                   óF   — e Zd ZdZdd„Zd„ Zd„ Zd„ Zd„ Zd„ Z	dd
+„Z
+d„ ZdS )ÚhgwebdirzÈHTTP server for multiple repositories.
+
+    Given a configuration, different repositories will be served depending
+    on the request path.
+
+    Instances are typically used as WSGI applications.
+    Nc                 óî   — || _         || _        d | _        d| _        d | _        |                      ¦   «          d| _        |s4t          j        | j        ¦  «         t          j	        | j        ¦  «         d S d S )Nr   )
+ÚconfÚbaseuir   ÚlastrefreshÚmotdÚrefreshÚrequests_countr   ÚloadallÚ
+populateui)Úselfr§   r¨   s      r+   Ú__init__zhgwebdir.__init__  sy   € ØˆŒ	ØˆŒØˆŒØˆÔØˆŒ	ØŠ‰ŒˆØˆÔØğ 	+åÔ˜tœwÑ'Ô'Ğ'İÔ! $¤'Ñ*Ô*Ğ*Ğ*Ğ*ğ	+ğ 	+r-   c                 óô  — | j         r| j                              dd¦  «        }nt          j        d         d         }|j        }|dk    r!| j        |z   t          j        ¦   «         k    rd S | j        r| j                             ¦   «         }nft          j          
+                    ¦   «         }|                     dddd¦  «         |                     ddd	d¦  «         |                     d
+dd	d¦  «         t          | j        t          t          t           f¦  «        s¼ddi}t"          j                             | j        ¦  «        s)t)          j        t-          d¦  «        | j        z  ¦  «        ‚|                     | j        |d¬¦  «         g }|                     d¦  «        D ]5\  }}|                     d|¦  «        D ]}|                     ||f¦  «         ŒŒ6n\t          | j        t          t           f¦  «        r| j        }n3t          | j        t          ¦  «        r| j                             ¦   «         }t7          j        |¦  «         t;          |¦  «        }	|                     d¦  «        D ]»\  }
+}t=          j        |
+¦  «        }
+tA          j!        |d¬¦  «        D ]‹}t"          j         "                    |¦  «        }t=          j        |¦  «        }| #                    |
+¦  «        r|tI          |
+¦  «        d …         }|	                     | %                    d¦  «        |f¦  «         ŒŒŒ¼|	| _&        || _         | j                              dd¦  «        | _'        d| _(        | j          )                    dd¦  «        tT          _*        | j          )                    dd¦  «        | _+        | j          )                    ddd¬¦  «        | _,        | j          )                    dd¦  «        | _-        | j-        rt]          | j-        ¦  «        | _-        | j          )                    dd¦  «        }
+|
+ #                    d¦  «        r
+|
+dd …         }
+|
+ /                    d¦  «        r
+|
+d d…         }
+|
+| _0        t          j        ¦   «         | _        d S ) NrI   s   refreshintervalr   s   uis   report_untrusteds   offs   hgwebdirs   nonttys   trues   progresss   disables   hgwebs   pathss   hgweb-pathss   config file %s not found!T)ÚremapÚtrusts   collections)r3   r%   s   experimentals    web.full-garbage-collection-rateó   encodingó   styles	   templatesFrJ   s   stripess   prefixr   éÿÿÿÿ)1r   Ú	configintr   Ú	coreitemsra   r©   Útimer¨   rq   rv   ÚloadÚ	setconfigÚ
+isinstancer§   ÚdictÚlistÚtupler5   r*   Úexistsr   ÚAbortr   rs   rM   r8   r/   r   r®   rD   r   r&   r   r;   r9   rf   rF   rG   r?   Úgc_full_collect_rateÚgc_full_collections_doner_   r   ÚstyleÚtemplatepathr™   ÚintÚendswithr@   )r¯   ÚrefreshintervalÚitemrb   Úmapr>   r)   Úignoredr*   r?   r@   rA   Úrepos                r+   r«   zhgwebdir.refresh%  s$  € ØŒ7ğ 	+Ø"œg×/Ò/°Ğ8JÑKÔKˆOˆOåÔ(¨Ô0Ğ1CÔDˆDØ"œlˆOğ ˜aÒĞØÔ  ?Ñ2µT´Y±[´[Ò@Ğ@àˆFàŒ;ğ 	DØ”× Ò Ñ"Ô"ˆAˆAå”—’‘”ˆAØKŠK˜Ğ2°F¸KÑHÔHĞHØKŠK˜˜y¨'°;Ñ?Ô?Ğ?ğ KŠK˜ Z°¸(ÑCÔCĞCå˜$œ)¥d­Dµ%Ğ%8Ñ9Ô9ğ 	&Ø˜^Ğ,ˆCİ”7—>’> $¤)Ñ,Ô,ğ Oİ”k¥!Ğ$@Ñ"AÔ"AÀDÄIÑ"MÑNÔNĞNØLŠL˜œ¨#°TˆLÑ:Ô:Ğ:ØˆEØ!"§¢¨~Ñ!>Ô!>ğ /ğ /‘gØŸLšL¨¸Ñ>Ô>ğ /ğ /DØ—L’L $¨ Ñ.Ô.Ğ.Ğ.ğ/ğ/õ ˜œ	¥D­% =Ñ1Ô1ğ 	&Ø”IˆEˆEİ˜œ	¥4Ñ(Ô(ğ 	&Ø”I—O’OÑ%Ô%ˆEİÔ˜aÑ Ô Ğ å˜%Ñ Ô ˆØŸMšM¨.Ñ9Ô9ğ 	8ğ 	8‰LˆFDİ”] 6Ñ*Ô*ˆFİÔ)¨$¸$Ğ?Ñ?Ô?ğ 8ğ 8İ”w×'Ò'¨Ñ-Ô-İ”} TÑ*Ô*Ø—?’? 6Ñ*Ô*ğ /Ø¥ F¡¤  Ô.DØ—’˜dŸkšk¨$Ñ/Ô/°Ğ6Ñ7Ô7Ğ7Ğ7ğ8ğ ˆŒ
+ØˆŒØ$(¤G×$5Ò$5ØĞ@ñ%
+ô %
+ˆÔ!ğ )*ˆÔ%Ø œGŸNšN¨6°;Ñ?Ô?ÔØ”W—^’^ F¨HÑ5Ô5ˆŒ
+Ø œGŸNšNØL¨Eğ +ñ 
+ô 
+ˆÔğ  œ7Ÿ>š>¨&°*Ñ=Ô=ˆÔØÔğ 	5İ" 4Ô#3Ñ4Ô4ˆDÔØ”—’ ¨	Ñ2Ô2ˆØ×Ò˜TÑ"Ô"ğ 	 Ø˜A˜B˜B”ZˆFØ?Š?˜4Ñ Ô ğ 	!Ø˜C˜R˜C”[ˆFØˆŒİœ9™;œ;ˆÔĞĞr-   c                 ó²   — t           j                             dd¦  «                             d¦  «        st	          d¦  «        ‚t          j        | ¦  «         d S )Ns   GATEWAY_INTERFACEr-   s   CGI/1.sJ   This function is only intended to be called while running as a CGI script.)r   Úenvironrc   rf   ÚRuntimeErrorr!   Úlaunch)r¯   s    r+   Úrunzhgwebdir.runl  sb   € İÔ×#Ò#Ğ$8¸#Ñ>Ô>×IÒIØñ
+ô 
+ğ 	õ ğ9ñô ğ õ 	ŒtÑÔĞĞĞr-   c                 óº   — | j                              dd¦  «        }t          j        ||¬¦  «        }t          j        ||¦  «        }|                      ||¦  «        S )NrI   ó   baseurl)Ú
+altbaseurl)r   r_   Ú
+requestmodÚparserequestfromenvÚwsgiresponseÚrun_wsgi)r¯   ÚenvÚrespondÚbaseurlrN   Úress         r+   Ú__call__zhgwebdir.__call__v  sR   € Ø”'—.’. ¨Ñ4Ô4ˆİÔ,¨S¸WĞEÑEÔEˆİÔ% c¨7Ñ3Ô3ˆà}Š}˜S #Ñ&Ô&Ğ&r-   c              #   ó‚  K  — | j                              dd¦  «        }t          j        | j         |¬¦  «        5  	 |                      ||¦  «        D ]}|V — Œ	 | j        }| xj        dz  c_        |dk    r2| j        |z  dk    r$t          j        ¦   «          | xj	        dz  c_	        nt          j        d¬¦  «         ni# | j        }| xj        dz  c_        |dk    r2| j        |z  dk    r$t          j        ¦   «          | xj	        dz  c_	        w t          j        d¬¦  «         w xY wd d d ¦  «         d S # 1 swxY w Y   d S )Ns	   profilings   enabled)Úenabledr   r   )Ú
+generation)
+r   rd   r   ÚprofileÚ_runwsgirÂ   r¬   ÚgcÚcollectrÃ   )r¯   rN   rÜ   rá   r‰   Úrates         r+   rØ   zhgwebdir.run_wsgi}  sµ  è è € Ø”'×$Ò$ \°:Ñ>Ô>ˆİÔ˜tœw°Ğ8Ñ8Ô8ğ 	-ğ 	-ğ-ØŸš s¨CÑ0Ô0ğ ğ AØGGGGğğ Ô0ğ Ğ#Ô# qÑ(Ğ#Ô#Ø˜!’88 Ô 3°dÑ :¸aÒ ?Ğ ?İ”J‘L”LLØĞ1Ô1°QÑ6Ğ1Ô1Ğ1å”J¨!Ğ,Ñ,Ô,Ğ,Ğ,øğ Ô0ğ Ğ#Ô# qÑ(Ğ#Ô#Ø˜!’88 Ô 3°dÑ :¸aÒ ?Ğ ?İ”J‘L”LLØĞ1Ô1°QÑ6Ğ1Ô1Ğ1å”J¨!Ğ,Ñ,Ô,Ğ,Ğ,øøøğ7	-ğ 	-ğ 	-ñ 	-ô 	-ğ 	-ğ 	-ğ 	-ğ 	-ğ 	-ğ 	-ğ 	-øøøğ 	-ğ 	-ğ 	-ğ 	-ğ 	-ğ 	-s*   ¹D4»B>ÁA%D4Â>A&D$Ä$D4Ä4D8Ä;D8c           	      óF  ‡‡— 	 |                       ¦   «          t          | j        ¦  «        \  }}|r
+||j        d<   |j                             d¦  «        Š|                      ||¦  «        }|                     ddt          j        i¦  «        }d|_	        ||j        d<   ‰ 
+                    d¦  «        s	d|j        v rv‰ 
+                    d¦  «        r‰d	d …         }n|j        d         }| j                             d
+dd¬¦  «        }t          | j        |||¦  «         |                     ¦   «         ~S t!          | j        ¦  «        }	‰r‰dk    r‰|	vr|                      |||¦  «        ~S ‰                     d¦  «        rP‰|	vrL‰d t)          d¦  «         …         Št+          ˆfd„|	D ¦   «         ¦  «        r|                      |||‰¦  «        ~S ˆfd„}
+ |
+¦   «         D ]@}|	                     |¦  «        }|r%d„ |j                             ¦   «         D ¦   «         }t3          j        ||| j                             d
+d¦  «        |j        ¬¦  «        }	 t9          j        | j                             ¦   «         |¦  «        }t?          j         |¦  «         !                    ||¦  «        c ~S # tD          $ r3}t          j#        |j$        ¦  «        }tK          tL          |¦  «        ‚d }~wtN          j(        $ r'}tK          tL          tS          |¦  «        ¦  «        ‚d }~ww xY wŒB‰dz   Šˆfd„|	D ¦   «         r|                      |||‰¦  «        ~S d|_	        | *                    | +                    dd‰i¦  «        ¦  «         |                     ¦   «         ~S # tJ          $ r}}tY          |j-        t]          j/        |¦  «        ¦  «        |_	        | *                    | +                    dd|j0        pdi¦  «        ¦  «         |                     ¦   «         cY d }~~S d }~ww xY w# ~w xY w)Ns   Content-Security-Policyr%   s   mimetyper´   s   200 Script output followss   Content-Types   static/s   staticé   rI   FrJ   ó   indexs   /indexc              3   óB   •K  — | ]}|                      ‰¦  «        V — Œd S rU   ©rf   ©r(   r‰   r{   s     €r+   rW   z$hgwebdir._runwsgi.<locals>.<genexpr>Á  s/   øè è € Ğ;Ğ;°q—|’| FÑ+Ô+Ğ;Ğ;Ğ;Ğ;Ğ;Ğ;r-   c               3   óJ   •K  — ‰V — t          j        ‰¦  «        D ]} | V — Œd S rU   )r   Úfinddirs)rV   Úvirtuals    €r+   Ú_virtualdirsz'hgwebdir._runwsgi.<locals>._virtualdirsÄ  s?   øè è € àİ!Ô*¨7Ñ3Ô3ğ ğ AØGGGGğğ r-   c                 ó@   — i | ]\  }}|                      d ¦  «        |“ŒS )Úlatin1)Údecode)r(   ÚkÚvs      r+   ú
+<dictcomp>z%hgwebdir._runwsgi.<locals>.<dictcomp>Ï  s7   € ğ ğ ğ Ù26°!°Q˜Ÿš Ñ*Ô*¨Ağğ ğ r-   rÓ   )ÚreponamerÔ   Úbodyfhc                 ó>   •— g | ]}|                      ‰¦  «        ¯|‘ŒS r.   rê   rë   s     €r+   r,   z%hgwebdir._runwsgi.<locals>.<listcomp>æ  s*   ø€ Ğ9Ğ9Ğ9a A§L¢L°Ñ$8Ô$8Ğ9Ğ9Ğ9Ğ9r-   s   404 Not Founds   notfounds   repos   errorr-   )1r«   r   r   ÚheadersÚdispatchpathr'   r   Úrenderr   Ústatusrf   Úqsparamsr_   r   rÅ   Úsendresponser½   r?   Ú	makeindexrÇ   rF   Úanyrc   Úrawenvr/   rÕ   rÖ   r÷   r   rh   rq   r   ÚhgwebrØ   ri   Ú
+strtolocalÚstrerrorr   r   r   rj   ÚbytesÚ
+setbodygenÚgenerater   Úcoder   ÚbytestrÚmessage)r¯   rN   rÜ   ÚcspÚnonceÚtmplÚctypeÚfnameÚstaticr?   rï   ÚvirtualrepoÚrealÚuenvrÌ   ÚinstÚmsgrˆ   r{   rî   s                     @@r+   râ   zhgwebdir._runwsgiœ  s¥  øø€ ğX	ØLŠL‰NŒNˆNå" 4¤7Ñ+Ô+‰JˆCØğ >Ø:=”Ğ6Ñ7àÔ&×,Ò,¨TÑ2Ô2ˆGØ—>’> # uÑ-Ô-ˆDØ—K’K ¨k½8Ô;LĞ-MÑNÔNˆEğ 6ˆCŒJØ+0ˆCŒK˜Ñ(ğ ×!Ò! *Ñ-Ô-ğ *°¸c¼lĞ1JĞ1JØ×%Ò% jÑ1Ô1ğ 4Ø# A B BœKEEàœL¨Ô3EØœŸš¨°	ÀU˜ÑKÔKİ˜4Ô,¨f°e¸SÑAÔAĞAØ×'Ò'Ñ)Ô)ğB õ{ ˜œÑ$Ô$ˆEàğ 6˜w¨(Ò2Ğ2¸ÀuĞ8LĞ8LØ—~’~ c¨3°Ñ5Ô5ğt ğm ×Ò 	Ñ*Ô*ğ B¨w¸eĞ/CĞ/CØ Ğ!1¥C¨¡M¤M >Ğ!1Ô2İĞ;Ğ;Ğ;Ğ;°UĞ;Ñ;Ô;Ñ;Ô;ğ BØŸ>š>¨#¨s°D¸&ÑAÔAğf ğcğ ğ ğ ğ ğ  ,˜|™~œ~ğ Lñ LØ—y’y Ñ-Ô-Øñ Lğğ Ø:=¼*×:JÒ:JÑ:LÔ:Lğñ ô Dõ %Ô8ØØ!,Ø#'¤7§>¢>°&¸*Ñ#EÔ#Eğ  #œzğñ ô CğLå!œ}¨T¬W¯\ª\©^¬^¸TÑBÔB˜İ(œ¨tÑ4Ô4×=Ò=¸cÀ3ÑGÔGĞGĞGğ0 øõ/ #ğ Dğ Dğ Dİ&Ô1°$´-Ñ@Ô@˜İ+Õ,=¸sÑCÔCĞCøøøøİ œ?ğ Lğ Lğ Lİ+Õ,=½uÀT¹{¼{ÑKÔKĞKøøøøğLøøøñ+Lğ2 ˜t‘^ˆFØ9Ğ9Ğ9Ğ9˜5Ğ9Ñ9Ô9ğ >Ø—~’~ c¨3°°fÑ=Ô=ğ ğ *ˆCŒJØNŠN˜4Ÿ=š=¨°wÀĞ6HÑIÔIÑJÔJĞJØ×#Ò#Ñ%Ô%ğ øõ ğ 	&ğ 	&ğ 	&İ& q¤v­xÔ/?ÀÑ/BÔ/BÑCÔCˆCŒJØNŠNØ—’˜h¨°1´9Ğ3CÀĞ(DÑEÔEñô ğ ğ ×#Ò#Ñ%Ô%Ğ%Ğ%Ğ%Ğ%Ğ%àøøøøğ	&øøøøğ ˆHˆHˆHˆHs}   „D,N Ä26N Å*A#N ÇBN ÉAJ*Ê&N Ê*
+LÊ4.K"Ë"LË4"LÌLÌ/N ÍAN Î
+PÎA1PĞPĞP ĞPĞP ĞP r-   c           	      ó4  ‡	‡
+— |                       ¦   «          g d¢}d\  Š
+Š	d|j        v r4|j        d         Š
+‰
+                     d¦  «        Š	‰	r
+‰
+dd …         Š
+‰
+|vrdŠ
+ˆ	ˆ
+fd„|D ¦   «         }|                       ¦   «          t          | j        | j        || j        ‰
+‰	|¬¦  «        }||t          j        d	|z   | j	        ¦  «        ‰
+‰	d
+œ}| 
+                    |¦  «         |                     |                     d|¦  «        ¦  «         |                     ¦   «         S )N)rY   r[   rX   r\   r   s   sortó   -r   r-   c                 ó>   •— g | ]}d |z  d‰ r|‰k    rdpd|fz  f‘ŒS )s   sort_%ss   %s%sr  r-   r.   )r(   Úcolumnr›   rš   s     €€r+   r,   z&hgwebdir.makeindex.<locals>.<listcomp>  s^   ø€ ğ 
+
+ğ 
+
+ğ 
+
+ğ ğ ˜VÑ#Øà#^Ğ<¨°*Ò(<ĞFÀ$ĞMÈ#Øğñğğ
+
+ğ 
+
+ğ 
+
+r-   )rš   r›   r{   r%   )s   entriess   subdirs   pathdefs
+   sortcolumns
+   descendingrè   )r«   rı   rf   r£   r   r?   r™   r   Úmakebreadcrumbr@   Úupdater  r  rş   )r¯   rN   rÜ   r  r{   ÚsortableÚsortÚentriesÚmappingr›   rš   s            @@r+   rÿ   zhgwebdir.makeindex÷  s[  øø€ ØŠ‰ŒˆØGĞGĞGˆØ!,Ñˆ
+JØc”lĞ"Ğ"Øœ gÔ.ˆJØ#×.Ò.¨tÑ4Ô4ˆJØğ ,Ø'¨¨¨œ^
+Ø Ğ)Ğ)Ø 
+ğ
+
+ğ 
+
+ğ 
+
+ğ 
+
+ğ 
+
+ğ #ğ
+
+ñ 
+
+ô 
+
+ˆğ 	Š‰ŒˆåØŒGØŒJØØÔØ!Ø!Øğ
+ñ 
+ô 
+ˆğ  Øİ!Ô0°¸±ÀÄÑLÔLØ%Ø%ğ
+ğ 
+ˆğ 	ŠtÑÔĞØŠt—}’} X¨wÑ7Ô7Ñ8Ô8Ğ8Ø×ÒÑ!Ô!Ğ!r-   c           	      ó2  ‡ ‡— ˆ fd„Ši }t          j        |‰‰ j        ¦  «        \  }\  }}}||d         k    r||d<   t          j        |d¦  «        } ‰dd¦  «        }	 ‰dd¦  «        }
+ ‰dd¦  «        p|j                             d	¦  «        d
+z   }|                     d	¦  «        s|d	z  }t          j        |j        d	z   |	|
+||||dœ}t          j
+        |¦  «        } |dd¬¦  «        ˆˆ fd„¦   «         }t          j                             |||¬¦  «        S )Nc                  óT   •— |                      dd¦  «          ‰j        j        | i |¤S )NrK   T)Ú
+setdefaultr   r_   )r¡   Úkwargsr¯   s     €r+   r_   z"hgwebdir.templater.<locals>.config'  s2   ø€ Ø×Ò˜k¨4Ñ0Ô0Ğ0Ø!4”7”> 4Ğ2¨6Ğ2Ğ2Ğ2r-   r   rµ   ó   ?rI   ó   logourló   logoimgó	   staticurlr%   s   /static/)r´   rZ   r%  r&  r'  s   sessionvarsrµ   s   nonceó   motdr.   )Úrequiresc              3   óL   •K  — ‰j         ‰j         V — d S  ‰dd¦  «        V — d S )NrI   r(  )rª   )r˜   r  r_   r¯   s     €€r+   rª   z hgwebdir.templater.<locals>.motdH  s<   øè è € àŒyĞ$Ø”iàf˜V WÑ-Ô-Ğ-Ğ-Ğ-Ğ-Ğ-r-   )ÚfpÚdefaults)r   ÚgetstylerÅ   r    Úsessionvarsrk   ÚrstriprÇ   r   r   Útemplatekeywordr   Úfrommapfile)r¯   rN   r  ÚvarsÚstylesrÄ   Úmapfiler+  r.  ÚlogourlÚlogoimgÚ	staticurlr,  r0  rª   r_   s   `              @r+   r   zhgwebdir.templater&  s  øø€ ğ	3ğ 	3ğ 	3ğ 	3ğ 	3ğ ˆİ'0Ô'9Ø˜Ô*ñ(
+ô (
+Ñ$ˆÑ$˜ ğ F˜1”IÒĞØ"ˆD‰NåÔ)¨$°Ñ5Ô5ˆØ&˜ Ñ,Ô,ˆØ&˜ Ñ,Ô,ˆàˆF6˜<Ñ(Ô(ğ 6ØŒ{×!Ò! $Ñ'Ô'¨+Ñ5ğ 	ğ ×!Ò! $Ñ'Ô'ğ 	Ø˜ÑˆIõ "Ô*Ø”K $Ñ&ØØØ#Ø'ØØğ	
+ğ 	
+ˆõ $Ô3°HÑ=Ô=ˆà	ˆ˜¨2Ğ	.Ñ	.Ô	.ğ	.ğ 	.ğ 	.ğ 	.ğ 	.ñ 
+/Ô	.ğ	.õ Ô"×.Ò.Ø˜ Xğ /ñ 
+ô 
+ğ 	
+r-   rU   ©r-   )Ú__name__Ú
+__module__Ú__qualname__Ú__doc__r°   r«   rÑ   rİ   rØ   râ   rÿ   r   r.   r-   r+   r¥   r¥     s©   € € € € € ğğ ğ+ğ +ğ +ğ +ğE'ğ E'ğ E'ğNğ ğ ğ'ğ 'ğ 'ğ-ğ -ğ -ğ>Yğ Yğ Yğv-"ğ -"ğ -"ğ -"ğ^+
+ğ +
+ğ +
+ğ +
+ğ +
+r-   r¥   r8  )r-   Fr-   )/rã   r5   r¹   Úi18nr   Úcommonr   r   r   r	   r
+   r   r   r   r   Ú r   r   r   r   r   r   r   r   r   r   r   r   r   r   rv   r   r   r   rÕ   r    r!   Úutilsr"   r0   rD   r=   rR   r   rŸ   r£   r¥   r.   r-   r+   ú<module>rA     s^  ğğ 
+€	€	€	Ø 	€	€	€	Ø €€€à Ğ Ğ Ğ Ğ Ğ ğ
+ğ 
+ğ 
+ğ 
+ğ 
+ğ 
+ğ 
+ğ 
+ğ 
+ğ 
+ğ 
+ğ 
+ğ 
+ğ 
+ğ 
+ğ 
+ğ 
+ğ 
+ğ 
+ğ 
+ğ 
+ğ 
+ğğ ğ ğ ğ ğ ğ ğ ğ ğ ğ ğ ğ ğ ğ ğ ğ ğ ğ ğ ğ ğ ğ ğ ğ ğ ğ ğ ğ ğ ğ ğ ğ ğ ğ$ğ ğ ğ ğ ğ ğ ğ ğ ğ ğ ğ ğ Ğ Ğ Ğ Ğ Ğ ğMğ Mğ Mğğ ğ ğ&ğ ğ ğ ğ ğ ğ.@ğ @ğ @ğ @ğFğ ğ ğ" KNğFğ Fğ Fğ FğB
+ğ B
+ğ B
+ğ B
+ğ B
+ñ B
+ô B
+ğ B
+ğ B
+ğ B
+r-                                                                                                                                                                                                                                                                       usr/lib/python3/dist-packages/mercurial/hgweb/__pycache__/request.cpython-311.pyc                   0000644 0000000 0000000 00000057110 14714551122 026435  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        §
+    	^µc3X  ã                   óÚ   — d dl mZ d dlmZmZmZmZ d dlmZ  G d„ d¦  «        Z	 ej
+        d¬¦  «         G d„ d	¦  «        ¦   «         Zdd„Z G d„ d¦  «        Z G d„ d¦  «        Zd„ Zd
+S )é   )Úattr)ÚencodingÚerrorÚpycompatÚutil)Úurlutilc                   óV   — e Zd ZdZd„ Zd„ Zd„ Zd„ Zd„ Zd„ Z	dd	„Z
+d
+„ Zd„ Zd„ Zd„ ZdS )Ú	multidictz¨A dict like object that can store multiple values for a key.
+
+    Used to store parsed request parameters.
+
+    This is inspired by WebOb's class of the same name.
+    c                 ó   — i | _         d S ©N©Ú_items©Úselfs    ú9/usr/lib/python3/dist-packages/mercurial/hgweb/request.pyÚ__init__zmultidict.__init__    s   € ØˆŒˆˆó    c                 ó(   — | j         |         d         S )z%Returns the last set value for a key.éÿÿÿÿr   ©r   Úkeys     r   Ú__getitem__zmultidict.__getitem__#   s   € àŒ{˜3Ô Ô#Ğ#r   c                 ó   — |g| j         |<   dS )z,Replace a values for a key with a new value.Nr   ©r   r   Úvalues      r   Ú__setitem__zmultidict.__setitem__'   s   € à!˜7ˆŒCÑĞĞr   c                 ó   — | j         |= dS )zDelete all values for a key.Nr   r   s     r   Ú__delitem__zmultidict.__delitem__+   s   € àŒK˜ĞĞĞr   c                 ó   — || j         v S r   r   r   s     r   Ú__contains__zmultidict.__contains__/   s   € Ød”kĞ!Ğ!r   c                 ó*   — t          | j        ¦  «        S r   )Úlenr   r   s    r   Ú__len__zmultidict.__len__2   s   € İ4”;ÑÔĞr   Nc                 óR   — 	 |                       |¦  «        S # t          $ r |cY S w xY wr   )r   ÚKeyError)r   r   Údefaults      r   Úgetzmultidict.get5   s?   € ğ	Ø×#Ò# CÑ(Ô(Ğ(øİğ 	ğ 	ğ 	ØˆNˆNˆNğ	øøøs   ‚ —&¥&c                 ób   — | j                              |g ¦  «                             |¦  «         dS )z<Add a new value for a key. Does not replace existing values.N)r   Ú
+setdefaultÚappendr   s      r   Úaddzmultidict.add;   s.   € àŒ×Ò˜s BÑ'Ô'×.Ò.¨uÑ5Ô5Ğ5Ğ5Ğ5r   c                 ó8   — | j                              |g ¦  «        S )zObtains all values for a key.)r   r'   r   s     r   Úgetallzmultidict.getall?   s   € àŒ{Š˜s BÑ'Ô'Ğ'r   c                 óv   — | j         |         }t          |¦  «        dk    rt          d|z  ¦  «        ‚|d         S )ztObtain a single value for a key.
+
+        Raises KeyError if key not defined or it has multiple values set.
+        é   s   multiple values for %ré    )r   r"   r%   )r   r   Úvalss      r   Úgetonezmultidict.getoneC   s<   € ğ
+ Œ{˜3Ôˆåˆt‰9Œ9qŠ=ˆ=İĞ4°sÑ:Ñ;Ô;Ğ;àAŒwˆr   c                 óH   — d„ | j                              ¦   «         D ¦   «         S )Nc                 ó4   — i | ]\  }}|t          |¦  «        “ŒS © )Úlist©Ú.0ÚkÚvs      r   ú
+<dictcomp>z+multidict.asdictoflists.<locals>.<dictcomp>P   s$   € Ğ;Ğ;Ğ;™t˜q !•4˜‘7”7Ğ;Ğ;Ğ;r   )r   Úitemsr   s    r   Úasdictoflistszmultidict.asdictoflistsO   s$   € Ø;Ğ; t¤{×'8Ò'8Ñ':Ô':Ğ;Ñ;Ô;Ğ;r   r   )Ú__name__Ú
+__module__Ú__qualname__Ú__doc__r   r   r   r   r    r#   r'   r+   r-   r2   r=   r5   r   r   r
+   r
+      sÈ   € € € € € ğğ ğğ ğ ğ$ğ $ğ $ğ#ğ #ğ #ğğ ğ ğ"ğ "ğ "ğ ğ  ğ  ğğ ğ ğ ğ6ğ 6ğ 6ğ(ğ (ğ (ğ
+ğ 
+ğ 
+ğ<ğ <ğ <ğ <ğ <r   r
+   T)Úfrozenc                   ó  — e Zd ZdZ ej        ¦   «         Z ej        ¦   «         Z ej        ¦   «         Z ej        ¦   «         Z	 ej        ¦   «         Z
+ ej        ¦   «         Z ej        ¦   «         Z ej        ¦   «         Z ej        ¦   «         Z ej        ¦   «         Z ej        ¦   «         Z ej        ¦   «         Z ej        ¦   «         Z ej        ¦   «         Z ej        ¦   «         Z ej        ¦   «         Z ej        ¦   «         ZdS )ÚparsedrequestztRepresents a parsed WSGI request.
+
+    Contains both parsed parameters as well as a handle on the input stream.
+    N)r>   r?   r@   rA   r   ÚibÚmethodÚurlÚbaseurlÚadvertisedurlÚadvertisedbaseurlÚ	urlschemeÚ
+remoteuserÚ
+remotehostÚapppathÚdispatchpartsÚdispatchpathÚreponameÚquerystringÚqsparamsÚheadersÚbodyfhÚrawenvr5   r   r   rD   rD   S   s   € € € € € ğğ ğ ˆTŒW‰YŒY€Fà
+ˆ$Œ'‰)Œ)€CàˆdŒg‰iŒi€Gğ D”G‘I”I€MØ˜œ™	œ	Ğà”‘	”	€Ià”‘”€Jà”‘”€Jğ ˆdŒg‰iŒi€GàD”G‘I”I€Mğ 4”7‘9”9€LàˆtŒw‰yŒy€Hà$”'‘)”)€KàˆtŒw‰yŒy€Hğ ˆdŒg‰iŒi€GàˆTŒW‰YŒY€FàˆTŒW‰YŒY€F€F€Fr   rD   Nc                 ó(  ‡— d„ Šˆfd„|                       ¦   «         D ¦   «         } |s|                      d¦  «        }|rt          j        |¦  «        }| d         dz   }|r|j        r|j        dz   }n|}d„ }|                      d¦  «        r|| d         z  }n|| d         z  } ||| d	         ¦  «        }|r_|j        rX||j        z  }|j        r|j        }n2|j        d

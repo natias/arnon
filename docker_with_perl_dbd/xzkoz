@@ -1,0 +1,1000 @@
+    ':2.31'  => [qw(:default)],
+    ':2.32'  => [qw(:default)],
+    ':2.33'  => [qw(:default)],
+    ':2.34'  => [qw(:default)],
+    ':2.35'  => [qw(:default)],
+    ':2.36'  => [qw(:default)],
+    ':2.37'  => [qw(:default)],
+);
+
+
+{
+    # Expand :all immediately by expanding and flattening all tags.
+    # _expand_tag is not really optimised for expanding the ":all"
+    # case (i.e. keys %TAGS, or values %TAGS for that matter), so we
+    # just do it here.
+    #
+    # NB: The %tag_cache/_expand_tag relies on $TAGS{':all'} being
+    # pre-expanded.
+    my %seen;
+    my @all = grep {
+        !/^:/ && !$seen{$_}++
+    } map { @{$_} } values %TAGS;
+    $TAGS{':all'} = \@all;
+}
+
+# This hash contains subroutines for which we should
+# subroutine() // die() rather than subroutine() || die()
+
+my %Use_defined_or;
+
+# CORE::open returns undef on failure.  It can legitimately return
+# 0 on success, eg: open(my $fh, '-|') || exec(...);
+
+@Use_defined_or{qw(
+    CORE::fork
+    CORE::recv
+    CORE::send
+    CORE::open
+    CORE::fileno
+    CORE::read
+    CORE::readlink
+    CORE::sysread
+    CORE::syswrite
+    CORE::sysseek
+    CORE::umask
+)} = ();
+
+# Some functions can return true because they changed *some* things, but
+# not all of them.  This is a list of offending functions, and how many
+# items to subtract from @_ to determine the "success" value they return.
+
+my %Returns_num_things_changed = (
+    'CORE::chmod'  => 1,
+    'CORE::chown'  => 2,
+    'CORE::kill'   => 1,  # TODO: Could this return anything on negative args?
+    'CORE::unlink' => 0,
+    'CORE::utime'  => 2,
+);
+
+# Optional actions to take on the return value before returning it.
+
+my %Retval_action = (
+    "CORE::open"        => q{
+
+    # apply the open pragma from our caller
+    if( defined $retval && !( @_ >= 3 && $_[1] =~ /:/ )) {
+        # Get the caller's hint hash
+        my $hints = (caller 0)[10];
+
+        # Decide if we're reading or writing and apply the appropriate encoding
+        # These keys are undocumented.
+        # Match what PerlIO_context_layers() does.  Read gets the read layer,
+        # everything else gets the write layer.
+        my $encoding = $_[1] =~ /^\+?>/ ? $hints->{"open>"} : $hints->{"open<"};
+
+        # Apply the encoding, if any.
+        if( $encoding ) {
+            binmode $_[0], $encoding;
+        }
+    }
+
+},
+    "CORE::sysopen"     => q{
+
+    # apply the open pragma from our caller
+    if( defined $retval ) {
+        # Get the caller's hint hash
+        my $hints = (caller 0)[10];
+
+        require Fcntl;
+
+        # Decide if we're reading or writing and apply the appropriate encoding.
+        # Match what PerlIO_context_layers() does.  Read gets the read layer,
+        # everything else gets the write layer.
+        my $open_read_only = !($_[2] ^ Fcntl::O_RDONLY());
+        my $encoding = $open_read_only ? $hints->{"open<"} : $hints->{"open>"};
+
+        # Apply the encoding, if any.
+        if( $encoding ) {
+            binmode $_[0], $encoding;
+        }
+    }
+
+},
+);
+
+my %reusable_builtins;
+
+# "Wait!" I hear you cry, "truncate() and chdir() are not reuseable! They can
+# take file and directory handles, which are package depedent."
+#
+# You would be correct, except that prototype() returns signatures which don't
+# allow for passing of globs, and nobody's complained about that. You can
+# still use \*FILEHANDLE, but that results in a reference coming through,
+# and it's already pointing to the filehandle in the caller's packge, so
+# it's all okay.
+
+@reusable_builtins{qw(
+    CORE::fork
+    CORE::kill
+    CORE::truncate
+    CORE::chdir
+    CORE::link
+    CORE::unlink
+    CORE::rename
+    CORE::mkdir
+    CORE::symlink
+    CORE::rmdir
+    CORE::readlink
+    CORE::umask
+    CORE::chmod
+    CORE::chown
+    CORE::utime
+    CORE::msgctl
+    CORE::msgget
+    CORE::msgrcv
+    CORE::msgsnd
+    CORE::semctl
+    CORE::semget
+    CORE::semop
+    CORE::shmctl
+    CORE::shmget
+    CORE::shmread
+    CORE::exec
+    CORE::system
+)} = ();
+
+# Cached_fatalised_sub caches the various versions of our
+# fatalised subs as they're produced.  This means we don't
+# have to build our own replacement of CORE::open and friends
+# for every single package that wants to use them.
+
+my %Cached_fatalised_sub = ();
+
+# Every time we're called with package scope, we record the subroutine
+# (including package or CORE::) in %Package_Fatal.  This allows us
+# to detect illegal combinations of autodie and Fatal, and makes sure
+# we don't accidently make a Fatal function autodying (which isn't
+# very useful).
+
+my %Package_Fatal = ();
+
+# The first time we're called with a user-sub, we cache it here.
+# In the case of a "no autodie ..." we put back the cached copy.
+
+my %Original_user_sub = ();
+
+# Is_fatalised_sub simply records a big map of fatalised subroutine
+# refs.  It means we can avoid repeating work, or fatalising something
+# we've already processed.
+
+my  %Is_fatalised_sub = ();
+tie %Is_fatalised_sub, 'Tie::RefHash';
+
+# Our trampoline cache allows us to cache trampolines which are used to
+# bounce leaked wrapped core subroutines to their actual core counterparts.
+
+my %Trampoline_cache;
+
+# A cache mapping "CORE::<name>" to their prototype.  Turns out that if
+# you "use autodie;" enough times, this pays off.
+my %CORE_prototype_cache;
+
+# We use our package in a few hash-keys.  Having it in a scalar is
+# convenient.  The "guard $PACKAGE" string is used as a key when
+# setting up lexical guards.
+
+my $PACKAGE       = __PACKAGE__;
+my $NO_PACKAGE    = "no $PACKAGE";      # Used to detect 'no autodie'
+
+# Here's where all the magic happens when someone write 'use Fatal'
+# or 'use autodie'.
+
+sub import {
+    my $class        = shift(@_);
+    my @original_args = @_;
+    my $void         = 0;
+    my $lexical      = 0;
+    my $insist_hints = 0;
+
+    my ($pkg, $filename) = caller();
+
+    @_ or return;   # 'use Fatal' is a no-op.
+
+    # If we see the :lexical flag, then _all_ arguments are
+    # changed lexically
+
+    if ($_[0] eq LEXICAL_TAG) {
+        $lexical = 1;
+        shift @_;
+
+        # It is currently an implementation detail that autodie is
+        # implemented as "use Fatal qw(:lexical ...)".  For backwards
+        # compatibility, we allow it - but not without a warning.
+        # NB: Optimise for autodie as it is quite possibly the most
+        # freq. consumer of this case.
+        if ($class ne 'autodie' and not $class->isa('autodie')) {
+            if ($class eq 'Fatal') {
+                warnings::warnif(
+                    'deprecated',
+                    '[deprecated] The "use Fatal qw(:lexical ...)" '
+                    . 'should be replaced by "use autodie qw(...)". '
+                    . 'Seen' # warnif appends " at <...>"
+                    );
+            } else {
+                warnings::warnif(
+                    'deprecated',
+                    "[deprecated] The class/Package $class is a "
+                    . 'subclass of Fatal and used the :lexical. '
+                    . 'If $class provides lexical error checking '
+                    . 'it should extend autodie instead of using :lexical. '
+                    . 'Seen' # warnif appends " at <...>"
+                    );
+            }
+            # "Promote" the call to autodie from here on.  This is
+            # already mostly the case (e.g. use Fatal qw(:lexical ...)
+            # would throw autodie::exceptions on error rather than the
+            # Fatal errors.
+            $class = 'autodie';
+            # This requires that autodie is in fact loaded; otherwise
+            # the "$class->X()" method calls below will explode.
+            require autodie;
+            # TODO, when autodie and Fatal are cleanly separated, we
+            # should go a "goto &autodie::import" here instead.
+        }
+
+        # If we see no arguments and :lexical, we assume they
+        # wanted ':default'.
+
+        if (@_ == 0) {
+            push(@_, ':default');
+        }
+
+        # Don't allow :lexical with :void, it's needlessly confusing.
+        if ( grep { $_ eq VOID_TAG } @_ ) {
+            croak(ERROR_VOID_LEX);
+        }
+    }
+
+    if ( grep { $_ eq LEXICAL_TAG } @_ ) {
+        # If we see the lexical tag as the non-first argument, complain.
+        croak(ERROR_LEX_FIRST);
+    }
+
+    my @fatalise_these =  @_;
+
+    # These subs will get unloaded at the end of lexical scope.
+    my %unload_later;
+    # These subs are to be installed into callers namespace.
+    my %install_subs;
+
+    # Use _translate_import_args to expand tags for us.  It will
+    # pass-through unknown tags (i.e. we have to manually handle
+    # VOID_TAG).
+    #
+    # NB: _translate_import_args re-orders everything for us, so
+    # we don't have to worry about stuff like:
+    #
+    #     :default :void :io
+    #
+    # That will (correctly) translated into
+    #
+    #     expand(:defaults-without-io) :void :io
+    #
+    # by _translate_import_args.
+    for my $func ($class->_translate_import_args(@fatalise_these)) {
+
+        if ($func eq VOID_TAG) {
+
+            # When we see :void, set the void flag.
+            $void = 1;
+
+        } elsif ($func eq INSIST_TAG) {
+
+            $insist_hints = 1;
+
+        } else {
+
+            # Otherwise, fatalise it.
+
+            # Check to see if there's an insist flag at the front.
+            # If so, remove it, and insist we have hints for this sub.
+            my $insist_this = $insist_hints;
+
+            if (substr($func, 0, 1) eq '!') {
+                $func = substr($func, 1);
+                $insist_this = 1;
+            }
+
+            # We're going to make a subroutine fatalistic.
+            # However if we're being invoked with 'use Fatal qw(x)'
+            # and we've already been called with 'no autodie qw(x)'
+            # in the same scope, we consider this to be an error.
+            # Mixing Fatal and autodie effects was considered to be
+            # needlessly confusing on p5p.
+
+            my $sub = $func;
+            $sub = "${pkg}::$sub" unless $sub =~ /::/;
+
+            # If we're being called as Fatal, and we've previously
+            # had a 'no X' in scope for the subroutine, then complain
+            # bitterly.
+
+            if (! $lexical and $^H{$NO_PACKAGE}{$sub}) {
+                 croak(sprintf(ERROR_FATAL_CONFLICT, $func, $func));
+            }
+
+            # We're not being used in a confusing way, so make
+            # the sub fatal.  Note that _make_fatal returns the
+            # old (original) version of the sub, or undef for
+            # built-ins.
+
+            my $sub_ref = $class->_make_fatal(
+                $func, $pkg, $void, $lexical, $filename,
+                $insist_this, \%install_subs,
+            );
+
+            $Original_user_sub{$sub} ||= $sub_ref;
+
+            # If we're making lexical changes, we need to arrange
+            # for them to be cleaned at the end of our scope, so
+            # record them here.
+
+            $unload_later{$func} = $sub_ref if $lexical;
+        }
+    }
+
+    install_subs($pkg, \%install_subs);
+
+    if ($lexical) {
+
+        # Dark magic to have autodie work under 5.8
+        # Copied from namespace::clean, that copied it from
+        # autobox, that found it on an ancient scroll written
+        # in blood.
+
+        # This magic bit causes %^H to be lexically scoped.
+
+        $^H |= 0x020000;
+
+        # Our package guard gets invoked when we leave our lexical
+        # scope.
+
+        on_end_of_compile_scope(sub {
+            install_subs($pkg, \%unload_later);
+        });
+
+        # To allow others to determine when autodie was in scope,
+        # and with what arguments, we also set a %^H hint which
+        # is how we were called.
+
+        # This feature should be considered EXPERIMENTAL, and
+        # may change without notice.  Please e-mail pjf@cpan.org
+        # if you're actually using it.
+
+        $^H{autodie} = "$PACKAGE @original_args";
+
+    }
+
+    return;
+
+}
+
+sub unimport {
+    my $class = shift;
+
+    # Calling "no Fatal" must start with ":lexical"
+    if ($_[0] ne LEXICAL_TAG) {
+        croak(sprintf(ERROR_NO_LEX,$class));
+    }
+
+    shift @_;   # Remove :lexical
+
+    my $pkg = (caller)[0];
+
+    # If we've been called with arguments, then the developer
+    # has explicitly stated 'no autodie qw(blah)',
+    # in which case, we disable Fatalistic behaviour for 'blah'.
+
+    my @unimport_these = @_ ? @_ : ':all';
+    my (%uninstall_subs, %reinstall_subs);
+
+    for my $symbol ($class->_translate_import_args(@unimport_these)) {
+
+        my $sub = $symbol;
+        $sub = "${pkg}::$sub" unless $sub =~ /::/;
+
+        # If 'blah' was already enabled with Fatal (which has package
+        # scope) then, this is considered an error.
+
+        if (exists $Package_Fatal{$sub}) {
+            croak(sprintf(ERROR_AUTODIE_CONFLICT,$symbol,$symbol));
+        }
+
+        # Record 'no autodie qw($sub)' as being in effect.
+        # This is to catch conflicting semantics elsewhere
+        # (eg, mixing Fatal with no autodie)
+
+        $^H{$NO_PACKAGE}{$sub} = 1;
+        # Record the current sub to be reinstalled at end of scope
+        # and then restore the original (can be undef for "CORE::"
+        # subs)
+
+        {
+            no strict 'refs';  ## no critic # to avoid: Can't use string (...) as a symbol ref ...
+            $reinstall_subs{$symbol} = \&$sub
+                if exists ${"${pkg}::"}{$symbol};
+        }
+        $uninstall_subs{$symbol} = $Original_user_sub{$sub};
+
+    }
+
+    install_subs($pkg, \%uninstall_subs);
+    on_end_of_compile_scope(sub {
+        install_subs($pkg, \%reinstall_subs);
+    });
+
+    return;
+
+}
+
+sub _translate_import_args {
+    my ($class, @args) = @_;
+    my @result;
+    my %seen;
+
+    if (@args < 2) {
+        # Optimize for this case, as it is fairly common.  (e.g. use
+        # autodie; or use autodie qw(:all); both trigger this).
+        return unless @args;
+
+        # Not a (known) tag, pass through.
+        return @args unless exists($TAGS{$args[0]});
+
+        # Strip "CORE::" from all elements in the list as import and
+        # unimport does not handle the "CORE::" prefix too well.
+        #
+        # NB: we use substr as it is faster than s/^CORE::// and
+        # it does not change the elements.
+        return map { substr($_, 6) } @{ $class->_expand_tag($args[0]) };
+    }
+
+    # We want to translate
+    #
+    #     :default :void :io
+    #
+    # into (pseudo-ish):
+    #
+    #     expanded(:threads) :void expanded(:io)
+    #
+    # We accomplish this by "reverse, expand + filter, reverse".
+    for my $a (reverse(@args)) {
+        if (exists $TAGS{$a}) {
+            my $expanded = $class->_expand_tag($a);
+            push(@result,
+                 # Remove duplicates after ...
+                 grep { !$seen{$_}++ }
+                 # we have stripped CORE:: (see above)
+                 map { substr($_, 6) }
+                 # We take the elements in reverse order
+                 # (as @result be reversed later).
+                 reverse(@{$expanded}));
+        } else {
+            # pass through - no filtering here for tags.
+            #
+            # The reason for not filtering tags cases like:
+            #
+            #    ":default :void :io :void :threads"
+            #
+            # As we have reversed args, we see this as:
+            #
+            #    ":threads :void :io :void* :default*"
+            #
+            # (Entries marked with "*" will be filtered out completely).  When
+            # reversed again, this will be:
+            #
+            #    ":io :void :threads"
+            #
+            # But we would rather want it to be:
+            #
+            #    ":void :io :threads" or ":void :io :void :threads"
+            #
+
+            my $letter = substr($a, 0, 1);
+            if ($letter ne ':' && $a ne INSIST_TAG) {
+                next if $seen{$a}++;
+                if ($letter eq '!' and $seen{substr($a, 1)}++) {
+                    my $name = substr($a, 1);
+                    # People are being silly and doing:
+                    #
+                    #    use autodie qw(!a a);
+                    #
+                    # Enjoy this little O(n) clean up...
+                    @result = grep { $_ ne $name } @result;
+                }
+            }
+            push @result, $a;
+        }
+    }
+    # Reverse the result to restore the input order
+    return reverse(@result);
+}
+
+
+# NB: Perl::Critic's dump-autodie-tag-contents depends upon this
+# continuing to work.
+
+{
+    # We assume that $TAGS{':all'} is pre-expanded and just fill it in
+    # from the beginning.
+    my %tag_cache = (
+        'all' => [map { "CORE::$_" } @{$TAGS{':all'}}],
+    );
+
+    # Expand a given tag (e.g. ":default") into a listref containing
+    # all sub names covered by that tag.  Each sub is returned as
+    # "CORE::<name>" (i.e. "CORE::open" rather than "open").
+    #
+    # NB: the listref must not be modified.
+    sub _expand_tag {
+        my ($class, $tag) = @_;
+
+        if (my $cached = $tag_cache{$tag}) {
+            return $cached;
+        }
+
+        if (not exists $TAGS{$tag}) {
+            croak "Invalid exception class $tag";
+        }
+
+        my @to_process = @{$TAGS{$tag}};
+
+        # If the tag is basically an alias of another tag (like e.g. ":2.11"),
+        # then just share the resulting reference with the original content (so
+        # we only pay for an extra reference for the alias memory-wise).
+        if (@to_process == 1 && substr($to_process[0], 0, 1) eq ':') {
+            # We could do this for "non-tags" as well, but that only occurs
+            # once at the time of writing (":threads" => ["fork"]), so
+            # probably not worth it.
+            my $expanded = $class->_expand_tag($to_process[0]);
+            $tag_cache{$tag} = $expanded;
+            return $expanded;
+        }
+
+        my %seen = ();
+        my @taglist = ();
+
+        for my $item (@to_process) {
+            # substr is more efficient than m/^:/ for stuff like this,
+            # at the price of being a bit more verbose/low-level.
+            if (substr($item, 0, 1) eq ':') {
+                # Use recursion here to ensure we expand a tag at most once.
+
+                my $expanded = $class->_expand_tag($item);
+                push @taglist, grep { !$seen{$_}++ } @{$expanded};
+            } else {
+                my $subname = "CORE::$item";
+                push @taglist, $subname
+                    unless $seen{$subname}++;
+            }
+        }
+
+        $tag_cache{$tag} = \@taglist;
+
+        return \@taglist;
+
+    }
+
+}
+
+# This is a backwards compatible version of _write_invocation.  It's
+# recommended you don't use it.
+
+sub write_invocation {
+    my ($core, $call, $name, $void, @args) = @_;
+
+    return Fatal->_write_invocation(
+        $core, $call, $name, $void,
+        0,      # Lexical flag
+        undef,  # Sub, unused in legacy mode
+        undef,  # Subref, unused in legacy mode.
+        @args
+    );
+}
+
+# This version of _write_invocation is used internally.  It's not
+# recommended you call it from external code, as the interface WILL
+# change in the future.
+
+sub _write_invocation {
+
+    my ($class, $core, $call, $name, $void, $lexical, $sub, $sref, @argvs) = @_;
+
+    if (@argvs == 1) {        # No optional arguments
+
+        my @argv = @{$argvs[0]};
+        shift @argv;
+
+        return $class->_one_invocation($core,$call,$name,$void,$sub,! $lexical, $sref, @argv);
+
+    } else {
+        my $else = "\t";
+        my (@out, @argv, $n);
+        while (@argvs) {
+            @argv = @{shift @argvs};
+            $n = shift @argv;
+
+            my $condition = "\@_ == $n";
+
+            if (@argv and $argv[-1] =~ /[#@]_/) {
+                # This argv ends with '@' in the prototype, so it matches
+                # any number of args >= the number of expressions in the
+                # argv.
+                $condition = "\@_ >= $n";
+            }
+
+            push @out, "${else}if ($condition) {\n";
+
+            $else = "\t} els";
+
+        push @out, $class->_one_invocation($core,$call,$name,$void,$sub,! $lexical, $sref, @argv);
+        }
+        push @out, qq[
+            }
+            die "Internal error: $name(\@_): Do not expect to get ", scalar(\@_), " arguments";
+    ];
+
+        return join '', @out;
+    }
+}
+
+
+# This is a slim interface to ensure backward compatibility with
+# anyone doing very foolish things with old versions of Fatal.
+
+sub one_invocation {
+    my ($core, $call, $name, $void, @argv) = @_;
+
+    return Fatal->_one_invocation(
+        $core, $call, $name, $void,
+        undef,   # Sub.  Unused in back-compat mode.
+        1,       # Back-compat flag
+        undef,   # Subref, unused in back-compat mode.
+        @argv
+    );
+
+}
+
+# This is the internal interface that generates code.
+# NOTE: This interface WILL change in the future.  Please do not
+# call this subroutine directly.
+
+# TODO: Whatever's calling this code has already looked up hints.  Pass
+# them in, rather than look them up a second time.
+
+sub _one_invocation {
+    my ($class, $core, $call, $name, $void, $sub, $back_compat, $sref, @argv) = @_;
+
+
+    # If someone is calling us directly (a child class perhaps?) then
+    # they could try to mix void without enabling backwards
+    # compatibility.  We just don't support this at all, so we gripe
+    # about it rather than doing something unwise.
+
+    if ($void and not $back_compat) {
+        Carp::confess("Internal error: :void mode not supported with $class");
+    }
+
+    # @argv only contains the results of the in-built prototype
+    # function, and is therefore safe to interpolate in the
+    # code generators below.
+
+    # TODO - The following clobbers context, but that's what the
+    #        old Fatal did.  Do we care?
+
+    if ($back_compat) {
+
+        # Use Fatal qw(system) will never be supported.  It generated
+        # a compile-time error with legacy Fatal, and there's no reason
+        # to support it when autodie does a better job.
+
+        if ($call eq 'CORE::system') {
+            return q{
+                croak("UNIMPLEMENTED: use Fatal qw(system) not supported.");
+            };
+        }
+
+        local $" = ', ';
+
+        if ($void) {
+            return qq/return (defined wantarray)?$call(@argv):
+                   $call(@argv) || Carp::croak("Can't $name(\@_)/ .
+                   ($core ? ': $!' : ', \$! is \"$!\"') . '")'
+        } else {
+            return qq{return $call(@argv) || Carp::croak("Can't $name(\@_)} .
+                   ($core ? ': $!' : ', \$! is \"$!\"') . '")';
+        }
+    }
+
+    # The name of our original function is:
+    #   $call if the function is CORE
+    #   $sub if our function is non-CORE
+
+    # The reason for this is that $call is what we're actually
+    # calling.  For our core functions, this is always
+    # CORE::something.  However for user-defined subs, we're about to
+    # replace whatever it is that we're calling; as such, we actually
+    # calling a subroutine ref.
+
+    my $human_sub_name = $core ? $call : $sub;
+
+    # Should we be testing to see if our result is defined, or
+    # just true?
+
+    my $use_defined_or;
+
+    my $hints;      # All user-sub hints, including list hints.
+
+    if ( $core ) {
+
+        # Core hints are built into autodie.
+
+        $use_defined_or = exists ( $Use_defined_or{$call} );
+
+    }
+    else {
+
+        # User sub hints are looked up using autodie::hints,
+        # since users may wish to add their own hints.
+
+        require autodie::hints;
+
+        $hints = autodie::hints->get_hints_for( $sref );
+
+        # We'll look up the sub's fullname.  This means we
+        # get better reports of where it came from in our
+        # error messages, rather than what imported it.
+
+        $human_sub_name = autodie::hints->sub_fullname( $sref );
+
+    }
+
+    # Checks for special core subs.
+
+    if ($call eq 'CORE::system') {
+
+        # Leverage IPC::System::Simple if we're making an autodying
+        # system.
+
+        local $" = ", ";
+
+        # We need to stash $@ into $E, rather than using
+        # local $@ for the whole sub.  If we don't then
+        # any exceptions from internal errors in autodie/Fatal
+        # will mysteriously disappear before propagating
+        # upwards.
+
+        return qq{
+            my \$retval;
+            my \$E;
+
+
+            {
+                local \$@;
+
+                eval {
+                    \$retval = IPC::System::Simple::system(@argv);
+                };
+
+                \$E = \$@;
+            }
+
+            if (\$E) {
+
+                # TODO - This can't be overridden in child
+                # classes!
+
+                die autodie::exception::system->new(
+                    function => q{CORE::system}, args => [ @argv ],
+                    message => "\$E", errno => \$!,
+                );
+            }
+
+            return \$retval;
+        };
+
+    }
+
+    local $" = ', ';
+
+    # If we're going to throw an exception, here's the code to use.
+    my $die = qq{
+        die $class->throw(
+            function => q{$human_sub_name}, args => [ @argv ],
+            pragma => q{$class}, errno => \$!,
+            context => \$context, return => \$retval,
+            eval_error => \$@
+        )
+    };
+
+    if ($call eq 'CORE::flock') {
+
+        # flock needs special treatment.  When it fails with
+        # LOCK_UN and EWOULDBLOCK, then it's not really fatal, it just
+        # means we couldn't get the lock right now.
+
+        require POSIX;      # For POSIX::EWOULDBLOCK
+
+        local $@;   # Don't blat anyone else's $@.
+
+        # Ensure that our vendor supports EWOULDBLOCK.  If they
+        # don't (eg, Windows), then we use known values for its
+        # equivalent on other systems.
+
+        my $EWOULDBLOCK = eval { POSIX::EWOULDBLOCK(); }
+                          || $_EWOULDBLOCK{$^O}
+                          || _autocroak("Internal error - can't overload flock - EWOULDBLOCK not defined on this system.");
+        my $EAGAIN = $EWOULDBLOCK;
+        if ($try_EAGAIN) {
+            $EAGAIN = eval { POSIX::EAGAIN(); }
+                          || _autocroak("Internal error - can't overload flock - EAGAIN not defined on this system.");
+        }
+
+        require Fcntl;      # For Fcntl::LOCK_NB
+
+        return qq{
+
+            my \$context = wantarray() ? "list" : "scalar";
+
+            # Try to flock.  If successful, return it immediately.
+
+            my \$retval = $call(@argv);
+            return \$retval if \$retval;
+
+            # If we failed, but we're using LOCK_NB and
+            # returned EWOULDBLOCK, it's not a real error.
+
+            if (\$_[1] & Fcntl::LOCK_NB() and
+                (\$! == $EWOULDBLOCK or
+                ($try_EAGAIN and \$! == $EAGAIN ))) {
+                return \$retval;
+            }
+
+            # Otherwise, we failed.  Die noisily.
+
+            $die;
+
+        };
+    }
+
+    if ($call eq 'CORE::kill') {
+
+        return qq[
+
+            my \$num_things = \@_ - $Returns_num_things_changed{$call};
+            my \$context = ! defined wantarray() ? 'void' : 'scalar';
+            my \$signal = \$_[0];
+            my \$retval = $call(@argv);
+            my \$sigzero = looks_like_number( \$signal ) && \$signal == 0;
+
+            if (    (   \$sigzero && \$context eq 'void' )
+                 or ( ! \$sigzero && \$retval != \$num_things ) ) {
+
+                $die;
+            }
+
+            return \$retval;
+        ];
+    }
+
+    if (exists $Returns_num_things_changed{$call}) {
+
+        # Some things return the number of things changed (like
+        # chown, kill, chmod, etc). We only consider these successful
+        # if *all* the things are changed.
+
+        return qq[
+            my \$num_things = \@_ - $Returns_num_things_changed{$call};
+            my \$retval = $call(@argv);
+
+            if (\$retval != \$num_things) {
+
+                # We need \$context to throw an exception.
+                # It's *always* set to scalar, because that's how
+                # autodie calls chown() above.
+
+                my \$context = "scalar";
+                $die;
+            }
+
+            return \$retval;
+        ];
+    }
+
+    # AFAIK everything that can be given an unopned filehandle
+    # will fail if it tries to use it, so we don't really need
+    # the 'unopened' warning class here.  Especially since they
+    # then report the wrong line number.
+
+    # Other warnings are disabled because they produce excessive
+    # complaints from smart-match hints under 5.10.1.
+
+    my $code = qq[
+        no warnings qw(unopened uninitialized numeric);
+
+        if (wantarray) {
+            my \@results = $call(@argv);
+            my \$retval  = \\\@results;
+            my \$context = "list";
+
+    ];
+
+    my $retval_action = $Retval_action{$call} || '';
+
+    if ( $hints && exists $hints->{list} ) {
+        my $match;
+        if ( ref($hints->{list}) eq 'CODE' ) {
+            # NB: Subroutine hints are passed as a full list.
+            # This differs from the 5.10.0 smart-match behaviour,
+            # but means that context unaware subroutines can use
+            # the same hints in both list and scalar context.
+
+            $match = q[ $hints->{list}->(@results) ];
+        }
+        elsif ( ref($hints->{list}) eq 'Regexp' ) {
+            $match = q[ grep $_ =~ $hints->{list}, @results ];
+        }
+        elsif ( !defined $hints->{list} ) {
+            $match = q[ grep !defined, @results ];
+        }
+        elsif ( SMARTMATCH_ALLOWED ) {
+            $match = q[ @results ~~ $hints->{list} ];
+            warnings::warnif('deprecated', sprintf(WARNING_SMARTMATCH_DEPRECATED, 'list', $sub));
+            if (SMARTMATCH_CATEGORY) {
+                $match = sprintf q[ do { no warnings '%s'; %s } ], SMARTMATCH_CATEGORY, $match;
+            }
+        }
+        else {
+            croak sprintf(ERROR_SMARTMATCH_HINTS, 'list', $sub);
+        }
+
+        $code .= qq{
+            if ( $match ) { $die };
+        };
+    }
+    else {
+        $code .= qq{
+            # An empty list, or a single undef is failure
+            if (! \@results or (\@results == 1 and ! defined \$results[0])) {
+                $die;
+            }
+        }
+    }
+
+    # Tidy up the end of our wantarray call.
+
+    $code .= qq[
+            return \@results;
+        }
+    ];
+
+
+    # Otherwise, we're in scalar context.
+    # We're never in a void context, since we have to look
+    # at the result.
+
+    $code .= qq{
+        my \$retval  = $call(@argv);
+        my \$context = "scalar";
+    };
+
+    if ( $hints && exists $hints->{scalar} ) {
+        my $match;
+
+        if ( ref($hints->{scalar}) eq 'CODE' ) {
+            # We always call code refs directly, since that always
+            # works in 5.8.x, and always works in 5.10.1
+            $match = q[ $hints->{scalar}->($retval) ];
+        }
+        elsif ( ref($hints->{scalar}) eq 'Regexp' ) {

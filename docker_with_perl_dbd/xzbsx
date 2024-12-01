@@ -1,0 +1,1000 @@
+            test = tdata[0]
+            timesd[test] = tdata[1:]
+
+        outcome = {}
+        groups = [
+            ('success', ((tc, None) for tc in result.successes)),
+            ('failure', result.failures),
+            ('skip', result.skipped),
+        ]
+        for res, testcases in groups:
+            for tc, __ in testcases:
+                if tc.name in timesd:
+                    diff = result.faildata.get(tc.name, b'')
+                    try:
+                        diff = diff.decode('unicode_escape')
+                    except UnicodeDecodeError as e:
+                        diff = '%r decoding diff, sorry' % e
+                    tres = {
+                        'result': res,
+                        'time': ('%0.3f' % timesd[tc.name][2]),
+                        'cuser': ('%0.3f' % timesd[tc.name][0]),
+                        'csys': ('%0.3f' % timesd[tc.name][1]),
+                        'start': ('%0.3f' % timesd[tc.name][3]),
+                        'end': ('%0.3f' % timesd[tc.name][4]),
+                        'diff': diff,
+                    }
+                else:
+                    # blacklisted test
+                    tres = {'result': res}
+
+                outcome[tc.name] = tres
+        jsonout = json.dumps(
+            outcome, sort_keys=True, indent=4, separators=(',', ': ')
+        )
+        outf.writelines(("testreport =", jsonout))
+
+
+def sorttests(testdescs, previoustimes, shuffle=False):
+    """Do an in-place sort of tests."""
+    if shuffle:
+        random.shuffle(testdescs)
+        return
+
+    if previoustimes:
+
+        def sortkey(f):
+            f = f['path']
+            if f in previoustimes:
+                # Use most recent time as estimate
+                return -(previoustimes[f][-1])
+            else:
+                # Default to a rather arbitrary value of 1 second for new tests
+                return -1.0
+
+    else:
+        # keywords for slow tests
+        slow = {
+            b'svn': 10,
+            b'cvs': 10,
+            b'hghave': 10,
+            b'largefiles-update': 10,
+            b'run-tests': 10,
+            b'corruption': 10,
+            b'race': 10,
+            b'i18n': 10,
+            b'check': 100,
+            b'gendoc': 100,
+            b'contrib-perf': 200,
+            b'merge-combination': 100,
+        }
+        perf = {}
+
+        def sortkey(f):
+            # run largest tests first, as they tend to take the longest
+            f = f['path']
+            try:
+                return perf[f]
+            except KeyError:
+                try:
+                    val = -os.stat(f).st_size
+                except FileNotFoundError:
+                    perf[f] = -1e9  # file does not exist, tell early
+                    return -1e9
+                for kw, mul in slow.items():
+                    if kw in f:
+                        val *= mul
+                if f.endswith(b'.py'):
+                    val /= 10.0
+                perf[f] = val / 1000.0
+                return perf[f]
+
+    testdescs.sort(key=sortkey)
+
+
+class TestRunner:
+    """Holds context for executing tests.
+
+    Tests rely on a lot of state. This object holds it for them.
+    """
+
+    # Programs required to run tests.
+    REQUIREDTOOLS = [
+        b'diff',
+        b'grep',
+        b'unzip',
+        b'gunzip',
+        b'bunzip2',
+        b'sed',
+    ]
+
+    # Maps file extensions to test class.
+    TESTTYPES = [
+        (b'.py', PythonTest),
+        (b'.t', TTest),
+    ]
+
+    def __init__(self):
+        self.options = None
+        self._hgroot = None
+        self._testdir = None
+        self._outputdir = None
+        self._hgtmp = None
+        self._installdir = None
+        self._bindir = None
+        # a place for run-tests.py to generate executable it needs
+        self._custom_bin_dir = None
+        self._pythondir = None
+        # True if we had to infer the pythondir from --with-hg
+        self._pythondir_inferred = False
+        self._coveragefile = None
+        self._createdfiles = []
+        self._hgcommand = None
+        self._hgpath = None
+        self._portoffset = 0
+        self._ports = {}
+
+    def run(self, args, parser=None):
+        """Run the test suite."""
+        oldmask = os.umask(0o22)
+        try:
+            parser = parser or getparser()
+            options = parseargs(args, parser)
+            tests = [_sys2bytes(a) for a in options.tests]
+            if options.test_list is not None:
+                for listfile in options.test_list:
+                    with open(listfile, 'rb') as f:
+                        tests.extend(t for t in f.read().splitlines() if t)
+            self.options = options
+
+            self._checktools()
+            testdescs = self.findtests(tests)
+            if options.profile_runner:
+                import statprof
+
+                statprof.start()
+            result = self._run(testdescs)
+            if options.profile_runner:
+                statprof.stop()
+                statprof.display()
+            return result
+
+        finally:
+            os.umask(oldmask)
+
+    def _run(self, testdescs):
+        testdir = getcwdb()
+        # assume all tests in same folder for now
+        if testdescs:
+            pathname = os.path.dirname(testdescs[0]['path'])
+            if pathname:
+                testdir = os.path.join(testdir, pathname)
+        self._testdir = osenvironb[b'TESTDIR'] = testdir
+        osenvironb[b'TESTDIR_FORWARD_SLASH'] = osenvironb[b'TESTDIR'].replace(
+            os.sep.encode('ascii'), b'/'
+        )
+
+        if self.options.outputdir:
+            self._outputdir = canonpath(_sys2bytes(self.options.outputdir))
+        else:
+            self._outputdir = getcwdb()
+            if testdescs and pathname:
+                self._outputdir = os.path.join(self._outputdir, pathname)
+        previoustimes = {}
+        if self.options.order_by_runtime:
+            previoustimes = dict(loadtimes(self._outputdir))
+        sorttests(testdescs, previoustimes, shuffle=self.options.random)
+
+        if 'PYTHONHASHSEED' not in os.environ:
+            # use a random python hash seed all the time
+            # we do the randomness ourself to know what seed is used
+            os.environ['PYTHONHASHSEED'] = str(random.getrandbits(32))
+
+        # Rayon (Rust crate for multi-threading) will use all logical CPU cores
+        # by default, causing thrashing on high-cpu-count systems.
+        # Setting its limit to 3 during tests should still let us uncover
+        # multi-threading bugs while keeping the thrashing reasonable.
+        os.environ.setdefault("RAYON_NUM_THREADS", "3")
+
+        if self.options.tmpdir:
+            self.options.keep_tmpdir = True
+            tmpdir = _sys2bytes(self.options.tmpdir)
+            if os.path.exists(tmpdir):
+                # Meaning of tmpdir has changed since 1.3: we used to create
+                # HGTMP inside tmpdir; now HGTMP is tmpdir.  So fail if
+                # tmpdir already exists.
+                print("error: temp dir %r already exists" % tmpdir)
+                return 1
+
+            os.makedirs(tmpdir)
+        else:
+            d = None
+            if WINDOWS:
+                # without this, we get the default temp dir location, but
+                # in all lowercase, which causes troubles with paths (issue3490)
+                d = osenvironb.get(b'TMP', None)
+            tmpdir = tempfile.mkdtemp(b'', b'hgtests.', d)
+
+        self._hgtmp = osenvironb[b'HGTMP'] = os.path.realpath(tmpdir)
+
+        self._custom_bin_dir = os.path.join(self._hgtmp, b'custom-bin')
+        os.makedirs(self._custom_bin_dir)
+
+        if self.options.with_hg:
+            self._installdir = None
+            whg = self.options.with_hg
+            self._bindir = os.path.dirname(os.path.realpath(whg))
+            assert isinstance(self._bindir, bytes)
+            self._hgcommand = os.path.basename(whg)
+
+            normbin = os.path.normpath(os.path.abspath(whg))
+            normbin = normbin.replace(_sys2bytes(os.sep), b'/')
+
+            # Other Python scripts in the test harness need to
+            # `import mercurial`. If `hg` is a Python script, we assume
+            # the Mercurial modules are relative to its path and tell the tests
+            # to load Python modules from its directory.
+            with open(whg, 'rb') as fh:
+                initial = fh.read(1024)
+
+            if re.match(b'#!.*python', initial):
+                self._pythondir = self._bindir
+            # If it looks like our in-repo Rust binary, use the source root.
+            # This is a bit hacky. But rhg is still not supported outside the
+            # source directory. So until it is, do the simple thing.
+            elif re.search(b'/rust/target/[^/]+/hg', normbin):
+                self._pythondir = os.path.dirname(self._testdir)
+            # Fall back to the legacy behavior.
+            else:
+                self._pythondir = self._bindir
+            self._pythondir_inferred = True
+
+        else:
+            self._installdir = os.path.join(self._hgtmp, b"install")
+            self._bindir = os.path.join(self._installdir, b"bin")
+            self._hgcommand = b'hg'
+            self._pythondir = os.path.join(self._installdir, b"lib", b"python")
+
+        # Force the use of hg.exe instead of relying on MSYS to recognize hg is
+        # a python script and feed it to python.exe.  Legacy stdio is force
+        # enabled by hg.exe, and this is a more realistic way to launch hg
+        # anyway.
+        if WINDOWS and not self._hgcommand.endswith(b'.exe'):
+            self._hgcommand += b'.exe'
+
+        real_hg = os.path.join(self._bindir, self._hgcommand)
+        osenvironb[b'HGTEST_REAL_HG'] = real_hg
+        # set CHGHG, then replace "hg" command by "chg"
+        chgbindir = self._bindir
+        if self.options.chg or self.options.with_chg:
+            osenvironb[b'CHG_INSTALLED_AS_HG'] = b'1'
+            osenvironb[b'CHGHG'] = real_hg
+        else:
+            # drop flag for hghave
+            osenvironb.pop(b'CHG_INSTALLED_AS_HG', None)
+        if self.options.chg:
+            self._hgcommand = b'chg'
+        elif self.options.with_chg:
+            chgbindir = os.path.dirname(os.path.realpath(self.options.with_chg))
+            self._hgcommand = os.path.basename(self.options.with_chg)
+
+        # configure fallback and replace "hg" command by "rhg"
+        rhgbindir = self._bindir
+        if self.options.rhg or self.options.with_rhg:
+            # Affects hghave.py
+            osenvironb[b'RHG_INSTALLED_AS_HG'] = b'1'
+            # Affects configuration. Alternatives would be setting configuration through
+            # `$HGRCPATH` but some tests override that, or changing `_hgcommand` to include
+            # `--config` but that disrupts tests that print command lines and check expected
+            # output.
+            osenvironb[b'RHG_ON_UNSUPPORTED'] = b'fallback'
+            osenvironb[b'RHG_FALLBACK_EXECUTABLE'] = real_hg
+        else:
+            # drop flag for hghave
+            osenvironb.pop(b'RHG_INSTALLED_AS_HG', None)
+        if self.options.rhg:
+            self._hgcommand = b'rhg'
+        elif self.options.with_rhg:
+            rhgbindir = os.path.dirname(os.path.realpath(self.options.with_rhg))
+            self._hgcommand = os.path.basename(self.options.with_rhg)
+
+        if self.options.pyoxidized:
+            testdir = os.path.dirname(_sys2bytes(canonpath(sys.argv[0])))
+            reporootdir = os.path.dirname(testdir)
+            # XXX we should ideally install stuff instead of using the local build
+
+            exe = b'hg'
+            triple = b''
+
+            if WINDOWS:
+                triple = b'x86_64-pc-windows-msvc'
+                exe = b'hg.exe'
+            elif MACOS:
+                # TODO: support Apple silicon too
+                triple = b'x86_64-apple-darwin'
+
+            bin_path = b'build/pyoxidizer/%s/release/app/%s' % (triple, exe)
+            full_path = os.path.join(reporootdir, bin_path)
+            self._hgcommand = full_path
+            # Affects hghave.py
+            osenvironb[b'PYOXIDIZED_INSTALLED_AS_HG'] = b'1'
+        else:
+            osenvironb.pop(b'PYOXIDIZED_INSTALLED_AS_HG', None)
+
+        osenvironb[b"BINDIR"] = self._bindir
+        osenvironb[b"PYTHON"] = PYTHON
+
+        fileb = _sys2bytes(__file__)
+        runtestdir = os.path.abspath(os.path.dirname(fileb))
+        osenvironb[b'RUNTESTDIR'] = runtestdir
+        osenvironb[b'RUNTESTDIR_FORWARD_SLASH'] = runtestdir.replace(
+            os.sep.encode('ascii'), b'/'
+        )
+        sepb = _sys2bytes(os.pathsep)
+        path = [self._bindir, runtestdir] + osenvironb[b"PATH"].split(sepb)
+        if os.path.islink(__file__):
+            # test helper will likely be at the end of the symlink
+            realfile = os.path.realpath(fileb)
+            realdir = os.path.abspath(os.path.dirname(realfile))
+            path.insert(2, realdir)
+        if chgbindir != self._bindir:
+            path.insert(1, chgbindir)
+        if rhgbindir != self._bindir:
+            path.insert(1, rhgbindir)
+        if self._testdir != runtestdir:
+            path = [self._testdir] + path
+        path = [self._custom_bin_dir] + path
+        osenvironb[b"PATH"] = sepb.join(path)
+
+        # Include TESTDIR in PYTHONPATH so that out-of-tree extensions
+        # can run .../tests/run-tests.py test-foo where test-foo
+        # adds an extension to HGRC. Also include run-test.py directory to
+        # import modules like heredoctest.
+        pypath = [self._pythondir, self._testdir, runtestdir]
+        # We have to augment PYTHONPATH, rather than simply replacing
+        # it, in case external libraries are only available via current
+        # PYTHONPATH.  (In particular, the Subversion bindings on OS X
+        # are in /opt/subversion.)
+        oldpypath = osenvironb.get(IMPL_PATH)
+        if oldpypath:
+            pypath.append(oldpypath)
+        osenvironb[IMPL_PATH] = sepb.join(pypath)
+
+        if self.options.pure:
+            os.environ["HGTEST_RUN_TESTS_PURE"] = "--pure"
+            os.environ["HGMODULEPOLICY"] = "py"
+        if self.options.rust:
+            os.environ["HGMODULEPOLICY"] = "rust+c"
+        if self.options.no_rust:
+            current_policy = os.environ.get("HGMODULEPOLICY", "")
+            if current_policy.startswith("rust+"):
+                os.environ["HGMODULEPOLICY"] = current_policy[len("rust+") :]
+            os.environ.pop("HGWITHRUSTEXT", None)
+
+        if self.options.allow_slow_tests:
+            os.environ["HGTEST_SLOW"] = "slow"
+        elif 'HGTEST_SLOW' in os.environ:
+            del os.environ['HGTEST_SLOW']
+
+        self._coveragefile = os.path.join(self._testdir, b'.coverage')
+
+        if self.options.exceptions:
+            exceptionsdir = os.path.join(self._outputdir, b'exceptions')
+            try:
+                os.makedirs(exceptionsdir)
+            except FileExistsError:
+                pass
+
+            # Remove all existing exception reports.
+            for f in os.listdir(exceptionsdir):
+                os.unlink(os.path.join(exceptionsdir, f))
+
+            osenvironb[b'HGEXCEPTIONSDIR'] = exceptionsdir
+            logexceptions = os.path.join(self._testdir, b'logexceptions.py')
+            self.options.extra_config_opt.append(
+                'extensions.logexceptions=%s' % logexceptions.decode('utf-8')
+            )
+
+        vlog("# Using TESTDIR", _bytes2sys(self._testdir))
+        vlog("# Using RUNTESTDIR", _bytes2sys(osenvironb[b'RUNTESTDIR']))
+        vlog("# Using HGTMP", _bytes2sys(self._hgtmp))
+        vlog("# Using PATH", os.environ["PATH"])
+        vlog(
+            "# Using",
+            _bytes2sys(IMPL_PATH),
+            _bytes2sys(osenvironb[IMPL_PATH]),
+        )
+        vlog("# Writing to directory", _bytes2sys(self._outputdir))
+
+        try:
+            return self._runtests(testdescs) or 0
+        finally:
+            time.sleep(0.1)
+            self._cleanup()
+
+    def findtests(self, args):
+        """Finds possible test files from arguments.
+
+        If you wish to inject custom tests into the test harness, this would
+        be a good function to monkeypatch or override in a derived class.
+        """
+        if not args:
+            if self.options.changed:
+                proc = Popen4(
+                    b'hg st --rev "%s" -man0 .'
+                    % _sys2bytes(self.options.changed),
+                    None,
+                    0,
+                )
+                stdout, stderr = proc.communicate()
+                args = stdout.strip(b'\0').split(b'\0')
+            else:
+                args = os.listdir(b'.')
+
+        expanded_args = []
+        for arg in args:
+            if os.path.isdir(arg):
+                if not arg.endswith(b'/'):
+                    arg += b'/'
+                expanded_args.extend([arg + a for a in os.listdir(arg)])
+            else:
+                expanded_args.append(arg)
+        args = expanded_args
+
+        testcasepattern = re.compile(br'([\w-]+\.t|py)(?:#([a-zA-Z0-9_\-.#]+))')
+        tests = []
+        for t in args:
+            case = []
+
+            if not (
+                os.path.basename(t).startswith(b'test-')
+                and (t.endswith(b'.py') or t.endswith(b'.t'))
+            ):
+
+                m = testcasepattern.match(os.path.basename(t))
+                if m is not None:
+                    t_basename, casestr = m.groups()
+                    t = os.path.join(os.path.dirname(t), t_basename)
+                    if casestr:
+                        case = casestr.split(b'#')
+                else:
+                    continue
+
+            if t.endswith(b'.t'):
+                # .t file may contain multiple test cases
+                casedimensions = parsettestcases(t)
+                if casedimensions:
+                    cases = []
+
+                    def addcases(case, casedimensions):
+                        if not casedimensions:
+                            cases.append(case)
+                        else:
+                            for c in casedimensions[0]:
+                                addcases(case + [c], casedimensions[1:])
+
+                    addcases([], casedimensions)
+                    if case and case in cases:
+                        cases = [case]
+                    elif case:
+                        # Ignore invalid cases
+                        cases = []
+                    else:
+                        pass
+                    tests += [{'path': t, 'case': c} for c in sorted(cases)]
+                else:
+                    tests.append({'path': t})
+            else:
+                tests.append({'path': t})
+
+        if self.options.retest:
+            retest_args = []
+            for test in tests:
+                errpath = self._geterrpath(test)
+                if os.path.exists(errpath):
+                    retest_args.append(test)
+            tests = retest_args
+        return tests
+
+    def _runtests(self, testdescs):
+        def _reloadtest(test, i):
+            # convert a test back to its description dict
+            desc = {'path': test.path}
+            case = getattr(test, '_case', [])
+            if case:
+                desc['case'] = case
+            return self._gettest(desc, i)
+
+        try:
+            if self.options.restart:
+                orig = list(testdescs)
+                while testdescs:
+                    desc = testdescs[0]
+                    errpath = self._geterrpath(desc)
+                    if os.path.exists(errpath):
+                        break
+                    testdescs.pop(0)
+                if not testdescs:
+                    print("running all tests")
+                    testdescs = orig
+
+            tests = [self._gettest(d, i) for i, d in enumerate(testdescs)]
+            num_tests = len(tests) * self.options.runs_per_test
+
+            jobs = min(num_tests, self.options.jobs)
+
+            failed = False
+            kws = self.options.keywords
+            if kws is not None:
+                kws = kws.encode('utf-8')
+
+            suite = TestSuite(
+                self._testdir,
+                jobs=jobs,
+                whitelist=self.options.whitelisted,
+                blacklist=self.options.blacklist,
+                keywords=kws,
+                loop=self.options.loop,
+                runs_per_test=self.options.runs_per_test,
+                showchannels=self.options.showchannels,
+                tests=tests,
+                loadtest=_reloadtest,
+            )
+            verbosity = 1
+            if self.options.list_tests:
+                verbosity = 0
+            elif self.options.verbose:
+                verbosity = 2
+            runner = TextTestRunner(self, verbosity=verbosity)
+
+            osenvironb.pop(b'PYOXIDIZED_IN_MEMORY_RSRC', None)
+            osenvironb.pop(b'PYOXIDIZED_FILESYSTEM_RSRC', None)
+
+            if self.options.list_tests:
+                result = runner.listtests(suite)
+            else:
+                install_start_time = time.monotonic()
+                self._usecorrectpython()
+                if self._installdir:
+                    self._installhg()
+                    self._checkhglib("Testing")
+                if self.options.chg:
+                    assert self._installdir
+                    self._installchg()
+                if self.options.rhg:
+                    assert self._installdir
+                    self._installrhg()
+                elif self.options.pyoxidized:
+                    self._build_pyoxidized()
+                self._use_correct_mercurial()
+                install_end_time = time.monotonic()
+                if self._installdir:
+                    msg = 'installed Mercurial in %.2f seconds'
+                    msg %= install_end_time - install_start_time
+                    log(msg)
+
+                log(
+                    'running %d tests using %d parallel processes'
+                    % (num_tests, jobs)
+                )
+
+                result = runner.run(suite)
+
+            if result.failures or result.errors:
+                failed = True
+
+            result.onEnd()
+
+            if self.options.anycoverage:
+                self._outputcoverage()
+        except KeyboardInterrupt:
+            failed = True
+            print("\ninterrupted!")
+
+        if failed:
+            return 1
+
+    def _geterrpath(self, test):
+        # test['path'] is a relative path
+        if 'case' in test:
+            # for multiple dimensions test cases
+            casestr = b'#'.join(test['case'])
+            errpath = b'%s#%s.err' % (test['path'], casestr)
+        else:
+            errpath = b'%s.err' % test['path']
+        if self.options.outputdir:
+            self._outputdir = canonpath(_sys2bytes(self.options.outputdir))
+            errpath = os.path.join(self._outputdir, errpath)
+        return errpath
+
+    def _getport(self, count):
+        port = self._ports.get(count)  # do we have a cached entry?
+        if port is None:
+            portneeded = 3
+            # above 100 tries we just give up and let test reports failure
+            for tries in range(100):
+                allfree = True
+                port = self.options.port + self._portoffset
+                for idx in range(portneeded):
+                    if not checkportisavailable(port + idx):
+                        allfree = False
+                        break
+                self._portoffset += portneeded
+                if allfree:
+                    break
+            self._ports[count] = port
+        return port
+
+    def _gettest(self, testdesc, count):
+        """Obtain a Test by looking at its filename.
+
+        Returns a Test instance. The Test may not be runnable if it doesn't
+        map to a known type.
+        """
+        path = testdesc['path']
+        lctest = path.lower()
+        testcls = Test
+
+        for ext, cls in self.TESTTYPES:
+            if lctest.endswith(ext):
+                testcls = cls
+                break
+
+        refpath = os.path.join(getcwdb(), path)
+        tmpdir = os.path.join(self._hgtmp, b'child%d' % count)
+
+        # extra keyword parameters. 'case' is used by .t tests
+        kwds = {k: testdesc[k] for k in ['case'] if k in testdesc}
+
+        t = testcls(
+            refpath,
+            self._outputdir,
+            tmpdir,
+            keeptmpdir=self.options.keep_tmpdir,
+            debug=self.options.debug,
+            first=self.options.first,
+            timeout=self.options.timeout,
+            startport=self._getport(count),
+            extraconfigopts=self.options.extra_config_opt,
+            shell=self.options.shell,
+            hgcommand=self._hgcommand,
+            usechg=bool(self.options.with_chg or self.options.chg),
+            chgdebug=self.options.chg_debug,
+            useipv6=useipv6,
+            **kwds
+        )
+        t.should_reload = True
+        return t
+
+    def _cleanup(self):
+        """Clean up state from this test invocation."""
+        if self.options.keep_tmpdir:
+            return
+
+        vlog("# Cleaning up HGTMP", _bytes2sys(self._hgtmp))
+        shutil.rmtree(self._hgtmp, True)
+        for f in self._createdfiles:
+            try:
+                os.remove(f)
+            except OSError:
+                pass
+
+    def _usecorrectpython(self):
+        """Configure the environment to use the appropriate Python in tests."""
+        # Tests must use the same interpreter as us or bad things will happen.
+        if WINDOWS:
+            pyexe_names = [b'python', b'python3', b'python.exe']
+        else:
+            pyexe_names = [b'python', b'python3']
+
+        # os.symlink() is a thing with py3 on Windows, but it requires
+        # Administrator rights.
+        if not WINDOWS and getattr(os, 'symlink', None):
+            msg = "# Making python executable in test path a symlink to '%s'"
+            msg %= sysexecutable
+            vlog(msg)
+            for pyexename in pyexe_names:
+                mypython = os.path.join(self._custom_bin_dir, pyexename)
+                try:
+                    if os.readlink(mypython) == sysexecutable:
+                        continue
+                    os.unlink(mypython)
+                except FileNotFoundError:
+                    pass
+                if self._findprogram(pyexename) != sysexecutable:
+                    try:
+                        os.symlink(sysexecutable, mypython)
+                        self._createdfiles.append(mypython)
+                    except FileExistsError:
+                        # child processes may race, which is harmless
+                        pass
+        elif WINDOWS and not os.getenv('MSYSTEM'):
+            raise AssertionError('cannot run test on Windows without MSYSTEM')
+        else:
+            # Generate explicit file instead of symlink
+            #
+            # This is especially important as Windows doesn't have
+            # `python3.exe`, and MSYS cannot understand the reparse point with
+            # that name provided by Microsoft.  Create a simple script on PATH
+            # with that name that delegates to the py3 launcher so the shebang
+            # lines work.
+            esc_executable = _sys2bytes(shellquote(sysexecutable))
+            for pyexename in pyexe_names:
+                stub_exec_path = os.path.join(self._custom_bin_dir, pyexename)
+                with open(stub_exec_path, 'wb') as f:
+                    f.write(b'#!/bin/sh\n')
+                    f.write(b'%s "$@"\n' % esc_executable)
+
+            if WINDOWS:
+                # adjust the path to make sur the main python finds it own dll
+                path = os.environ['PATH'].split(os.pathsep)
+                main_exec_dir = os.path.dirname(sysexecutable)
+                extra_paths = [_bytes2sys(self._custom_bin_dir), main_exec_dir]
+
+                # Binaries installed by pip into the user area like pylint.exe may
+                # not be in PATH by default.
+                appdata = os.environ.get('APPDATA')
+                vi = sys.version_info
+                if appdata is not None:
+                    python_dir = 'Python%d%d' % (vi[0], vi[1])
+                    scripts_path = [appdata, 'Python', python_dir, 'Scripts']
+                    scripts_dir = os.path.join(*scripts_path)
+                    extra_paths.append(scripts_dir)
+
+                os.environ['PATH'] = os.pathsep.join(extra_paths + path)
+
+    def _use_correct_mercurial(self):
+        target_exec = os.path.join(self._custom_bin_dir, b'hg')
+        if self._hgcommand != b'hg':
+            # shutil.which only accept bytes from 3.8
+            real_exec = which(self._hgcommand)
+            if real_exec is None:
+                raise ValueError('could not find exec path for "%s"', real_exec)
+            if real_exec == target_exec:
+                # do not overwrite something with itself
+                return
+            if WINDOWS:
+                with open(target_exec, 'wb') as f:
+                    f.write(b'#!/bin/sh\n')
+                    escaped_exec = shellquote(_bytes2sys(real_exec))
+                    f.write(b'%s "$@"\n' % _sys2bytes(escaped_exec))
+            else:
+                os.symlink(real_exec, target_exec)
+            self._createdfiles.append(target_exec)
+
+    def _installhg(self):
+        """Install hg into the test environment.
+
+        This will also configure hg with the appropriate testing settings.
+        """
+        vlog("# Performing temporary installation of HG")
+        installerrs = os.path.join(self._hgtmp, b"install.err")
+        compiler = ''
+        if self.options.compiler:
+            compiler = '--compiler ' + self.options.compiler
+        setup_opts = b""
+        if self.options.pure:
+            setup_opts = b"--pure"
+        elif self.options.rust:
+            setup_opts = b"--rust"
+        elif self.options.no_rust:
+            setup_opts = b"--no-rust"
+
+        # Run installer in hg root
+        compiler = _sys2bytes(compiler)
+        script = _sys2bytes(os.path.realpath(sys.argv[0]))
+        exe = _sys2bytes(sysexecutable)
+        hgroot = os.path.dirname(os.path.dirname(script))
+        self._hgroot = hgroot
+        os.chdir(hgroot)
+        nohome = b'--home=""'
+        if WINDOWS:
+            # The --home="" trick works only on OS where os.sep == '/'
+            # because of a distutils convert_path() fast-path. Avoid it at
+            # least on Windows for now, deal with .pydistutils.cfg bugs
+            # when they happen.
+            nohome = b''
+        cmd = (
+            b'"%(exe)s" setup.py %(setup_opts)s clean --all'
+            b' build %(compiler)s --build-base="%(base)s"'
+            b' install --force --prefix="%(prefix)s"'
+            b' --install-lib="%(libdir)s"'
+            b' --install-scripts="%(bindir)s" %(nohome)s >%(logfile)s 2>&1'
+            % {
+                b'exe': exe,
+                b'setup_opts': setup_opts,
+                b'compiler': compiler,
+                b'base': os.path.join(self._hgtmp, b"build"),
+                b'prefix': self._installdir,
+                b'libdir': self._pythondir,
+                b'bindir': self._bindir,
+                b'nohome': nohome,
+                b'logfile': installerrs,
+            }
+        )
+
+        # setuptools requires install directories to exist.
+        def makedirs(p):
+            try:
+                os.makedirs(p)
+            except FileExistsError:
+                pass
+
+        makedirs(self._pythondir)
+        makedirs(self._bindir)
+
+        vlog("# Running", cmd.decode("utf-8"))
+        if subprocess.call(_bytes2sys(cmd), shell=True) == 0:
+            if not self.options.verbose:
+                try:
+                    os.remove(installerrs)
+                except FileNotFoundError:
+                    pass
+        else:
+            with open(installerrs, 'rb') as f:
+                for line in f:
+                    sys.stdout.buffer.write(line)
+            sys.exit(1)
+        os.chdir(self._testdir)
+
+        hgbat = os.path.join(self._bindir, b'hg.bat')
+        if os.path.isfile(hgbat):
+            # hg.bat expects to be put in bin/scripts while run-tests.py
+            # installation layout put it in bin/ directly. Fix it
+            with open(hgbat, 'rb') as f:
+                data = f.read()
+            if br'"%~dp0..\python" "%~dp0hg" %*' in data:
+                data = data.replace(
+                    br'"%~dp0..\python" "%~dp0hg" %*',
+                    b'"%~dp0python" "%~dp0hg" %*',
+                )
+                with open(hgbat, 'wb') as f:
+                    f.write(data)
+            else:
+                print('WARNING: cannot fix hg.bat reference to python.exe')
+
+        if self.options.anycoverage:
+            custom = os.path.join(
+                osenvironb[b'RUNTESTDIR'], b'sitecustomize.py'
+            )
+            target = os.path.join(self._pythondir, b'sitecustomize.py')
+            vlog('# Installing coverage trigger to %s' % target)
+            shutil.copyfile(custom, target)
+            rc = os.path.join(self._testdir, b'.coveragerc')
+            vlog('# Installing coverage rc to %s' % rc)
+            osenvironb[b'COVERAGE_PROCESS_START'] = rc
+            covdir = os.path.join(self._installdir, b'..', b'coverage')
+            try:
+                os.mkdir(covdir)
+            except FileExistsError:
+                pass
+
+            osenvironb[b'COVERAGE_DIR'] = covdir
+
+    def _checkhglib(self, verb):
+        """Ensure that the 'mercurial' package imported by python is
+        the one we expect it to be.  If not, print a warning to stderr."""
+        if self._pythondir_inferred:
+            # The pythondir has been inferred from --with-hg flag.
+            # We cannot expect anything sensible here.
+            return
+        expecthg = os.path.join(self._pythondir, b'mercurial')
+        actualhg = self._gethgpath()
+        if os.path.abspath(actualhg) != os.path.abspath(expecthg):
+            sys.stderr.write(
+                'warning: %s with unexpected mercurial lib: %s\n'
+                '         (expected %s)\n' % (verb, actualhg, expecthg)
+            )
+
+    def _gethgpath(self):
+        """Return the path to the mercurial package that is actually found by
+        the current Python interpreter."""
+        if self._hgpath is not None:
+            return self._hgpath
+
+        cmd = b'"%s" -c "import mercurial; print (mercurial.__path__[0])"'
+        cmd = _bytes2sys(cmd % PYTHON)
+
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, shell=True)
+        out, err = p.communicate()
+
+        self._hgpath = out.strip()
+
+        return self._hgpath
+
+    def _installchg(self):
+        """Install chg into the test environment"""
+        vlog('# Performing temporary installation of CHG')
+        assert os.path.dirname(self._bindir) == self._installdir
+        assert self._hgroot, 'must be called after _installhg()'
+        cmd = b'"%(make)s" clean install PREFIX="%(prefix)s"' % {
+            b'make': b'make',  # TODO: switch by option or environment?
+            b'prefix': self._installdir,
+        }
+        cwd = os.path.join(self._hgroot, b'contrib', b'chg')
+        vlog("# Running", cmd)
+        proc = subprocess.Popen(
+            cmd,
+            shell=True,
+            cwd=cwd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+        out, _err = proc.communicate()
+        if proc.returncode != 0:
+            sys.stdout.buffer.write(out)
+            sys.exit(1)
+
+    def _installrhg(self):
+        """Install rhg into the test environment"""
+        vlog('# Performing temporary installation of rhg')
+        assert os.path.dirname(self._bindir) == self._installdir
+        assert self._hgroot, 'must be called after _installhg()'
+        cmd = b'"%(make)s" install-rhg PREFIX="%(prefix)s"' % {
+            b'make': b'make',  # TODO: switch by option or environment?
+            b'prefix': self._installdir,
+        }
+        cwd = self._hgroot
+        vlog("# Running", cmd)
+        proc = subprocess.Popen(
+            cmd,
+            shell=True,
+            cwd=cwd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+        out, _err = proc.communicate()
+        if proc.returncode != 0:
+            sys.stdout.buffer.write(out)
+            sys.exit(1)
+
+    def _build_pyoxidized(self):
+        """build a pyoxidized version of mercurial into the test environment
+
+        Ideally this function would be `install_pyoxidier` and would both build
+        and install pyoxidier. However we are starting small to get pyoxidizer
+        build binary to testing quickly.
+        """
+        vlog('# build a pyoxidized version of Mercurial')
+        assert os.path.dirname(self._bindir) == self._installdir
+        assert self._hgroot, 'must be called after _installhg()'
+        target = b''
+        if WINDOWS:
+            target = b'windows'
+        elif MACOS:
+            target = b'macos'
+
+        cmd = b'"%(make)s" pyoxidizer-%(platform)s-tests' % {
+            b'make': b'make',
+            b'platform': target,
+        }
+        cwd = self._hgroot
+        vlog("# Running", cmd)
+        proc = subprocess.Popen(
+            _bytes2sys(cmd),
+            shell=True,
+            cwd=_bytes2sys(cwd),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+        out, _err = proc.communicate()
+        if proc.returncode != 0:
+            sys.stdout.buffer.write(out)
+            sys.exit(1)
+
+        cmd = _bytes2sys(b"%s debuginstall -Tjson" % self._hgcommand)
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, shell=True)
+        out, err = p.communicate()
+
+        props = json.loads(out)[0]
+
+        # Affects hghave.py
+        osenvironb.pop(b'PYOXIDIZED_IN_MEMORY_RSRC', None)
+        osenvironb.pop(b'PYOXIDIZED_FILESYSTEM_RSRC', None)
+        if props["hgmodules"] == props["pythonexe"]:
+            osenvironb[b'PYOXIDIZED_IN_MEMORY_RSRC'] = b'1'
+        else:
+            osenvironb[b'PYOXIDIZED_FILESYSTEM_RSRC'] = b'1'

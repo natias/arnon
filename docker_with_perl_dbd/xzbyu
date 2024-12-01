@@ -1,0 +1,1000 @@
+            my $sign = defined $base && $base < 1 ? '+' : '-';
+            $x -> binf($sign);
+            $done = 1;
+        }
+    }
+
+    if ($done) {
+        if ($fallback) {
+            # clear a/p after round, since user did not request it
+            delete $x->{_a};
+            delete $x->{_p};
+        }
+        return $x;
+    }
+
+    # when user set globals, they would interfere with our calculation, so
+    # disable them and later re-enable them
+    no strict 'refs';
+    my $abr = "$class\::accuracy"; my $ab = $$abr; $$abr = undef;
+    my $pbr = "$class\::precision"; my $pb = $$pbr; $$pbr = undef;
+    # we also need to disable any set A or P on $x (_find_round_parameters took
+    # them already into account), since these would interfere, too
+    delete $x->{_a}; delete $x->{_p};
+    # need to disable $upgrade in BigInt, to avoid deep recursion
+    local $Math::BigInt::upgrade = undef;
+    local $Math::BigFloat::downgrade = undef;
+
+    # upgrade $x if $x is not a Math::BigFloat (handle BigInt input)
+    # XXX TODO: rebless!
+    if (!$x->isa('Math::BigFloat')) {
+        $x = Math::BigFloat->new($x);
+        $class = ref($x);
+    }
+
+    $done = 0;
+
+    # If the base is defined and an integer, try to calculate integer result
+    # first. This is very fast, and in case the real result was found, we can
+    # stop right here.
+    if (defined $base && $base->is_int() && $x->is_int()) {
+        my $xint = Math::BigInt -> new($x    -> bdstr());
+        my $bint = Math::BigInt -> new($base -> bdstr());
+        $xint->blog($bint);
+
+        # if we found the exact result, we're done
+        if ($bint -> bpow($xint) == $x) {
+            my $xflt = Math::BigFloat -> new($xint -> bdstr());
+            $x->{sign} = $xflt->{sign};
+            $x->{_m}   = $xflt->{_m};
+            $x->{_es}  = $xflt->{_es};
+            $x->{_e}   = $xflt->{_e};
+            $done = 1;
+        }
+    }
+
+    if ($done == 0) {
+        # First calculate the log to base e (using reduction by 10 and possibly
+        # also by 2):
+        $x->_log_10($scale);
+
+        # and if a different base was requested, convert it
+        if (defined $base) {
+            $base = Math::BigFloat->new($base)
+              unless $base->isa('Math::BigFloat');
+            # log_b(x) = ln(x) / ln(b), so compute ln(b)
+            my $base_log_e = $base->copy()->_log_10($scale);
+            $x->bdiv($base_log_e, $scale);
+        }
+    }
+
+    # shortcut to not run through _find_round_parameters again
+    if (defined $params[0]) {
+        $x->bround($params[0], $params[2]); # then round accordingly
+    } else {
+        $x->bfround($params[1], $params[2]); # then round accordingly
+    }
+    if ($fallback) {
+        # clear a/p after round, since user did not request it
+        delete $x->{_a};
+        delete $x->{_p};
+    }
+    # restore globals
+    $$abr = $ab;
+    $$pbr = $pb;
+
+    $x;
+}
+
+sub bexp {
+    # Calculate e ** X (Euler's number to the power of X)
+    my ($class, $x, $a, $p, $r) = ref($_[0]) ? (ref($_[0]), @_) : objectify(1, @_);
+
+    return $x if $x->modify('bexp');
+
+    return $x->binf() if $x->{sign} eq '+inf';
+    return $x->bzero() if $x->{sign} eq '-inf';
+
+    # we need to limit the accuracy to protect against overflow
+    my $fallback = 0;
+    my ($scale, @params);
+    ($x, @params) = $x->_find_round_parameters($a, $p, $r);
+
+    # also takes care of the "error in _find_round_parameters?" case
+    return $x if $x->{sign} eq 'NaN';
+
+    # no rounding at all, so must use fallback
+    if (scalar @params == 0) {
+        # simulate old behaviour
+        $params[0] = $class->div_scale(); # and round to it as accuracy
+        $params[1] = undef;               # P = undef
+        $scale = $params[0]+4;            # at least four more for proper round
+        $params[2] = $r;                  # round mode by caller or undef
+        $fallback = 1;                    # to clear a/p afterwards
+    } else {
+        # the 4 below is empirical, and there might be cases where it's not
+        # enough ...
+        $scale = abs($params[0] || $params[1]) + 4; # take whatever is defined
+    }
+
+    return $x->bone(@params) if $x->is_zero();
+
+    if (!$x->isa('Math::BigFloat')) {
+        $x = Math::BigFloat->new($x);
+        $class = ref($x);
+    }
+
+    # when user set globals, they would interfere with our calculation, so
+    # disable them and later re-enable them
+    no strict 'refs';
+    my $abr = "$class\::accuracy"; my $ab = $$abr; $$abr = undef;
+    my $pbr = "$class\::precision"; my $pb = $$pbr; $$pbr = undef;
+    # we also need to disable any set A or P on $x (_find_round_parameters took
+    # them already into account), since these would interfere, too
+    delete $x->{_a};
+    delete $x->{_p};
+    # need to disable $upgrade in BigInt, to avoid deep recursion
+    local $Math::BigInt::upgrade = undef;
+    local $Math::BigFloat::downgrade = undef;
+
+    my $x_org = $x->copy();
+
+    # We use the following Taylor series:
+
+    #           x    x^2   x^3   x^4
+    #  e = 1 + --- + --- + --- + --- ...
+    #           1!    2!    3!    4!
+
+    # The difference for each term is X and N, which would result in:
+    # 2 copy, 2 mul, 2 add, 1 inc, 1 div operations per term
+
+    # But it is faster to compute exp(1) and then raising it to the
+    # given power, esp. if $x is really big and an integer because:
+
+    #  * The numerator is always 1, making the computation faster
+    #  * the series converges faster in the case of x == 1
+    #  * We can also easily check when we have reached our limit: when the
+    #    term to be added is smaller than "1E$scale", we can stop - f.i.
+    #    scale == 5, and we have 1/40320, then we stop since 1/40320 < 1E-5.
+    #  * we can compute the *exact* result by simulating bigrat math:
+
+    #  1   1    gcd(3, 4) = 1    1*24 + 1*6    5
+    #  - + -                  = ---------- =  --
+    #  6   24                      6*24       24
+
+    # We do not compute the gcd() here, but simple do:
+    #  1   1    1*24 + 1*6   30
+    #  - + -  = --------- =  --
+    #  6   24       6*24     144
+
+    # In general:
+    #  a   c    a*d + c*b         and note that c is always 1 and d = (b*f)
+    #  - + -  = ---------
+    #  b   d       b*d
+
+    # This leads to:         which can be reduced by b to:
+    #  a   1     a*b*f + b    a*f + 1
+    #  - + -   = --------- =  -------
+    #  b   b*f     b*b*f        b*f
+
+    # The first terms in the series are:
+
+    # 1     1    1    1    1    1     1     1     13700
+    # -- + -- + -- + -- + -- + --- + --- + ---- = -----
+    # 1     1    2    6   24   120   720   5040   5040
+
+    # Note that we cannot simply reduce 13700/5040 to 685/252, but must keep
+    # the numerator and the denominator!
+
+    if ($scale <= 75) {
+        # set $x directly from a cached string form
+        $x->{_m} = $LIB->_new("2718281828459045235360287471352662497757" .
+                              "2470936999595749669676277240766303535476");
+        $x->{sign} = '+';
+        $x->{_es} = '-';
+        $x->{_e} = $LIB->_new(79);
+    } else {
+        # compute A and B so that e = A / B.
+
+        # After some terms we end up with this, so we use it as a starting point:
+        my $A = $LIB->_new("9093339520860578540197197" .
+                           "0164779391644753259799242");
+        my $F = $LIB->_new(42);
+        my $step = 42;
+
+        # Compute how many steps we need to take to get $A and $B sufficiently big
+        my $steps = _len_to_steps($scale - 4);
+        #    print STDERR "# Doing $steps steps for ", $scale-4, " digits\n";
+        while ($step++ <= $steps) {
+            # calculate $a * $f + 1
+            $A = $LIB->_mul($A, $F);
+            $A = $LIB->_inc($A);
+            # increment f
+            $F = $LIB->_inc($F);
+        }
+        # compute $B as factorial of $steps (this is faster than doing it manually)
+        my $B = $LIB->_fac($LIB->_new($steps));
+
+        #  print "A ", $LIB->_str($A), "\nB ", $LIB->_str($B), "\n";
+
+        # compute A/B with $scale digits in the result (truncate, not round)
+        $A = $LIB->_lsft($A, $LIB->_new($scale), 10);
+        $A = $LIB->_div($A, $B);
+
+        $x->{_m} = $A;
+        $x->{sign} = '+';
+        $x->{_es} = '-';
+        $x->{_e} = $LIB->_new($scale);
+    }
+
+    # $x contains now an estimate of e, with some surplus digits, so we can round
+    if (!$x_org->is_one()) {
+        # Reduce size of fractional part, followup with integer power of two.
+        my $lshift = 0;
+        while ($lshift < 30 && $x_org->bacmp(2 << $lshift) > 0) {
+            $lshift++;
+        }
+        # Raise $x to the wanted power and round it.
+        if ($lshift == 0) {
+            $x->bpow($x_org, @params);
+        } else {
+            my($mul, $rescale) = (1 << $lshift, $scale+1+$lshift);
+            $x->bpow(scalar $x_org->bdiv($mul, $rescale), $rescale)->bpow($mul, @params);
+        }
+    } else {
+        # else just round the already computed result
+        delete $x->{_a};
+        delete $x->{_p};
+        # shortcut to not run through _find_round_parameters again
+        if (defined $params[0]) {
+            $x->bround($params[0], $params[2]); # then round accordingly
+        } else {
+            $x->bfround($params[1], $params[2]); # then round accordingly
+        }
+    }
+    if ($fallback) {
+        # clear a/p after round, since user did not request it
+        delete $x->{_a};
+        delete $x->{_p};
+    }
+    # restore globals
+    $$abr = $ab;
+    $$pbr = $pb;
+
+    $x;                         # return modified $x
+}
+
+sub bnok {
+    # Calculate n over k (binomial coefficient or "choose" function) as integer.
+    # set up parameters
+    my ($class, $x, $y, @r) = (ref($_[0]), @_);
+
+    # objectify is costly, so avoid it
+    if ((!ref($_[0])) || (ref($_[0]) ne ref($_[1]))) {
+        ($class, $x, $y, @r) = objectify(2, @_);
+    }
+
+    return $x if $x->modify('bnok');
+
+    return $x->bnan() if $x->is_nan() || $y->is_nan();
+    return $x->bnan() if (($x->is_finite() && !$x->is_int()) ||
+                          ($y->is_finite() && !$y->is_int()));
+
+    my $xint = Math::BigInt -> new($x -> bsstr());
+    my $yint = Math::BigInt -> new($y -> bsstr());
+    $xint -> bnok($yint);
+    my $xflt = Math::BigFloat -> new($xint);
+
+    $x->{_m}   = $xflt->{_m};
+    $x->{_e}   = $xflt->{_e};
+    $x->{_es}  = $xflt->{_es};
+    $x->{sign} = $xflt->{sign};
+
+    return $x;
+}
+
+sub bsin {
+    # Calculate a sinus of x.
+    my ($class, $x, @r) = ref($_[0]) ? (ref($_[0]), @_) : objectify(1, @_);
+
+    # taylor:      x^3   x^5   x^7   x^9
+    #    sin = x - --- + --- - --- + --- ...
+    #               3!    5!    7!    9!
+
+    # we need to limit the accuracy to protect against overflow
+    my $fallback = 0;
+    my ($scale, @params);
+    ($x, @params) = $x->_find_round_parameters(@r);
+
+    #         constant object       or error in _find_round_parameters?
+    return $x if $x->modify('bsin') || $x->is_nan();
+    return $x->bnan()    if $x->is_inf();
+    return $x->bzero(@r) if $x->is_zero();
+
+    # no rounding at all, so must use fallback
+    if (scalar @params == 0) {
+        # simulate old behaviour
+        $params[0] = $class->div_scale(); # and round to it as accuracy
+        $params[1] = undef;               # disable P
+        $scale = $params[0]+4;            # at least four more for proper round
+        $params[2] = $r[2];               # round mode by caller or undef
+        $fallback = 1;                    # to clear a/p afterwards
+    } else {
+        # the 4 below is empirical, and there might be cases where it is not
+        # enough...
+        $scale = abs($params[0] || $params[1]) + 4; # take whatever is defined
+    }
+
+    # when user set globals, they would interfere with our calculation, so
+    # disable them and later re-enable them
+    no strict 'refs';
+    my $abr = "$class\::accuracy"; my $ab = $$abr; $$abr = undef;
+    my $pbr = "$class\::precision"; my $pb = $$pbr; $$pbr = undef;
+    # we also need to disable any set A or P on $x (_find_round_parameters took
+    # them already into account), since these would interfere, too
+    delete $x->{_a};
+    delete $x->{_p};
+    # need to disable $upgrade in BigInt, to avoid deep recursion
+    local $Math::BigInt::upgrade = undef;
+
+    my $over = $x * $x;         # X ^ 2
+    my $x2 = $over->copy();     # X ^ 2; difference between terms
+    $over->bmul($x);            # X ^ 3 as starting value
+    my $sign = 1;               # start with -=
+    my $below = $class->new(6); my $factorial = $class->new(4);
+    delete $x->{_a};
+    delete $x->{_p};
+
+    my $limit = $class->new("1E-". ($scale-1));
+    #my $steps = 0;
+    while (3 < 5) {
+        # we calculate the next term, and add it to the last
+        # when the next term is below our limit, it won't affect the outcome
+        # anymore, so we stop:
+        my $next = $over->copy()->bdiv($below, $scale);
+        last if $next->bacmp($limit) <= 0;
+
+        if ($sign == 0) {
+            $x->badd($next);
+        } else {
+            $x->bsub($next);
+        }
+        $sign = 1-$sign;        # alternate
+        # calculate things for the next term
+        $over->bmul($x2);                         # $x*$x
+        $below->bmul($factorial); $factorial->binc(); # n*(n+1)
+        $below->bmul($factorial); $factorial->binc(); # n*(n+1)
+    }
+
+    # shortcut to not run through _find_round_parameters again
+    if (defined $params[0]) {
+        $x->bround($params[0], $params[2]); # then round accordingly
+    } else {
+        $x->bfround($params[1], $params[2]); # then round accordingly
+    }
+    if ($fallback) {
+        # clear a/p after round, since user did not request it
+        delete $x->{_a};
+        delete $x->{_p};
+    }
+    # restore globals
+    $$abr = $ab;
+    $$pbr = $pb;
+    $x;
+}
+
+sub bcos {
+    # Calculate a cosinus of x.
+    my ($class, $x, @r) = ref($_[0]) ? (ref($_[0]), @_) : objectify(1, @_);
+
+    # Taylor:      x^2   x^4   x^6   x^8
+    #    cos = 1 - --- + --- - --- + --- ...
+    #               2!    4!    6!    8!
+
+    # we need to limit the accuracy to protect against overflow
+    my $fallback = 0;
+    my ($scale, @params);
+    ($x, @params) = $x->_find_round_parameters(@r);
+
+    #         constant object       or error in _find_round_parameters?
+    return $x if $x->modify('bcos') || $x->is_nan();
+    return $x->bnan()   if $x->is_inf();
+    return $x->bone(@r) if $x->is_zero();
+
+    # no rounding at all, so must use fallback
+    if (scalar @params == 0) {
+        # simulate old behaviour
+        $params[0] = $class->div_scale(); # and round to it as accuracy
+        $params[1] = undef;               # disable P
+        $scale = $params[0]+4;            # at least four more for proper round
+        $params[2] = $r[2];               # round mode by caller or undef
+        $fallback = 1;                    # to clear a/p afterwards
+    } else {
+        # the 4 below is empirical, and there might be cases where it is not
+        # enough...
+        $scale = abs($params[0] || $params[1]) + 4; # take whatever is defined
+    }
+
+    # when user set globals, they would interfere with our calculation, so
+    # disable them and later re-enable them
+    no strict 'refs';
+    my $abr = "$class\::accuracy"; my $ab = $$abr; $$abr = undef;
+    my $pbr = "$class\::precision"; my $pb = $$pbr; $$pbr = undef;
+    # we also need to disable any set A or P on $x (_find_round_parameters took
+    # them already into account), since these would interfere, too
+    delete $x->{_a}; delete $x->{_p};
+    # need to disable $upgrade in BigInt, to avoid deep recursion
+    local $Math::BigInt::upgrade = undef;
+
+    my $over = $x * $x;         # X ^ 2
+    my $x2 = $over->copy();     # X ^ 2; difference between terms
+    my $sign = 1;               # start with -=
+    my $below = $class->new(2);
+    my $factorial = $class->new(3);
+    $x->bone();
+    delete $x->{_a};
+    delete $x->{_p};
+
+    my $limit = $class->new("1E-". ($scale-1));
+    #my $steps = 0;
+    while (3 < 5) {
+        # we calculate the next term, and add it to the last
+        # when the next term is below our limit, it won't affect the outcome
+        # anymore, so we stop:
+        my $next = $over->copy()->bdiv($below, $scale);
+        last if $next->bacmp($limit) <= 0;
+
+        if ($sign == 0) {
+            $x->badd($next);
+        } else {
+            $x->bsub($next);
+        }
+        $sign = 1-$sign;        # alternate
+        # calculate things for the next term
+        $over->bmul($x2);                         # $x*$x
+        $below->bmul($factorial); $factorial->binc(); # n*(n+1)
+        $below->bmul($factorial); $factorial->binc(); # n*(n+1)
+    }
+
+    # shortcut to not run through _find_round_parameters again
+    if (defined $params[0]) {
+        $x->bround($params[0], $params[2]); # then round accordingly
+    } else {
+        $x->bfround($params[1], $params[2]); # then round accordingly
+    }
+    if ($fallback) {
+        # clear a/p after round, since user did not request it
+        delete $x->{_a};
+        delete $x->{_p};
+    }
+    # restore globals
+    $$abr = $ab;
+    $$pbr = $pb;
+    $x;
+}
+
+sub batan {
+    # Calculate a arcus tangens of x.
+
+    my $self    = shift;
+    my $selfref = ref $self;
+    my $class   = $selfref || $self;
+
+    my (@r) = @_;
+
+    # taylor:       x^3   x^5   x^7   x^9
+    #    atan = x - --- + --- - --- + --- ...
+    #                3     5     7     9
+
+    # We need to limit the accuracy to protect against overflow.
+
+    my $fallback = 0;
+    my ($scale, @params);
+    ($self, @params) = $self->_find_round_parameters(@r);
+
+    # Constant object or error in _find_round_parameters?
+
+    return $self if $self->modify('batan') || $self->is_nan();
+
+    if ($self->{sign} =~ /^[+-]inf\z/) {
+        # +inf result is PI/2
+        # -inf result is -PI/2
+        # calculate PI/2
+        my $pi = $class->bpi(@r);
+        # modify $self in place
+        $self->{_m} = $pi->{_m};
+        $self->{_e} = $pi->{_e};
+        $self->{_es} = $pi->{_es};
+        # -y => -PI/2, +y => PI/2
+        $self->{sign} = substr($self->{sign}, 0, 1); # "+inf" => "+"
+        $self -> {_m} = $LIB->_div($self->{_m}, $LIB->_new(2));
+        return $self;
+    }
+
+    return $self->bzero(@r) if $self->is_zero();
+
+    # no rounding at all, so must use fallback
+    if (scalar @params == 0) {
+        # simulate old behaviour
+        $params[0] = $class->div_scale(); # and round to it as accuracy
+        $params[1] = undef;               # disable P
+        $scale = $params[0]+4;            # at least four more for proper round
+        $params[2] = $r[2];               # round mode by caller or undef
+        $fallback = 1;                    # to clear a/p afterwards
+    } else {
+        # the 4 below is empirical, and there might be cases where it is not
+        # enough...
+        $scale = abs($params[0] || $params[1]) + 4; # take whatever is defined
+    }
+
+    # 1 or -1 => PI/4
+    # inlined is_one() && is_one('-')
+    if ($LIB->_is_one($self->{_m}) && $LIB->_is_zero($self->{_e})) {
+        my $pi = $class->bpi($scale - 3);
+        # modify $self in place
+        $self->{_m} = $pi->{_m};
+        $self->{_e} = $pi->{_e};
+        $self->{_es} = $pi->{_es};
+        # leave the sign of $self alone (+1 => +PI/4, -1 => -PI/4)
+        $self->{_m} = $LIB->_div($self->{_m}, $LIB->_new(4));
+        return $self;
+    }
+
+    # This series is only valid if -1 < x < 1, so for other x we need to
+    # calculate PI/2 - atan(1/x):
+    my $pi = undef;
+    if ($self->bacmp($self->copy()->bone) >= 0) {
+        # calculate PI/2
+        $pi = $class->bpi($scale - 3);
+        $pi->{_m} = $LIB->_div($pi->{_m}, $LIB->_new(2));
+        # calculate 1/$self:
+        my $self_copy = $self->copy();
+        # modify $self in place
+        $self->bone();
+        $self->bdiv($self_copy, $scale);
+    }
+
+    my $fmul = 1;
+    foreach (0 .. int($scale / 20)) {
+        $fmul *= 2;
+        $self->bdiv($self->copy()->bmul($self)->binc->bsqrt($scale + 4)->binc, $scale + 4);
+    }
+
+    # When user set globals, they would interfere with our calculation, so
+    # disable them and later re-enable them.
+    no strict 'refs';
+    my $abr = "$class\::accuracy";  my $ab = $$abr; $$abr = undef;
+    my $pbr = "$class\::precision"; my $pb = $$pbr; $$pbr = undef;
+    # We also need to disable any set A or P on $self (_find_round_parameters
+    # took them already into account), since these would interfere, too
+    delete $self->{_a};
+    delete $self->{_p};
+    # Need to disable $upgrade in BigInt, to avoid deep recursion.
+    local $Math::BigInt::upgrade = undef;
+
+    my $over = $self * $self;   # X ^ 2
+    my $self2 = $over->copy();  # X ^ 2; difference between terms
+    $over->bmul($self);         # X ^ 3 as starting value
+    my $sign = 1;               # start with -=
+    my $below = $class->new(3);
+    my $two = $class->new(2);
+    delete $self->{_a};
+    delete $self->{_p};
+
+    my $limit = $class->new("1E-". ($scale-1));
+    #my $steps = 0;
+    while (1) {
+        # We calculate the next term, and add it to the last. When the next
+        # term is below our limit, it won't affect the outcome anymore, so we
+        # stop:
+        my $next = $over->copy()->bdiv($below, $scale);
+        last if $next->bacmp($limit) <= 0;
+
+        if ($sign == 0) {
+            $self->badd($next);
+        } else {
+            $self->bsub($next);
+        }
+        $sign = 1-$sign;        # alternatex
+        # calculate things for the next term
+        $over->bmul($self2);    # $self*$self
+        $below->badd($two);     # n += 2
+    }
+    $self->bmul($fmul);
+
+    if (defined $pi) {
+        my $self_copy = $self->copy();
+        # modify $self in place
+        $self->{_m} = $pi->{_m};
+        $self->{_e} = $pi->{_e};
+        $self->{_es} = $pi->{_es};
+        # PI/2 - $self
+        $self->bsub($self_copy);
+    }
+
+    # Shortcut to not run through _find_round_parameters again.
+    if (defined $params[0]) {
+        $self->bround($params[0], $params[2]); # then round accordingly
+    } else {
+        $self->bfround($params[1], $params[2]); # then round accordingly
+    }
+    if ($fallback) {
+        # Clear a/p after round, since user did not request it.
+        delete $self->{_a};
+        delete $self->{_p};
+    }
+
+    # restore globals
+    $$abr = $ab;
+    $$pbr = $pb;
+    $self;
+}
+
+sub batan2 {
+    # $y -> batan2($x) returns the arcus tangens of $y / $x.
+
+    # Set up parameters.
+    my ($class, $y, $x, @r) = (ref($_[0]), @_);
+
+    # Objectify is costly, so avoid it if we can.
+    if ((!ref($_[0])) || (ref($_[0]) ne ref($_[1]))) {
+        ($class, $y, $x, @r) = objectify(2, @_);
+    }
+
+    # Quick exit if $y is read-only.
+    return $y if $y -> modify('batan2');
+
+    # Handle all NaN cases.
+    return $y -> bnan() if $x->{sign} eq $nan || $y->{sign} eq $nan;
+
+    # We need to limit the accuracy to protect against overflow.
+    my $fallback = 0;
+    my ($scale, @params);
+    ($y, @params) = $y -> _find_round_parameters(@r);
+
+    # Error in _find_round_parameters?
+    return $y if $y->is_nan();
+
+    # No rounding at all, so must use fallback.
+    if (scalar @params == 0) {
+        # Simulate old behaviour
+        $params[0] = $class -> div_scale(); # and round to it as accuracy
+        $params[1] = undef;                 # disable P
+        $scale = $params[0] + 4; # at least four more for proper round
+        $params[2] = $r[2];      # round mode by caller or undef
+        $fallback = 1;           # to clear a/p afterwards
+    } else {
+        # The 4 below is empirical, and there might be cases where it is not
+        # enough ...
+        $scale = abs($params[0] || $params[1]) + 4; # take whatever is defined
+    }
+
+    if ($x -> is_inf("+")) {                    # x = inf
+        if ($y -> is_inf("+")) {                #    y = inf
+            $y -> bpi($scale) -> bmul("0.25");  #       pi/4
+        } elsif ($y -> is_inf("-")) {           #    y = -inf
+            $y -> bpi($scale) -> bmul("-0.25"); #       -pi/4
+        } else {                                #    -inf < y < inf
+            return $y -> bzero(@r);             #       0
+        }
+    } elsif ($x -> is_inf("-")) {               # x = -inf
+        if ($y -> is_inf("+")) {                #    y = inf
+            $y -> bpi($scale) -> bmul("0.75");  #       3/4 pi
+        } elsif ($y -> is_inf("-")) {           #    y = -inf
+            $y -> bpi($scale) -> bmul("-0.75"); #       -3/4 pi
+        } elsif ($y >= 0) {                     #    y >= 0
+            $y -> bpi($scale);                  #       pi
+        } else {                                #    y < 0
+            $y -> bpi($scale) -> bneg();        #       -pi
+        }
+    } elsif ($x > 0) {                               # 0 < x < inf
+        if ($y -> is_inf("+")) {                     #    y = inf
+            $y -> bpi($scale) -> bmul("0.5");        #       pi/2
+        } elsif ($y -> is_inf("-")) {                #    y = -inf
+            $y -> bpi($scale) -> bmul("-0.5");       #       -pi/2
+        } else {                                     #   -inf < y < inf
+            $y -> bdiv($x, $scale) -> batan($scale); #       atan(y/x)
+        }
+    } elsif ($x < 0) {                        # -inf < x < 0
+        my $pi = $class -> bpi($scale);
+        if ($y >= 0) {                        #    y >= 0
+            $y -> bdiv($x, $scale) -> batan() #       atan(y/x) + pi
+               -> badd($pi);
+        } else {                              #    y < 0
+            $y -> bdiv($x, $scale) -> batan() #       atan(y/x) - pi
+               -> bsub($pi);
+        }
+    } else {                                   # x = 0
+        if ($y > 0) {                          #    y > 0
+            $y -> bpi($scale) -> bmul("0.5");  #       pi/2
+        } elsif ($y < 0) {                     #    y < 0
+            $y -> bpi($scale) -> bmul("-0.5"); #       -pi/2
+        } else {                               #    y = 0
+            return $y -> bzero(@r);            #       0
+        }
+    }
+
+    $y -> round(@r);
+
+    if ($fallback) {
+        delete $y->{_a};
+        delete $y->{_p};
+    }
+
+    return $y;
+}
+##############################################################################
+
+sub bsqrt {
+    # calculate square root
+    my ($class, $x, $a, $p, $r) = ref($_[0]) ? (ref($_[0]), @_) : objectify(1, @_);
+
+    return $x if $x->modify('bsqrt');
+
+    return $x->bnan() if $x->{sign} !~ /^\+/;  # NaN, -inf or < 0
+    return $x if $x->{sign} eq '+inf';         # sqrt(inf) == inf
+    return $x->round($a, $p, $r) if $x->is_zero() || $x->is_one();
+
+    # we need to limit the accuracy to protect against overflow
+    my $fallback = 0;
+    my (@params, $scale);
+    ($x, @params) = $x->_find_round_parameters($a, $p, $r);
+
+    return $x if $x->is_nan();  # error in _find_round_parameters?
+
+    # no rounding at all, so must use fallback
+    if (scalar @params == 0) {
+        # simulate old behaviour
+        $params[0] = $class->div_scale(); # and round to it as accuracy
+        $scale = $params[0]+4;            # at least four more for proper round
+        $params[2] = $r;                  # round mode by caller or undef
+        $fallback = 1;                    # to clear a/p afterwards
+    } else {
+        # the 4 below is empirical, and there might be cases where it is not
+        # enough...
+        $scale = abs($params[0] || $params[1]) + 4; # take whatever is defined
+    }
+
+    # when user set globals, they would interfere with our calculation, so
+    # disable them and later re-enable them
+    no strict 'refs';
+    my $abr = "$class\::accuracy"; my $ab = $$abr; $$abr = undef;
+    my $pbr = "$class\::precision"; my $pb = $$pbr; $$pbr = undef;
+    # we also need to disable any set A or P on $x (_find_round_parameters took
+    # them already into account), since these would interfere, too
+    delete $x->{_a};
+    delete $x->{_p};
+    # need to disable $upgrade in BigInt, to avoid deep recursion
+    local $Math::BigInt::upgrade = undef; # should be really parent class vs MBI
+
+    my $i = $LIB->_copy($x->{_m});
+    $i = $LIB->_lsft($i, $x->{_e}, 10) unless $LIB->_is_zero($x->{_e});
+    my $xas = Math::BigInt->bzero();
+    $xas->{value} = $i;
+
+    my $gs = $xas->copy()->bsqrt(); # some guess
+
+    if (($x->{_es} ne '-')           # guess can't be accurate if there are
+        # digits after the dot
+        && ($xas->bacmp($gs * $gs) == 0)) # guess hit the nail on the head?
+    {
+        # exact result, copy result over to keep $x
+        $x->{_m} = $gs->{value};
+        $x->{_e} = $LIB->_zero();
+        $x->{_es} = '+';
+        $x->bnorm();
+        # shortcut to not run through _find_round_parameters again
+        if (defined $params[0]) {
+            $x->bround($params[0], $params[2]); # then round accordingly
+        } else {
+            $x->bfround($params[1], $params[2]); # then round accordingly
+        }
+        if ($fallback) {
+            # clear a/p after round, since user did not request it
+            delete $x->{_a};
+            delete $x->{_p};
+        }
+        # re-enable A and P, upgrade is taken care of by "local"
+        ${"$class\::accuracy"} = $ab;
+        ${"$class\::precision"} = $pb;
+        return $x;
+    }
+
+    # sqrt(2) = 1.4 because sqrt(2*100) = 1.4*10; so we can increase the accuracy
+    # of the result by multiplying the input by 100 and then divide the integer
+    # result of sqrt(input) by 10. Rounding afterwards returns the real result.
+
+    # The following steps will transform 123.456 (in $x) into 123456 (in $y1)
+    my $y1 = $LIB->_copy($x->{_m});
+
+    my $length = $LIB->_len($y1);
+
+    # Now calculate how many digits the result of sqrt(y1) would have
+    my $digits = int($length / 2);
+
+    # But we need at least $scale digits, so calculate how many are missing
+    my $shift = $scale - $digits;
+
+    # This happens if the input had enough digits
+    # (we take care of integer guesses above)
+    $shift = 0 if $shift < 0;
+
+    # Multiply in steps of 100, by shifting left two times the "missing" digits
+    my $s2 = $shift * 2;
+
+    # We now make sure that $y1 has the same odd or even number of digits than
+    # $x had. So when _e of $x is odd, we must shift $y1 by one digit left,
+    # because we always must multiply by steps of 100 (sqrt(100) is 10) and not
+    # steps of 10. The length of $x does not count, since an even or odd number
+    # of digits before the dot is not changed by adding an even number of digits
+    # after the dot (the result is still odd or even digits long).
+    $s2++ if $LIB->_is_odd($x->{_e});
+
+    $y1 = $LIB->_lsft($y1, $LIB->_new($s2), 10);
+
+    # now take the square root and truncate to integer
+    $y1 = $LIB->_sqrt($y1);
+
+    # By "shifting" $y1 right (by creating a negative _e) we calculate the final
+    # result, which is than later rounded to the desired scale.
+
+    # calculate how many zeros $x had after the '.' (or before it, depending
+    # on sign of $dat, the result should have half as many:
+    my $dat = $LIB->_num($x->{_e});
+    $dat = -$dat if $x->{_es} eq '-';
+    $dat += $length;
+
+    if ($dat > 0) {
+        # no zeros after the dot (e.g. 1.23, 0.49 etc)
+        # preserve half as many digits before the dot than the input had
+        # (but round this "up")
+        $dat = int(($dat+1)/2);
+    } else {
+        $dat = int(($dat)/2);
+    }
+    $dat -= $LIB->_len($y1);
+    if ($dat < 0) {
+        $dat = abs($dat);
+        $x->{_e} = $LIB->_new($dat);
+        $x->{_es} = '-';
+    } else {
+        $x->{_e} = $LIB->_new($dat);
+        $x->{_es} = '+';
+    }
+    $x->{_m} = $y1;
+    $x->bnorm();
+
+    # shortcut to not run through _find_round_parameters again
+    if (defined $params[0]) {
+        $x->bround($params[0], $params[2]); # then round accordingly
+    } else {
+        $x->bfround($params[1], $params[2]); # then round accordingly
+    }
+    if ($fallback) {
+        # clear a/p after round, since user did not request it
+        delete $x->{_a};
+        delete $x->{_p};
+    }
+    # restore globals
+    $$abr = $ab;
+    $$pbr = $pb;
+    $x;
+}
+
+sub broot {
+    # calculate $y'th root of $x
+
+    # set up parameters
+    my ($class, $x, $y, $a, $p, $r) = (ref($_[0]), @_);
+    # objectify is costly, so avoid it
+    if ((!ref($_[0])) || (ref($_[0]) ne ref($_[1]))) {
+        ($class, $x, $y, $a, $p, $r) = objectify(2, @_);
+    }
+
+    return $x if $x->modify('broot');
+
+    # NaN handling: $x ** 1/0, x or y NaN, or y inf/-inf or y == 0
+    return $x->bnan() if $x->{sign} !~ /^\+/ || $y->is_zero() ||
+      $y->{sign} !~ /^\+$/;
+
+    return $x if $x->is_zero() || $x->is_one() || $x->is_inf() || $y->is_one();
+
+    # we need to limit the accuracy to protect against overflow
+    my $fallback = 0;
+    my (@params, $scale);
+    ($x, @params) = $x->_find_round_parameters($a, $p, $r);
+
+    return $x if $x->is_nan();  # error in _find_round_parameters?
+
+    # no rounding at all, so must use fallback
+    if (scalar @params == 0) {
+        # simulate old behaviour
+        $params[0] = $class->div_scale(); # and round to it as accuracy
+        $scale = $params[0]+4;            # at least four more for proper round
+        $params[2] = $r;                  # round mode by caller or undef
+        $fallback = 1;                    # to clear a/p afterwards
+    } else {
+        # the 4 below is empirical, and there might be cases where it is not
+        # enough...
+        $scale = abs($params[0] || $params[1]) + 4; # take whatever is defined
+    }
+
+    # when user set globals, they would interfere with our calculation, so
+    # disable them and later re-enable them
+    no strict 'refs';
+    my $abr = "$class\::accuracy"; my $ab = $$abr; $$abr = undef;
+    my $pbr = "$class\::precision"; my $pb = $$pbr; $$pbr = undef;
+    # we also need to disable any set A or P on $x (_find_round_parameters took
+    # them already into account), since these would interfere, too
+    delete $x->{_a};
+    delete $x->{_p};
+    # need to disable $upgrade in BigInt, to avoid deep recursion
+    local $Math::BigInt::upgrade = undef; # should be really parent class vs MBI
+
+    # remember sign and make $x positive, since -4 ** (1/2) => -2
+    my $sign = 0;
+    $sign = 1 if $x->{sign} eq '-';
+    $x->{sign} = '+';
+
+    my $is_two = 0;
+    if ($y->isa('Math::BigFloat')) {
+        $is_two = ($y->{sign} eq '+' && $LIB->_is_two($y->{_m}) && $LIB->_is_zero($y->{_e}));
+    } else {
+        $is_two = ($y == 2);
+    }
+
+    # normal square root if $y == 2:
+    if ($is_two) {
+        $x->bsqrt($scale+4);
+    } elsif ($y->is_one('-')) {
+        # $x ** -1 => 1/$x
+        my $u = $class->bone()->bdiv($x, $scale);
+        # copy private parts over
+        $x->{_m} = $u->{_m};
+        $x->{_e} = $u->{_e};
+        $x->{_es} = $u->{_es};
+    } else {
+        # calculate the broot() as integer result first, and if it fits, return
+        # it rightaway (but only if $x and $y are integer):
+
+        my $done = 0;           # not yet
+        if ($y->is_int() && $x->is_int()) {
+            my $i = $LIB->_copy($x->{_m});
+            $i = $LIB->_lsft($i, $x->{_e}, 10) unless $LIB->_is_zero($x->{_e});
+            my $int = Math::BigInt->bzero();
+            $int->{value} = $i;
+            $int->broot($y->as_number());
+            # if ($exact)
+            if ($int->copy()->bpow($y) == $x) {
+                # found result, return it
+                $x->{_m} = $int->{value};
+                $x->{_e} = $LIB->_zero();
+                $x->{_es} = '+';
+                $x->bnorm();
+                $done = 1;
+            }
+        }
+        if ($done == 0) {
+            my $u = $class->bone()->bdiv($y, $scale+4);
+            delete $u->{_a}; delete $u->{_p}; # otherwise it conflicts
+            $x->bpow($u, $scale+4);            # el cheapo
+        }
+    }
+    $x->bneg() if $sign == 1;
+
+    # shortcut to not run through _find_round_parameters again
+    if (defined $params[0]) {
+        $x->bround($params[0], $params[2]); # then round accordingly
+    } else {
+        $x->bfround($params[1], $params[2]); # then round accordingly
+    }
+    if ($fallback) {
+        # clear a/p after round, since user did not request it
+        delete $x->{_a};
+        delete $x->{_p};
+    }
+    # restore globals
+    $$abr = $ab;
+    $$pbr = $pb;
+    $x;
+}

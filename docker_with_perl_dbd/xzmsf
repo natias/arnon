@@ -1,0 +1,1000 @@
+
+
+/*
+=for apidoc rpp_context
+
+Impose void, scalar or list context on the stack.
+First, pop C<extra> items off the stack, then when C<gimme> is:
+C<G_LIST>:   return as-is.
+C<G_VOID>:   pop everything back to C<mark>
+C<G_SCALAR>: move the top stack item (or C<&PL_sv_undef> if none) to
+C<mark+1> and free everything above it.
+
+=cut
+*/
+
+PERL_STATIC_INLINE void
+Perl_rpp_context(pTHX_ SV **mark, U8 gimme, SSize_t extra)
+{
+    PERL_ARGS_ASSERT_RPP_CONTEXT;
+    assert(extra >= 0);
+    assert(mark <= PL_stack_sp - extra);
+
+    if (gimme == G_LIST)
+        mark = PL_stack_sp - extra;
+    else if (gimme == G_SCALAR) {
+        SV **svp = PL_stack_sp - extra;
+        mark++;
+        if (mark > svp) {
+            /* empty list (plus extra) */
+            rpp_popfree_to(svp);
+            rpp_extend(1);
+            *++PL_stack_sp = &PL_sv_undef;
+            return;
+        }
+        /* swap top and bottom list items */
+        SV *top = *svp;
+        *svp = *mark;
+        *mark = top;
+     }
+    rpp_popfree_to(mark);
+}
+
+
+
+
+/*
+=for apidoc      rpp_try_AMAGIC_1
+=for apidoc_item rpp_try_AMAGIC_2
+
+Check whether either of the one or two SVs at the top of the stack is
+magical or a ref, and in either case handle it specially: invoke get
+magic, call an overload method, or replace a ref with a temporary numeric
+value, as appropriate. If this function returns true, it indicates that
+the correct return value is already on the stack. Intended to be used at
+the beginning of the PP function for unary or binary ops.
+
+=cut
+*/
+
+PERL_STATIC_INLINE bool
+Perl_rpp_try_AMAGIC_1(pTHX_ int method, int flags)
+{
+    return    UNLIKELY((SvFLAGS(*PL_stack_sp) & (SVf_ROK|SVs_GMG)))
+           && Perl_try_amagic_un(aTHX_ method, flags);
+}
+
+PERL_STATIC_INLINE bool
+Perl_rpp_try_AMAGIC_2(pTHX_ int method, int flags)
+{
+    return    UNLIKELY(((SvFLAGS(PL_stack_sp[-1])|SvFLAGS(PL_stack_sp[0]))
+                     & (SVf_ROK|SVs_GMG)))
+           && Perl_try_amagic_bin(aTHX_ method, flags);
+}
+
+
+/*
+=for apidoc rpp_stack_is_rc
+
+Returns a boolean value indicating whether the stack is currently
+reference-counted. Note that if the stack is split (bottom half RC, top
+half non-RC), this function returns false, even if the top half currently
+contains zero items.
+
+=cut
+*/
+
+PERL_STATIC_INLINE bool
+Perl_rpp_stack_is_rc(pTHX)
+{
+#ifdef PERL_RC_STACK
+    return AvREAL(PL_curstack) && !PL_curstackinfo->si_stack_nonrc_base;
+#else
+    return 0;
+#endif
+
+}
+
+
+/*
+=for apidoc rpp_is_lone
+
+Indicates whether the stacked SV C<sv> (assumed to be not yet popped off
+the stack) is only kept alive due to a single reference from the argument
+stack and/or and the temps stack.
+
+This can used for example to decide whether the copying of return values
+in rvalue context can be skipped, or whether it shouldn't be assigned to
+in lvalue context.
+
+=cut
+*/
+
+
+PERL_STATIC_INLINE bool
+Perl_rpp_is_lone(pTHX_ SV *sv)
+{
+#ifdef PERL_RC_STACK
+    /* note that rpp_is_lone() can be used in wrapped pp functions,
+     * where technically the stack is no longer ref-counted; but because
+     * the args are non-RC copies of RC args further down the stack, we
+     * can't be in a *completely* non-ref stack.
+     */
+    assert(AvREAL(PL_curstack));
+#endif
+
+    return SvREFCNT(sv) <= cBOOL(SvTEMP(sv))
+#ifdef PERL_RC_STACK
+                         + 1
+            && !SvIMMORTAL(sv) /* PL_sv_undef etc are never stealable */
+#endif
+    ;
+}
+
+
+/*
+=for apidoc rpp_invoke_xs
+
+Call the XS function associated with C<cv>. Wraps the call if necessary to
+handle XS functions which are not aware of reference-counted stacks.
+
+=cut
+*/
+
+
+PERL_STATIC_INLINE void
+Perl_rpp_invoke_xs(pTHX_ CV *cv)
+{
+    PERL_ARGS_ASSERT_RPP_INVOKE_XS;
+
+#ifdef PERL_RC_STACK
+    if (!CvXS_RCSTACK(cv))
+        Perl_xs_wrap(aTHX_ CvXSUB(cv), cv);
+    else
+#endif
+        CvXSUB(cv)(aTHX_ cv);
+}
+
+
+
+
+/* ----------------------------- regexp.h ----------------------------- */
+
+/* PVLVs need to act as a superset of all scalar types - they are basically
+ * PVMGs with a few extra fields.
+ * REGEXPs are first class scalars, but have many fields that can't be copied
+ * into a PVLV body.
+ *
+ * Hence we take a different approach - instead of a copy, PVLVs store a pointer
+ * back to the original body. To avoid increasing the size of PVLVs just for the
+ * rare case of REGEXP assignment, this pointer is stored in the memory usually
+ * used for SvLEN(). Hence the check for SVt_PVLV below, and the ? : ternary to
+ * read the pointer from the two possible locations. The macro SvLEN() wraps the
+ * access to the union's member xpvlenu_len, but there is no equivalent macro
+ * for wrapping the union's member xpvlenu_rx, hence the direct reference here.
+ *
+ * See commit df6b4bd56551f2d3 for more details. */
+
+PERL_STATIC_INLINE struct regexp *
+Perl_ReANY(const REGEXP * const re)
+{
+    XPV* const p = (XPV*)SvANY(re);
+
+    PERL_ARGS_ASSERT_REANY;
+    assert(isREGEXP(re));
+
+    return SvTYPE(re) == SVt_PVLV ? p->xpv_len_u.xpvlenu_rx
+                                   : (struct regexp *)p;
+}
+
+/* ------------------------------- utf8.h ------------------------------- */
+
+/*
+=for apidoc_section $unicode
+*/
+
+PERL_STATIC_INLINE void
+Perl_append_utf8_from_native_byte(const U8 byte, U8** dest)
+{
+    /* Takes an input 'byte' (Latin1 or EBCDIC) and appends it to the UTF-8
+     * encoded string at '*dest', updating '*dest' to include it */
+
+    PERL_ARGS_ASSERT_APPEND_UTF8_FROM_NATIVE_BYTE;
+
+    if (NATIVE_BYTE_IS_INVARIANT(byte))
+        *((*dest)++) = byte;
+    else {
+        *((*dest)++) = UTF8_EIGHT_BIT_HI(byte);
+        *((*dest)++) = UTF8_EIGHT_BIT_LO(byte);
+    }
+}
+
+/*
+=for apidoc valid_utf8_to_uvchr
+Like C<L<perlapi/utf8_to_uvchr_buf>>, but should only be called when it is
+known that the next character in the input UTF-8 string C<s> is well-formed
+(I<e.g.>, it passes C<L<perlapi/isUTF8_CHAR>>.  Surrogates, non-character code
+points, and non-Unicode code points are allowed.
+
+=cut
+
+ */
+
+PERL_STATIC_INLINE UV
+Perl_valid_utf8_to_uvchr(const U8 *s, STRLEN *retlen)
+{
+    const UV expectlen = UTF8SKIP(s);
+    const U8* send = s + expectlen;
+    UV uv = *s;
+
+    PERL_ARGS_ASSERT_VALID_UTF8_TO_UVCHR;
+
+    if (retlen) {
+        *retlen = expectlen;
+    }
+
+    /* An invariant is trivially returned */
+    if (expectlen == 1) {
+        return uv;
+    }
+
+    /* Remove the leading bits that indicate the number of bytes, leaving just
+     * the bits that are part of the value */
+    uv = NATIVE_UTF8_TO_I8(uv) & UTF_START_MASK(expectlen);
+
+    /* Now, loop through the remaining bytes, accumulating each into the
+     * working total as we go.  (I khw tried unrolling the loop for up to 4
+     * bytes, but there was no performance improvement) */
+    for (++s; s < send; s++) {
+        uv = UTF8_ACCUMULATE(uv, *s);
+    }
+
+    return UNI_TO_NATIVE(uv);
+
+}
+
+/*
+=for apidoc is_utf8_invariant_string
+
+Returns TRUE if the first C<len> bytes of the string C<s> are the same
+regardless of the UTF-8 encoding of the string (or UTF-EBCDIC encoding on
+EBCDIC machines); otherwise it returns FALSE.  That is, it returns TRUE if they
+are UTF-8 invariant.  On ASCII-ish machines, all the ASCII characters and only
+the ASCII characters fit this definition.  On EBCDIC machines, the ASCII-range
+characters are invariant, but so also are the C1 controls.
+
+If C<len> is 0, it will be calculated using C<strlen(s)>, (which means if you
+use this option, that C<s> can't have embedded C<NUL> characters and has to
+have a terminating C<NUL> byte).
+
+See also
+C<L</is_utf8_string>>,
+C<L</is_utf8_string_flags>>,
+C<L</is_utf8_string_loc>>,
+C<L</is_utf8_string_loc_flags>>,
+C<L</is_utf8_string_loclen>>,
+C<L</is_utf8_string_loclen_flags>>,
+C<L</is_utf8_fixed_width_buf_flags>>,
+C<L</is_utf8_fixed_width_buf_loc_flags>>,
+C<L</is_utf8_fixed_width_buf_loclen_flags>>,
+C<L</is_strict_utf8_string>>,
+C<L</is_strict_utf8_string_loc>>,
+C<L</is_strict_utf8_string_loclen>>,
+C<L</is_c9strict_utf8_string>>,
+C<L</is_c9strict_utf8_string_loc>>,
+and
+C<L</is_c9strict_utf8_string_loclen>>.
+
+=cut
+
+*/
+
+#define is_utf8_invariant_string(s, len)                                    \
+                                is_utf8_invariant_string_loc(s, len, NULL)
+
+/*
+=for apidoc is_utf8_invariant_string_loc
+
+Like C<L</is_utf8_invariant_string>> but upon failure, stores the location of
+the first UTF-8 variant character in the C<ep> pointer; if all characters are
+UTF-8 invariant, this function does not change the contents of C<*ep>.
+
+=cut
+
+*/
+
+PERL_STATIC_INLINE bool
+Perl_is_utf8_invariant_string_loc(const U8* const s, STRLEN len, const U8 ** ep)
+{
+    const U8* send;
+    const U8* x = s;
+
+    PERL_ARGS_ASSERT_IS_UTF8_INVARIANT_STRING_LOC;
+
+    if (len == 0) {
+        len = strlen((const char *)s);
+    }
+
+    send = s + len;
+
+/* This looks like 0x010101... */
+#  define PERL_COUNT_MULTIPLIER   (~ (UINTMAX_C(0)) / 0xFF)
+
+/* This looks like 0x808080... */
+#  define PERL_VARIANTS_WORD_MASK (PERL_COUNT_MULTIPLIER * 0x80)
+#  define PERL_WORDSIZE            sizeof(PERL_UINTMAX_T)
+#  define PERL_WORD_BOUNDARY_MASK (PERL_WORDSIZE - 1)
+
+/* Evaluates to 0 if 'x' is at a word boundary; otherwise evaluates to 1, by
+ * or'ing together the lowest bits of 'x'.  Hopefully the final term gets
+ * optimized out completely on a 32-bit system, and its mask gets optimized out
+ * on a 64-bit system */
+#  define PERL_IS_SUBWORD_ADDR(x) (1 & (       PTR2nat(x)                     \
+                                      |   (  PTR2nat(x) >> 1)                 \
+                                      | ( ( (PTR2nat(x)                       \
+                                           & PERL_WORD_BOUNDARY_MASK) >> 2))))
+
+#ifndef EBCDIC
+
+    /* Do the word-at-a-time iff there is at least one usable full word.  That
+     * means that after advancing to a word boundary, there still is at least a
+     * full word left.  The number of bytes needed to advance is 'wordsize -
+     * offset' unless offset is 0. */
+    if ((STRLEN) (send - x) >= PERL_WORDSIZE
+
+                            /* This term is wordsize if subword; 0 if not */
+                          + PERL_WORDSIZE * PERL_IS_SUBWORD_ADDR(x)
+
+                            /* 'offset' */
+                          - (PTR2nat(x) & PERL_WORD_BOUNDARY_MASK))
+    {
+
+        /* Process per-byte until reach word boundary.  XXX This loop could be
+         * eliminated if we knew that this platform had fast unaligned reads */
+        while (PTR2nat(x) & PERL_WORD_BOUNDARY_MASK) {
+            if (! UTF8_IS_INVARIANT(*x)) {
+                if (ep) {
+                    *ep = x;
+                }
+
+                return FALSE;
+            }
+            x++;
+        }
+
+        /* Here, we know we have at least one full word to process.  Process
+         * per-word as long as we have at least a full word left */
+        do {
+            if ((* (const PERL_UINTMAX_T *) x) & PERL_VARIANTS_WORD_MASK)  {
+
+                /* Found a variant.  Just return if caller doesn't want its
+                 * exact position */
+                if (! ep) {
+                    return FALSE;
+                }
+
+#  if   BYTEORDER == 0x1234 || BYTEORDER == 0x12345678    \
+     || BYTEORDER == 0x4321 || BYTEORDER == 0x87654321
+
+                *ep = x + variant_byte_number(* (const PERL_UINTMAX_T *) x);
+                assert(*ep >= s && *ep < send);
+
+                return FALSE;
+
+#  else   /* If weird byte order, drop into next loop to do byte-at-a-time
+           checks. */
+
+                break;
+#  endif
+            }
+
+            x += PERL_WORDSIZE;
+
+        } while (x + PERL_WORDSIZE <= send);
+    }
+
+#endif      /* End of ! EBCDIC */
+
+    /* Process per-byte */
+    while (x < send) {
+        if (! UTF8_IS_INVARIANT(*x)) {
+            if (ep) {
+                *ep = x;
+            }
+
+            return FALSE;
+        }
+
+        x++;
+    }
+
+    return TRUE;
+}
+
+/* See if the platform has builtins for finding the most/least significant bit,
+ * and which one is right for using on 32 and 64 bit operands */
+#if (__has_builtin(__builtin_clz) || PERL_GCC_VERSION_GE(3,4,0))
+#  if U32SIZE == INTSIZE
+#    define PERL_CLZ_32 __builtin_clz
+#  endif
+#  if defined(U64TYPE) && U64SIZE == INTSIZE
+#    define PERL_CLZ_64 __builtin_clz
+#  endif
+#endif
+#if (__has_builtin(__builtin_ctz) || PERL_GCC_VERSION_GE(3,4,0))
+#  if U32SIZE == INTSIZE
+#    define PERL_CTZ_32 __builtin_ctz
+#  endif
+#  if defined(U64TYPE) && U64SIZE == INTSIZE
+#    define PERL_CTZ_64 __builtin_ctz
+#  endif
+#endif
+
+#if (__has_builtin(__builtin_clzl) || PERL_GCC_VERSION_GE(3,4,0))
+#  if U32SIZE == LONGSIZE && ! defined(PERL_CLZ_32)
+#    define PERL_CLZ_32 __builtin_clzl
+#  endif
+#  if defined(U64TYPE) && U64SIZE == LONGSIZE && ! defined(PERL_CLZ_64)
+#    define PERL_CLZ_64 __builtin_clzl
+#  endif
+#endif
+#if (__has_builtin(__builtin_ctzl) || PERL_GCC_VERSION_GE(3,4,0))
+#  if U32SIZE == LONGSIZE && ! defined(PERL_CTZ_32)
+#    define PERL_CTZ_32 __builtin_ctzl
+#  endif
+#  if defined(U64TYPE) && U64SIZE == LONGSIZE && ! defined(PERL_CTZ_64)
+#    define PERL_CTZ_64 __builtin_ctzl
+#  endif
+#endif
+
+#if (__has_builtin(__builtin_clzll) || PERL_GCC_VERSION_GE(3,4,0))
+#  if U32SIZE == LONGLONGSIZE && ! defined(PERL_CLZ_32)
+#    define PERL_CLZ_32 __builtin_clzll
+#  endif
+#  if defined(U64TYPE) && U64SIZE == LONGLONGSIZE && ! defined(PERL_CLZ_64)
+#    define PERL_CLZ_64 __builtin_clzll
+#  endif
+#endif
+#if (__has_builtin(__builtin_ctzll) || PERL_GCC_VERSION_GE(3,4,0))
+#  if U32SIZE == LONGLONGSIZE && ! defined(PERL_CTZ_32)
+#    define PERL_CTZ_32 __builtin_ctzll
+#  endif
+#  if defined(U64TYPE) && U64SIZE == LONGLONGSIZE && ! defined(PERL_CTZ_64)
+#    define PERL_CTZ_64 __builtin_ctzll
+#  endif
+#endif
+
+#if defined(WIN32)
+#  include <intrin.h>
+   /* MinGW warns that it ignores "pragma intrinsic". */
+#  if defined(_MSC_VER)
+#    pragma intrinsic(_BitScanForward)
+#    pragma intrinsic(_BitScanReverse)
+#    if defined(_WIN64)
+#      pragma intrinsic(_BitScanForward64)
+#      pragma intrinsic(_BitScanReverse64)
+#    endif
+#  endif
+#endif
+
+/* The reason there are not checks to see if ffs() and ffsl() are available for
+ * determining the lsb, is because these don't improve on the deBruijn method
+ * fallback, which is just a branchless integer multiply, array element
+ * retrieval, and shift.  The others, even if the function call overhead is
+ * optimized out, have to cope with the possibility of the input being all
+ * zeroes, and almost certainly will have conditionals for this eventuality.
+ * khw, at the time of this commit, looked at the source for both gcc and clang
+ * to verify this.  (gcc used a method inferior to deBruijn.) */
+
+/* Below are functions to find the first, last, or only set bit in a word.  On
+ * platforms with 64-bit capability, there is a pair for each operation; the
+ * first taking a 64 bit operand, and the second a 32 bit one.  The logic is
+ * the same in each pair, so the second is stripped of most comments. */
+
+#ifdef U64TYPE  /* HAS_QUAD not usable outside the core */
+
+PERL_STATIC_INLINE unsigned
+Perl_lsbit_pos64(U64 word)
+{
+    /* Find the position (0..63) of the least significant set bit in the input
+     * word */
+
+    ASSUME(word != 0);
+
+    /* If we can determine that the platform has a usable fast method to get
+     * this info, use that */
+
+#  if defined(PERL_CTZ_64)
+#    define PERL_HAS_FAST_GET_LSB_POS64
+
+    return (unsigned) PERL_CTZ_64(word);
+
+#  elif U64SIZE == 8 && defined(_WIN64)
+#    define PERL_HAS_FAST_GET_LSB_POS64
+
+    {
+        unsigned long index;
+        _BitScanForward64(&index, word);
+        return (unsigned)index;
+    }
+
+#  else
+
+    /* Here, we didn't find a fast method for finding the lsb.  Fall back to
+     * making the lsb the only set bit in the word, and use our function that
+     * works on words with a single bit set.
+     *
+     * Isolate the lsb;
+     * https://stackoverflow.com/questions/757059/position-of-least-significant-bit-that-is-set
+     *
+     * The word will look like this, with a rightmost set bit in position 's':
+     * ('x's are don't cares, and 'y's are their complements)
+     *      s
+     *  x..x100..00
+     *  y..y011..11      Complement
+     *  y..y100..00      Add 1
+     *  0..0100..00      And with the original
+     *
+     *  (Yes, complementing and adding 1 is just taking the negative on 2's
+     *  complement machines, but not on 1's complement ones, and some compilers
+     *  complain about negating an unsigned.)
+     */
+    return single_1bit_pos64(word & (~word + 1));
+
+#  endif
+
+}
+
+#  define lsbit_pos_uintmax_(word) lsbit_pos64(word)
+#else   /* ! QUAD */
+#  define lsbit_pos_uintmax_(word) lsbit_pos32(word)
+#endif
+
+PERL_STATIC_INLINE unsigned     /* Like above for 32 bit word */
+Perl_lsbit_pos32(U32 word)
+{
+    /* Find the position (0..31) of the least significant set bit in the input
+     * word */
+
+    ASSUME(word != 0);
+
+#if defined(PERL_CTZ_32)
+#  define PERL_HAS_FAST_GET_LSB_POS32
+
+    return (unsigned) PERL_CTZ_32(word);
+
+#elif U32SIZE == 4 && defined(WIN32)
+#  define PERL_HAS_FAST_GET_LSB_POS32
+
+    {
+        unsigned long index;
+        _BitScanForward(&index, word);
+        return (unsigned)index;
+    }
+
+#elif defined(PERL_HAS_FAST_GET_LSB_POS64)
+#  define PERL_HAS_FAST_GET_LSB_POS32
+
+    /* Unlikely, but possible for the platform to have a wider fast operation
+     * but not a narrower one.  But easy enough to handle the case by widening
+     * the parameter size. */
+    return lsbit_pos64(word);
+
+#else
+
+    return single_1bit_pos32(word & (~word + 1));
+
+#endif
+
+}
+
+
+/* Convert the leading zeros count to the bit position of the first set bit.
+ * This just subtracts from the highest position, 31 or 63.  But some compilers
+ * don't optimize this optimally, and so a bit of bit twiddling encourages them
+ * to do the right thing.  It turns out that subtracting a smaller non-negative
+ * number 'x' from 2**n-1 for any n is the same as taking the exclusive-or of
+ * the two numbers.  To see why, first note that the sum of any number, x, and
+ * its complement, x', is all ones.  So all ones minus x is x'.  Then note that
+ * the xor of x and all ones is x'. */
+#define LZC_TO_MSBIT_POS_(size, lzc)  ((size##SIZE * CHARBITS - 1) ^ (lzc))
+
+#ifdef U64TYPE  /* HAS_QUAD not usable outside the core */
+
+PERL_STATIC_INLINE unsigned
+Perl_msbit_pos64(U64 word)
+{
+    /* Find the position (0..63) of the most significant set bit in the input
+     * word */
+
+    ASSUME(word != 0);
+
+    /* If we can determine that the platform has a usable fast method to get
+     * this, use that */
+
+#  if defined(PERL_CLZ_64)
+#    define PERL_HAS_FAST_GET_MSB_POS64
+
+    return (unsigned) LZC_TO_MSBIT_POS_(U64, PERL_CLZ_64(word));
+
+#  elif U64SIZE == 8 && defined(_WIN64)
+#    define PERL_HAS_FAST_GET_MSB_POS64
+
+    {
+        unsigned long index;
+        _BitScanReverse64(&index, word);
+        return (unsigned)index;
+    }
+
+#  else
+
+    /* Here, we didn't find a fast method for finding the msb.  Fall back to
+     * making the msb the only set bit in the word, and use our function that
+     * works on words with a single bit set.
+     *
+     * Isolate the msb; http://codeforces.com/blog/entry/10330
+     *
+     * Only the most significant set bit matters.  Or'ing word with its right
+     * shift of 1 makes that bit and the next one to its right both 1.
+     * Repeating that with the right shift of 2 makes for 4 1-bits in a row.
+     * ...  We end with the msb and all to the right being 1. */
+    word |= (word >>  1);
+    word |= (word >>  2);
+    word |= (word >>  4);
+    word |= (word >>  8);
+    word |= (word >> 16);
+    word |= (word >> 32);
+
+    /* Then subtracting the right shift by 1 clears all but the left-most of
+     * the 1 bits, which is our desired result */
+    word -= (word >> 1);
+
+    /* Now we have a single bit set */
+    return single_1bit_pos64(word);
+
+#  endif
+
+}
+
+#  define msbit_pos_uintmax_(word) msbit_pos64(word)
+#else   /* ! QUAD */
+#  define msbit_pos_uintmax_(word) msbit_pos32(word)
+#endif
+
+PERL_STATIC_INLINE unsigned
+Perl_msbit_pos32(U32 word)
+{
+    /* Find the position (0..31) of the most significant set bit in the input
+     * word */
+
+    ASSUME(word != 0);
+
+#if defined(PERL_CLZ_32)
+#  define PERL_HAS_FAST_GET_MSB_POS32
+
+    return (unsigned) LZC_TO_MSBIT_POS_(U32, PERL_CLZ_32(word));
+#elif U32SIZE == 4 && defined(WIN32)
+#  define PERL_HAS_FAST_GET_MSB_POS32
+
+    {
+        unsigned long index;
+        _BitScanReverse(&index, word);
+        return (unsigned)index;
+    }
+
+#elif defined(PERL_HAS_FAST_GET_MSB_POS64)
+#  define PERL_HAS_FAST_GET_MSB_POS32
+
+    return msbit_pos64(word);   /* Let compiler widen parameter */
+
+#else
+
+    word |= (word >>  1);
+    word |= (word >>  2);
+    word |= (word >>  4);
+    word |= (word >>  8);
+    word |= (word >> 16);
+    word -= (word >> 1);
+    return single_1bit_pos32(word);
+
+#endif
+
+}
+
+/* Note that if you are working through all the 1 bits in a word, and don't
+ * care which order you process them in, it is better to use lsbit_pos.  This
+ * is because some platforms have a fast way to find the msb but not the lsb,
+ * and others vice versa.  The code above falls back to use the single
+ * available fast method when the desired one is missing, and it is cheaper to
+ * fall back from lsb to msb than the other way around */
+
+#if UVSIZE == U64SIZE
+#  define msbit_pos(word)  msbit_pos64(word)
+#  define lsbit_pos(word)  lsbit_pos64(word)
+#elif UVSIZE == U32SIZE
+#  define msbit_pos(word)  msbit_pos32(word)
+#  define lsbit_pos(word)  lsbit_pos32(word)
+#endif
+
+#ifdef U64TYPE  /* HAS_QUAD not usable outside the core */
+
+PERL_STATIC_INLINE unsigned
+Perl_single_1bit_pos64(U64 word)
+{
+    /* Given a 64-bit word known to contain all zero bits except one 1 bit,
+     * find and return the 1's position: 0..63 */
+
+#  ifdef PERL_CORE    /* macro not exported */
+    ASSUME(isPOWER_OF_2(word));
+#  else
+    ASSUME(word && (word & (word-1)) == 0);
+#  endif
+
+    /* The only set bit is both the most and least significant bit.  If we have
+     * a fast way of finding either one, use that.
+     *
+     * It may appear at first glance that those functions call this one, but
+     * they don't if the corresponding #define is set */
+
+#  ifdef PERL_HAS_FAST_GET_MSB_POS64
+
+    return msbit_pos64(word);
+
+#  elif defined(PERL_HAS_FAST_GET_LSB_POS64)
+
+    return lsbit_pos64(word);
+
+#  else
+
+    /* The position of the only set bit in a word can be quickly calculated
+     * using deBruijn sequences.  See for example
+     * https://en.wikipedia.org/wiki/De_Bruijn_sequence */
+    return PL_deBruijn_bitpos_tab64[(word * PERL_deBruijnMagic64_)
+                                                    >> PERL_deBruijnShift64_];
+#  endif
+
+}
+
+#endif
+
+PERL_STATIC_INLINE unsigned
+Perl_single_1bit_pos32(U32 word)
+{
+    /* Given a 32-bit word known to contain all zero bits except one 1 bit,
+     * find and return the 1's position: 0..31 */
+
+#ifdef PERL_CORE    /* macro not exported */
+    ASSUME(isPOWER_OF_2(word));
+#else
+    ASSUME(word && (word & (word-1)) == 0);
+#endif
+#ifdef PERL_HAS_FAST_GET_MSB_POS32
+
+    return msbit_pos32(word);
+
+#elif defined(PERL_HAS_FAST_GET_LSB_POS32)
+
+    return lsbit_pos32(word);
+
+#else
+
+    return PL_deBruijn_bitpos_tab32[(word * PERL_deBruijnMagic32_)
+                                                    >> PERL_deBruijnShift32_];
+#endif
+
+}
+
+#ifndef EBCDIC
+
+PERL_STATIC_INLINE unsigned int
+Perl_variant_byte_number(PERL_UINTMAX_T word)
+{
+    /* This returns the position in a word (0..7) of the first variant byte in
+     * it.  This is a helper function.  Note that there are no branches */
+
+    /* Get just the msb bits of each byte */
+    word &= PERL_VARIANTS_WORD_MASK;
+
+    /* This should only be called if we know there is a variant byte in the
+     * word */
+    assert(word);
+
+#  if BYTEORDER == 0x1234 || BYTEORDER == 0x12345678
+
+    /* Bytes are stored like
+     *  Byte8 ... Byte2 Byte1
+     *  63..56...15...8 7...0
+     * so getting the lsb of the whole modified word is getting the msb of the
+     * first byte that has its msb set */
+    word = lsbit_pos_uintmax_(word);
+
+    /* Here, word contains the position 7,15,23,...55,63 of that bit.  Convert
+     * to 0..7 */
+    return (unsigned int) ((word + 1) >> 3) - 1;
+
+#  elif BYTEORDER == 0x4321 || BYTEORDER == 0x87654321
+
+    /* Bytes are stored like
+     *  Byte1 Byte2  ... Byte8
+     * 63..56 55..47 ... 7...0
+     * so getting the msb of the whole modified word is getting the msb of the
+     * first byte that has its msb set */
+    word = msbit_pos_uintmax_(word);
+
+    /* Here, word contains the position 63,55,...,23,15,7 of that bit.  Convert
+     * to 0..7 */
+    word = ((word + 1) >> 3) - 1;
+
+    /* And invert the result because of the reversed byte order on this
+     * platform */
+    word = CHARBITS - word - 1;
+
+    return (unsigned int) word;
+
+#  else
+#    error Unexpected byte order
+#  endif
+
+}
+
+#endif
+#if defined(PERL_CORE) || defined(PERL_EXT)
+
+/*
+=for apidoc variant_under_utf8_count
+
+This function looks at the sequence of bytes between C<s> and C<e>, which are
+assumed to be encoded in ASCII/Latin1, and returns how many of them would
+change should the string be translated into UTF-8.  Due to the nature of UTF-8,
+each of these would occupy two bytes instead of the single one in the input
+string.  Thus, this function returns the precise number of bytes the string
+would expand by when translated to UTF-8.
+
+Unlike most of the other functions that have C<utf8> in their name, the input
+to this function is NOT a UTF-8-encoded string.  The function name is slightly
+I<odd> to emphasize this.
+
+This function is internal to Perl because khw thinks that any XS code that
+would want this is probably operating too close to the internals.  Presenting a
+valid use case could change that.
+
+See also
+C<L<perlapi/is_utf8_invariant_string>>
+and
+C<L<perlapi/is_utf8_invariant_string_loc>>,
+
+=cut
+
+*/
+
+PERL_STATIC_INLINE Size_t
+S_variant_under_utf8_count(const U8* const s, const U8* const e)
+{
+    const U8* x = s;
+    Size_t count = 0;
+
+    PERL_ARGS_ASSERT_VARIANT_UNDER_UTF8_COUNT;
+
+#  ifndef EBCDIC
+
+    /* Test if the string is long enough to use word-at-a-time.  (Logic is the
+     * same as for is_utf8_invariant_string()) */
+    if ((STRLEN) (e - x) >= PERL_WORDSIZE
+                          + PERL_WORDSIZE * PERL_IS_SUBWORD_ADDR(x)
+                          - (PTR2nat(x) & PERL_WORD_BOUNDARY_MASK))
+    {
+
+        /* Process per-byte until reach word boundary.  XXX This loop could be
+         * eliminated if we knew that this platform had fast unaligned reads */
+        while (PTR2nat(x) & PERL_WORD_BOUNDARY_MASK) {
+            count += ! UTF8_IS_INVARIANT(*x++);
+        }
+
+        /* Process per-word as long as we have at least a full word left */
+        do {    /* Commit 03c1e4ab1d6ee9062fb3f94b0ba31db6698724b1 contains an
+                   explanation of how this works */
+            PERL_UINTMAX_T increment
+                = ((((* (PERL_UINTMAX_T *) x) & PERL_VARIANTS_WORD_MASK) >> 7)
+                      * PERL_COUNT_MULTIPLIER)
+                    >> ((PERL_WORDSIZE - 1) * CHARBITS);
+            count += (Size_t) increment;
+            x += PERL_WORDSIZE;
+        } while (x + PERL_WORDSIZE <= e);
+    }
+
+#  endif
+
+    /* Process per-byte */
+    while (x < e) {
+        if (! UTF8_IS_INVARIANT(*x)) {
+            count++;
+        }
+
+        x++;
+    }
+
+    return count;
+}
+
+#endif
+
+   /* Keep  these around for these files */
+#if ! defined(PERL_IN_REGEXEC_C) && ! defined(PERL_IN_UTF8_C)
+#  undef PERL_WORDSIZE
+#  undef PERL_COUNT_MULTIPLIER
+#  undef PERL_WORD_BOUNDARY_MASK
+#  undef PERL_VARIANTS_WORD_MASK
+#endif
+
+/*
+=for apidoc is_utf8_string
+
+Returns TRUE if the first C<len> bytes of string C<s> form a valid
+Perl-extended-UTF-8 string; returns FALSE otherwise.  If C<len> is 0, it will
+be calculated using C<strlen(s)> (which means if you use this option, that C<s>
+can't have embedded C<NUL> characters and has to have a terminating C<NUL>
+byte).  Note that all characters being ASCII constitute 'a valid UTF-8 string'.
+
+This function considers Perl's extended UTF-8 to be valid.  That means that
+code points above Unicode, surrogates, and non-character code points are
+considered valid by this function.  Use C<L</is_strict_utf8_string>>,
+C<L</is_c9strict_utf8_string>>, or C<L</is_utf8_string_flags>> to restrict what
+code points are considered valid.
+
+See also
+C<L</is_utf8_invariant_string>>,
+C<L</is_utf8_invariant_string_loc>>,
+C<L</is_utf8_string_loc>>,
+C<L</is_utf8_string_loclen>>,
+C<L</is_utf8_fixed_width_buf_flags>>,
+C<L</is_utf8_fixed_width_buf_loc_flags>>,
+C<L</is_utf8_fixed_width_buf_loclen_flags>>,
+
+=cut
+*/
+
+#define is_utf8_string(s, len)  is_utf8_string_loclen(s, len, NULL, NULL)
+
+#if defined(PERL_CORE) || defined (PERL_EXT)
+
+/*
+=for apidoc is_utf8_non_invariant_string
+
+Returns TRUE if L<perlapi/is_utf8_invariant_string> returns FALSE for the first
+C<len> bytes of the string C<s>, but they are, nonetheless, legal Perl-extended
+UTF-8; otherwise returns FALSE.
+
+A TRUE return means that at least one code point represented by the sequence
+either is a wide character not representable as a single byte, or the
+representation differs depending on whether the sequence is encoded in UTF-8 or
+not.
+
+See also
+C<L<perlapi/is_utf8_invariant_string>>,
+C<L<perlapi/is_utf8_string>>
+
+=cut
+
+This is commonly used to determine if a SV's UTF-8 flag should be turned on.
+It generally needn't be if its string is entirely UTF-8 invariant, and it
+shouldn't be if it otherwise contains invalid UTF-8.
+
+It is an internal function because khw thinks that XS code shouldn't be working
+at this low a level.  A valid use case could change that.
+
+*/
+
+PERL_STATIC_INLINE bool
+Perl_is_utf8_non_invariant_string(const U8* const s, STRLEN len)
+{
+    const U8 * first_variant;
+
+    PERL_ARGS_ASSERT_IS_UTF8_NON_INVARIANT_STRING;
+
+    if (is_utf8_invariant_string_loc(s, len, &first_variant)) {
+        return FALSE;
+    }
+
+    return is_utf8_string(first_variant, len - (first_variant - s));
+}
+

@@ -1,0 +1,1000 @@
+
+
+def vcrcommand(name, flags, spec, helpcategory=None, optionalrepo=False):
+    fullflags = flags + _VCR_FLAGS
+
+    def hgmatcher(r1, r2):
+        if r1.uri != r2.uri or r1.method != r2.method:
+            return False
+        r1params = util.urlreq.parseqs(r1.body)
+        r2params = util.urlreq.parseqs(r2.body)
+        for key in r1params:
+            if key not in r2params:
+                return False
+            value = r1params[key][0]
+            # we want to compare json payloads without worrying about ordering
+            if value.startswith(b'{') and value.endswith(b'}'):
+                r1json = pycompat.json_loads(value)
+                r2json = pycompat.json_loads(r2params[key][0])
+                if r1json != r2json:
+                    return False
+            elif r2params[key][0] != value:
+                return False
+        return True
+
+    def sanitiserequest(request):
+        request.body = re.sub(
+            br'cli-[a-z0-9]+', br'cli-hahayouwish', request.body
+        )
+        return request
+
+    def sanitiseresponse(response):
+        if 'set-cookie' in response['headers']:
+            del response['headers']['set-cookie']
+        return response
+
+    def decorate(fn):
+        def inner(*args, **kwargs):
+            vcr = kwargs.pop('test_vcr')
+            if vcr:
+                cassette = pycompat.fsdecode(vcr)
+                import hgdemandimport
+
+                with hgdemandimport.deactivated():
+                    import vcr as vcrmod
+                    import vcr.stubs as stubs
+
+                    vcr = vcrmod.VCR(
+                        serializer='json',
+                        before_record_request=sanitiserequest,
+                        before_record_response=sanitiseresponse,
+                        custom_patches=[
+                            (
+                                urlmod,
+                                'httpconnection',
+                                stubs.VCRHTTPConnection,
+                            ),
+                            (
+                                urlmod,
+                                'httpsconnection',
+                                stubs.VCRHTTPSConnection,
+                            ),
+                        ],
+                    )
+                    vcr.register_matcher('hgmatcher', hgmatcher)
+                    with vcr.use_cassette(cassette, match_on=['hgmatcher']):
+                        return fn(*args, **kwargs)
+            return fn(*args, **kwargs)
+
+        cmd = util.checksignature(inner, depth=2)
+        cmd.__name__ = fn.__name__
+        cmd.__doc__ = fn.__doc__
+
+        return command(
+            name,
+            fullflags,
+            spec,
+            helpcategory=helpcategory,
+            optionalrepo=optionalrepo,
+        )(cmd)
+
+    return decorate
+
+
+def _debug(ui, *msg, **opts):
+    """write debug output for Phabricator if ``phabricator.debug`` is set
+
+    Specifically, this avoids dumping Conduit and HTTP auth chatter that is
+    printed with the --debug argument.
+    """
+    if ui.configbool(b"phabricator", b"debug"):
+        flag = ui.debugflag
+        try:
+            ui.debugflag = True
+            ui.write(*msg, **opts)
+        finally:
+            ui.debugflag = flag
+
+
+def urlencodenested(params):
+    """like urlencode, but works with nested parameters.
+
+    For example, if params is {'a': ['b', 'c'], 'd': {'e': 'f'}}, it will be
+    flattened to {'a[0]': 'b', 'a[1]': 'c', 'd[e]': 'f'} and then passed to
+    urlencode. Note: the encoding is consistent with PHP's http_build_query.
+    """
+    flatparams = util.sortdict()
+
+    def process(prefix, obj):
+        if isinstance(obj, bool):
+            obj = {True: b'true', False: b'false'}[obj]  # Python -> PHP form
+        lister = lambda l: [(b'%d' % k, v) for k, v in enumerate(l)]
+        items = {list: lister, dict: lambda x: x.items()}.get(type(obj))
+        if items is None:
+            flatparams[prefix] = obj
+        else:
+            for k, v in items(obj):
+                if prefix:
+                    process(b'%s[%s]' % (prefix, k), v)
+                else:
+                    process(k, v)
+
+    process(b'', params)
+    return urlutil.urlreq.urlencode(flatparams)
+
+
+def readurltoken(ui):
+    """return conduit url, token and make sure they exist
+
+    Currently read from [auth] config section. In the future, it might
+    make sense to read from .arcconfig and .arcrc as well.
+    """
+    url = ui.config(b'phabricator', b'url')
+    if not url:
+        raise error.Abort(
+            _(b'config %s.%s is required') % (b'phabricator', b'url')
+        )
+
+    res = httpconnectionmod.readauthforuri(ui, url, urlutil.url(url).user)
+    token = None
+
+    if res:
+        group, auth = res
+
+        ui.debug(b"using auth.%s.* for authentication\n" % group)
+
+        token = auth.get(b'phabtoken')
+
+    if not token:
+        raise error.Abort(
+            _(b'Can\'t find conduit token associated to %s') % (url,)
+        )
+
+    return url, token
+
+
+def callconduit(ui, name, params):
+    """call Conduit API, params is a dict. return json.loads result, or None"""
+    host, token = readurltoken(ui)
+    url, authinfo = urlutil.url(b'/'.join([host, b'api', name])).authinfo()
+    ui.debug(b'Conduit Call: %s %s\n' % (url, pycompat.byterepr(params)))
+    params = params.copy()
+    params[b'__conduit__'] = {
+        b'token': token,
+    }
+    rawdata = {
+        b'params': templatefilters.json(params),
+        b'output': b'json',
+        b'__conduit__': 1,
+    }
+    data = urlencodenested(rawdata)
+    curlcmd = ui.config(b'phabricator', b'curlcmd')
+    if curlcmd:
+        sin, sout = procutil.popen2(
+            b'%s -d @- %s' % (curlcmd, procutil.shellquote(url))
+        )
+        sin.write(data)
+        sin.close()
+        body = sout.read()
+    else:
+        urlopener = urlmod.opener(ui, authinfo)
+        request = util.urlreq.request(pycompat.strurl(url), data=data)
+        max_try = ui.configint(b'phabricator', b'retry') + 1
+        timeout = ui.configwith(float, b'http', b'timeout')
+        for try_count in range(max_try):
+            try:
+                with contextlib.closing(
+                    urlopener.open(request, timeout=timeout)
+                ) as rsp:
+                    body = rsp.read()
+                break
+            except util.urlerr.urlerror as err:
+                if try_count == max_try - 1:
+                    raise
+                ui.debug(
+                    b'Conduit Request failed (try %d/%d): %r\n'
+                    % (try_count + 1, max_try, err)
+                )
+                # failing request might come from overloaded server
+                retry_interval = ui.configint(b'phabricator', b'retry.interval')
+                time.sleep(retry_interval)
+    ui.debug(b'Conduit Response: %s\n' % body)
+    parsed = pycompat.rapply(
+        lambda x: encoding.unitolocal(x) if isinstance(x, str) else x,
+        # json.loads only accepts bytes from py3.6+
+        pycompat.json_loads(encoding.unifromlocal(body)),
+    )
+    if parsed.get(b'error_code'):
+        msg = _(b'Conduit Error (%s): %s') % (
+            parsed[b'error_code'],
+            parsed[b'error_info'],
+        )
+        raise error.Abort(msg)
+    return parsed[b'result']
+
+
+@vcrcommand(b'debugcallconduit', [], _(b'METHOD'), optionalrepo=True)
+def debugcallconduit(ui, repo, name):
+    """call Conduit API
+
+    Call parameters are read from stdin as a JSON blob. Result will be written
+    to stdout as a JSON blob.
+    """
+    # json.loads only accepts bytes from 3.6+
+    rawparams = encoding.unifromlocal(ui.fin.read())
+    # json.loads only returns unicode strings
+    params = pycompat.rapply(
+        lambda x: encoding.unitolocal(x) if isinstance(x, str) else x,
+        pycompat.json_loads(rawparams),
+    )
+    # json.dumps only accepts unicode strings
+    result = pycompat.rapply(
+        lambda x: encoding.unifromlocal(x) if isinstance(x, bytes) else x,
+        callconduit(ui, name, params),
+    )
+    s = json.dumps(result, sort_keys=True, indent=2, separators=(u',', u': '))
+    ui.write(b'%s\n' % encoding.unitolocal(s))
+
+
+def getrepophid(repo):
+    """given callsign, return repository PHID or None"""
+    # developer config: phabricator.repophid
+    repophid = repo.ui.config(b'phabricator', b'repophid')
+    if repophid:
+        return repophid
+    callsign = repo.ui.config(b'phabricator', b'callsign')
+    if not callsign:
+        return None
+    query = callconduit(
+        repo.ui,
+        b'diffusion.repository.search',
+        {b'constraints': {b'callsigns': [callsign]}},
+    )
+    if len(query[b'data']) == 0:
+        return None
+    repophid = query[b'data'][0][b'phid']
+    repo.ui.setconfig(b'phabricator', b'repophid', repophid)
+    return repophid
+
+
+_differentialrevisiontagre = re.compile(br'\AD([1-9][0-9]*)\Z')
+_differentialrevisiondescre = re.compile(
+    br'^Differential Revision:\s*(?P<url>(?:.*)D(?P<id>[1-9][0-9]*))$', re.M
+)
+
+
+def getoldnodedrevmap(repo, nodelist):
+    """find previous nodes that has been sent to Phabricator
+
+    return {node: (oldnode, Differential diff, Differential Revision ID)}
+    for node in nodelist with known previous sent versions, or associated
+    Differential Revision IDs. ``oldnode`` and ``Differential diff`` could
+    be ``None``.
+
+    Examines commit messages like "Differential Revision:" to get the
+    association information.
+
+    If such commit message line is not found, examines all precursors and their
+    tags. Tags with format like "D1234" are considered a match and the node
+    with that tag, and the number after "D" (ex. 1234) will be returned.
+
+    The ``old node``, if not None, is guaranteed to be the last diff of
+    corresponding Differential Revision, and exist in the repo.
+    """
+    unfi = repo.unfiltered()
+    has_node = unfi.changelog.index.has_node
+
+    result = {}  # {node: (oldnode?, lastdiff?, drev)}
+    # ordered for test stability when printing new -> old mapping below
+    toconfirm = util.sortdict()  # {node: (force, {precnode}, drev)}
+    for node in nodelist:
+        ctx = unfi[node]
+        # For tags like "D123", put them into "toconfirm" to verify later
+        precnodes = list(obsutil.allpredecessors(unfi.obsstore, [node]))
+        for n in precnodes:
+            if has_node(n):
+                for tag in unfi.nodetags(n):
+                    m = _differentialrevisiontagre.match(tag)
+                    if m:
+                        toconfirm[node] = (0, set(precnodes), int(m.group(1)))
+                        break
+                else:
+                    continue  # move to next predecessor
+                break  # found a tag, stop
+        else:
+            # Check commit message
+            m = _differentialrevisiondescre.search(ctx.description())
+            if m:
+                toconfirm[node] = (1, set(precnodes), int(m.group('id')))
+
+    # Double check if tags are genuine by collecting all old nodes from
+    # Phabricator, and expect precursors overlap with it.
+    if toconfirm:
+        drevs = [drev for force, precs, drev in toconfirm.values()]
+        alldiffs = callconduit(
+            unfi.ui, b'differential.querydiffs', {b'revisionIDs': drevs}
+        )
+
+        def getnodes(d, precset):
+            # Ignore other nodes that were combined into the Differential
+            # that aren't predecessors of the current local node.
+            return [n for n in getlocalcommits(d) if n in precset]
+
+        for newnode, (force, precset, drev) in toconfirm.items():
+            diffs = [
+                d for d in alldiffs.values() if int(d[b'revisionID']) == drev
+            ]
+
+            # local predecessors known by Phabricator
+            phprecset = {n for d in diffs for n in getnodes(d, precset)}
+
+            # Ignore if precursors (Phabricator and local repo) do not overlap,
+            # and force is not set (when commit message says nothing)
+            if not force and not phprecset:
+                tagname = b'D%d' % drev
+                tags.tag(
+                    repo,
+                    tagname,
+                    repo.nullid,
+                    message=None,
+                    user=None,
+                    date=None,
+                    local=True,
+                )
+                unfi.ui.warn(
+                    _(
+                        b'D%d: local tag removed - does not match '
+                        b'Differential history\n'
+                    )
+                    % drev
+                )
+                continue
+
+            # Find the last node using Phabricator metadata, and make sure it
+            # exists in the repo
+            oldnode = lastdiff = None
+            if diffs:
+                lastdiff = max(diffs, key=lambda d: int(d[b'id']))
+                oldnodes = getnodes(lastdiff, precset)
+
+                _debug(
+                    unfi.ui,
+                    b"%s mapped to old nodes %s\n"
+                    % (
+                        short(newnode),
+                        stringutil.pprint([short(n) for n in sorted(oldnodes)]),
+                    ),
+                )
+
+                # If this commit was the result of `hg fold` after submission,
+                # and now resubmitted with --fold, the easiest thing to do is
+                # to leave the node clear.  This only results in creating a new
+                # diff for the _same_ Differential Revision if this commit is
+                # the first or last in the selected range.  If we picked a node
+                # from the list instead, it would have to be the lowest if at
+                # the beginning of the --fold range, or the highest at the end.
+                # Otherwise, one or more of the nodes wouldn't be considered in
+                # the diff, and the Differential wouldn't be properly updated.
+                # If this commit is the result of `hg split` in the same
+                # scenario, there is a single oldnode here (and multiple
+                # newnodes mapped to it).  That makes it the same as the normal
+                # case, as the edges of the newnode range cleanly maps to one
+                # oldnode each.
+                if len(oldnodes) == 1:
+                    oldnode = oldnodes[0]
+                if oldnode and not has_node(oldnode):
+                    oldnode = None
+
+            result[newnode] = (oldnode, lastdiff, drev)
+
+    return result
+
+
+def getdrevmap(repo, revs):
+    """Return a dict mapping each rev in `revs` to their Differential Revision
+    ID or None.
+    """
+    result = {}
+    for rev in revs:
+        result[rev] = None
+        ctx = repo[rev]
+        # Check commit message
+        m = _differentialrevisiondescre.search(ctx.description())
+        if m:
+            result[rev] = int(m.group('id'))
+            continue
+        # Check tags
+        for tag in repo.nodetags(ctx.node()):
+            m = _differentialrevisiontagre.match(tag)
+            if m:
+                result[rev] = int(m.group(1))
+                break
+
+    return result
+
+
+def getdiff(basectx, ctx, diffopts):
+    """plain-text diff without header (user, commit message, etc)"""
+    output = util.stringio()
+    for chunk, _label in patch.diffui(
+        ctx.repo(), basectx.p1().node(), ctx.node(), None, opts=diffopts
+    ):
+        output.write(chunk)
+    return output.getvalue()
+
+
+class DiffChangeType:
+    ADD = 1
+    CHANGE = 2
+    DELETE = 3
+    MOVE_AWAY = 4
+    COPY_AWAY = 5
+    MOVE_HERE = 6
+    COPY_HERE = 7
+    MULTICOPY = 8
+
+
+class DiffFileType:
+    TEXT = 1
+    IMAGE = 2
+    BINARY = 3
+
+
+@attr.s
+class phabhunk(dict):
+    """Represents a Differential hunk, which is owned by a Differential change"""
+
+    oldOffset = attr.ib(default=0)  # camelcase-required
+    oldLength = attr.ib(default=0)  # camelcase-required
+    newOffset = attr.ib(default=0)  # camelcase-required
+    newLength = attr.ib(default=0)  # camelcase-required
+    corpus = attr.ib(default='')
+    # These get added to the phabchange's equivalents
+    addLines = attr.ib(default=0)  # camelcase-required
+    delLines = attr.ib(default=0)  # camelcase-required
+
+
+@attr.s
+class phabchange:
+    """Represents a Differential change, owns Differential hunks and owned by a
+    Differential diff.  Each one represents one file in a diff.
+    """
+
+    currentPath = attr.ib(default=None)  # camelcase-required
+    oldPath = attr.ib(default=None)  # camelcase-required
+    awayPaths = attr.ib(default=attr.Factory(list))  # camelcase-required
+    metadata = attr.ib(default=attr.Factory(dict))
+    oldProperties = attr.ib(default=attr.Factory(dict))  # camelcase-required
+    newProperties = attr.ib(default=attr.Factory(dict))  # camelcase-required
+    type = attr.ib(default=DiffChangeType.CHANGE)
+    fileType = attr.ib(default=DiffFileType.TEXT)  # camelcase-required
+    commitHash = attr.ib(default=None)  # camelcase-required
+    addLines = attr.ib(default=0)  # camelcase-required
+    delLines = attr.ib(default=0)  # camelcase-required
+    hunks = attr.ib(default=attr.Factory(list))
+
+    def copynewmetadatatoold(self):
+        for key in list(self.metadata.keys()):
+            newkey = key.replace(b'new:', b'old:')
+            self.metadata[newkey] = self.metadata[key]
+
+    def addoldmode(self, value):
+        self.oldProperties[b'unix:filemode'] = value
+
+    def addnewmode(self, value):
+        self.newProperties[b'unix:filemode'] = value
+
+    def addhunk(self, hunk):
+        if not isinstance(hunk, phabhunk):
+            raise error.Abort(b'phabchange.addhunk only takes phabhunks')
+        self.hunks.append(pycompat.byteskwargs(attr.asdict(hunk)))
+        # It's useful to include these stats since the Phab web UI shows them,
+        # and uses them to estimate how large a change a Revision is. Also used
+        # in email subjects for the [+++--] bit.
+        self.addLines += hunk.addLines
+        self.delLines += hunk.delLines
+
+
+@attr.s
+class phabdiff:
+    """Represents a Differential diff, owns Differential changes.  Corresponds
+    to a commit.
+    """
+
+    # Doesn't seem to be any reason to send this (output of uname -n)
+    sourceMachine = attr.ib(default=b'')  # camelcase-required
+    sourcePath = attr.ib(default=b'/')  # camelcase-required
+    sourceControlBaseRevision = attr.ib(default=b'0' * 40)  # camelcase-required
+    sourceControlPath = attr.ib(default=b'/')  # camelcase-required
+    sourceControlSystem = attr.ib(default=b'hg')  # camelcase-required
+    branch = attr.ib(default=b'default')
+    bookmark = attr.ib(default=None)
+    creationMethod = attr.ib(default=b'phabsend')  # camelcase-required
+    lintStatus = attr.ib(default=b'none')  # camelcase-required
+    unitStatus = attr.ib(default=b'none')  # camelcase-required
+    changes = attr.ib(default=attr.Factory(dict))
+    repositoryPHID = attr.ib(default=None)  # camelcase-required
+
+    def addchange(self, change):
+        if not isinstance(change, phabchange):
+            raise error.Abort(b'phabdiff.addchange only takes phabchanges')
+        self.changes[change.currentPath] = pycompat.byteskwargs(
+            attr.asdict(change)
+        )
+
+
+def maketext(pchange, basectx, ctx, fname):
+    """populate the phabchange for a text file"""
+    repo = ctx.repo()
+    fmatcher = match.exact([fname])
+    diffopts = mdiff.diffopts(git=True, context=32767)
+    _pfctx, _fctx, header, fhunks = next(
+        patch.diffhunks(repo, basectx.p1(), ctx, fmatcher, opts=diffopts)
+    )
+
+    for fhunk in fhunks:
+        (oldOffset, oldLength, newOffset, newLength), lines = fhunk
+        corpus = b''.join(lines[1:])
+        shunk = list(header)
+        shunk.extend(lines)
+        _mf, _mt, addLines, delLines, _hb = patch.diffstatsum(
+            patch.diffstatdata(util.iterlines(shunk))
+        )
+        pchange.addhunk(
+            phabhunk(
+                oldOffset,
+                oldLength,
+                newOffset,
+                newLength,
+                corpus,
+                addLines,
+                delLines,
+            )
+        )
+
+
+def uploadchunks(fctx, fphid):
+    """upload large binary files as separate chunks.
+    Phab requests chunking over 8MiB, and splits into 4MiB chunks
+    """
+    ui = fctx.repo().ui
+    chunks = callconduit(ui, b'file.querychunks', {b'filePHID': fphid})
+    with ui.makeprogress(
+        _(b'uploading file chunks'), unit=_(b'chunks'), total=len(chunks)
+    ) as progress:
+        for chunk in chunks:
+            progress.increment()
+            if chunk[b'complete']:
+                continue
+            bstart = int(chunk[b'byteStart'])
+            bend = int(chunk[b'byteEnd'])
+            callconduit(
+                ui,
+                b'file.uploadchunk',
+                {
+                    b'filePHID': fphid,
+                    b'byteStart': bstart,
+                    b'data': base64.b64encode(fctx.data()[bstart:bend]),
+                    b'dataEncoding': b'base64',
+                },
+            )
+
+
+def uploadfile(fctx):
+    """upload binary files to Phabricator"""
+    repo = fctx.repo()
+    ui = repo.ui
+    fname = fctx.path()
+    size = fctx.size()
+    fhash = pycompat.bytestr(hashlib.sha256(fctx.data()).hexdigest())
+
+    # an allocate call is required first to see if an upload is even required
+    # (Phab might already have it) and to determine if chunking is needed
+    allocateparams = {
+        b'name': fname,
+        b'contentLength': size,
+        b'contentHash': fhash,
+    }
+    filealloc = callconduit(ui, b'file.allocate', allocateparams)
+    fphid = filealloc[b'filePHID']
+
+    if filealloc[b'upload']:
+        ui.write(_(b'uploading %s\n') % bytes(fctx))
+        if not fphid:
+            uploadparams = {
+                b'name': fname,
+                b'data_base64': base64.b64encode(fctx.data()),
+            }
+            fphid = callconduit(ui, b'file.upload', uploadparams)
+        else:
+            uploadchunks(fctx, fphid)
+    else:
+        ui.debug(b'server already has %s\n' % bytes(fctx))
+
+    if not fphid:
+        raise error.Abort(b'Upload of %s failed.' % bytes(fctx))
+
+    return fphid
+
+
+def addoldbinary(pchange, oldfctx, fctx):
+    """add the metadata for the previous version of a binary file to the
+    phabchange for the new version
+
+    ``oldfctx`` is the previous version of the file; ``fctx`` is the new
+    version of the file, or None if the file is being removed.
+    """
+    if not fctx or fctx.cmp(oldfctx):
+        # Files differ, add the old one
+        pchange.metadata[b'old:file:size'] = oldfctx.size()
+        mimeguess, _enc = mimetypes.guess_type(
+            encoding.unifromlocal(oldfctx.path())
+        )
+        if mimeguess:
+            pchange.metadata[b'old:file:mime-type'] = pycompat.bytestr(
+                mimeguess
+            )
+        fphid = uploadfile(oldfctx)
+        pchange.metadata[b'old:binary-phid'] = fphid
+    else:
+        # If it's left as IMAGE/BINARY web UI might try to display it
+        pchange.fileType = DiffFileType.TEXT
+        pchange.copynewmetadatatoold()
+
+
+def makebinary(pchange, fctx):
+    """populate the phabchange for a binary file"""
+    pchange.fileType = DiffFileType.BINARY
+    fphid = uploadfile(fctx)
+    pchange.metadata[b'new:binary-phid'] = fphid
+    pchange.metadata[b'new:file:size'] = fctx.size()
+    mimeguess, _enc = mimetypes.guess_type(encoding.unifromlocal(fctx.path()))
+    if mimeguess:
+        mimeguess = pycompat.bytestr(mimeguess)
+        pchange.metadata[b'new:file:mime-type'] = mimeguess
+        if mimeguess.startswith(b'image/'):
+            pchange.fileType = DiffFileType.IMAGE
+
+
+# Copied from mercurial/patch.py
+gitmode = {b'l': b'120000', b'x': b'100755', b'': b'100644'}
+
+
+def notutf8(fctx):
+    """detect non-UTF-8 text files since Phabricator requires them to be marked
+    as binary
+    """
+    try:
+        fctx.data().decode('utf-8')
+        return False
+    except UnicodeDecodeError:
+        fctx.repo().ui.write(
+            _(b'file %s detected as non-UTF-8, marked as binary\n')
+            % fctx.path()
+        )
+        return True
+
+
+def addremoved(pdiff, basectx, ctx, removed):
+    """add removed files to the phabdiff. Shouldn't include moves"""
+    for fname in removed:
+        pchange = phabchange(
+            currentPath=fname, oldPath=fname, type=DiffChangeType.DELETE
+        )
+        oldfctx = basectx.p1()[fname]
+        pchange.addoldmode(gitmode[oldfctx.flags()])
+        if not (oldfctx.isbinary() or notutf8(oldfctx)):
+            maketext(pchange, basectx, ctx, fname)
+
+        pdiff.addchange(pchange)
+
+
+def addmodified(pdiff, basectx, ctx, modified):
+    """add modified files to the phabdiff"""
+    for fname in modified:
+        fctx = ctx[fname]
+        oldfctx = basectx.p1()[fname]
+        pchange = phabchange(currentPath=fname, oldPath=fname)
+        filemode = gitmode[fctx.flags()]
+        originalmode = gitmode[oldfctx.flags()]
+        if filemode != originalmode:
+            pchange.addoldmode(originalmode)
+            pchange.addnewmode(filemode)
+
+        if (
+            fctx.isbinary()
+            or notutf8(fctx)
+            or oldfctx.isbinary()
+            or notutf8(oldfctx)
+        ):
+            makebinary(pchange, fctx)
+            addoldbinary(pchange, oldfctx, fctx)
+        else:
+            maketext(pchange, basectx, ctx, fname)
+
+        pdiff.addchange(pchange)
+
+
+def addadded(pdiff, basectx, ctx, added, removed):
+    """add file adds to the phabdiff, both new files and copies/moves"""
+    # Keep track of files that've been recorded as moved/copied, so if there are
+    # additional copies we can mark them (moves get removed from removed)
+    copiedchanges = {}
+    movedchanges = {}
+
+    copy = {}
+    if basectx != ctx:
+        copy = copies.pathcopies(basectx.p1(), ctx)
+
+    for fname in added:
+        fctx = ctx[fname]
+        oldfctx = None
+        pchange = phabchange(currentPath=fname)
+
+        filemode = gitmode[fctx.flags()]
+
+        if copy:
+            originalfname = copy.get(fname, fname)
+        else:
+            originalfname = fname
+            if fctx.renamed():
+                originalfname = fctx.renamed()[0]
+
+        renamed = fname != originalfname
+
+        if renamed:
+            oldfctx = basectx.p1()[originalfname]
+            originalmode = gitmode[oldfctx.flags()]
+            pchange.oldPath = originalfname
+
+            if originalfname in removed:
+                origpchange = phabchange(
+                    currentPath=originalfname,
+                    oldPath=originalfname,
+                    type=DiffChangeType.MOVE_AWAY,
+                    awayPaths=[fname],
+                )
+                movedchanges[originalfname] = origpchange
+                removed.remove(originalfname)
+                pchange.type = DiffChangeType.MOVE_HERE
+            elif originalfname in movedchanges:
+                movedchanges[originalfname].type = DiffChangeType.MULTICOPY
+                movedchanges[originalfname].awayPaths.append(fname)
+                pchange.type = DiffChangeType.COPY_HERE
+            else:  # pure copy
+                if originalfname not in copiedchanges:
+                    origpchange = phabchange(
+                        currentPath=originalfname, type=DiffChangeType.COPY_AWAY
+                    )
+                    copiedchanges[originalfname] = origpchange
+                else:
+                    origpchange = copiedchanges[originalfname]
+                origpchange.awayPaths.append(fname)
+                pchange.type = DiffChangeType.COPY_HERE
+
+            if filemode != originalmode:
+                pchange.addoldmode(originalmode)
+                pchange.addnewmode(filemode)
+        else:  # Brand-new file
+            pchange.addnewmode(gitmode[fctx.flags()])
+            pchange.type = DiffChangeType.ADD
+
+        if (
+            fctx.isbinary()
+            or notutf8(fctx)
+            or (oldfctx and (oldfctx.isbinary() or notutf8(oldfctx)))
+        ):
+            makebinary(pchange, fctx)
+            if renamed:
+                addoldbinary(pchange, oldfctx, fctx)
+        else:
+            maketext(pchange, basectx, ctx, fname)
+
+        pdiff.addchange(pchange)
+
+    for _path, copiedchange in copiedchanges.items():
+        pdiff.addchange(copiedchange)
+    for _path, movedchange in movedchanges.items():
+        pdiff.addchange(movedchange)
+
+
+def creatediff(basectx, ctx):
+    """create a Differential Diff"""
+    repo = ctx.repo()
+    repophid = getrepophid(repo)
+    # Create a "Differential Diff" via "differential.creatediff" API
+    pdiff = phabdiff(
+        sourceControlBaseRevision=b'%s' % basectx.p1().hex(),
+        branch=b'%s' % ctx.branch(),
+    )
+    modified, added, removed, _d, _u, _i, _c = basectx.p1().status(ctx)
+    # addadded will remove moved files from removed, so addremoved won't get
+    # them
+    addadded(pdiff, basectx, ctx, added, removed)
+    addmodified(pdiff, basectx, ctx, modified)
+    addremoved(pdiff, basectx, ctx, removed)
+    if repophid:
+        pdiff.repositoryPHID = repophid
+    diff = callconduit(
+        repo.ui,
+        b'differential.creatediff',
+        pycompat.byteskwargs(attr.asdict(pdiff)),
+    )
+    if not diff:
+        if basectx != ctx:
+            msg = _(b'cannot create diff for %s::%s') % (basectx, ctx)
+        else:
+            msg = _(b'cannot create diff for %s') % ctx
+        raise error.Abort(msg)
+    return diff
+
+
+def writediffproperties(ctxs, diff):
+    """write metadata to diff so patches could be applied losslessly
+
+    ``ctxs`` is the list of commits that created the diff, in ascending order.
+    The list is generally a single commit, but may be several when using
+    ``phabsend --fold``.
+    """
+    # creatediff returns with a diffid but query returns with an id
+    diffid = diff.get(b'diffid', diff.get(b'id'))
+    basectx = ctxs[0]
+    tipctx = ctxs[-1]
+
+    params = {
+        b'diff_id': diffid,
+        b'name': b'hg:meta',
+        b'data': templatefilters.json(
+            {
+                b'user': tipctx.user(),
+                b'date': b'%d %d' % tipctx.date(),
+                b'branch': tipctx.branch(),
+                b'node': tipctx.hex(),
+                b'parent': basectx.p1().hex(),
+            }
+        ),
+    }
+    callconduit(basectx.repo().ui, b'differential.setdiffproperty', params)
+
+    commits = {}
+    for ctx in ctxs:
+        commits[ctx.hex()] = {
+            b'author': stringutil.person(ctx.user()),
+            b'authorEmail': stringutil.email(ctx.user()),
+            b'time': int(ctx.date()[0]),
+            b'commit': ctx.hex(),
+            b'parents': [ctx.p1().hex()],
+            b'branch': ctx.branch(),
+        }
+    params = {
+        b'diff_id': diffid,
+        b'name': b'local:commits',
+        b'data': templatefilters.json(commits),
+    }
+    callconduit(basectx.repo().ui, b'differential.setdiffproperty', params)
+
+
+def createdifferentialrevision(
+    ctxs,
+    revid=None,
+    parentrevphid=None,
+    oldbasenode=None,
+    oldnode=None,
+    olddiff=None,
+    actions=None,
+    comment=None,
+):
+    """create or update a Differential Revision
+
+    If revid is None, create a new Differential Revision, otherwise update
+    revid. If parentrevphid is not None, set it as a dependency.
+
+    If there is a single commit for the new Differential Revision, ``ctxs`` will
+    be a list of that single context.  Otherwise, it is a list that covers the
+    range of changes for the differential, where ``ctxs[0]`` is the first change
+    to include and ``ctxs[-1]`` is the last.
+
+    If oldnode is not None, check if the patch content (without commit message
+    and metadata) has changed before creating another diff.  For a Revision with
+    a single commit, ``oldbasenode`` and ``oldnode`` have the same value.  For a
+    Revision covering multiple commits, ``oldbasenode`` corresponds to
+    ``ctxs[0]`` the previous time this Revision was posted, and ``oldnode``
+    corresponds to ``ctxs[-1]``.
+
+    If actions is not None, they will be appended to the transaction.
+    """
+    ctx = ctxs[-1]
+    basectx = ctxs[0]
+
+    repo = ctx.repo()
+    if oldnode:
+        diffopts = mdiff.diffopts(git=True, context=32767)
+        unfi = repo.unfiltered()
+        oldctx = unfi[oldnode]
+        oldbasectx = unfi[oldbasenode]
+        neednewdiff = getdiff(basectx, ctx, diffopts) != getdiff(
+            oldbasectx, oldctx, diffopts
+        )
+    else:
+        neednewdiff = True
+
+    transactions = []
+    if neednewdiff:
+        diff = creatediff(basectx, ctx)
+        transactions.append({b'type': b'update', b'value': diff[b'phid']})
+        if comment:
+            transactions.append({b'type': b'comment', b'value': comment})
+    else:
+        # Even if we don't need to upload a new diff because the patch content
+        # does not change. We might still need to update its metadata so
+        # pushers could know the correct node metadata.
+        assert olddiff
+        diff = olddiff
+    writediffproperties(ctxs, diff)
+
+    # Set the parent Revision every time, so commit re-ordering is picked-up
+    if parentrevphid:
+        transactions.append(
+            {b'type': b'parents.set', b'value': [parentrevphid]}
+        )
+
+    if actions:
+        transactions += actions
+
+    # When folding multiple local commits into a single review, arcanist will
+    # take the summary line of the first commit as the title, and then
+    # concatenate the rest of the remaining messages (including each of their
+    # first lines) to the rest of the first commit message (each separated by
+    # an empty line), and use that as the summary field.  Do the same here.
+    # For commits with only a one line message, there is no summary field, as
+    # this gets assigned to the title.
+    fields = util.sortdict()  # sorted for stable wire protocol in tests
+
+    for i, _ctx in enumerate(ctxs):
+        # Parse commit message and update related fields.
+        desc = _ctx.description()
+        info = callconduit(
+            repo.ui, b'differential.parsecommitmessage', {b'corpus': desc}
+        )
+
+        for k in [b'title', b'summary', b'testPlan']:
+            v = info[b'fields'].get(k)
+            if not v:
+                continue
+
+            if i == 0:
+                # Title, summary and test plan (if present) are taken verbatim
+                # for the first commit.
+                fields[k] = v.rstrip()
+                continue
+            elif k == b'title':
+                # Add subsequent titles (i.e. the first line of the commit
+                # message) back to the summary.
+                k = b'summary'
+
+            # Append any current field to the existing composite field
+            fields[k] = b'\n\n'.join(filter(None, [fields.get(k), v.rstrip()]))
+
+    for k, v in fields.items():
+        transactions.append({b'type': k, b'value': v})
+
+    params = {b'transactions': transactions}
+    if revid is not None:
+        # Update an existing Differential Revision
+        params[b'objectIdentifier'] = revid
+
+    revision = callconduit(repo.ui, b'differential.revision.edit', params)
+    if not revision:
+        if len(ctxs) == 1:
+            msg = _(b'cannot create revision for %s') % ctx
+        else:
+            msg = _(b'cannot create revision for %s::%s') % (basectx, ctx)
+        raise error.Abort(msg)
+
+    return revision, diff
+
+
+def userphids(ui, names):
+    """convert user names to PHIDs"""
+    names = [name.lower() for name in names]
+    query = {b'constraints': {b'usernames': names}}

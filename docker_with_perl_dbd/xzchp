@@ -1,0 +1,1000 @@
+=head2 C<%set>
+
+The C<%set> hash defines the mapping from command letter to subroutine
+name suffix.
+
+C<%set> is a two-level hash, indexed by set name and then by command name.
+Note that trying to set the CommandSet to C<foobar> simply results in the
+5.8.0 command set being used, since there's no top-level entry for C<foobar>.
+
+=cut
+
+### The API section
+
+my %set = (    #
+    'pre580' => {
+        'a' => 'pre580_a',
+        'A' => 'pre580_null',
+        'b' => 'pre580_b',
+        'B' => 'pre580_null',
+        'd' => 'pre580_null',
+        'D' => 'pre580_D',
+        'h' => 'pre580_h',
+        'M' => 'pre580_null',
+        'O' => 'o',
+        'o' => 'pre580_null',
+        'v' => 'M',
+        'w' => 'v',
+        'W' => 'pre580_W',
+    },
+    'pre590' => {
+        '<'  => 'pre590_prepost',
+        '<<' => 'pre590_prepost',
+        '>'  => 'pre590_prepost',
+        '>>' => 'pre590_prepost',
+        '{'  => 'pre590_prepost',
+        '{{' => 'pre590_prepost',
+    },
+);
+
+my %breakpoints_data;
+
+sub _has_breakpoint_data_ref {
+    my ($filename, $line) = @_;
+
+    return (
+        exists( $breakpoints_data{$filename} )
+            and
+        exists( $breakpoints_data{$filename}{$line} )
+    );
+}
+
+sub _get_breakpoint_data_ref {
+    my ($filename, $line) = @_;
+
+    return ($breakpoints_data{$filename}{$line} ||= +{});
+}
+
+sub _delete_breakpoint_data_ref {
+    my ($filename, $line) = @_;
+
+    delete($breakpoints_data{$filename}{$line});
+    if (! scalar(keys( %{$breakpoints_data{$filename}} )) ) {
+        delete($breakpoints_data{$filename});
+    }
+
+    return;
+}
+
+sub _set_breakpoint_enabled_status {
+    my ($filename, $line, $status) = @_;
+
+    _get_breakpoint_data_ref($filename, $line)->{'enabled'} =
+        ($status ? 1 : '')
+        ;
+
+    return;
+}
+
+sub _enable_breakpoint_temp_enabled_status {
+    my ($filename, $line) = @_;
+
+    _get_breakpoint_data_ref($filename, $line)->{'temp_enabled'} = 1;
+
+    return;
+}
+
+sub _cancel_breakpoint_temp_enabled_status {
+    my ($filename, $line) = @_;
+
+    my $ref = _get_breakpoint_data_ref($filename, $line);
+
+    delete ($ref->{'temp_enabled'});
+
+    if (! %$ref) {
+        _delete_breakpoint_data_ref($filename, $line);
+    }
+
+    return;
+}
+
+sub _is_breakpoint_enabled {
+    my ($filename, $line) = @_;
+
+    my $data_ref = _get_breakpoint_data_ref($filename, $line);
+    return ($data_ref->{'enabled'} || $data_ref->{'temp_enabled'});
+}
+
+=head2 C<cmd_wrapper()> (API)
+
+C<cmd_wrapper()> allows the debugger to switch command sets
+depending on the value of the C<CommandSet> option.
+
+It tries to look up the command in the C<%set> package-level I<lexical>
+(which means external entities can't fiddle with it) and create the name of
+the sub to call based on the value found in the hash (if it's there). I<All>
+of the commands to be handled in a set have to be added to C<%set>; if they
+aren't found, the 5.8.0 equivalent is called (if there is one).
+
+This code uses symbolic references.
+
+=cut
+
+sub cmd_wrapper {
+    my $cmd      = shift;
+    my $line     = shift;
+    my $dblineno = shift;
+
+    # Assemble the command subroutine's name by looking up the
+    # command set and command name in %set. If we can't find it,
+    # default to the older version of the command.
+    my $call = 'cmd_'
+      . ( $set{$CommandSet}{$cmd}
+          || ( $cmd =~ /\A[<>{]+/o ? 'prepost' : $cmd ) );
+
+    # Call the command subroutine, call it by name.
+    return __PACKAGE__->can($call)->( $cmd, $line, $dblineno );
+} ## end sub cmd_wrapper
+
+=head3 C<cmd_a> (command)
+
+The C<a> command handles pre-execution actions. These are associated with a
+particular line, so they're stored in C<%dbline>. We default to the current
+line if none is specified.
+
+=cut
+
+sub cmd_a {
+    my $cmd    = shift;
+    my $line   = shift || '';    # [.|line] expr
+    my $dbline = shift;
+
+    # If it's dot (here), or not all digits,  use the current line.
+    $line =~ s/\A\./$dbline/;
+
+    # Should be a line number followed by an expression.
+    if ( my ($lineno, $expr) = $line =~ /^\s*(\d*)\s*(\S.+)/ ) {
+
+        if (! length($lineno)) {
+            $lineno = $dbline;
+        }
+
+        # If we have an expression ...
+        if ( length $expr ) {
+
+            # ... but the line isn't breakable, complain.
+            if ( $dbline[$lineno] == 0 ) {
+                print $OUT
+                  "Line $lineno($dbline[$lineno]) does not have an action?\n";
+            }
+            else {
+
+                # It's executable. Record that the line has an action.
+                $had_breakpoints{$filename} |= 2;
+
+                # Remove any action, temp breakpoint, etc.
+                $dbline{$lineno} =~ s/\0[^\0]*//;
+
+                # Add the action to the line.
+                $dbline{$lineno} .= "\0" . action($expr);
+
+                _set_breakpoint_enabled_status($filename, $lineno, 1);
+            }
+        } ## end if (length $expr)
+    } ## end if ($line =~ /^\s*(\d*)\s*(\S.+)/)
+    else {
+
+        # Syntax wrong.
+        print $OUT
+          "Adding an action requires an optional lineno and an expression\n"
+          ;    # hint
+    }
+} ## end sub cmd_a
+
+=head3 C<cmd_A> (command)
+
+Delete actions. Similar to above, except the delete code is in a separate
+subroutine, C<delete_action>.
+
+=cut
+
+sub cmd_A {
+    my $cmd    = shift;
+    my $line   = shift || '';
+    my $dbline = shift;
+
+    # Dot is this line.
+    $line =~ s/^\./$dbline/;
+
+    # Call delete_action with a null param to delete them all.
+    # The '1' forces the eval to be true. It'll be false only
+    # if delete_action blows up for some reason, in which case
+    # we print $@ and get out.
+    if ( $line eq '*' ) {
+        if (! eval { _delete_all_actions(); 1 }) {
+            print {$OUT} $@;
+            return;
+        }
+    }
+
+    # There's a real line  number. Pass it to delete_action.
+    # Error trapping is as above.
+    elsif ( $line =~ /^(\S.*)/ ) {
+        if (! eval { delete_action($1); 1 }) {
+            print {$OUT} $@;
+            return;
+        }
+    }
+
+    # Swing and a miss. Bad syntax.
+    else {
+        print $OUT
+          "Deleting an action requires a line number, or '*' for all\n" ; # hint
+    }
+} ## end sub cmd_A
+
+=head3 C<delete_action> (API)
+
+C<delete_action> accepts either a line number or C<undef>. If a line number
+is specified, we check for the line being executable (if it's not, it
+couldn't have had an  action). If it is, we just take the action off (this
+will get any kind of an action, including breakpoints).
+
+=cut
+
+sub _remove_action_from_dbline {
+    my $i = shift;
+
+    $dbline{$i} =~ s/\0[^\0]*//;    # \^a
+    delete $dbline{$i} if $dbline{$i} eq '';
+
+    return;
+}
+
+sub _delete_all_actions {
+    print {$OUT} "Deleting all actions...\n";
+
+    for my $file ( keys %had_breakpoints ) {
+        local *dbline = $main::{ '_<' . $file };
+        $max = $#dbline;
+        my $was;
+        for my $i (1 .. $max) {
+            if ( defined $dbline{$i} ) {
+                _remove_action_from_dbline($i);
+            }
+        }
+
+        unless ( $had_breakpoints{$file} &= ~2 ) {
+            delete $had_breakpoints{$file};
+        }
+    }
+
+    return;
+}
+
+sub delete_action {
+    my $i = shift;
+
+    if ( defined($i) ) {
+        # Can there be one?
+        die "Line $i has no action .\n" if $dbline[$i] == 0;
+
+        # Nuke whatever's there.
+        _remove_action_from_dbline($i);
+    }
+    else {
+        _delete_all_actions();
+    }
+}
+
+=head3 C<cmd_b> (command)
+
+Set breakpoints. Since breakpoints can be set in so many places, in so many
+ways, conditionally or not, the breakpoint code is kind of complex. Mostly,
+we try to parse the command type, and then shuttle it off to an appropriate
+subroutine to actually do the work of setting the breakpoint in the right
+place.
+
+=cut
+
+sub cmd_b {
+    my $cmd    = shift;
+    my $line   = shift;    # [.|line] [cond]
+    my $dbline = shift;
+
+    my $default_cond = sub {
+        my $cond = shift;
+        return length($cond) ? $cond : '1';
+    };
+
+    # Make . the current line number if it's there..
+    $line =~ s/^\.(\s|\z)/$dbline$1/;
+
+    # No line number, no condition. Simple break on current line.
+    if ( $line =~ /^\s*$/ ) {
+        cmd_b_line( $dbline, 1 );
+    }
+
+    # Break on load for a file.
+    elsif ( my ($file) = $line =~ /^load\b\s*(.*)/ ) {
+        $file =~ s/\s+\z//;
+        cmd_b_load($file);
+    }
+
+    # b compile|postpone <some sub> [<condition>]
+    # The interpreter actually traps this one for us; we just put the
+    # necessary condition in the %postponed hash.
+    elsif ( my ($action, $subname, $cond)
+        = $line =~ /^(postpone|compile)\b\s*([':A-Za-z_][':\w]*)\s*(.*)/ ) {
+
+        # De-Perl4-ify the name - ' separators to ::.
+        $subname =~ s/'/::/g;
+
+        # Qualify it into the current package unless it's already qualified.
+        $subname = "${package}::" . $subname unless $subname =~ /::/;
+
+        # Add main if it starts with ::.
+        $subname = "main" . $subname if substr( $subname, 0, 2 ) eq "::";
+
+        # Save the break type for this sub.
+        $postponed{$subname} = (($action eq 'postpone')
+            ? ( "break +0 if " . $default_cond->($cond) )
+            : "compile");
+    } ## end elsif ($line =~ ...
+    # b <filename>:<line> [<condition>]
+    elsif (my ($filename, $line_num, $cond)
+        = $line =~ /\A(\S+[^:]):(\d+)\s*(.*)/ms) {
+        cmd_b_filename_line(
+            $filename,
+            $line_num,
+            (length($cond) ? $cond : '1'),
+        );
+    }
+    # b <sub name> [<condition>]
+    elsif ( my ($new_subname, $new_cond) =
+        $line =~ /^([':A-Za-z_][':\w]*(?:\[.*\])?)\s*(.*)/ ) {
+
+        #
+        $subname = $new_subname;
+        cmd_b_sub( $subname, $default_cond->($new_cond) );
+    }
+
+    # b <line> [<condition>].
+    elsif ( my ($line_n, $cond) = $line =~ /^(\d*)\s*(.*)/ ) {
+
+        # Capture the line. If none, it's the current line.
+        $line = $line_n || $dbline;
+
+        # Break on line.
+        cmd_b_line( $line, $default_cond->($cond) );
+    }
+
+    # Line didn't make sense.
+    else {
+        print "confused by line($line)?\n";
+    }
+
+    return;
+} ## end sub cmd_b
+
+=head3 C<break_on_load> (API)
+
+We want to break when this file is loaded. Mark this file in the
+C<%break_on_load> hash, and note that it has a breakpoint in
+C<%had_breakpoints>.
+
+=cut
+
+sub break_on_load {
+    my $file = shift;
+    $break_on_load{$file} = 1;
+    $had_breakpoints{$file} |= 1;
+}
+
+=head3 C<report_break_on_load> (API)
+
+Gives us an array of filenames that are set to break on load. Note that
+only files with break-on-load are in here, so simply showing the keys
+suffices.
+
+=cut
+
+sub report_break_on_load {
+    sort keys %break_on_load;
+}
+
+=head3 C<cmd_b_load> (command)
+
+We take the file passed in and try to find it in C<%INC> (which maps modules
+to files they came from). We mark those files for break-on-load via
+C<break_on_load> and then report that it was done.
+
+=cut
+
+sub cmd_b_load {
+    my $file = shift;
+    my @files;
+
+    # This is a block because that way we can use a redo inside it
+    # even without there being any looping structure at all outside it.
+    {
+
+        # Save short name and full path if found.
+        push @files, $file;
+        push @files, $::INC{$file} if $::INC{$file};
+
+        # Tack on .pm and do it again unless there was a '.' in the name
+        # already.
+        $file .= '.pm', redo unless $file =~ /\./;
+    }
+
+    # Do the real work here.
+    break_on_load($_) for @files;
+
+    # All the files that have break-on-load breakpoints.
+    @files = report_break_on_load;
+
+    # Normalize for the purposes of our printing this.
+    local $\ = '';
+    local $" = ' ';
+    print $OUT "Will stop on load of '@files'.\n";
+} ## end sub cmd_b_load
+
+=head3 C<$filename_error> (API package global)
+
+Several of the functions we need to implement in the API need to work both
+on the current file and on other files. We don't want to duplicate code, so
+C<$filename_error> is used to contain the name of the file that's being
+worked on (if it's not the current one).
+
+We can now build functions in pairs: the basic function works on the current
+file, and uses C<$filename_error> as part of its error message. Since this is
+initialized to C<"">, no filename will appear when we are working on the
+current file.
+
+The second function is a wrapper which does the following:
+
+=over 4
+
+=item *
+
+Localizes C<$filename_error> and sets it to the name of the file to be processed.
+
+=item *
+
+Localizes the C<*dbline> glob and reassigns it to point to the file we want to process.
+
+=item *
+
+Calls the first function.
+
+The first function works on the I<current> file (i.e., the one we changed to),
+and prints C<$filename_error> in the error message (the name of the other file)
+if it needs to. When the functions return, C<*dbline> is restored to point
+to the actual current file (the one we're executing in) and
+C<$filename_error> is restored to C<"">. This restores everything to
+the way it was before the second function was called at all.
+
+See the comments in L<S<C<sub breakable_line>>|/breakable_line(from, to) (API)>
+and
+L<S<C<sub breakable_line_in_filename>>|/breakable_line_in_filename(file, from, to) (API)>
+for more details.
+
+=back
+
+=cut
+
+use vars qw($filename_error);
+$filename_error = '';
+
+=head3 breakable_line(from, to) (API)
+
+The subroutine decides whether or not a line in the current file is breakable.
+It walks through C<@dbline> within the range of lines specified, looking for
+the first line that is breakable.
+
+If C<$to> is greater than C<$from>, the search moves forwards, finding the
+first line I<after> C<$to> that's breakable, if there is one.
+
+If C<$from> is greater than C<$to>, the search goes I<backwards>, finding the
+first line I<before> C<$to> that's breakable, if there is one.
+
+=cut
+
+sub breakable_line {
+
+    my ( $from, $to ) = @_;
+
+    # $i is the start point. (Where are the FORTRAN programs of yesteryear?)
+    my $i = $from;
+
+    # If there are at least 2 arguments, we're trying to search a range.
+    if ( @_ >= 2 ) {
+
+        # $delta is positive for a forward search, negative for a backward one.
+        my $delta = $from < $to ? +1 : -1;
+
+        # Keep us from running off the ends of the file.
+        my $limit = $delta > 0 ? $#dbline : 1;
+
+        # Clever test. If you're a mathematician, it's obvious why this
+        # test works. If not:
+        # If $delta is positive (going forward), $limit will be $#dbline.
+        #    If $to is less than $limit, ($limit - $to) will be positive, times
+        #    $delta of 1 (positive), so the result is > 0 and we should use $to
+        #    as the stopping point.
+        #
+        #    If $to is greater than $limit, ($limit - $to) is negative,
+        #    times $delta of 1 (positive), so the result is < 0 and we should
+        #    use $limit ($#dbline) as the stopping point.
+        #
+        # If $delta is negative (going backward), $limit will be 1.
+        #    If $to is zero, ($limit - $to) will be 1, times $delta of -1
+        #    (negative) so the result is > 0, and we use $to as the stopping
+        #    point.
+        #
+        #    If $to is less than zero, ($limit - $to) will be positive,
+        #    times $delta of -1 (negative), so the result is not > 0, and
+        #    we use $limit (1) as the stopping point.
+        #
+        #    If $to is 1, ($limit - $to) will zero, times $delta of -1
+        #    (negative), still giving zero; the result is not > 0, and
+        #    we use $limit (1) as the stopping point.
+        #
+        #    if $to is >1, ($limit - $to) will be negative, times $delta of -1
+        #    (negative), giving a positive (>0) value, so we'll set $limit to
+        #    $to.
+
+        $limit = $to if ( $limit - $to ) * $delta > 0;
+
+        # The real search loop.
+        # $i starts at $from (the point we want to start searching from).
+        # We move through @dbline in the appropriate direction (determined
+        # by $delta: either -1 (back) or +1 (ahead).
+        # We stay in as long as we haven't hit an executable line
+        # ($dbline[$i] == 0 means not executable) and we haven't reached
+        # the limit yet (test similar to the above).
+        $i += $delta while $dbline[$i] == 0 and ( $limit - $i ) * $delta > 0;
+
+    } ## end if (@_ >= 2)
+
+    # If $i points to a line that is executable, return that.
+    return $i unless $dbline[$i] == 0;
+
+    # Format the message and print it: no breakable lines in range.
+    my ( $pl, $upto ) = ( '', '' );
+    ( $pl, $upto ) = ( 's', "..$to" ) if @_ >= 2 and $from != $to;
+
+    # If there's a filename in filename_error, we'll see it.
+    # If not, not.
+    die "Line$pl $from$upto$filename_error not breakable\n";
+} ## end sub breakable_line
+
+=head3 breakable_line_in_filename(file, from, to) (API)
+
+Like C<breakable_line>, but look in another file.
+
+=cut
+
+sub breakable_line_in_filename {
+
+    # Capture the file name.
+    my ($f) = shift;
+
+    # Swap the magic line array over there temporarily.
+    local *dbline = $main::{ '_<' . $f };
+
+    # If there's an error, it's in this other file.
+    local $filename_error = " of '$f'";
+
+    # Find the breakable line.
+    breakable_line(@_);
+
+    # *dbline and $filename_error get restored when this block ends.
+
+} ## end sub breakable_line_in_filename
+
+=head3 break_on_line(lineno, [condition]) (API)
+
+Adds a breakpoint with the specified condition (or 1 if no condition was
+specified) to the specified line. Dies if it can't.
+
+=cut
+
+sub break_on_line {
+    my $i = shift;
+    my $cond = @_ ? shift(@_) : 1;
+
+    my $inii  = $i;
+    my $after = '';
+    my $pl    = '';
+
+    # Woops, not a breakable line. $filename_error allows us to say
+    # if it was in a different file.
+    die "Line $i$filename_error not breakable.\n" if $dbline[$i] == 0;
+
+    # Mark this file as having breakpoints in it.
+    $had_breakpoints{$filename} |= 1;
+
+    # If there is an action or condition here already ...
+    if ( $dbline{$i} ) {
+
+        # ... swap this condition for the existing one.
+        $dbline{$i} =~ s/^[^\0]*/$cond/;
+    }
+    else {
+
+        # Nothing here - just add the condition.
+        $dbline{$i} = $cond;
+
+        _set_breakpoint_enabled_status($filename, $i, 1);
+    }
+
+    return;
+} ## end sub break_on_line
+
+=head3 cmd_b_line(line, [condition]) (command)
+
+Wrapper for C<break_on_line>. Prints the failure message if it
+doesn't work.
+
+=cut
+
+sub cmd_b_line {
+    if (not eval { break_on_line(@_); 1 }) {
+        local $\ = '';
+        print $OUT $@ and return;
+    }
+
+    return;
+} ## end sub cmd_b_line
+
+=head3 cmd_b_filename_line(line, [condition]) (command)
+
+Wrapper for C<break_on_filename_line>. Prints the failure message if it
+doesn't work.
+
+=cut
+
+sub cmd_b_filename_line {
+    if (not eval { break_on_filename_line(@_); 1 }) {
+        local $\ = '';
+        print $OUT $@ and return;
+    }
+
+    return;
+}
+
+=head3 break_on_filename_line(file, line, [condition]) (API)
+
+Switches to the file specified and then calls C<break_on_line> to set
+the breakpoint.
+
+=cut
+
+sub break_on_filename_line {
+    my $f = shift;
+    my $i = shift;
+    my $cond = @_ ? shift(@_) : 1;
+
+    # Switch the magical hash temporarily.
+    local *dbline = $main::{ '_<' . $f };
+
+    # Localize the variables that break_on_line uses to make its message.
+    local $filename_error = " of '$f'";
+    local $filename       = $f;
+
+    # Add the breakpoint.
+    break_on_line( $i, $cond );
+
+    return;
+} ## end sub break_on_filename_line
+
+=head3 break_on_filename_line_range(file, from, to, [condition]) (API)
+
+Switch to another file, search the range of lines specified for an
+executable one, and put a breakpoint on the first one you find.
+
+=cut
+
+sub break_on_filename_line_range {
+    my $f = shift;
+    my $from = shift;
+    my $to = shift;
+    my $cond = @_ ? shift(@_) : 1;
+
+    # Find a breakable line if there is one.
+    my $i = breakable_line_in_filename( $f, $from, $to );
+
+    # Add the breakpoint.
+    break_on_filename_line( $f, $i, $cond );
+
+    return;
+} ## end sub break_on_filename_line_range
+
+=head3 subroutine_filename_lines(subname, [condition]) (API)
+
+Search for a subroutine within a given file. The condition is ignored.
+Uses C<find_sub> to locate the desired subroutine.
+
+=cut
+
+sub subroutine_filename_lines {
+    my ( $subname ) = @_;
+
+    # Returned value from find_sub() is fullpathname:startline-endline.
+    # The match creates the list (fullpathname, start, end).
+    return (find_sub($subname) =~ /^(.*):(\d+)-(\d+)$/);
+} ## end sub subroutine_filename_lines
+
+=head3 break_subroutine(subname) (API)
+
+Places a break on the first line possible in the specified subroutine. Uses
+C<subroutine_filename_lines> to find the subroutine, and
+C<break_on_filename_line_range> to place the break.
+
+=cut
+
+sub break_subroutine {
+    my $subname = shift;
+
+    # Get filename, start, and end.
+    my ( $file, $s, $e ) = subroutine_filename_lines($subname)
+      or die "Subroutine $subname not found.\n";
+
+
+    # Null condition changes to '1' (always true).
+    my $cond = @_ ? shift(@_) : 1;
+
+    # Put a break the first place possible in the range of lines
+    # that make up this subroutine.
+    break_on_filename_line_range( $file, $s, $e, $cond );
+
+    return;
+} ## end sub break_subroutine
+
+=head3 cmd_b_sub(subname, [condition]) (command)
+
+We take the incoming subroutine name and fully-qualify it as best we can.
+
+=over 4
+
+=item 1. If it's already fully-qualified, leave it alone.
+
+=item 2. Try putting it in the current package.
+
+=item 3. If it's not there, try putting it in CORE::GLOBAL if it exists there.
+
+=item 4. If it starts with '::', put it in 'main::'.
+
+=back
+
+After all this cleanup, we call C<break_subroutine> to try to set the
+breakpoint.
+
+=cut
+
+sub cmd_b_sub {
+    my $subname = shift;
+    my $cond = @_ ? shift : 1;
+
+    # If the subname isn't a code reference, qualify it so that
+    # break_subroutine() will work right.
+    if ( ref($subname) ne 'CODE' ) {
+
+        # Not Perl 4.
+        $subname =~ s/'/::/g;
+        my $s = $subname;
+
+        # Put it in this package unless it's already qualified.
+        if ($subname !~ /::/)
+        {
+            $subname = $package . '::' . $subname;
+        };
+
+        # Requalify it into CORE::GLOBAL if qualifying it into this
+        # package resulted in its not being defined, but only do so
+        # if it really is in CORE::GLOBAL.
+        my $core_name = "CORE::GLOBAL::$s";
+        if ((!defined(&$subname))
+                and ($s !~ /::/)
+                and (defined &{$core_name}))
+        {
+            $subname = $core_name;
+        }
+
+        # Put it in package 'main' if it has a leading ::.
+        if ($subname =~ /\A::/)
+        {
+            $subname = "main" . $subname;
+        }
+    } ## end if ( ref($subname) ne 'CODE' ) {
+
+    # Try to set the breakpoint.
+    if (not eval { break_subroutine( $subname, $cond ); 1 }) {
+        local $\ = '';
+        print {$OUT} $@;
+        return;
+    }
+
+    return;
+} ## end sub cmd_b_sub
+
+=head3 C<cmd_B> - delete breakpoint(s) (command)
+
+The command mostly parses the command line and tries to turn the argument
+into a line spec. If it can't, it uses the current line. It then calls
+C<delete_breakpoint> to actually do the work.
+
+If C<*> is  specified, C<cmd_B> calls C<delete_breakpoint> with no arguments,
+thereby deleting all the breakpoints.
+
+=cut
+
+sub cmd_B {
+    my $cmd = shift;
+
+    # No line spec? Use dbline.
+    # If there is one, use it if it's non-zero, or wipe it out if it is.
+    my $line   = ( $_[0] =~ /\A\./ ) ? $dbline : (shift || '');
+    my $dbline = shift;
+
+    # If the line was dot, make the line the current one.
+    $line =~ s/^\./$dbline/;
+
+    # If it's * we're deleting all the breakpoints.
+    if ( $line eq '*' ) {
+        if (not eval { delete_breakpoint(); 1 }) {
+            print {$OUT} $@;
+        }
+    }
+
+    # If there is a line spec, delete the breakpoint on that line.
+    elsif ( $line =~ /\A(\S.*)/ ) {
+        if (not eval { delete_breakpoint( $line || $dbline ); 1 }) {
+            local $\ = '';
+            print {$OUT} $@;
+        }
+    } ## end elsif ($line =~ /^(\S.*)/)
+
+    # No line spec.
+    else {
+        print {$OUT}
+          "Deleting a breakpoint requires a line number, or '*' for all\n"
+          ;    # hint
+    }
+
+    return;
+} ## end sub cmd_B
+
+=head3 delete_breakpoint([line]) (API)
+
+This actually does the work of deleting either a single breakpoint, or all
+of them.
+
+For a single line, we look for it in C<@dbline>. If it's nonbreakable, we
+just drop out with a message saying so. If it is, we remove the condition
+part of the 'condition\0action' that says there's a breakpoint here. If,
+after we've done that, there's nothing left, we delete the corresponding
+line in C<%dbline> to signal that no action needs to be taken for this line.
+
+For all breakpoints, we iterate through the keys of C<%had_breakpoints>,
+which lists all currently-loaded files which have breakpoints. We then look
+at each line in each of these files, temporarily switching the C<%dbline>
+and C<@dbline> structures to point to the files in question, and do what
+we did in the single line case: delete the condition in C<@dbline>, and
+delete the key in C<%dbline> if nothing's left.
+
+We then wholesale delete C<%postponed>, C<%postponed_file>, and
+C<%break_on_load>, because these structures contain breakpoints for files
+and code that haven't been loaded yet. We can just kill these off because there
+are no magical debugger structures associated with them.
+
+=cut
+
+sub _remove_breakpoint_entry {
+    my ($fn, $i) = @_;
+
+    delete $dbline{$i};
+    _delete_breakpoint_data_ref($fn, $i);
+
+    return;
+}
+
+sub _delete_all_breakpoints {
+    print {$OUT} "Deleting all breakpoints...\n";
+
+    # %had_breakpoints lists every file that had at least one
+    # breakpoint in it.
+    for my $fn ( keys %had_breakpoints ) {
+
+        # Switch to the desired file temporarily.
+        local *dbline = $main::{ '_<' . $fn };
+
+        $max = $#dbline;
+
+        # For all lines in this file ...
+        for my $i (1 .. $max) {
+
+            # If there's a breakpoint or action on this line ...
+            if ( defined $dbline{$i} ) {
+
+                # ... remove the breakpoint.
+                $dbline{$i} =~ s/\A[^\0]+//;
+                if ( $dbline{$i} =~ s/\A\0?\z// ) {
+                    # Remove the entry altogether if no action is there.
+                    _remove_breakpoint_entry($fn, $i);
+                }
+            } ## end if (defined $dbline{$i...
+        } ## end for $i (1 .. $max)
+
+        # If, after we turn off the "there were breakpoints in this file"
+        # bit, the entry in %had_breakpoints for this file is zero,
+        # we should remove this file from the hash.
+        if ( not $had_breakpoints{$fn} &= (~1) ) {
+            delete $had_breakpoints{$fn};
+        }
+    } ## end for my $fn (keys %had_breakpoints)
+
+    # Kill off all the other breakpoints that are waiting for files that
+    # haven't been loaded yet.
+    undef %postponed;
+    undef %postponed_file;
+    undef %break_on_load;
+
+    return;
+}
+
+sub _delete_breakpoint_from_line {
+    my ($i) = @_;
+
+    # Woops. This line wasn't breakable at all.
+    die "Line $i not breakable.\n" if $dbline[$i] == 0;
+
+    # Kill the condition, but leave any action.
+    $dbline{$i} =~ s/\A[^\0]*//;
+
+    # Remove the entry entirely if there's no action left.
+    if ($dbline{$i} eq '') {
+        _remove_breakpoint_entry($filename, $i);
+    }
+
+    return;
+}
+
+sub delete_breakpoint {
+    my $i = shift;
+
+    # If we got a line, delete just that one.
+    if ( defined($i) ) {
+        _delete_breakpoint_from_line($i);
+    }
+    # No line; delete them all.
+    else {
+        _delete_all_breakpoints();
+    }
+
+    return;
+}
+
+=head3 cmd_stop (command)
+
+This is meant to be part of the new command API, but it isn't called or used
+anywhere else in the debugger. XXX It is probably meant for use in development
+of new commands.
+
+=cut
+
+sub cmd_stop {    # As on ^C, but not signal-safy.
+    $signal = 1;
+}
+
+=head3 C<cmd_e> - threads
+
+Display the current thread id:
+
+    e
+
+This could be how (when implemented) to send commands to this thread id (e cmd)
+or that thread id (e tid cmd).
+

@@ -1,0 +1,1000 @@
+		push(@addon_requests, '+build-stamp');
+	}
+	for my $addon_name (sort(keys(%addon_constraints))) {
+		my $addon_type = $addon_constraints{$addon_name};
+
+		# Special-case for the "clean" target to avoid B-D-I dependencies in that for conditional add-ons
+		next if $sequence_name eq 'clean' and $addon_type ne SEQUENCE_TYPE_BOTH;
+		if ($addon_type eq 'both' or $sequence_type eq 'both' or $addon_type eq $sequence_type) {
+			push(@addon_requests, "+${addon_name}");
+		}
+	}
+
+	push(@addon_requests, @addon_requests_from_args);
+
+	# Removing disabled add-ons are expensive (O(N) per time), so we
+	# attempt to make removals in bulk.  Note that we have to be order
+	# preserving (due to #885580), so there is a limit to how "smart"
+	# we can be.
+	my $flush_disable_cache = sub {
+		@enabled_addons = grep { not exists($disabled_addons{$_}) } @enabled_addons;
+		for my $addon (keys(%disabled_addons)) {
+			delete($enabled{$addon});
+		}
+		%disabled_addons = ();
+	};
+
+	for my $request (@addon_requests) {
+		if ($request =~ m/^[+-]root[-_]sequence$/) {
+			error("Invalid request to skip the sequence \"root-sequence\": It cannot be disabled")
+				if $request =~ m/^-/;
+			error("Invalid request to load the sequence \"root-sequence\": Do not reference it directly");
+		}
+		if ($request =~ s/^[+]//) {
+			# Normalize "_" to "-" in the name.
+			$request =~ tr/_/-/;
+			$flush_disable_cache->() if %disabled_addons;
+			$explicitly_managed{$request} = 1;
+			push(@enabled_addons, $request) if not $enabled{$request}++;
+		} elsif ($request =~ s/^-//) {
+			# Normalize "_" to "-" in the name.
+			$request =~ tr/_/-/;
+			$explicitly_managed{$request} = 1;
+			$disabled_addons{$request} = 1;
+		} else {
+			error("Internal error: Invalid add-on request: $request (Missing +/- prefix)");
+		}
+	}
+
+	if (compat(14, 1) && getpackages() == 1 && !exists($explicitly_managed{'single-binary'})) {
+		if (not compat(13, 1)) {
+			warning("Implicitly activating single-binary dh addon for backwards compatibility.  In compat 14+,");
+			warning("this fallback will *not* happen automatically and dh_auto_install will instead use a");
+			warning("different default for --destdir, which can cause the source to produce an empty binary package");
+			warning();
+			warning('To keep the existing behaviour, please activate the single-binary addon explicitly.');
+			warning('This can be done by adding "dh-sequence-single-binary" to Build-Depends or passing');
+			warning('--with=single-binary to dh.');
+			warning();
+			warning('If you have solved this issue differently (e.g., by passing --destdir explicitly to');
+			warning('dh_auto_install or not using dh_auto_install at all) and want to silence this warning');
+			warning('without activating the addon, you can do that by passing --without=single-binary to dh');
+			warning('to explicitly acknowledge the change.');
+			warning();
+			warning('Please see the description of the "single-binary" in "man dh" for more details of what');
+			warning('it does and why this is changing from implicit behaviour to explicitly opt-in.');
+		}
+		push(@enabled_addons, 'single-binary');
+	}
+
+	$flush_disable_cache->() if %disabled_addons;
+	return map {
+		{
+			'name' => $_,
+			'addon-type' => $addon_constraints{$_} // SEQUENCE_TYPE_BOTH,
+		}
+	} @enabled_addons;
+}
+
+
+sub load_sequence_addon {
+	my ($addon_name, $addon_type) = @_;
+	require Debian::Debhelper::DH::AddonAPI;
+	my $mod="Debian::Debhelper::Sequence::${addon_name}";
+	$mod=~s/-/_/g;
+	local $Debian::Debhelper::DH::AddonAPI::DH_INTERNAL_ADDON_NAME = $addon_name;
+	local $Debian::Debhelper::DH::AddonAPI::DH_INTERNAL_ADDON_TYPE = $addon_type;
+	eval "package Debian::Debhelper::DH::AddonAPI; use $mod";
+	if ($@) {
+		error("unable to load addon ${addon_name}: $@");
+	}
+}
+
+sub check_for_obsolete_commands {
+	my ($full_sequence) = @_;
+	my ($found_obsolete_targets, $min_compat);
+	for my $command (@{$full_sequence}) {
+		if (exists($Debian::Debhelper::DH::SequenceState::obsolete_command{$command})) {
+			my $addon_name = $Debian::Debhelper::DH::SequenceState::obsolete_command{$command}[1];
+			error("The addon ${addon_name} claimed that $command was obsolete, but it is not!?");
+		}
+	}
+	for my $command (sort(keys(%Debian::Debhelper::DH::SequenceState::obsolete_command))) {
+		my ($addon_name, $error_compat) = @{$Debian::Debhelper::DH::SequenceState::obsolete_command{$command}};
+		$addon_name = 'debhelper' if $addon_name eq 'root-sequence';
+		for my $prefix (qw(execute_before_ execute_after_ override_)) {
+			for my $suffix ('', '-arch', '-indep') {
+				my $target = "${prefix}${command}${suffix}";
+				if (defined(rules_explicit_target($target))) {
+					$found_obsolete_targets = 1;
+					$min_compat //= $error_compat;
+					$min_compat = $error_compat if $error_compat < $min_compat;
+					warning("The target ${target} references a now obsolete command and will not be run!"
+							. " (Marked by ${addon_name}, will be an error in compat $error_compat)");
+				}
+			}
+		}
+	}
+	if ($found_obsolete_targets and not compat($min_compat - 1)) {
+		error("Aborting due to left over override/hook targets for now removed commands.");
+	}
+	return;
+}
+
+sub run_sequence_command_and_exit_on_failure {
+	my ($command, @options) = @_;
+
+	# 3 space indent lines the command being run up under the
+	# sequence name after "dh ".
+	if (!$dh{QUIET}) {
+		print "   ".escape_shell($command, @options)."\n";
+	}
+
+	return if $dh{NO_ACT};
+
+	my $ret=system { $command } $command, @options;
+	if ($ret >> 8 != 0) {
+		exit $ret >> 8;
+	}
+	if ($ret) {
+		exit 1;
+	}
+	return;
+}
+
+
+sub run_hook_target {
+	my ($target_stem, $min_compat_level, $command, $packages, @opts) = @_;
+	my @todo = @{$packages};
+	foreach my $override_type (undef, "arch", "indep") {
+		@todo = _run_injected_rules_target($target_stem, $override_type, $min_compat_level, $command, \@todo, @opts);
+	}
+	return @todo;
+}
+
+# Tries to run an override / hook target for a command. Returns the list of
+# packages that it was unable to run the target for.
+sub _run_injected_rules_target {
+	my ($target_stem, $override_type, $min_compat_level, $command, $packages, @options) = @_;
+
+	my $rules_target = $target_stem .
+		(defined $override_type ? "-".$override_type : "");
+
+	$command //= $rules_target;  # Ensure it is defined
+
+	# Check which packages are of the right architecture for the
+	# override_type.
+	my (@todo, @rest);
+	my $has_explicit_target = rules_explicit_target($rules_target);
+
+	if ($has_explicit_target and defined($min_compat_level) and compat($min_compat_level - 1)) {
+		error("Hook target ${rules_target} is only supported in compat ${min_compat_level} or later");
+	}
+
+	if (defined $override_type) {
+		foreach my $package (@{$packages}) {
+			my $isall=package_is_arch_all($package);
+			if (($override_type eq 'indep' && $isall) ||
+				($override_type eq 'arch' && !$isall)) {
+				push @todo, $package;
+			} else {
+				push @rest, $package;
+				push @options, "-N$package";
+			}
+		}
+	} else {
+		@todo=@{$packages};
+	}
+
+	return @{$packages} unless defined $has_explicit_target; # no such override
+	return @rest if ! $has_explicit_target; # has empty override
+	return @rest unless @todo; # has override, but no packages to act on
+	return @rest if should_skip_due_to_dpo($command, "debian/rules $rules_target");
+
+	if (defined $override_type) {
+		# Ensure appropriate -a or -i option is passed when running
+		# an arch-specific override target.
+		my $opt=$override_type eq "arch" ? "-a" : "-i";
+		push @options, $opt unless grep { $_ eq $opt } @options;
+	}
+
+	# Discard any override log files before calling the override
+	# target
+	if (not compat(9)) {
+		my @files = glob('debian/*.debhelper.log');
+		rm_files(@files) if @files;
+	}
+	# This passes the options through to commands called
+	# inside the target.
+	$ENV{DH_INTERNAL_OPTIONS}=join("\x1e", @options);
+	$ENV{DH_INTERNAL_OVERRIDE}=$command;
+	run_sequence_command_and_exit_on_failure("debian/rules", $rules_target);
+	delete $ENV{DH_INTERNAL_OPTIONS};
+	delete $ENV{DH_INTERNAL_OVERRIDE};
+
+	# Update log for overridden command now that it has
+	# finished successfully.
+	# (But avoid logging for dh_clean since it removes
+	# the log earlier.)
+	if (! $dh{NO_ACT} && $command ne 'dh_clean' && compat(9)) {
+		write_log($command, @todo);
+		commit_override_log(@todo);
+	}
+
+	# Override targets may introduce new helper files.  Strictly
+	# speaking this *shouldn't* be necessary, but lets make no
+	# assumptions.
+	Debian::Debhelper::Dh_Lib::dh_clear_unsafe_cache();
+
+	return @rest;
+}
+
+
+# Options parsed to dh that may need to be passed on to helpers
+sub parse_dh_cmd_options {
+	my (@argv) = @_;
+
+	# Ref for readability
+	my $options_ref = \@Debian::Debhelper::DH::SequenceState::options;
+
+	while (@argv) {
+		my $opt = shift(@argv);
+		if ($opt =~ /^--?(after|until|before|with|without)$/) {
+			shift(@argv);
+			next;
+		} elsif ($opt =~ /^--?(no-act|remaining|(after|until|before|with|without)=)/) {
+			next;
+		} elsif ($opt =~ /^-/) {
+			if (not @{$options_ref} and $opt eq '--parallel' or $opt eq '--no-parallel') {
+				my $max_parallel;
+				# Ignore the option if it is the default for the given
+				# compat level.
+				next if compat(9) and $opt eq '--no-parallel';
+				next if not compat(9) and $opt eq '--parallel';
+				# Having an non-empty "@options" hurts performance quite a
+				# bit.  At the same time, we want to promote the use of
+				# --(no-)parallel, so "tweak" the options a bit if there
+				# is no reason to include this option.
+				$max_parallel = get_buildoption('parallel') // 1;
+				next if $max_parallel == 1;
+			}
+			if ($opt =~ m/^(--[^=]++)(?:=.*)?$/ or $opt =~ m/^(-[^-])(?:=.*)?$/) {
+				my $optname = $1;
+				if (length($optname) > 2 and (compat(12, 1) or $optname =~ m/^-[^-][^=]/)) {
+					# We cannot optimize bundled options but we can optimize a single
+					# short option with an explicit parameter (-B=F is ok, -BF is not)
+					# In compat 12 or earlier, we also punt on long options due to
+					# auto-abbreviation.
+					$Debian::Debhelper::DH::SequenceState::unoptimizable_option_bundle = 1
+				}
+				$Debian::Debhelper::DH::SequenceState::seen_options{$optname} = 1;
+			} elsif ($opt =~ m/^-[^-][^-]/) {
+				# We cannot optimize bundled options but we can optimize a single
+				# short option with an explicit parameter (-B=F is ok, -BF is not)
+				$Debian::Debhelper::DH::SequenceState::unoptimizable_option_bundle = 1
+			} else {
+				# Special case that disables NOOP cli-options() as well
+				$Debian::Debhelper::DH::SequenceState::unoptimizable_user_option = 1;
+			}
+			push(@{$options_ref}, "-O" . $opt);
+		} elsif (@{$options_ref}) {
+			if ($options_ref->[$#{$options_ref}] =~ /^-O--/) {
+				$options_ref->[$#{$options_ref}] .= '=' . $opt;
+			} else {
+				# Special case that disables NOOP cli-options() as well
+				$Debian::Debhelper::DH::SequenceState::unoptimizable_user_option = 1;
+				$options_ref->[$#{$options_ref}] .= $opt;
+			}
+		} else {
+			error("Unknown parameter: $opt");
+		}
+	}
+	return;
+}
+
+
+sub run_through_command_sequence {
+	my ($full_sequence, $startpoint, $logged, $options, $all_packages, $arch_packages, $indep_packages) = @_;
+
+	my $command_opts = \%Debian::Debhelper::DH::SequenceState::command_opts;
+	my $stoppoint = $#{$full_sequence};
+
+	# Now run the commands in the sequence.
+	foreach my $i (0 .. $stoppoint) {
+		my $command = $full_sequence->[$i];
+
+		# Figure out which packages need to run this command.
+		my (@todo, @opts);
+		my @filtered_packages = _active_packages_for_command($command, $all_packages, $arch_packages, $indep_packages);
+
+		foreach my $package (@filtered_packages) {
+			if (($startpoint->{$package}//0) > $i ||
+				$logged->{$package}{$full_sequence->[$i]}) {
+				push(@opts, "-N$package");
+			}
+			else {
+				push(@todo, $package);
+			}
+		}
+		next unless @todo;
+		push(@opts, @{$options});
+
+		my $rules_target = extract_rules_target_name($command);
+		error("Internal error: $command is a rules target, but it is not supported to be!?") if defined($rules_target);
+
+		if (my $stamp_file = _stamp_target($command)) {
+			my %seen;
+			print "   create-stamp " . escape_shell($stamp_file) . "\n";
+
+			next if $dh{NO_ACT};
+			open(my $fd, '+>>', $stamp_file) or error("open($stamp_file, rw) failed: $!");
+			# Seek to the beginning
+			seek($fd, 0, 0) or error("seek($stamp_file) failed: $!");
+			while (my $line = <$fd>) {
+				chomp($line);
+				$seen{$line} = 1;
+			}
+			for my $pkg (grep {not exists($seen{$_})} @todo) {
+				print {$fd} "$pkg\n";
+			}
+			close($fd) or error("close($stamp_file) failed: $!");
+			next;
+		}
+
+		my @full_todo = @todo;
+		run_hook_target("execute_before_${command}", 10, $command, \@full_todo, @opts);
+
+		# Check for override targets in debian/rules, and run instead of
+		# the usual command. (The non-arch-specific override is tried first,
+		# for simplest semantics; mixing it with arch-specific overrides
+		# makes little sense.)
+		@todo = run_hook_target("override_${command}", undef, $command, \@full_todo, @opts);
+
+		if (@todo and not _can_skip_command($command, @todo)) {
+			# No need to run the command for any packages handled by the
+			# override targets.
+			my %todo = map {$_ => 1} @todo;
+			foreach my $package (@full_todo) {
+				if (!$todo{$package}) {
+					push @opts, "-N$package";
+				}
+			}
+			if (not should_skip_due_to_dpo($command, Debian::Debhelper::Dh_Lib::_format_cmdline($command, @opts))) {
+				my @cmd_options;
+				# Include additional command options if any
+				push(@cmd_options, @{$command_opts->{$command}})
+					if exists($command_opts->{$command});
+				push(@cmd_options, @opts);
+				run_sequence_command_and_exit_on_failure($command, _remove_dup_pkg_options(@cmd_options));
+			}
+		}
+
+		run_hook_target("execute_after_${command}", 10, $command, \@full_todo, @opts);
+	}
+}
+
+sub _remove_dup_pkg_options {
+	my (@options) = @_;
+	my @filtered_options;
+	my $arch = 0;
+	my $indep = 0;
+	for my $option (@options) {
+		if ($option eq '-a' or $option eq '--arch') {
+			next if $arch;
+			$arch = 1;
+		}
+		if ($option eq '-i' or $option eq '--indep') {
+			next if $indep;
+			$indep = 1;
+		}
+		push(@filtered_options, $option);
+	}
+	return @filtered_options;
+}
+
+
+sub _stamp_target {
+	my ($command) = @_;
+	if ($command =~ s/^create-stamp\s+//) {
+		return $command;
+	}
+	return;
+}
+
+{
+	my %skipinfo;
+	sub _can_skip_command {
+		my ($command, @packages) = @_;
+
+		return 0 if $dh{NO_ACT} and not $ENV{DH_INTERNAL_TEST_CAN_SKIP};
+
+		return 0 if $Debian::Debhelper::DH::SequenceState::unoptimizable_user_option ||
+			(exists $ENV{DH_OPTIONS} && length $ENV{DH_OPTIONS});
+
+		return 0 if exists($Debian::Debhelper::DH::SequenceState::command_opts{$command})
+			and @{$Debian::Debhelper::DH::SequenceState::command_opts{$command}};
+
+		if (! defined $skipinfo{$command}) {
+			$skipinfo{$command}=[extract_skipinfo($command)];
+		}
+		my @skipinfo=@{$skipinfo{$command}};
+		return 0 unless @skipinfo;
+		return 1 if scalar(@skipinfo) == 1 and $skipinfo[0] eq 'always-skip';
+		my ($all_pkgs, $had_cli_options);
+
+		foreach my $skipinfo (@skipinfo) {
+			my $type = 'pkgfile';
+			my $need = $skipinfo;
+			if ($skipinfo=~/^([a-zA-Z0-9-_]+)\((.*)\)$/) {
+				($type, $need) = ($1, $2);
+			}
+			if ($type eq 'tmp') {
+				foreach my $package (@packages) {
+					my $tmp = tmpdir($package);
+					return 0 if -e "$tmp/$need";
+				}
+			} elsif ($type eq 'pkgfile' or $type eq 'pkgfile-logged') {
+				my $pkgs;
+				if ($type eq 'pkgfile') {
+					$pkgs = \@packages;
+				} else {
+					$all_pkgs //= [ getpackages() ];
+					$pkgs = $all_pkgs;
+				}
+				# Use the secret bulk check call
+				return 0 if pkgfile($pkgs, $need) ne '';
+			} elsif ($type eq 'cli-options') {
+				$had_cli_options = 1;
+				# If cli-options is empty, we know the helper does not
+				# react to any thing and can always be skipped.
+				next if $need =~ m/^\s*$/;
+				# Long options are subject to abbreviations so it is
+				# very difficult to implement this optimization with
+				# long options.
+				return 0 if $Debian::Debhelper::DH::SequenceState::unoptimizable_option_bundle;
+				$need =~ s/(?:^|\s)BUILDSYSTEM(?:\s|$)/${\UNSKIPPABLE_CLI_OPTIONS_BUILD_SYSTEM}/;
+				my @behavior_options = split(qr/\Q|\E/, $need);
+				for my $opt (@behavior_options) {
+					return 0 if exists($Debian::Debhelper::DH::SequenceState::seen_options{$opt});
+				}
+			} elsif ($type eq 'buildsystem') {
+				require Debian::Debhelper::Dh_Buildsystems;
+				my $system = Debian::Debhelper::Dh_Buildsystems::load_buildsystem(undef, $need);
+				return 0 if defined($system);
+			} elsif ($type eq 'internal') {
+				if ($need eq 'bug#950723') {
+					$all_pkgs //= [ getpackages() ];
+					push(@{$all_pkgs}, map { "${_}@"} getpackages());
+					push(@packages, map { "${_}@"} @packages);
+				} elsif ($need eq 'rrr') {
+					my $req = Debian::Debhelper::Dh_Lib::root_requirements();
+					return 0 if $req ne 'none';
+				} else {
+					warning('Broken internal NOOP hint; should not happen unless someone is using implementation details');
+					error("Unknown internal NOOP type hint in ${command}: ${need}");
+				}
+			} else {
+				# Unknown hint - make no assumptions
+				return 0;
+			}
+		}
+		return 0 if not $had_cli_options and %Debian::Debhelper::DH::SequenceState::seen_options;
+		return 1;
+	}
+}
+
+sub _active_packages_for_command {
+	my ($command, $all_packages, $arch_packages, $indep_packages) = @_;
+	my $command_opts_ref = $Debian::Debhelper::DH::SequenceState::command_opts{$command};
+	my $selection = $all_packages;
+	if (grep { $_ eq '-i'} @{$command_opts_ref}) {
+		if (grep { $_ ne '-a'} @{$command_opts_ref}) {
+			$selection = $indep_packages;
+		}
+	} elsif (grep { $_ eq '-a'} @{$command_opts_ref}) {
+		$selection = $arch_packages;
+	}
+	return @{$selection};
+}
+
+1;
+                                           usr/share/perl5/File/                                                                               0000755 0000000 0000000 00000000000 14723045613 013072  5                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        usr/share/perl5/File/.wh..wh..opq                                                                   0000755 0000000 0000000 00000000000 00000000000 015005  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        usr/share/perl5/File/StripNondeterminism/                                                           0000755 0000000 0000000 00000000000 14723045613 017107  5                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        usr/share/perl5/File/StripNondeterminism/Common.pm                                                  0000644 0000000 0000000 00000002663 14361054711 020701  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        #
+# Copyright 2016 Ryuunosuke Ayanokouzi <i38w7i3@yahoo.co.jp>
+#
+# This file is part of strip-nondeterminism.
+#
+# strip-nondeterminism is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# strip-nondeterminism is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with strip-nondeterminism.  If not, see <http://www.gnu.org/licenses/>.
+#
+package File::StripNondeterminism::Common;
+
+require Exporter;
+@ISA = qw(Exporter);
+@EXPORT_OK = qw(copy_data);
+
+use strict;
+use warnings;
+
+use File::Copy;
+
+# Copy ONLY data from "$from_path" to "$to_path".
+# It means that...
+# 1. This function preserves as much of file "attributes"
+#    (information stored in "inode" in Unix-style file system term)
+#    of "$to_path" as possible.
+# 2. This function simulates file editing of "$to_path".
+# 3. After this function, "$to_path" would be a file associated with
+#    a copied "data" from "from_path" and a "inode" from "$to_path".
+sub copy_data($$) {
+	my $from_path = shift;
+	my $to_path = shift;
+
+	return copy($from_path, $to_path);
+}
+
+1;
+                                                                             usr/share/perl5/File/StripNondeterminism/handlers/                                                  0000755 0000000 0000000 00000000000 14723045613 020707  5                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        usr/share/perl5/File/StripNondeterminism/handlers/ar.pm                                             0000644 0000000 0000000 00000007730 14361054711 021653  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        # Copyright © 2014 Jérémy Bobbio <lunar@debian.org>
+# Copyright © 2014 Niko Tyni <ntyni@debian.org>
+# Copyright © 2016-2019 Chris Lamb <lamby@debian.org>
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful, but
+# WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+# General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+#
+# Some code borrowed from ArFile
+# Copyright (C) 2007    Stefano Zacchiroli  <zack@debian.org>
+# Copyright (C) 2007    Filippo Giunchedi   <filippo@debian.org>
+
+package File::StripNondeterminism::handlers::ar;
+
+use strict;
+use warnings;
+
+use Fcntl q/SEEK_SET/;
+
+use File::StripNondeterminism;
+
+=head1 DEPRECATION PLAN
+
+This handler was originally removed in late 2018 as binutils was deemed to be
+reproducible (781262, #843811, etc.)  However, it was re-introduced in late
+2019 via issue #3 as an optional handler in order to support "not just 'older'
+toolchains, it's also about 'other' toolchains".
+
+=cut
+
+sub normalize {
+	my ($file) = @_;
+
+	my $GLOBAL_HEADER = "!<arch>\n";
+	my $GLOBAL_HEADER_LENGTH = length $GLOBAL_HEADER;
+
+	my $FILE_HEADER_LENGTH = 60;
+	my $FILE_MAGIC = "`\n";
+
+	my $buf;
+
+	open(my $fh, '+<', $file)
+	  or die("failed to open $file for read+write: $!");
+
+	read $fh, $buf, $GLOBAL_HEADER_LENGTH;
+	return 0 if $buf ne $GLOBAL_HEADER;
+
+	while (1) {
+		my $file_header_start = tell $fh;
+		my $count = read $fh, $buf, $FILE_HEADER_LENGTH;
+		die "reading $file failed: $!" if !defined $count;
+		last if $count == 0;
+
+		# http://en.wikipedia.org/wiki/Ar_(Unix)
+		#from   to     Name                      Format
+		#0      15     File name                 ASCII
+		#16     27     File modification date    Decimal
+		#28     33     Owner ID                  Decimal
+		#34     39     Group ID                  Decimal
+		#40     47     File mode                 Octal
+		#48     57     File size in bytes        Decimal
+		#58     59     File magic                \140\012
+
+		die "Incorrect header length"
+		  if length $buf != $FILE_HEADER_LENGTH;
+		die "Incorrect file magic"
+		  if substr($buf, 58, length($FILE_MAGIC)) ne $FILE_MAGIC;
+
+		# $member_id is the member's filename if it's short
+		# enough to fit in 16 characters. Otherwise it's a
+		# "/number" index in the table of long member names '//'
+		# (SysV/GNU), or a #1/ prefixed length (BSD)
+		my $member_id = substr($buf, 0, 16);
+
+		my $file_mode = oct(substr($buf, 40, 8));
+		my $file_size = substr($buf, 48, 10);
+
+		die "Incorrect file size"
+		  if $file_size < 1;
+
+		# Don't touch the System V/GNU table of long filenames
+		# '//', it's a different format and already
+		# deterministic.
+		if (substr($member_id, 0, 3) eq "// ") {
+			goto NEXT_MEMBER;
+		}
+
+		seek $fh, $file_header_start + 16, SEEK_SET;
+
+		# mtime
+		if ($File::StripNondeterminism::verbose
+		    && $File::StripNondeterminism::canonical_time
+		    && substr($member_id, 0, 2) eq "/ ") {
+		    print STDERR "Setting symbols table's mtime in $file to: "
+			. gmtime($File::StripNondeterminism::canonical_time)
+			. ". GNU ar cannot do this.\n";
+		}
+		syswrite $fh,
+		  sprintf("%-12d", $File::StripNondeterminism::canonical_time // 0);
+		# owner
+		syswrite $fh, sprintf("%-6d", 0);
+		# group
+		syswrite $fh, sprintf("%-6d", 0);
+		# file mode
+
+		# Don't touch the pseudo-"filemode" of the symbols table '/ '
+		if (substr($member_id, 0, 2) eq "/ ") {
+			goto NEXT_MEMBER;
+		}
+		syswrite $fh,
+		  sprintf("%-8o", ($file_mode & oct(100)) ? oct(755) : oct(644));
+
+	NEXT_MEMBER:
+		my $padding = $file_size % 2;
+		seek $fh,
+		  $file_header_start + $FILE_HEADER_LENGTH + $file_size + $padding,
+		  SEEK_SET;
+
+	}
+
+	return 1;
+}
+
+1;
+                                        usr/share/perl5/File/StripNondeterminism/handlers/bflt.pm                                           0000644 0000000 0000000 00000012204 14361054711 022170  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        #
+# Copyright 2016 Evgueni Souleimanov
+#
+# This file is part of strip-nondeterminism.
+#
+# strip-nondeterminism is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# strip-nondeterminism is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with strip-nondeterminism.  If not, see <http://www.gnu.org/licenses/>.
+#
+package File::StripNondeterminism::handlers::bflt;
+
+use strict;
+use warnings;
+
+use File::StripNondeterminism;
+use Fcntl q/SEEK_SET/;
+
+use constant bFLT => 0x62464C54;
+use constant FLAT_HDRLEN => 64;
+
+# Heuristic values
+use constant MAX_OFFSET => 0xFFFFFFF;
+use constant MAX_STACK_SIZE => 0xFFFFFF;
+use constant MAX_COUNT => 0xFFFFFF;
+use constant RESERVED_FLAGS => 0xFFFFFFC0;
+
+=head1 DEPRECATION PLAN
+
+bFLT format is used in uClibc/uCLinux systems. As of 2020-04-30 there are zero
+.bflt files being shipped in Debian packages so this handler is a good
+candidate to commence deprecation via first making it optional, etc., perhaps
+surveying whether any embedded distributions could be relying on this.
+
+Also see the uimage handler.
+
+=cut
+
+# From elf2flt flat.h
+# /*
+#  * To make everything easier to port and manage cross platform
+#  * development,  all fields are in network byte order.
+#  */
+#
+# struct flat_hdr {
+#     char magic[4];
+#     uint32_t rev;          /* version (as above) */
+#     uint32_t entry;        /* Offset of first executable instruction
+#                               with text segment from beginning of file */
+#     uint32_t data_start;   /* Offset of data segment from beginning of
+#                               file */
+#     uint32_t data_end;     /* Offset of end of data segment from beginning
+#                               of file */
+#     uint32_t bss_end;      /* Offset of end of bss segment from beginning
+#                               of file */
+#
+#     /* (It is assumed that data_end through bss_end forms the bss segment.) */
+#
+#     uint32_t stack_size;   /* Size of stack, in bytes */
+#     uint32_t reloc_start;  /* Offset of relocation records from beginning
+#                               of file */
+#     uint32_t reloc_count;  /* Number of relocation records */
+#     uint32_t flags;
+#     uint32_t build_date;   /* When the program/library was built */
+#     uint32_t filler[5];    /* Reservered, set to zero */
+# };
+
+sub is_bflt_header {
+	my ($hdr) = @_;
+
+	my ($f_magic, $f_rev, $f_entry, $f_data_start,
+		$f_data_end, $f_bss_end, $f_stack_size, $f_reloc_start,
+		$f_reloc_count, $f_flags, $f_build_date, $filler_11,
+		$filler_12, $filler_13, $filler_14, $filler_15) = unpack('NNNNNNNNNNNNNNNN', $hdr);
+
+	return 0 unless ($f_magic == bFLT);
+
+	return 0 unless ($f_rev == 4);
+
+	return 0 unless ($f_entry < MAX_OFFSET && $f_data_start < MAX_OFFSET
+			&& $f_data_end < MAX_OFFSET && $f_bss_end < MAX_OFFSET);
+
+	return 0 unless ($f_stack_size < MAX_STACK_SIZE);
+
+	return 0 unless ($f_reloc_start < MAX_OFFSET && $f_reloc_count < MAX_COUNT);
+
+	return 0 unless (($f_flags & RESERVED_FLAGS) == 0);
+
+	return 0 unless ($filler_11 == 0 && $filler_12 == 0
+		&& $filler_13 == 0 && $filler_14 == 0 && $filler_15 == 0);
+
+	return 1;
+}
+
+sub is_bflt_fh {
+	my ($fh) = @_;
+	my $hdr;
+
+	binmode($fh);
+
+	my $bytes_read = sysread($fh, $hdr, FLAT_HDRLEN);
+	return 0 unless $bytes_read == FLAT_HDRLEN;
+
+	return is_bflt_header($hdr);
+}
+
+sub is_bflt_file {
+	my ($filename) = @_;
+	my $fh;
+	return open($fh, '<', $filename) && is_bflt_fh($fh);
+}
+
+sub normalize {
+	my ($filename) = @_;
+
+	open(my $fh, '+<', $filename)
+		or die("failed to open $filename for read+write: $!");
+
+	binmode($fh);
+
+	my $hdr;
+	my $bytes_read = sysread($fh, $hdr, FLAT_HDRLEN);
+	return 0 unless $bytes_read == FLAT_HDRLEN;
+
+	my ($f_magic, $f_rev, $f_entry, $f_data_start,
+		$f_data_end, $f_bss_end, $f_stack_size, $f_reloc_start,
+		$f_reloc_count, $f_flags, $f_build_date, $filler_11,
+		$filler_12, $filler_13, $filler_14, $filler_15) = unpack('NNNNNNNNNNNNNNNN', $hdr);
+
+	return 0 unless $f_magic == bFLT;
+	return 0 unless $f_rev == 4;
+	return 0 unless (is_bflt_header($hdr));
+
+	my $f_build_date_orig = $f_build_date;
+
+	unless ($f_build_date == 0) {	# Don't set a deterministic timestamp if there wasn't already a timestamp
+		if (defined $File::StripNondeterminism::canonical_time) {
+			if (!$File::StripNondeterminism::clamp_time || $f_build_date > $File::StripNondeterminism::canonical_time) {
+				$f_build_date = $File::StripNondeterminism::canonical_time;
+			}
+		} else {
+			$f_build_date = 0; # 0 is "no timestamp"
+		}
+	}
+
+	return 0 if $f_build_date == $f_build_date_orig;
+
+	my $hdr_new = pack('NNNNNNNNNNNNNNNN',
+		$f_magic, $f_rev, $f_entry, $f_data_start,
+		$f_data_end, $f_bss_end, $f_stack_size, $f_reloc_start,
+		$f_reloc_count, $f_flags, $f_build_date, $filler_11,
+		$filler_12, $filler_13, $filler_14, $filler_15);
+
+	seek $fh, 0, SEEK_SET;
+	syswrite ($fh, $hdr_new, 64);
+
+	return 1;
+}
+
+1;
+                                                                                                                                                                                                                                                                                                                                                                                            usr/share/perl5/File/StripNondeterminism/handlers/cpio.pm                                           0000644 0000000 0000000 00000003351 14361054711 022176  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        # Copyright © 2017 Bernhard M. Wiedemann <bmwiedemann@opensuse.org>
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful, but
+# WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+# General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+#
+
+package File::StripNondeterminism::handlers::cpio;
+
+use strict;
+use warnings;
+
+use File::StripNondeterminism;
+
+=head1 DEPRECATION PLAN
+
+This was added in mid-2017. As-of 2020-04-30, Debian ships a total of 8 .cpio
+files in binary packages and none of these appear to be integral to the working
+of those package.
+
+After consulting with the original (Bernhard, ie. OpenSuse) this handler is a
+good candidate to commence deprecation via initially making it optional.
+
+=cut
+
+sub normalize {
+	my ($file) = @_;
+	# if we cannot load the Cpio module, we just leave the file alone
+	# to not have Archive::Cpio as a hard requirement
+	# for strip-nondeterminism
+	if (not eval {require Archive::Cpio}) {
+		if ($File::StripNondeterminism::verbose) {
+			print STDERR "Archive::Cpio not found\n";
+		}
+		return 0;
+	}
+	my $cpio = Archive::Cpio->new;
+	eval {$cpio->read($file)};
+	return 0 if $@; # not a cpio archive if it throws an error
+	foreach my $e ($cpio->get_files()) {
+		$e->{mtime} = $File::StripNondeterminism::canonical_time;
+	}
+	$cpio->write($file);
+	return 1;
+}
+
+1;
+                                                                                                                                                                                                                                                                                       usr/share/perl5/File/StripNondeterminism/handlers/gettext.pm                                        0000644 0000000 0000000 00000006005 14361054711 022727  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        #
+# Copyright 2016 Reiner Herrmann <reiner@reiner-h.de>
+# Copyright 2016 Chris Lamb <lamby@debian.org>
+#
+# This file is part of strip-nondeterminism.
+#
+# strip-nondeterminism is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# strip-nondeterminism is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with strip-nondeterminism.  If not, see <http://www.gnu.org/licenses/>.
+#
+package File::StripNondeterminism::handlers::gettext;
+
+use Time::Piece;
+use POSIX qw(strftime);
+
+use strict;
+use warnings;
+
+use File::StripNondeterminism;
+
+=head1 DEPRECATION PLAN
+
+Situation unclear. Whilst #792687 is closed, many Gettext related files are
+being normalised based on anecdotal viewings of build logs.
+
+=cut
+
+sub read_file($) {
+	my $filename = shift;
+
+	local $/ = undef;
+	open(my $fh, '<', $filename)
+	  or die "Can't open file $filename for reading: $!";
+	binmode($fh);
+	my $buf = <$fh>;
+	close($fh);
+
+	return $buf;
+}
+
+sub normalize {
+	my ($mo_filename, %options) = @_;
+
+	my $norm_time = $File::StripNondeterminism::canonical_time // 0;
+	my $fmt;
+
+	my $buf = read_file($mo_filename);
+
+	my $magic = unpack("V", substr($buf, 0*4, 4));
+	if ($magic == 0x950412DE) {
+		# little endian
+		$fmt = "V";
+	} elsif ($magic == 0xDE120495) {
+		# big endian
+		$fmt = "N";
+	} else {
+		# unknown format
+		return 0;
+	}
+
+	my ($revision, $nstrings, $orig_to, $trans_to)
+	  = unpack($fmt x 4, substr($buf, 1*4, 4*4));
+	my $major = int($revision / 256);
+	my $minor = int($revision % 256);
+	return 0 if $major > 1;
+
+	my $modified = 0;
+	for (my $i=0; $i < $nstrings; $i++) {
+		my $len = unpack($fmt, substr($buf, $orig_to + $i*8, 4));
+		next if $len > 0;
+
+		my $offset = unpack($fmt, substr($buf, $orig_to + $i*8 + 4, 4));
+		my $trans_len = unpack($fmt, substr($buf, $trans_to + $i*8));
+		my $trans_offset = unpack($fmt, substr($buf, $trans_to + $i*8 + 4));
+		my $trans_msg = substr($buf, $trans_offset, $trans_len);
+		next unless $trans_msg =~ m/^(POT-Creation-Date|PO-Revision-Date): (.*)/m;
+
+		my $date_key = $1;
+		my $date_value = $2;
+		my $time;
+		eval {$time = Time::Piece->strptime($date_value, "%Y-%m-%d %H:%M%z");};
+		next if $@;
+		next if $time <= $norm_time;
+
+		my $new_time = strftime("%Y-%m-%d %H:%M%z", gmtime($norm_time));
+		$trans_msg
+		  =~ s/\Q$date_key: $date_value\E/$date_key: $new_time/;
+		next if length($trans_msg) != $trans_len;
+

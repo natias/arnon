@@ -1,0 +1,1000 @@
+    @active
+    def removefilegenerator(self, genid):
+        """reverse of addfilegenerator, remove a file generator function"""
+        if genid in self._filegenerators:
+            del self._filegenerators[genid]
+
+    def _generatefiles(self, suffix=b'', group=GEN_GROUP_ALL):
+        # write files registered for generation
+        any = False
+
+        if group == GEN_GROUP_ALL:
+            skip_post = skip_pre = False
+        else:
+            skip_pre = group == GEN_GROUP_POST_FINALIZE
+            skip_post = group == GEN_GROUP_PRE_FINALIZE
+
+        for id, entry in sorted(self._filegenerators.items()):
+            any = True
+            order, filenames, genfunc, location, post_finalize = entry
+
+            # for generation at closing, check if it's before or after finalize
+            if skip_post and post_finalize:
+                continue
+            elif skip_pre and not post_finalize:
+                continue
+
+            vfs = self._vfsmap[location]
+            files = []
+            try:
+                for name in filenames:
+                    name += suffix
+                    if suffix:
+                        self.registertmp(name, location=location)
+                        checkambig = False
+                    else:
+                        self.addbackup(name, location=location)
+                        checkambig = (name, location) in self._checkambigfiles
+                    files.append(
+                        vfs(name, b'w', atomictemp=True, checkambig=checkambig)
+                    )
+                genfunc(*files)
+                for f in files:
+                    f.close()
+                # skip discard() loop since we're sure no open file remains
+                del files[:]
+            finally:
+                for f in files:
+                    f.discard()
+        return any
+
+    @active
+    def findoffset(self, file):
+        if file in self._newfiles:
+            return 0
+        return self._offsetmap.get(file)
+
+    @active
+    def readjournal(self):
+        self._file.seek(0)
+        entries = []
+        for l in self._file.readlines():
+            file, troffset = l.split(b'\0')
+            entries.append((file, int(troffset)))
+        return entries
+
+    @active
+    def replace(self, file, offset):
+        """
+        replace can only replace already committed entries
+        that are not pending in the queue
+        """
+        if file in self._newfiles:
+            if not offset:
+                return
+            self._newfiles.remove(file)
+            self._offsetmap[file] = offset
+        elif file in self._offsetmap:
+            if not offset:
+                del self._offsetmap[file]
+                self._newfiles.add(file)
+            else:
+                self._offsetmap[file] = offset
+        else:
+            raise KeyError(file)
+        self._file.write(b"%s\0%d\n" % (file, offset))
+        self._file.flush()
+
+    @active
+    def nest(self, name='<unnamed>'):
+        self._count += 1
+        self._usages += 1
+        self._names.append(name)
+        return self
+
+    def release(self):
+        if self._count > 0:
+            self._usages -= 1
+        if self._names:
+            self._names.pop()
+        # if the transaction scopes are left without being closed, fail
+        if self._count > 0 and self._usages == 0:
+            self._abort()
+
+    def running(self):
+        return self._count > 0
+
+    def addpending(self, category, callback):
+        """add a callback to be called when the transaction is pending
+
+        The transaction will be given as callback's first argument.
+
+        Category is a unique identifier to allow overwriting an old callback
+        with a newer callback.
+        """
+        self._pendingcallback[category] = callback
+
+    @active
+    def writepending(self):
+        """write pending file to temporary version
+
+        This is used to allow hooks to view a transaction before commit"""
+        categories = sorted(self._pendingcallback)
+        for cat in categories:
+            # remove callback since the data will have been flushed
+            any = self._pendingcallback.pop(cat)(self)
+            self._anypending = self._anypending or any
+        self._anypending |= self._generatefiles(suffix=b'.pending')
+        return self._anypending
+
+    @active
+    def hasfinalize(self, category):
+        """check is a callback already exist for a category"""
+        return category in self._finalizecallback
+
+    @active
+    def addfinalize(self, category, callback):
+        """add a callback to be called when the transaction is closed
+
+        The transaction will be given as callback's first argument.
+
+        Category is a unique identifier to allow overwriting old callbacks with
+        newer callbacks.
+        """
+        self._finalizecallback[category] = callback
+
+    @active
+    def addpostclose(self, category, callback):
+        """add or replace a callback to be called after the transaction closed
+
+        The transaction will be given as callback's first argument.
+
+        Category is a unique identifier to allow overwriting an old callback
+        with a newer callback.
+        """
+        self._postclosecallback[category] = callback
+
+    @active
+    def getpostclose(self, category):
+        """return a postclose callback added before, or None"""
+        return self._postclosecallback.get(category, None)
+
+    @active
+    def addabort(self, category, callback):
+        """add a callback to be called when the transaction is aborted.
+
+        The transaction will be given as the first argument to the callback.
+
+        Category is a unique identifier to allow overwriting an old callback
+        with a newer callback.
+        """
+        self._abortcallback[category] = callback
+
+    @active
+    def addvalidator(self, category, callback):
+        """adds a callback to be called when validating the transaction.
+
+        The transaction will be given as the first argument to the callback.
+
+        callback should raise exception if to abort transaction"""
+        self._validatecallback[category] = callback
+
+    @active
+    def close(self):
+        '''commit the transaction'''
+        if self._count == 1:
+            for category in sorted(self._validatecallback):
+                self._validatecallback[category](self)
+            self._validatecallback = None  # Help prevent cycles.
+            self._generatefiles(group=GEN_GROUP_PRE_FINALIZE)
+            while self._finalizecallback:
+                callbacks = self._finalizecallback
+                self._finalizecallback = {}
+                categories = sorted(callbacks)
+                for cat in categories:
+                    callbacks[cat](self)
+            # Prevent double usage and help clear cycles.
+            self._finalizecallback = None
+            self._generatefiles(group=GEN_GROUP_POST_FINALIZE)
+
+        self._count -= 1
+        if self._count != 0:
+            return
+        self._file.close()
+        self._backupsfile.close()
+        # cleanup temporary files
+        for l, f, b, c in self._backupentries:
+            if l not in self._vfsmap and c:
+                self._report(
+                    b"couldn't remove %s: unknown cache location %s\n" % (b, l)
+                )
+                continue
+            vfs = self._vfsmap[l]
+            if not f and b and vfs.exists(b):
+                try:
+                    vfs.unlink(b)
+                except (IOError, OSError, error.Abort) as inst:
+                    if not c:
+                        raise
+                    # Abort may be raise by read only opener
+                    self._report(
+                        b"couldn't remove %s: %s\n" % (vfs.join(b), inst)
+                    )
+        self._offsetmap = {}
+        self._newfiles = set()
+        self._writeundo()
+        if self._after:
+            self._after()
+            self._after = None  # Help prevent cycles.
+        if self._opener.isfile(self._backupjournal):
+            self._opener.unlink(self._backupjournal)
+        if self._opener.isfile(self._journal):
+            self._opener.unlink(self._journal)
+        for l, _f, b, c in self._backupentries:
+            if l not in self._vfsmap and c:
+                self._report(
+                    b"couldn't remove %s: unknown cache location"
+                    b"%s\n" % (b, l)
+                )
+                continue
+            vfs = self._vfsmap[l]
+            if b and vfs.exists(b):
+                try:
+                    vfs.unlink(b)
+                except (IOError, OSError, error.Abort) as inst:
+                    if not c:
+                        raise
+                    # Abort may be raise by read only opener
+                    self._report(
+                        b"couldn't remove %s: %s\n" % (vfs.join(b), inst)
+                    )
+        self._backupentries = []
+        self._journal = None
+
+        self._releasefn(self, True)  # notify success of closing transaction
+        self._releasefn = None  # Help prevent cycles.
+
+        # run post close action
+        categories = sorted(self._postclosecallback)
+        for cat in categories:
+            self._postclosecallback[cat](self)
+        # Prevent double usage and help clear cycles.
+        self._postclosecallback = None
+
+    @active
+    def abort(self):
+        """abort the transaction (generally called on error, or when the
+        transaction is not explicitly committed before going out of
+        scope)"""
+        self._abort()
+
+    def _writeundo(self):
+        """write transaction data for possible future undo call"""
+        if self._undoname is None:
+            return
+
+        undo_backup_path = b"%s.backupfiles" % self._undoname
+        undobackupfile = self._opener.open(undo_backup_path, b'w')
+        undobackupfile.write(b'%d\n' % version)
+        for l, f, b, c in self._backupentries:
+            if not f:  # temporary file
+                continue
+            if not b:
+                u = b''
+            else:
+                if l not in self._vfsmap and c:
+                    self._report(
+                        b"couldn't remove %s: unknown cache location"
+                        b"%s\n" % (b, l)
+                    )
+                    continue
+                vfs = self._vfsmap[l]
+                base, name = vfs.split(b)
+                assert name.startswith(self._journal), name
+                uname = name.replace(self._journal, self._undoname, 1)
+                u = vfs.reljoin(base, uname)
+                util.copyfile(vfs.join(b), vfs.join(u), hardlink=True)
+            undobackupfile.write(b"%s\0%s\0%s\0%d\n" % (l, f, u, c))
+        undobackupfile.close()
+
+    def _abort(self):
+        entries = self.readjournal()
+        self._count = 0
+        self._usages = 0
+        self._file.close()
+        self._backupsfile.close()
+
+        try:
+            if not entries and not self._backupentries:
+                if self._backupjournal:
+                    self._opener.unlink(self._backupjournal)
+                if self._journal:
+                    self._opener.unlink(self._journal)
+                return
+
+            self._report(_(b"transaction abort!\n"))
+
+            try:
+                for cat in sorted(self._abortcallback):
+                    self._abortcallback[cat](self)
+                # Prevent double usage and help clear cycles.
+                self._abortcallback = None
+                _playback(
+                    self._journal,
+                    self._report,
+                    self._opener,
+                    self._vfsmap,
+                    entries,
+                    self._backupentries,
+                    False,
+                    checkambigfiles=self._checkambigfiles,
+                )
+                self._report(_(b"rollback completed\n"))
+            except BaseException as exc:
+                self._report(_(b"rollback failed - please run hg recover\n"))
+                self._report(
+                    _(b"(failure reason: %s)\n") % stringutil.forcebytestr(exc)
+                )
+        finally:
+            self._journal = None
+            self._releasefn(self, False)  # notify failure of transaction
+            self._releasefn = None  # Help prevent cycles.
+
+
+BAD_VERSION_MSG = _(
+    b"journal was created by a different version of Mercurial\n"
+)
+
+
+def rollback(opener, vfsmap, file, report, checkambigfiles=None):
+    """Rolls back the transaction contained in the given file
+
+    Reads the entries in the specified file, and the corresponding
+    '*.backupfiles' file, to recover from an incomplete transaction.
+
+    * `file`: a file containing a list of entries, specifying where
+    to truncate each file.  The file should contain a list of
+    file\0offset pairs, delimited by newlines. The corresponding
+    '*.backupfiles' file should contain a list of file\0backupfile
+    pairs, delimited by \0.
+
+    `checkambigfiles` is a set of (path, vfs-location) tuples,
+    which determine whether file stat ambiguity should be avoided at
+    restoring corresponded files.
+    """
+    entries = []
+    backupentries = []
+
+    with opener.open(file) as fp:
+        lines = fp.readlines()
+    for l in lines:
+        try:
+            f, o = l.split(b'\0')
+            entries.append((f, int(o)))
+        except ValueError:
+            report(
+                _(b"couldn't read journal entry %r!\n") % pycompat.bytestr(l)
+            )
+
+    backupjournal = b"%s.backupfiles" % file
+    if opener.exists(backupjournal):
+        fp = opener.open(backupjournal)
+        lines = fp.readlines()
+        if lines:
+            ver = lines[0][:-1]
+            if ver != (b'%d' % version):
+                report(BAD_VERSION_MSG)
+            else:
+                for line in lines[1:]:
+                    if line:
+                        # Shave off the trailing newline
+                        line = line[:-1]
+                        l, f, b, c = line.split(b'\0')
+                        backupentries.append((l, f, b, bool(c)))
+
+    _playback(
+        file,
+        report,
+        opener,
+        vfsmap,
+        entries,
+        backupentries,
+        checkambigfiles=checkambigfiles,
+    )
+                                                                                                                                                                                                                           usr/lib/python3/dist-packages/mercurial/treediscovery.py                                            0000644 0000000 0000000 00000015702 14355257011 022202  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        # discovery.py - protocol changeset discovery functions
+#
+# Copyright 2010 Olivia Mackall <olivia@selenic.com>
+#
+# This software may be used and distributed according to the terms of the
+# GNU General Public License version 2 or any later version.
+
+
+import collections
+
+from .i18n import _
+from .node import short
+from . import (
+    error,
+)
+
+
+def findcommonincoming(repo, remote, heads=None, force=False, audit=None):
+    """Return a tuple (common, fetch, heads) used to identify the common
+    subset of nodes between repo and remote.
+
+    "common" is a list of (at least) the heads of the common subset.
+    "fetch" is a list of roots of the nodes that would be incoming, to be
+      supplied to changegroupsubset.
+    "heads" is either the supplied heads, or else the remote's heads.
+    """
+
+    knownnode = repo.changelog.hasnode
+    search = []
+    fetch = set()
+    seen = set()
+    seenbranch = set()
+    base = set()
+
+    if not heads:
+        with remote.commandexecutor() as e:
+            heads = e.callcommand(b'heads', {}).result()
+
+    if audit is not None:
+        audit[b'total-roundtrips'] = 1
+        audit[b'total-roundtrips-heads'] = 1
+        audit[b'total-roundtrips-branches'] = 0
+        audit[b'total-roundtrips-between'] = 0
+        audit[b'total-queries'] = 0
+        audit[b'total-queries-branches'] = 0
+        audit[b'total-queries-between'] = 0
+
+    if repo.changelog.tip() == repo.nullid:
+        base.add(repo.nullid)
+        if heads != [repo.nullid]:
+            return [repo.nullid], [repo.nullid], list(heads)
+        return [repo.nullid], [], heads
+
+    # assume we're closer to the tip than the root
+    # and start by examining the heads
+    repo.ui.status(_(b"searching for changes\n"))
+
+    unknown = []
+    for h in heads:
+        if not knownnode(h):
+            unknown.append(h)
+        else:
+            base.add(h)
+
+    if not unknown:
+        return list(base), [], list(heads)
+
+    req = set(unknown)
+    reqcnt = 0
+    progress = repo.ui.makeprogress(_(b'searching'), unit=_(b'queries'))
+
+    # search through remote branches
+    # a 'branch' here is a linear segment of history, with four parts:
+    # head, root, first parent, second parent
+    # (a branch always has two parents (or none) by definition)
+    with remote.commandexecutor() as e:
+        if audit is not None:
+            audit[b'total-queries'] += len(unknown)
+            audit[b'total-queries-branches'] += len(unknown)
+            audit[b'total-roundtrips'] += 1
+            audit[b'total-roundtrips-branches'] += 1
+        branches = e.callcommand(b'branches', {b'nodes': unknown}).result()
+
+    unknown = collections.deque(branches)
+    while unknown:
+        r = []
+        while unknown:
+            n = unknown.popleft()
+            if n[0] in seen:
+                continue
+
+            repo.ui.debug(b"examining %s:%s\n" % (short(n[0]), short(n[1])))
+            if n[0] == repo.nullid:  # found the end of the branch
+                pass
+            elif n in seenbranch:
+                repo.ui.debug(b"branch already found\n")
+                continue
+            elif n[1] and knownnode(n[1]):  # do we know the base?
+                repo.ui.debug(
+                    b"found incomplete branch %s:%s\n"
+                    % (short(n[0]), short(n[1]))
+                )
+                search.append(n[0:2])  # schedule branch range for scanning
+                seenbranch.add(n)
+            else:
+                if n[1] not in seen and n[1] not in fetch:
+                    if knownnode(n[2]) and knownnode(n[3]):
+                        repo.ui.debug(b"found new changeset %s\n" % short(n[1]))
+                        fetch.add(n[1])  # earliest unknown
+                    for p in n[2:4]:
+                        if knownnode(p):
+                            base.add(p)  # latest known
+
+                for p in n[2:4]:
+                    if p not in req and not knownnode(p):
+                        r.append(p)
+                        req.add(p)
+            seen.add(n[0])
+
+        if r:
+            for p in range(0, len(r), 10):
+                reqcnt += 1
+                progress.increment()
+                if repo.ui.debugflag:
+                    msg = b"request %d: %s\n"
+                    msg %= (reqcnt, b" ".join(map(short, r)))
+                    repo.ui.debug(msg)
+                with remote.commandexecutor() as e:
+                    subset = r[p : p + 10]
+                    if audit is not None:
+                        audit[b'total-queries'] += len(subset)
+                        audit[b'total-queries-branches'] += len(subset)
+                        audit[b'total-roundtrips'] += 1
+                        audit[b'total-roundtrips-branches'] += 1
+                    branches = e.callcommand(
+                        b'branches',
+                        {
+                            b'nodes': subset,
+                        },
+                    ).result()
+
+                for b in branches:
+                    repo.ui.debug(
+                        b"received %s:%s\n" % (short(b[0]), short(b[1]))
+                    )
+                    unknown.append(b)
+
+    # do binary search on the branches we found
+    while search:
+        newsearch = []
+        reqcnt += 1
+        progress.increment()
+
+        with remote.commandexecutor() as e:
+            if audit is not None:
+                audit[b'total-queries'] += len(search)
+                audit[b'total-queries-between'] += len(search)
+                audit[b'total-roundtrips'] += 1
+                audit[b'total-roundtrips-between'] += 1
+            between = e.callcommand(b'between', {b'pairs': search}).result()
+
+        for n, l in zip(search, between):
+            l.append(n[1])
+            p = n[0]
+            f = 1
+            for i in l:
+                repo.ui.debug(b"narrowing %d:%d %s\n" % (f, len(l), short(i)))
+                if knownnode(i):
+                    if f <= 2:
+                        repo.ui.debug(
+                            b"found new branch changeset %s\n" % short(p)
+                        )
+                        fetch.add(p)
+                        base.add(i)
+                    else:
+                        repo.ui.debug(
+                            b"narrowed branch search to %s:%s\n"
+                            % (short(p), short(i))
+                        )
+                        newsearch.append((p, i))
+                    break
+                p, f = i, f * 2
+            search = newsearch
+
+    # sanity check our fetch list
+    for f in fetch:
+        if knownnode(f):
+            raise error.RepoError(_(b"already have changeset ") + short(f[:4]))
+
+    base = list(base)
+    if base == [repo.nullid]:
+        if force:
+            repo.ui.warn(_(b"warning: repository is unrelated\n"))
+        else:
+            raise error.Abort(_(b"repository is unrelated"))
+
+    repo.ui.debug(
+        b"found new changesets starting at "
+        + b" ".join([short(f) for f in fetch])
+        + b"\n"
+    )
+
+    progress.complete()
+    repo.ui.debug(b"%d total queries\n" % reqcnt)
+
+    return base, list(fetch), heads
+                                                              usr/lib/python3/dist-packages/mercurial/txnutil.py                                                  0000644 0000000 0000000 00000001657 14355257011 021026  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        # txnutil.py - transaction related utilities
+#
+#  Copyright FUJIWARA Katsunori <foozy@lares.dti.ne.jp> and others
+#
+# This software may be used and distributed according to the terms of the
+# GNU General Public License version 2 or any later version.
+
+
+from . import encoding
+
+
+def mayhavepending(root):
+    """return whether 'root' may have pending changes, which are
+    visible to this process.
+    """
+    return root == encoding.environ.get(b'HG_PENDING')
+
+
+def trypending(root, vfs, filename, **kwargs):
+    """Open  file to be read according to HG_PENDING environment variable
+
+    This opens '.pending' of specified 'filename' only when HG_PENDING
+    is equal to 'root'.
+
+    This returns '(fp, is_pending_opened)' tuple.
+    """
+    if mayhavepending(root):
+        try:
+            return (vfs(b'%s.pending' % filename, **kwargs), True)
+        except FileNotFoundError:
+            pass
+    return (vfs(filename, **kwargs), False)
+                                                                                 usr/lib/python3/dist-packages/mercurial/ui.py                                                       0000644 0000000 0000000 00000241105 14355257011 017726  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        # ui.py - user interface bits for mercurial
+#
+# Copyright 2005-2007 Olivia Mackall <olivia@selenic.com>
+#
+# This software may be used and distributed according to the terms of the
+# GNU General Public License version 2 or any later version.
+
+
+import collections
+import contextlib
+import datetime
+import errno
+import inspect
+import os
+import re
+import signal
+import socket
+import subprocess
+import sys
+import traceback
+
+from .i18n import _
+from .node import hex
+from .pycompat import (
+    getattr,
+    open,
+)
+
+from . import (
+    color,
+    config,
+    configitems,
+    encoding,
+    error,
+    formatter,
+    loggingutil,
+    progress,
+    pycompat,
+    rcutil,
+    scmutil,
+    util,
+)
+from .utils import (
+    dateutil,
+    procutil,
+    resourceutil,
+    stringutil,
+    urlutil,
+)
+
+urlreq = util.urlreq
+
+# for use with str.translate(None, _keepalnum), to keep just alphanumerics
+_keepalnum = b''.join(
+    c for c in map(pycompat.bytechr, range(256)) if not c.isalnum()
+)
+
+# The config knobs that will be altered (if unset) by ui.tweakdefaults.
+tweakrc = b"""
+[ui]
+# The rollback command is dangerous. As a rule, don't use it.
+rollback = False
+# Make `hg status` report copy information
+statuscopies = yes
+# Prefer curses UIs when available. Revert to plain-text with `text`.
+interface = curses
+# Make compatible commands emit cwd-relative paths by default.
+relative-paths = yes
+
+[commands]
+# Grep working directory by default.
+grep.all-files = True
+# Refuse to perform an `hg update` that would cause a file content merge
+update.check = noconflict
+# Show conflicts information in `hg status`
+status.verbose = True
+# Make `hg resolve` with no action (like `-m`) fail instead of re-merging.
+resolve.explicit-re-merge = True
+
+[diff]
+git = 1
+showfunc = 1
+word-diff = 1
+"""
+
+samplehgrcs = {
+    b'user': b"""# example user config (see 'hg help config' for more info)
+[ui]
+# name and email, e.g.
+# username = Jane Doe <jdoe@example.com>
+username =
+
+# We recommend enabling tweakdefaults to get slight improvements to
+# the UI over time. Make sure to set HGPLAIN in the environment when
+# writing scripts!
+# tweakdefaults = True
+
+# uncomment to disable color in command output
+# (see 'hg help color' for details)
+# color = never
+
+# uncomment to disable command output pagination
+# (see 'hg help pager' for details)
+# paginate = never
+
+[extensions]
+# uncomment the lines below to enable some popular extensions
+# (see 'hg help extensions' for more info)
+#
+# histedit =
+# rebase =
+# uncommit =
+""",
+    b'cloned': b"""# example repository config (see 'hg help config' for more info)
+[paths]
+default = %s
+
+# path aliases to other clones of this repo in URLs or filesystem paths
+# (see 'hg help config.paths' for more info)
+#
+# default:pushurl = ssh://jdoe@example.net/hg/jdoes-fork
+# my-fork         = ssh://jdoe@example.net/hg/jdoes-fork
+# my-clone        = /home/jdoe/jdoes-clone
+
+[ui]
+# name and email (local to this repository, optional), e.g.
+# username = Jane Doe <jdoe@example.com>
+""",
+    b'local': b"""# example repository config (see 'hg help config' for more info)
+[paths]
+# path aliases to other clones of this repo in URLs or filesystem paths
+# (see 'hg help config.paths' for more info)
+#
+# default         = http://example.com/hg/example-repo
+# default:pushurl = ssh://jdoe@example.net/hg/jdoes-fork
+# my-fork         = ssh://jdoe@example.net/hg/jdoes-fork
+# my-clone        = /home/jdoe/jdoes-clone
+
+[ui]
+# name and email (local to this repository, optional), e.g.
+# username = Jane Doe <jdoe@example.com>
+""",
+    b'global': b"""# example system-wide hg config (see 'hg help config' for more info)
+
+[ui]
+# uncomment to disable color in command output
+# (see 'hg help color' for details)
+# color = never
+
+# uncomment to disable command output pagination
+# (see 'hg help pager' for details)
+# paginate = never
+
+[extensions]
+# uncomment the lines below to enable some popular extensions
+# (see 'hg help extensions' for more info)
+#
+# blackbox =
+# churn =
+""",
+}
+
+
+def _maybestrurl(maybebytes):
+    return pycompat.rapply(pycompat.strurl, maybebytes)
+
+
+def _maybebytesurl(maybestr):
+    return pycompat.rapply(pycompat.bytesurl, maybestr)
+
+
+class httppasswordmgrdbproxy:
+    """Delays loading urllib2 until it's needed."""
+
+    def __init__(self):
+        self._mgr = None
+
+    def _get_mgr(self):
+        if self._mgr is None:
+            self._mgr = urlreq.httppasswordmgrwithdefaultrealm()
+        return self._mgr
+
+    def add_password(self, realm, uris, user, passwd):
+        return self._get_mgr().add_password(
+            _maybestrurl(realm),
+            _maybestrurl(uris),
+            _maybestrurl(user),
+            _maybestrurl(passwd),
+        )
+
+    def find_user_password(self, realm, uri):
+        mgr = self._get_mgr()
+        return _maybebytesurl(
+            mgr.find_user_password(_maybestrurl(realm), _maybestrurl(uri))
+        )
+
+
+def _catchterm(*args):
+    raise error.SignalInterrupt
+
+
+# unique object used to detect no default value has been provided when
+# retrieving configuration value.
+_unset = object()
+
+# _reqexithandlers: callbacks run at the end of a request
+_reqexithandlers = []
+
+
+class ui:
+    def __init__(self, src=None):
+        """Create a fresh new ui object if no src given
+
+        Use uimod.ui.load() to create a ui which knows global and user configs.
+        In most cases, you should use ui.copy() to create a copy of an existing
+        ui object.
+        """
+        # _buffers: used for temporary capture of output
+        self._buffers = []
+        # 3-tuple describing how each buffer in the stack behaves.
+        # Values are (capture stderr, capture subprocesses, apply labels).
+        self._bufferstates = []
+        # When a buffer is active, defines whether we are expanding labels.
+        # This exists to prevent an extra list lookup.
+        self._bufferapplylabels = None
+        self.quiet = self.verbose = self.debugflag = self.tracebackflag = False
+        self._reportuntrusted = True
+        self._knownconfig = configitems.coreitems
+        self._ocfg = config.config()  # overlay
+        self._tcfg = config.config()  # trusted
+        self._ucfg = config.config()  # untrusted
+        self._trustusers = set()
+        self._trustgroups = set()
+        self.callhooks = True
+        # hold the root to use for each [paths] entry
+        self._path_to_root = {}
+        # Insecure server connections requested.
+        self.insecureconnections = False
+        # Blocked time
+        self.logblockedtimes = False
+        # color mode: see mercurial/color.py for possible value
+        self._colormode = None
+        self._terminfoparams = {}
+        self._styles = {}
+        self._uninterruptible = False
+        self.showtimestamp = False
+
+        if src:
+            self._fout = src._fout
+            self._ferr = src._ferr
+            self._fin = src._fin
+            self._fmsg = src._fmsg
+            self._fmsgout = src._fmsgout
+            self._fmsgerr = src._fmsgerr
+            self._finoutredirected = src._finoutredirected
+            self._loggers = src._loggers.copy()
+            self.pageractive = src.pageractive
+            self._disablepager = src._disablepager
+            self._tweaked = src._tweaked
+
+            self._tcfg = src._tcfg.copy()
+            self._ucfg = src._ucfg.copy()
+            self._ocfg = src._ocfg.copy()
+            self._trustusers = src._trustusers.copy()
+            self._trustgroups = src._trustgroups.copy()
+            self.environ = src.environ
+            self.callhooks = src.callhooks
+            self._path_to_root = src._path_to_root
+            self.insecureconnections = src.insecureconnections
+            self._colormode = src._colormode
+            self._terminfoparams = src._terminfoparams.copy()
+            self._styles = src._styles.copy()
+
+            self.fixconfig()
+
+            self.httppasswordmgrdb = src.httppasswordmgrdb
+            self._blockedtimes = src._blockedtimes
+        else:
+            self._fout = procutil.stdout
+            self._ferr = procutil.stderr
+            self._fin = procutil.stdin
+            self._fmsg = None
+            self._fmsgout = self.fout  # configurable
+            self._fmsgerr = self.ferr  # configurable
+            self._finoutredirected = False
+            self._loggers = {}
+            self.pageractive = False
+            self._disablepager = False
+            self._tweaked = False
+
+            # shared read-only environment
+            self.environ = encoding.environ
+
+            self.httppasswordmgrdb = httppasswordmgrdbproxy()
+            self._blockedtimes = collections.defaultdict(int)
+
+        allowed = self.configlist(b'experimental', b'exportableenviron')
+        if b'*' in allowed:
+            self._exportableenviron = self.environ
+        else:
+            self._exportableenviron = {}
+            for k in allowed:
+                if k in self.environ:
+                    self._exportableenviron[k] = self.environ[k]
+
+    def _new_source(self):
+        self._ocfg.new_source()
+        self._tcfg.new_source()
+        self._ucfg.new_source()
+
+    @classmethod
+    def load(cls):
+        """Create a ui and load global and user configs"""
+        u = cls()
+        # we always trust global config files and environment variables
+        for t, f in rcutil.rccomponents():
+            if t == b'path':
+                u.readconfig(f, trust=True)
+            elif t == b'resource':
+                u.read_resource_config(f, trust=True)
+            elif t == b'items':
+                u._new_source()
+                sections = set()
+                for section, name, value, source in f:
+                    # do not set u._ocfg
+                    # XXX clean this up once immutable config object is a thing
+                    u._tcfg.set(section, name, value, source)
+                    u._ucfg.set(section, name, value, source)
+                    sections.add(section)
+                for section in sections:
+                    u.fixconfig(section=section)
+            else:
+                raise error.ProgrammingError(b'unknown rctype: %s' % t)
+        u._maybetweakdefaults()
+        u._new_source()  # anything after that is a different level
+        return u
+
+    def _maybetweakdefaults(self):
+        if not self.configbool(b'ui', b'tweakdefaults'):
+            return
+        if self._tweaked or self.plain(b'tweakdefaults'):
+            return
+
+        # Note: it is SUPER IMPORTANT that you set self._tweaked to
+        # True *before* any calls to setconfig(), otherwise you'll get
+        # infinite recursion between setconfig and this method.
+        #
+        # TODO: We should extract an inner method in setconfig() to
+        # avoid this weirdness.
+        self._tweaked = True
+        tmpcfg = config.config()
+        tmpcfg.parse(b'<tweakdefaults>', tweakrc)
+        for section in tmpcfg:
+            for name, value in tmpcfg.items(section):
+                if not self.hasconfig(section, name):
+                    self.setconfig(section, name, value, b"<tweakdefaults>")
+
+    def copy(self):
+        return self.__class__(self)

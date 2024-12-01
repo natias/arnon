@@ -1,0 +1,1000 @@
+
+=head3 C<macosx_get_fork_TTY>
+
+The Mac OS X version uses AppleScript to tell Terminal.app to create
+a new window.
+
+=cut
+
+# Notes about Terminal.app's AppleScript support,
+# (aka things that might break in future OS versions).
+#
+# The "do script" command doesn't return a reference to the new window
+# it creates, but since it appears frontmost and windows are enumerated
+# front to back, we can use "first window" === "window 1".
+#
+# Since "do script" is implemented by supplying the argument (plus a
+# return character) as terminal input, there's a potential race condition
+# where the debugger could beat the shell to reading the command.
+# To prevent this, we wait for the screen to clear before proceeding.
+#
+# 10.3 and 10.4:
+# There's no direct accessor for the tty device name, so we fiddle
+# with the window title options until it says what we want.
+#
+# 10.5:
+# There _is_ a direct accessor for the tty device name, _and_ there's
+# a new possible component of the window title (the name of the settings
+# set).  A separate version is needed.
+
+my @script_versions=
+
+    ([237, <<'__LEOPARD__'],
+tell application "Terminal"
+    do script "clear;exec sleep 100000"
+    tell first tab of first window
+        copy tty to thetty
+        set custom title to "forked perl debugger"
+        set title displays custom title to true
+        repeat while (length of first paragraph of (get contents)) > 0
+            delay 0.1
+        end repeat
+    end tell
+end tell
+thetty
+__LEOPARD__
+
+     [100, <<'__JAGUAR_TIGER__'],
+tell application "Terminal"
+    do script "clear;exec sleep 100000"
+    tell first window
+        set title displays shell path to false
+        set title displays window size to false
+        set title displays file name to false
+        set title displays device name to true
+        set title displays custom title to true
+        set custom title to ""
+        copy "/dev/" & name to thetty
+        set custom title to "forked perl debugger"
+        repeat while (length of first paragraph of (get contents)) > 0
+            delay 0.1
+        end repeat
+    end tell
+end tell
+thetty
+__JAGUAR_TIGER__
+
+);
+
+sub macosx_get_fork_TTY
+{
+    my($version,$script,$pipe,$tty);
+
+    return unless $version=$ENV{TERM_PROGRAM_VERSION};
+    foreach my $entry (@script_versions) {
+        if ($version>=$entry->[0]) {
+            $script=$entry->[1];
+            last;
+        }
+    }
+    return unless defined($script);
+    return unless open($pipe,'-|','/usr/bin/osascript','-e',$script);
+    $tty=readline($pipe);
+    close($pipe);
+    return unless defined($tty) && $tty =~ m(^/dev/);
+    chomp $tty;
+    return $tty;
+}
+
+=head3 C<tmux_get_fork_TTY>
+
+Creates a split window for subprocesses when a process running under the
+perl debugger in Tmux forks.
+
+=cut
+
+sub tmux_get_fork_TTY {
+    return unless $ENV{TMUX};
+
+    my $pipe;
+
+    my $status = open $pipe, '-|', 'tmux', 'split-window',
+        '-P', '-F', '#{pane_tty}', 'sleep 100000';
+
+    if ( !$status ) {
+        return;
+    }
+
+    my $tty = <$pipe>;
+    close $pipe;
+
+    if ( $tty ) {
+        chomp $tty;
+
+        if ( !defined $term ) {
+            require Term::ReadLine;
+            if ( !$rl ) {
+                $term = Term::ReadLine::Stub->new( 'perldb', $IN, $OUT );
+            }
+            else {
+                $term = Term::ReadLine->new( 'perldb', $IN, $OUT );
+            }
+        }
+    }
+
+    return $tty;
+}
+
+=head2 C<create_IN_OUT($flags)>
+
+Create a new pair of filehandles, pointing to a new TTY. If impossible,
+try to diagnose why.
+
+Flags are:
+
+=over 4
+
+=item * 1 - Don't know how to create a new TTY.
+
+=item * 2 - Debugger has forked, but we can't get a new TTY.
+
+=item * 4 - standard debugger startup is happening.
+
+=back
+
+=cut
+
+use vars qw($fork_TTY);
+
+sub create_IN_OUT {    # Create a window with IN/OUT handles redirected there
+
+    # If we know how to get a new TTY, do it! $in will have
+    # the TTY name if get_fork_TTY works.
+    my $in = get_fork_TTY(@_) if defined &get_fork_TTY;
+
+    # It used to be that
+    $in = $fork_TTY if defined $fork_TTY;    # Backward compatibility
+
+    if ( not defined $in ) {
+        my $why = shift;
+
+        # We don't know how.
+        print_help(<<EOP) if $why == 1;
+I<#########> Forked, but do not know how to create a new B<TTY>. I<#########>
+EOP
+
+        # Forked debugger.
+        print_help(<<EOP) if $why == 2;
+I<#########> Daughter session, do not know how to change a B<TTY>. I<#########>
+  This may be an asynchronous session, so the parent debugger may be active.
+EOP
+
+        # Note that both debuggers are fighting over the same input.
+        print_help(<<EOP) if $why != 4;
+  Since two debuggers fight for the same TTY, input is severely entangled.
+
+EOP
+        print_help(<<EOP);
+  I know how to switch the output to a different window in xterms, OS/2
+  consoles, and Mac OS X Terminal.app only.  For a manual switch, put the name
+  of the created I<TTY> in B<\$DB::fork_TTY>, or define a function
+  B<DB::get_fork_TTY()> returning this.
+
+  On I<UNIX>-like systems one can get the name of a I<TTY> for the given window
+  by typing B<tty>, and disconnect the I<shell> from I<TTY> by S<B<sleep 1000000>>.
+
+EOP
+    } ## end if (not defined $in)
+    elsif ( $in ne '' ) {
+        TTY($in);
+    }
+    else {
+        $console = '';    # Indicate no need to open-from-the-console
+    }
+    undef $fork_TTY;
+} ## end sub create_IN_OUT
+
+=head2 C<resetterm>
+
+Handles rejiggering the prompt when we've forked off a new debugger.
+
+If the new debugger happened because of a C<system()> that invoked a
+program under the debugger, the arrow between the old pid and the new
+in the prompt has I<two> dashes instead of one.
+
+We take the current list of pids and add this one to the end. If there
+isn't any list yet, we make one up out of the initial pid associated with
+the terminal and our new pid, sticking an arrow (either one-dashed or
+two dashed) in between them.
+
+If C<CreateTTY> is off, or C<resetterm> was called with no arguments,
+we don't try to create a new IN and OUT filehandle. Otherwise, we go ahead
+and try to do that.
+
+=cut
+
+sub resetterm {    # We forked, so we need a different TTY
+
+    # Needs to be passed to create_IN_OUT() as well.
+    my $in = shift;
+
+    # resetterm(2): got in here because of a system() starting a debugger.
+    # resetterm(1): just forked.
+    my $systemed = $in > 1 ? '-' : '';
+
+    # If there's already a list of pids, add this to the end.
+    if ($pids) {
+        $pids =~ s/\]/$systemed->$$]/;
+    }
+
+    # No pid list. Time to make one.
+    else {
+        $pids = "[$term_pid->$$]";
+    }
+
+    # The prompt we're going to be using for this debugger.
+    $pidprompt = $pids;
+
+    # We now 0wnz this terminal.
+    $term_pid = $$;
+
+    # Just return if we're not supposed to try to create a new TTY.
+    return unless $CreateTTY & $in;
+
+    # Try to create a new IN/OUT pair.
+    create_IN_OUT($in);
+} ## end sub resetterm
+
+=head2 C<readline>
+
+First, we handle stuff in the typeahead buffer. If there is any, we shift off
+the next line, print a message saying we got it, add it to the terminal
+history (if possible), and return it.
+
+If there's nothing in the typeahead buffer, check the command filehandle stack.
+If there are any filehandles there, read from the last one, and return the line
+if we got one. If not, we pop the filehandle off and close it, and try the
+next one up the stack.
+
+If we've emptied the filehandle stack, we check to see if we've got a socket
+open, and we read that and return it if we do. If we don't, we just call the
+core C<readline()> and return its value.
+
+=cut
+
+sub readline {
+
+    # Localize to prevent it from being smashed in the program being debugged.
+    local $.;
+
+    # If there are stacked filehandles to read from ...
+    # (Handle it before the typeahead, because we may call source/etc. from
+    # the typeahead.)
+    while (@cmdfhs) {
+
+        # Read from the last one in the stack.
+        my $line = CORE::readline( $cmdfhs[-1] );
+
+        # If we got a line ...
+        defined $line
+          ? ( print $OUT ">> $line" and return $line )    # Echo and return
+          : close pop @cmdfhs;                            # Pop and close
+    } ## end while (@cmdfhs)
+
+    # Pull a line out of the typeahead if there's stuff there.
+    if (@typeahead) {
+
+        # How many lines left.
+        my $left = @typeahead;
+
+        # Get the next line.
+        my $got = shift @typeahead;
+
+        # Print a message saying we got input from the typeahead.
+        local $\ = '';
+        print $OUT "auto(-$left)", shift, $got, "\n";
+
+        # Add it to the terminal history (if possible).
+        $term->AddHistory($got)
+          if length($got) >= option_val("HistItemMinLength", 2)
+          and defined $term->Features->{addHistory};
+        return $got;
+    } ## end if (@typeahead)
+
+    # We really need to read some input. Turn off entry/exit trace and
+    # return value printing.
+    local $frame = 0;
+    local $doret = -2;
+
+    # Nothing on the filehandle stack. Socket?
+    if ( ref $OUT and UNIVERSAL::isa( $OUT, 'IO::Socket::INET' ) ) {
+
+        # Send anything we have to send.
+        $OUT->write( join( '', @_ ) );
+
+        # Receive anything there is to receive.
+        my $stuff = '';
+        my $buf;
+        my $first_time = 1;
+
+        while ($first_time or (length($buf) && ($stuff .= $buf) !~ /\n/))
+        {
+            $first_time = 0;
+            $IN->recv( $buf = '', 2048 );   # XXX "what's wrong with sysread?"
+                                            # XXX Don't know. You tell me.
+        }
+
+        # What we got.
+        return $stuff;
+    } ## end if (ref $OUT and UNIVERSAL::isa...
+
+    # No socket. Just read from the terminal.
+    else {
+        return $term->readline(@_);
+    }
+} ## end sub readline
+
+=head1 OPTIONS SUPPORT ROUTINES
+
+These routines handle listing and setting option values.
+
+=head2 C<dump_option> - list the current value of an option setting
+
+This routine uses C<option_val> to look up the value for an option.
+It cleans up escaped single-quotes and then displays the option and
+its value.
+
+=cut
+
+sub dump_option {
+    my ( $opt, $val ) = @_;
+    $val = option_val( $opt, 'N/A' );
+    $val =~ s/([\\\'])/\\$1/g;
+    printf $OUT "%20s = '%s'\n", $opt, $val;
+} ## end sub dump_option
+
+sub options2remember {
+    foreach my $k (@RememberOnROptions) {
+        $option{$k} = option_val( $k, 'N/A' );
+    }
+    return %option;
+}
+
+=head2 C<option_val> - find the current value of an option
+
+This can't just be a simple hash lookup because of the indirect way that
+the option values are stored. Some are retrieved by calling a subroutine,
+some are just variables.
+
+You must supply a default value to be used in case the option isn't set.
+
+=cut
+
+sub option_val {
+    my ( $opt, $default ) = @_;
+    my $val;
+
+    # Does this option exist, and is it a variable?
+    # If so, retrieve the value via the value in %optionVars.
+    if (    defined $optionVars{$opt}
+        and defined ${ $optionVars{$opt} } )
+    {
+        $val = ${ $optionVars{$opt} };
+    }
+
+    # Does this option exist, and it's a subroutine?
+    # If so, call the subroutine via the ref in %optionAction
+    # and capture the value.
+    elsif ( defined $optionAction{$opt}
+        and defined &{ $optionAction{$opt} } )
+    {
+        $val = &{ $optionAction{$opt} }();
+    }
+
+    # If there's an action or variable for the supplied option,
+    # but no value was set, use the default.
+    elsif (defined $optionAction{$opt} and not defined $option{$opt}
+        or defined $optionVars{$opt} and not defined ${ $optionVars{$opt} } )
+    {
+        $val = $default;
+    }
+
+    # Otherwise, do the simple hash lookup.
+    else {
+        $val = $option{$opt};
+    }
+
+    # If the value isn't defined, use the default.
+    # Then return whatever the value is.
+    $val = $default unless defined $val;
+    $val;
+} ## end sub option_val
+
+=head2 C<parse_options>
+
+Handles the parsing and execution of option setting/displaying commands.
+
+An option entered by itself is assumed to be I<set me to 1> (the default value)
+if the option is a boolean one. If not, the user is prompted to enter a valid
+value or to query the current value (via C<option? >).
+
+If C<option=value> is entered, we try to extract a quoted string from the
+value (if it is quoted). If it's not, we just use the whole value as-is.
+
+We load any modules required to service this option, and then we set it: if
+it just gets stuck in a variable, we do that; if there's a subroutine to
+handle setting the option, we call that.
+
+Finally, if we're running in interactive mode, we display the effect of the
+user's command back to the terminal, skipping this if we're setting things
+during initialization.
+
+=cut
+
+sub parse_options {
+    my ($s) = @_;
+    local $\ = '';
+
+    my $option;
+
+    # These options need a value. Don't allow them to be clobbered by accident.
+    my %opt_needs_val = map { ( $_ => 1 ) } qw{
+      dumpDepth arrayDepth hashDepth LineInfo maxTraceLen ornaments windowSize
+      pager quote ReadLine recallCommand RemotePort ShellBang TTY CommandSet
+    };
+
+    while (length($s)) {
+        my $val_defaulted;
+
+        # Clean off excess leading whitespace.
+        $s =~ s/^\s+// && next;
+
+        # Options are always all word characters, followed by a non-word
+        # separator.
+        if ($s !~ s/^(\w+)(\W?)//) {
+            print {$OUT} "Invalid option '$s'\n";
+            last;
+        }
+        my ( $opt, $sep ) = ( $1, $2 );
+
+        # Make sure that such an option exists.
+        my $matches = ( grep { /^\Q$opt/ && ( $option = $_ ) } @options )
+          || ( grep { /^\Q$opt/i && ( $option = $_ ) } @options );
+
+        unless ($matches) {
+            print {$OUT} "Unknown option '$opt'\n";
+            next;
+        }
+        if ($matches > 1) {
+            print {$OUT} "Ambiguous option '$opt'\n";
+            next;
+        }
+        my $val;
+
+        # '?' as separator means query, but must have whitespace after it.
+        if ( "?" eq $sep ) {
+            if ($s =~ /\A\S/) {
+                print {$OUT} "Option query '$opt?' followed by non-space '$s'\n" ;
+
+                last;
+            }
+
+            #&dump_option($opt);
+        } ## end if ("?" eq $sep)
+
+        # Separator is whitespace (or just a carriage return).
+        # They're going for a default, which we assume is 1.
+        elsif ( $sep !~ /\S/ ) {
+            $val_defaulted = 1;
+            $val           = "1";   #  this is an evil default; make 'em set it!
+        }
+
+        # Separator is =. Trying to set a value.
+        elsif ( $sep eq "=" ) {
+
+            # If quoted, extract a quoted string.
+            if ($s =~ s/ (["']) ( (?: \\. | (?! \1 ) [^\\] )* ) \1 //x) {
+                my $quote = $1;
+                ( $val = $2 ) =~ s/\\([$quote\\])/$1/g;
+            }
+
+            # Not quoted. Use the whole thing. Warn about 'option='.
+            else {
+                $s =~ s/^(\S*)//;
+                $val = $1;
+                print OUT qq(Option better cleared using $opt=""\n)
+                  unless length $val;
+            } ## end else [ if (s/ (["']) ( (?: \\. | (?! \1 ) [^\\] )* ) \1 //x)
+
+        } ## end elsif ($sep eq "=")
+
+        # "Quoted" with [], <>, or {}.
+        else {    #{ to "let some poor schmuck bounce on the % key in B<vi>."
+            my ($end) =
+              "\\" . substr( ")]>}$sep", index( "([<{", $sep ), 1 );    #}
+            $s =~ s/^(([^\\$end]|\\[\\$end])*)$end($|\s+)//
+              or print( $OUT "Unclosed option value '$opt$sep$_'\n" ), last;
+            ( $val = $1 ) =~ s/\\([\\$end])/$1/g;
+        } ## end else [ if ("?" eq $sep)
+
+        # Exclude non-booleans from getting set to 1 by default.
+        if ( $opt_needs_val{$option} && $val_defaulted ) {
+            my $cmd = ( $CommandSet eq '580' ) ? 'o' : 'O';
+            print {$OUT}
+"Option '$opt' is non-boolean.  Use '$cmd $option=VAL' to set, '$cmd $option?' to query\n";
+            next;
+        } ## end if ($opt_needs_val{$option...
+
+        # Save the option value.
+        $option{$option} = $val if defined $val;
+
+        # Load any module that this option requires.
+        if ( defined($optionRequire{$option}) && defined($val) ) {
+            eval qq{
+            local \$frame = 0;
+            local \$doret = -2;
+            require '$optionRequire{$option}';
+            1;
+            } || die $@   # XXX: shouldn't happen
+        }
+
+        # Set it.
+        # Stick it in the proper variable if it goes in a variable.
+        if (defined($optionVars{$option}) && defined($val)) {
+            ${ $optionVars{$option} } = $val;
+        }
+
+        # Call the appropriate sub if it gets set via sub.
+        if (defined($optionAction{$option})
+          && defined (&{ $optionAction{$option} })
+          && defined ($val))
+        {
+          &{ $optionAction{$option} }($val);
+        }
+
+        # Not initialization - echo the value we set it to.
+        dump_option($option) if ($OUT ne \*STDERR);
+    } ## end while (length)
+} ## end sub parse_options
+
+=head1 RESTART SUPPORT
+
+These routines are used to store (and restore) lists of items in environment
+variables during a restart.
+
+=head2 set_list
+
+Set_list packages up items to be stored in a set of environment variables
+(VAR_n, containing the number of items, and VAR_0, VAR_1, etc., containing
+the values). Values outside the standard ASCII charset are stored by encoding
+them as hexadecimal values.
+
+=cut
+
+sub set_list {
+    my ( $stem, @list ) = @_;
+    my $val;
+
+    # VAR_n: how many we have. Scalar assignment gets the number of items.
+    $ENV{"${stem}_n"} = @list;
+
+    # Grab each item in the list, escape the backslashes, encode the non-ASCII
+    # as hex, and then save in the appropriate VAR_0, VAR_1, etc.
+    for my $i ( 0 .. $#list ) {
+        $val = $list[$i];
+        $val =~ s/\\/\\\\/g;
+        $val =~ s/ ( (?[ [\000-\xFF] & [:^print:] ]) ) /
+                                                "\\0x" . unpack('H2',$1)/xaeg;
+        $ENV{"${stem}_$i"} = $val;
+    } ## end for $i (0 .. $#list)
+} ## end sub set_list
+
+=head2 get_list
+
+Reverse the set_list operation: grab VAR_n to see how many we should be getting
+back, and then pull VAR_0, VAR_1. etc. back out.
+
+=cut
+
+sub get_list {
+    my $stem = shift;
+    my @list;
+    my $n = delete $ENV{"${stem}_n"};
+    my $val;
+    for my $i ( 0 .. $n - 1 ) {
+        $val = delete $ENV{"${stem}_$i"};
+        $val =~ s/\\((\\)|0x(..))/ $2 ? $2 : pack('H2', $3) /ge;
+        push @list, $val;
+    }
+    @list;
+} ## end sub get_list
+
+=head1 MISCELLANEOUS SIGNAL AND I/O MANAGEMENT
+
+=head2 catch()
+
+The C<catch()> subroutine is the essence of fast and low-impact. We simply
+set an already-existing global scalar variable to a constant value. This
+avoids allocating any memory possibly in the middle of something that will
+get all confused if we do, particularly under I<unsafe signals>.
+
+=cut
+
+sub catch {
+    $signal = 1;
+    return;    # Put nothing on the stack - malloc/free land!
+}
+
+=head2 C<warn()>
+
+C<warn> emits a warning, by joining together its arguments and printing
+them, with couple of fillips.
+
+If the composited message I<doesn't> end with a newline, we automatically
+add C<$!> and a newline to the end of the message. The subroutine expects $OUT
+to be set to the filehandle to be used to output warnings; it makes no
+assumptions about what filehandles are available.
+
+=cut
+
+sub _db_warn {
+    my ($msg) = join( "", @_ );
+    $msg .= ": $!\n" unless $msg =~ /\n$/;
+    local $\ = '';
+    print $OUT $msg;
+} ## end sub warn
+
+*warn = \&_db_warn;
+
+=head1 INITIALIZATION TTY SUPPORT
+
+=head2 C<reset_IN_OUT>
+
+This routine handles restoring the debugger's input and output filehandles
+after we've tried and failed to move them elsewhere.  In addition, it assigns
+the debugger's output filehandle to $LINEINFO if it was already open there.
+
+=cut
+
+sub reset_IN_OUT {
+    my $switch_li = $LINEINFO eq $OUT;
+
+    # If there's a term and it's able to get a new tty, try to get one.
+    if ( $term and $term->Features->{newTTY} ) {
+        ( $IN, $OUT ) = ( shift, shift );
+        $term->newTTY( $IN, $OUT );
+    }
+
+    # This term can't get a new tty now. Better luck later.
+    elsif ($term) {
+        _db_warn("Too late to set IN/OUT filehandles, enabled on next 'R'!\n");
+    }
+
+    # Set the filehndles up as they were.
+    else {
+        ( $IN, $OUT ) = ( shift, shift );
+    }
+
+    # Unbuffer the output filehandle.
+    _autoflush($OUT);
+
+    # Point LINEINFO to the same output filehandle if it was there before.
+    $LINEINFO = $OUT if $switch_li;
+} ## end sub reset_IN_OUT
+
+=head1 OPTION SUPPORT ROUTINES
+
+The following routines are used to process some of the more complicated
+debugger options.
+
+=head2 C<TTY>
+
+Sets the input and output filehandles to the specified files or pipes.
+If the terminal supports switching, we go ahead and do it. If not, and
+there's already a terminal in place, we save the information to take effect
+on restart.
+
+If there's no terminal yet (for instance, during debugger initialization),
+we go ahead and set C<$console> and C<$tty> to the file indicated.
+
+=cut
+
+sub TTY {
+
+    if ( @_ and $term and $term->Features->{newTTY} ) {
+
+        # This terminal supports switching to a new TTY.
+        # Can be a list of two files, or on string containing both names,
+        # comma-separated.
+        # XXX Should this perhaps be an assignment from @_?
+        my ( $in, $out ) = shift;
+        if ( $in =~ /,/ ) {
+
+            # Split list apart if supplied.
+            ( $in, $out ) = split /,/, $in, 2;
+        }
+        else {
+
+            # Use the same file for both input and output.
+            $out = $in;
+        }
+
+        # Open file onto the debugger's filehandles, if you can.
+        open IN,  '<', $in or die "cannot open '$in' for read: $!";
+        open OUT, '>', $out or die "cannot open '$out' for write: $!";
+
+        # Swap to the new filehandles.
+        reset_IN_OUT( \*IN, \*OUT );
+
+        # Save the setting for later.
+        return $tty = $in;
+    } ## end if (@_ and $term and $term...
+
+    # Terminal doesn't support new TTY, or doesn't support readline.
+    # Can't do it now, try restarting.
+    if ($term and @_) {
+        _db_warn("Too late to set TTY, enabled on next 'R'!\n");
+    }
+
+    # Useful if done through PERLDB_OPTS:
+    $console = $tty = shift if @_;
+
+    # Return whatever the TTY is.
+    $tty or $console;
+} ## end sub TTY
+
+=head2 C<noTTY>
+
+Sets the C<$notty> global, controlling whether or not the debugger tries to
+get a terminal to read from. If called after a terminal is already in place,
+we save the value to use it if we're restarted.
+
+=cut
+
+sub noTTY {
+    if ($term) {
+        _db_warn("Too late to set noTTY, enabled on next 'R'!\n") if @_;
+    }
+    $notty = shift if @_;
+    $notty;
+} ## end sub noTTY
+
+=head2 C<ReadLine>
+
+Sets the C<$rl> option variable. If 0, we use C<Term::ReadLine::Stub>
+(essentially, no C<readline> processing on this I<terminal>). Otherwise, we
+use C<Term::ReadLine>. Can't be changed after a terminal's in place; we save
+the value in case a restart is done so we can change it then.
+
+=cut
+
+sub ReadLine {
+    if ($term) {
+        _db_warn("Too late to set ReadLine, enabled on next 'R'!\n") if @_;
+    }
+    $rl = shift if @_;
+    $rl;
+} ## end sub ReadLine
+
+=head2 C<RemotePort>
+
+Sets the port that the debugger will try to connect to when starting up.
+If the terminal's already been set up, we can't do it, but we remember the
+setting in case the user does a restart.
+
+=cut
+
+sub RemotePort {
+    if ($term) {
+        _db_warn("Too late to set RemotePort, enabled on next 'R'!\n") if @_;
+    }
+    $remoteport = shift if @_;
+    $remoteport;
+} ## end sub RemotePort
+
+=head2 C<tkRunning>
+
+Checks with the terminal to see if C<Tk> is running, and returns true or
+false. Returns false if the current terminal doesn't support C<readline>.
+
+=cut
+
+sub tkRunning {
+    if ( ${ $term->Features }{tkRunning} ) {
+        return $term->tkRunning(@_);
+    }
+    else {
+        local $\ = '';
+        print $OUT "tkRunning not supported by current ReadLine package.\n";
+        0;
+    }
+} ## end sub tkRunning
+
+=head2 C<NonStop>
+
+Sets nonstop mode. If a terminal's already been set up, it's too late; the
+debugger remembers the setting in case you restart, though.
+
+=cut
+
+sub NonStop {
+    if ($term) {
+        _db_warn("Too late to set up NonStop mode, enabled on next 'R'!\n")
+          if @_;
+    }
+    $runnonstop = shift if @_;
+    $runnonstop;
+} ## end sub NonStop
+
+sub DollarCaretP {
+    if ($term) {
+        _db_warn("Some flag changes could not take effect until next 'R'!\n")
+          if @_;
+    }
+    $^P = parse_DollarCaretP_flags(shift) if @_;
+    expand_DollarCaretP_flags($^P);
+}
+
+=head2 C<pager>
+
+Set up the C<$pager> variable. Adds a pipe to the front unless there's one
+there already.
+
+=cut
+
+sub pager {
+    if (@_) {
+        $pager = shift;
+        $pager = "|" . $pager unless $pager =~ /^(\+?\>|\|)/;
+    }
+    $pager;
+} ## end sub pager
+
+=head2 C<shellBang>
+
+Sets the shell escape command, and generates a printable copy to be used
+in the help.
+
+=cut
+
+sub shellBang {
+
+    # If we got an argument, meta-quote it, and add '\b' if it
+    # ends in a word character.
+    if (@_) {
+        $sh = quotemeta shift;
+        $sh .= "\\b" if $sh =~ /\w$/;
+    }
+
+    # Generate the printable version for the help:
+    $psh = $sh;    # copy it
+    $psh =~ s/\\b$//;        # Take off trailing \b if any
+    $psh =~ s/\\(.)/$1/g;    # De-escape
+    $psh;                    # return the printable version
+} ## end sub shellBang
+
+=head2 C<ornaments>
+
+If the terminal has its own ornaments, fetch them. Otherwise accept whatever
+was passed as the argument. (This means you can't override the terminal's
+ornaments.)
+
+=cut
+
+sub ornaments {
+    if ( defined $term ) {
+
+        # We don't want to show warning backtraces, but we do want die() ones.
+        local $warnLevel = 0;
+        local $dieLevel = 1;
+
+        # No ornaments if the terminal doesn't support them.
+        if (not $term->Features->{ornaments}) {
+            return '';
+        }
+
+        return (eval { $term->ornaments(@_) } || '');
+    }
+
+    # Use what was passed in if we can't determine it ourselves.
+    else {
+        $ornaments = shift;
+
+        return $ornaments;
+    }
+
+} ## end sub ornaments
+
+=head2 C<recallCommand>
+
+Sets the recall command, and builds a printable version which will appear in
+the help text.
+
+=cut
+
+sub recallCommand {
+
+    # If there is input, metaquote it. Add '\b' if it ends with a word
+    # character.
+    if (@_) {
+        $rc = quotemeta shift;
+        $rc .= "\\b" if $rc =~ /\w$/;
+    }
+
+    # Build it into a printable version.
+    $prc = $rc;              # Copy it
+    $prc =~ s/\\b$//;        # Remove trailing \b
+    $prc =~ s/\\(.)/$1/g;    # Remove escapes
+    return $prc;             # Return the printable version
+} ## end sub recallCommand
+
+=head2 C<LineInfo> - where the line number information goes
+
+Called with no arguments, returns the file or pipe that line info should go to.
+
+Called with an argument (a file or a pipe), it opens that onto the
+C<LINEINFO> filehandle, unbuffers the filehandle, and then returns the
+file or pipe again to the caller.
+
+=cut
+
+sub LineInfo {
+    if (@_) {
+        $lineinfo = shift;
+
+        #  If this is a valid "thing to be opened for output", tack a
+        # '>' onto the front.
+        my $stream = ( $lineinfo =~ /^(\+?\>|\|)/ ) ? $lineinfo : ">$lineinfo";
+
+        # If this is a pipe, the stream points to a client editor.
+        $client_editor = ( $stream =~ /^\|/ );
+
+        my $new_lineinfo_fh;
+        # Open it up and unbuffer it.
+        open ($new_lineinfo_fh , $stream )
+            or _db_warn("Cannot open '$stream' for write");
+        $LINEINFO = $new_lineinfo_fh;
+        _autoflush($LINEINFO);
+    }
+
+    return $lineinfo;
+} ## end sub LineInfo
+
+=head1 COMMAND SUPPORT ROUTINES
+
+These subroutines provide functionality for various commands.
+
+=head2 C<list_modules>
+
+For the C<M> command: list modules loaded and their versions.
+Essentially just runs through the keys in %INC, picks each package's
+C<$VERSION> variable, gets the file name, and formats the information
+for output.
+
+=cut
+
+sub list_modules {    # versions
+    my %version;
+    my $file;
+
+    # keys are the "as-loaded" name, values are the fully-qualified path
+    # to the file itself.
+    for ( keys %INC ) {
+        $file = $_;                                # get the module name
+        s,\.p[lm]$,,i;                             # remove '.pl' or '.pm'
+        s,/,::,g;                                  # change '/' to '::'
+        s/^perl5db$/DB/;                           # Special case: debugger
+                                                   # moves to package DB
+        s/^Term::ReadLine::readline$/readline/;    # simplify readline
+
+        # If the package has a $VERSION package global (as all good packages
+        # should!) decode it and save as partial message.
+        my $pkg_version = do { no strict 'refs'; ${ $_ . '::VERSION' } };
+        if ( defined $pkg_version ) {
+            $version{$file} = "$pkg_version from ";
+        }
+
+        # Finish up the message with the file the package came from.
+        $version{$file} .= $INC{$file};
+    } ## end for (keys %INC)
+

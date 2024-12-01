@@ -1,0 +1,1000 @@
+
+
+def scangitpatch(lr, firstline):
+    """
+    Git patches can emit:
+    - rename a to b
+    - change b
+    - copy a to c
+    - change c
+
+    We cannot apply this sequence as-is, the renamed 'a' could not be
+    found for it would have been renamed already. And we cannot copy
+    from 'b' instead because 'b' would have been changed already. So
+    we scan the git patch for copy and rename commands so we can
+    perform the copies ahead of time.
+    """
+    pos = 0
+    try:
+        pos = lr.fp.tell()
+        fp = lr.fp
+    except IOError:
+        fp = stringio(lr.fp.read())
+    gitlr = linereader(fp)
+    gitlr.push(firstline)
+    gitpatches = readgitpatch(gitlr)
+    fp.seek(pos)
+    return gitpatches
+
+
+def iterhunks(fp):
+    """Read a patch and yield the following events:
+    - ("file", afile, bfile, firsthunk): select a new target file.
+    - ("hunk", hunk): a new hunk is ready to be applied, follows a
+    "file" event.
+    - ("git", gitchanges): current diff is in git format, gitchanges
+    maps filenames to gitpatch records. Unique event.
+    """
+    afile = b""
+    bfile = b""
+    state = None
+    hunknum = 0
+    emitfile = newfile = False
+    gitpatches = None
+
+    # our states
+    BFILE = 1
+    context = None
+    lr = linereader(fp)
+
+    for x in iter(lr.readline, b''):
+        if state == BFILE and (
+            (not context and x.startswith(b'@'))
+            or (context is not False and x.startswith(b'***************'))
+            or x.startswith(b'GIT binary patch')
+        ):
+            gp = None
+            if gitpatches and gitpatches[-1].ispatching(afile, bfile):
+                gp = gitpatches.pop()
+            if x.startswith(b'GIT binary patch'):
+                h = binhunk(lr, gp.path)
+            else:
+                if context is None and x.startswith(b'***************'):
+                    context = True
+                h = hunk(x, hunknum + 1, lr, context)
+            hunknum += 1
+            if emitfile:
+                emitfile = False
+                yield b'file', (afile, bfile, h, gp and gp.copy() or None)
+            yield b'hunk', h
+        elif x.startswith(b'diff --git a/'):
+            m = gitre.match(x.rstrip(b'\r\n'))
+            if not m:
+                continue
+            if gitpatches is None:
+                # scan whole input for git metadata
+                gitpatches = scangitpatch(lr, x)
+                yield b'git', [
+                    g.copy() for g in gitpatches if g.op in (b'COPY', b'RENAME')
+                ]
+                gitpatches.reverse()
+            afile = b'a/' + m.group(1)
+            bfile = b'b/' + m.group(2)
+            while gitpatches and not gitpatches[-1].ispatching(afile, bfile):
+                gp = gitpatches.pop()
+                yield b'file', (
+                    b'a/' + gp.path,
+                    b'b/' + gp.path,
+                    None,
+                    gp.copy(),
+                )
+            if not gitpatches:
+                raise PatchParseError(
+                    _(b'failed to synchronize metadata for "%s"') % afile[2:]
+                )
+            newfile = True
+        elif x.startswith(b'---'):
+            # check for a unified diff
+            l2 = lr.readline()
+            if not l2.startswith(b'+++'):
+                lr.push(l2)
+                continue
+            newfile = True
+            context = False
+            afile = parsefilename(x)
+            bfile = parsefilename(l2)
+        elif x.startswith(b'***'):
+            # check for a context diff
+            l2 = lr.readline()
+            if not l2.startswith(b'---'):
+                lr.push(l2)
+                continue
+            l3 = lr.readline()
+            lr.push(l3)
+            if not l3.startswith(b"***************"):
+                lr.push(l2)
+                continue
+            newfile = True
+            context = True
+            afile = parsefilename(x)
+            bfile = parsefilename(l2)
+
+        if newfile:
+            newfile = False
+            emitfile = True
+            state = BFILE
+            hunknum = 0
+
+    while gitpatches:
+        gp = gitpatches.pop()
+        yield b'file', (b'a/' + gp.path, b'b/' + gp.path, None, gp.copy())
+
+
+def applybindelta(binchunk, data):
+    """Apply a binary delta hunk
+    The algorithm used is the algorithm from git's patch-delta.c
+    """
+
+    def deltahead(binchunk):
+        i = 0
+        for c in pycompat.bytestr(binchunk):
+            i += 1
+            if not (ord(c) & 0x80):
+                return i
+        return i
+
+    out = b""
+    s = deltahead(binchunk)
+    binchunk = binchunk[s:]
+    s = deltahead(binchunk)
+    binchunk = binchunk[s:]
+    i = 0
+    while i < len(binchunk):
+        cmd = ord(binchunk[i : i + 1])
+        i += 1
+        if cmd & 0x80:
+            offset = 0
+            size = 0
+            if cmd & 0x01:
+                offset = ord(binchunk[i : i + 1])
+                i += 1
+            if cmd & 0x02:
+                offset |= ord(binchunk[i : i + 1]) << 8
+                i += 1
+            if cmd & 0x04:
+                offset |= ord(binchunk[i : i + 1]) << 16
+                i += 1
+            if cmd & 0x08:
+                offset |= ord(binchunk[i : i + 1]) << 24
+                i += 1
+            if cmd & 0x10:
+                size = ord(binchunk[i : i + 1])
+                i += 1
+            if cmd & 0x20:
+                size |= ord(binchunk[i : i + 1]) << 8
+                i += 1
+            if cmd & 0x40:
+                size |= ord(binchunk[i : i + 1]) << 16
+                i += 1
+            if size == 0:
+                size = 0x10000
+            offset_end = offset + size
+            out += data[offset:offset_end]
+        elif cmd != 0:
+            offset_end = i + cmd
+            out += binchunk[i:offset_end]
+            i += cmd
+        else:
+            raise PatchApplicationError(_(b'unexpected delta opcode 0'))
+    return out
+
+
+def applydiff(ui, fp, backend, store, strip=1, prefix=b'', eolmode=b'strict'):
+    """Reads a patch from fp and tries to apply it.
+
+    Returns 0 for a clean patch, -1 if any rejects were found and 1 if
+    there was any fuzz.
+
+    If 'eolmode' is 'strict', the patch content and patched file are
+    read in binary mode. Otherwise, line endings are ignored when
+    patching then normalized according to 'eolmode'.
+    """
+    return _applydiff(
+        ui,
+        fp,
+        patchfile,
+        backend,
+        store,
+        strip=strip,
+        prefix=prefix,
+        eolmode=eolmode,
+    )
+
+
+def _canonprefix(repo, prefix):
+    if prefix:
+        prefix = pathutil.canonpath(repo.root, repo.getcwd(), prefix)
+        if prefix != b'':
+            prefix += b'/'
+    return prefix
+
+
+def _applydiff(
+    ui, fp, patcher, backend, store, strip=1, prefix=b'', eolmode=b'strict'
+):
+    prefix = _canonprefix(backend.repo, prefix)
+
+    def pstrip(p):
+        return pathtransform(p, strip - 1, prefix)[1]
+
+    rejects = 0
+    err = 0
+    current_file = None
+
+    for state, values in iterhunks(fp):
+        if state == b'hunk':
+            if not current_file:
+                continue
+            ret = current_file.apply(values)
+            if ret > 0:
+                err = 1
+        elif state == b'file':
+            if current_file:
+                rejects += current_file.close()
+                current_file = None
+            afile, bfile, first_hunk, gp = values
+            if gp:
+                gp.path = pstrip(gp.path)
+                if gp.oldpath:
+                    gp.oldpath = pstrip(gp.oldpath)
+            else:
+                gp = makepatchmeta(
+                    backend, afile, bfile, first_hunk, strip, prefix
+                )
+            if gp.op == b'RENAME':
+                backend.unlink(gp.oldpath)
+            if not first_hunk:
+                if gp.op == b'DELETE':
+                    backend.unlink(gp.path)
+                    continue
+                data, mode = None, None
+                if gp.op in (b'RENAME', b'COPY'):
+                    data, mode = store.getfile(gp.oldpath)[:2]
+                    if data is None:
+                        # This means that the old path does not exist
+                        raise PatchApplicationError(
+                            _(b"source file '%s' does not exist") % gp.oldpath
+                        )
+                if gp.mode:
+                    mode = gp.mode
+                    if gp.op == b'ADD':
+                        # Added files without content have no hunk and
+                        # must be created
+                        data = b''
+                if data or mode:
+                    if gp.op in (b'ADD', b'RENAME', b'COPY') and backend.exists(
+                        gp.path
+                    ):
+                        raise PatchApplicationError(
+                            _(
+                                b"cannot create %s: destination "
+                                b"already exists"
+                            )
+                            % gp.path
+                        )
+                    backend.setfile(gp.path, data, mode, gp.oldpath)
+                continue
+            try:
+                current_file = patcher(ui, gp, backend, store, eolmode=eolmode)
+            except PatchError as inst:
+                ui.warn(stringutil.forcebytestr(inst) + b'\n')
+                current_file = None
+                rejects += 1
+                continue
+        elif state == b'git':
+            for gp in values:
+                path = pstrip(gp.oldpath)
+                data, mode = backend.getfile(path)
+                if data is None:
+                    # The error ignored here will trigger a getfile()
+                    # error in a place more appropriate for error
+                    # handling, and will not interrupt the patching
+                    # process.
+                    pass
+                else:
+                    store.setfile(path, data, mode)
+        else:
+            raise error.Abort(_(b'unsupported parser state: %s') % state)
+
+    if current_file:
+        rejects += current_file.close()
+
+    if rejects:
+        return -1
+    return err
+
+
+def _externalpatch(ui, repo, patcher, patchname, strip, files, similarity):
+    """use <patcher> to apply <patchname> to the working directory.
+    returns whether patch was applied with fuzz factor."""
+
+    fuzz = False
+    args = []
+    cwd = repo.root
+    if cwd:
+        args.append(b'-d %s' % procutil.shellquote(cwd))
+    cmd = b'%s %s -p%d < %s' % (
+        patcher,
+        b' '.join(args),
+        strip,
+        procutil.shellquote(patchname),
+    )
+    ui.debug(b'Using external patch tool: %s\n' % cmd)
+    fp = procutil.popen(cmd, b'rb')
+    try:
+        for line in fp:
+            line = line.rstrip()
+            ui.note(line + b'\n')
+            if line.startswith(b'patching file '):
+                pf = util.parsepatchoutput(line)
+                printed_file = False
+                files.add(pf)
+            elif line.find(b'with fuzz') >= 0:
+                fuzz = True
+                if not printed_file:
+                    ui.warn(pf + b'\n')
+                    printed_file = True
+                ui.warn(line + b'\n')
+            elif line.find(b'saving rejects to file') >= 0:
+                ui.warn(line + b'\n')
+            elif line.find(b'FAILED') >= 0:
+                if not printed_file:
+                    ui.warn(pf + b'\n')
+                    printed_file = True
+                ui.warn(line + b'\n')
+    finally:
+        if files:
+            scmutil.marktouched(repo, files, similarity)
+    code = fp.close()
+    if code:
+        raise PatchApplicationError(
+            _(b"patch command failed: %s") % procutil.explainexit(code)
+        )
+    return fuzz
+
+
+def patchbackend(
+    ui, backend, patchobj, strip, prefix, files=None, eolmode=b'strict'
+):
+    if files is None:
+        files = set()
+    if eolmode is None:
+        eolmode = ui.config(b'patch', b'eol')
+    if eolmode.lower() not in eolmodes:
+        raise error.Abort(_(b'unsupported line endings type: %s') % eolmode)
+    eolmode = eolmode.lower()
+
+    store = filestore()
+    try:
+        fp = open(patchobj, b'rb')
+    except TypeError:
+        fp = patchobj
+    try:
+        ret = applydiff(
+            ui, fp, backend, store, strip=strip, prefix=prefix, eolmode=eolmode
+        )
+    finally:
+        if fp != patchobj:
+            fp.close()
+        files.update(backend.close())
+        store.close()
+    if ret < 0:
+        raise PatchApplicationError(_(b'patch failed to apply'))
+    return ret > 0
+
+
+def internalpatch(
+    ui,
+    repo,
+    patchobj,
+    strip,
+    prefix=b'',
+    files=None,
+    eolmode=b'strict',
+    similarity=0,
+):
+    """use builtin patch to apply <patchobj> to the working directory.
+    returns whether patch was applied with fuzz factor."""
+    backend = workingbackend(ui, repo, similarity)
+    return patchbackend(ui, backend, patchobj, strip, prefix, files, eolmode)
+
+
+def patchrepo(
+    ui, repo, ctx, store, patchobj, strip, prefix, files=None, eolmode=b'strict'
+):
+    backend = repobackend(ui, repo, ctx, store)
+    return patchbackend(ui, backend, patchobj, strip, prefix, files, eolmode)
+
+
+def patch(
+    ui,
+    repo,
+    patchname,
+    strip=1,
+    prefix=b'',
+    files=None,
+    eolmode=b'strict',
+    similarity=0,
+):
+    """Apply <patchname> to the working directory.
+
+    'eolmode' specifies how end of lines should be handled. It can be:
+    - 'strict': inputs are read in binary mode, EOLs are preserved
+    - 'crlf': EOLs are ignored when patching and reset to CRLF
+    - 'lf': EOLs are ignored when patching and reset to LF
+    - None: get it from user settings, default to 'strict'
+    'eolmode' is ignored when using an external patcher program.
+
+    Returns whether patch was applied with fuzz factor.
+    """
+    patcher = ui.config(b'ui', b'patch')
+    if files is None:
+        files = set()
+    if patcher:
+        return _externalpatch(
+            ui, repo, patcher, patchname, strip, files, similarity
+        )
+    return internalpatch(
+        ui, repo, patchname, strip, prefix, files, eolmode, similarity
+    )
+
+
+def changedfiles(ui, repo, patchpath, strip=1, prefix=b''):
+    backend = fsbackend(ui, repo.root)
+    prefix = _canonprefix(repo, prefix)
+    with open(patchpath, b'rb') as fp:
+        changed = set()
+        for state, values in iterhunks(fp):
+            if state == b'file':
+                afile, bfile, first_hunk, gp = values
+                if gp:
+                    gp.path = pathtransform(gp.path, strip - 1, prefix)[1]
+                    if gp.oldpath:
+                        gp.oldpath = pathtransform(
+                            gp.oldpath, strip - 1, prefix
+                        )[1]
+                else:
+                    gp = makepatchmeta(
+                        backend, afile, bfile, first_hunk, strip, prefix
+                    )
+                changed.add(gp.path)
+                if gp.op == b'RENAME':
+                    changed.add(gp.oldpath)
+            elif state not in (b'hunk', b'git'):
+                raise error.Abort(_(b'unsupported parser state: %s') % state)
+        return changed
+
+
+class GitDiffRequired(Exception):
+    pass
+
+
+diffopts = diffutil.diffallopts
+diffallopts = diffutil.diffallopts
+difffeatureopts = diffutil.difffeatureopts
+
+
+def diff(
+    repo,
+    node1=None,
+    node2=None,
+    match=None,
+    changes=None,
+    opts=None,
+    losedatafn=None,
+    pathfn=None,
+    copy=None,
+    copysourcematch=None,
+    hunksfilterfn=None,
+):
+    """yields diff of changes to files between two nodes, or node and
+    working directory.
+
+    if node1 is None, use first dirstate parent instead.
+    if node2 is None, compare node1 with working directory.
+
+    losedatafn(**kwarg) is a callable run when opts.upgrade=True and
+    every time some change cannot be represented with the current
+    patch format. Return False to upgrade to git patch format, True to
+    accept the loss or raise an exception to abort the diff. It is
+    called with the name of current file being diffed as 'fn'. If set
+    to None, patches will always be upgraded to git format when
+    necessary.
+
+    prefix is a filename prefix that is prepended to all filenames on
+    display (used for subrepos).
+
+    relroot, if not empty, must be normalized with a trailing /. Any match
+    patterns that fall outside it will be ignored.
+
+    copy, if not empty, should contain mappings {dst@y: src@x} of copy
+    information.
+
+    if copysourcematch is not None, then copy sources will be filtered by this
+    matcher
+
+    hunksfilterfn, if not None, should be a function taking a filectx and
+    hunks generator that may yield filtered hunks.
+    """
+    if not node1 and not node2:
+        node1 = repo.dirstate.p1()
+
+    ctx1 = repo[node1]
+    ctx2 = repo[node2]
+
+    for fctx1, fctx2, hdr, hunks in diffhunks(
+        repo,
+        ctx1=ctx1,
+        ctx2=ctx2,
+        match=match,
+        changes=changes,
+        opts=opts,
+        losedatafn=losedatafn,
+        pathfn=pathfn,
+        copy=copy,
+        copysourcematch=copysourcematch,
+    ):
+        if hunksfilterfn is not None:
+            # If the file has been removed, fctx2 is None; but this should
+            # not occur here since we catch removed files early in
+            # logcmdutil.getlinerangerevs() for 'hg log -L'.
+            assert (
+                fctx2 is not None
+            ), b'fctx2 unexpectly None in diff hunks filtering'
+            hunks = hunksfilterfn(fctx2, hunks)
+        text = b''.join(b''.join(hlines) for hrange, hlines in hunks)
+        if hdr and (text or len(hdr) > 1):
+            yield b'\n'.join(hdr) + b'\n'
+        if text:
+            yield text
+
+
+def diffhunks(
+    repo,
+    ctx1,
+    ctx2,
+    match=None,
+    changes=None,
+    opts=None,
+    losedatafn=None,
+    pathfn=None,
+    copy=None,
+    copysourcematch=None,
+):
+    """Yield diff of changes to files in the form of (`header`, `hunks`) tuples
+    where `header` is a list of diff headers and `hunks` is an iterable of
+    (`hunkrange`, `hunklines`) tuples.
+
+    See diff() for the meaning of parameters.
+    """
+
+    if opts is None:
+        opts = mdiff.defaultopts
+
+    def lrugetfilectx():
+        cache = {}
+        order = collections.deque()
+
+        def getfilectx(f, ctx):
+            fctx = ctx.filectx(f, filelog=cache.get(f))
+            if f not in cache:
+                if len(cache) > 20:
+                    del cache[order.popleft()]
+                cache[f] = fctx.filelog()
+            else:
+                order.remove(f)
+            order.append(f)
+            return fctx
+
+        return getfilectx
+
+    getfilectx = lrugetfilectx()
+
+    if not changes:
+        changes = ctx1.status(ctx2, match=match)
+    if isinstance(changes, list):
+        modified, added, removed = changes[:3]
+    else:
+        modified, added, removed = (
+            changes.modified,
+            changes.added,
+            changes.removed,
+        )
+
+    if not modified and not added and not removed:
+        return []
+
+    if repo.ui.debugflag:
+        hexfunc = hex
+    else:
+        hexfunc = short
+    revs = [hexfunc(node) for node in [ctx1.node(), ctx2.node()] if node]
+
+    if copy is None:
+        copy = {}
+        if opts.git or opts.upgrade:
+            copy = copies.pathcopies(ctx1, ctx2, match=match)
+
+    if copysourcematch:
+        # filter out copies where source side isn't inside the matcher
+        # (copies.pathcopies() already filtered out the destination)
+        copy = {dst: src for dst, src in copy.items() if copysourcematch(src)}
+
+    modifiedset = set(modified)
+    addedset = set(added)
+    removedset = set(removed)
+    for f in modified:
+        if f not in ctx1:
+            # Fix up added, since merged-in additions appear as
+            # modifications during merges
+            modifiedset.remove(f)
+            addedset.add(f)
+    for f in removed:
+        if f not in ctx1:
+            # Merged-in additions that are then removed are reported as removed.
+            # They are not in ctx1, so We don't want to show them in the diff.
+            removedset.remove(f)
+    modified = sorted(modifiedset)
+    added = sorted(addedset)
+    removed = sorted(removedset)
+    for dst, src in list(copy.items()):
+        if src not in ctx1:
+            # Files merged in during a merge and then copied/renamed are
+            # reported as copies. We want to show them in the diff as additions.
+            del copy[dst]
+
+    prefetchmatch = scmutil.matchfiles(
+        repo, list(modifiedset | addedset | removedset)
+    )
+    revmatches = [
+        (ctx1.rev(), prefetchmatch),
+        (ctx2.rev(), prefetchmatch),
+    ]
+    scmutil.prefetchfiles(repo, revmatches)
+
+    def difffn(opts, losedata):
+        return trydiff(
+            repo,
+            revs,
+            ctx1,
+            ctx2,
+            modified,
+            added,
+            removed,
+            copy,
+            getfilectx,
+            opts,
+            losedata,
+            pathfn,
+        )
+
+    if opts.upgrade and not opts.git:
+        try:
+
+            def losedata(fn):
+                if not losedatafn or not losedatafn(fn=fn):
+                    raise GitDiffRequired
+
+            # Buffer the whole output until we are sure it can be generated
+            return list(difffn(opts.copy(git=False), losedata))
+        except GitDiffRequired:
+            return difffn(opts.copy(git=True), None)
+    else:
+        return difffn(opts, None)
+
+
+def diffsinglehunk(hunklines):
+    """yield tokens for a list of lines in a single hunk"""
+    for line in hunklines:
+        # chomp
+        chompline = line.rstrip(b'\r\n')
+        # highlight tabs and trailing whitespace
+        stripline = chompline.rstrip()
+        if line.startswith(b'-'):
+            label = b'diff.deleted'
+        elif line.startswith(b'+'):
+            label = b'diff.inserted'
+        else:
+            raise error.ProgrammingError(b'unexpected hunk line: %s' % line)
+        for token in tabsplitter.findall(stripline):
+            if token.startswith(b'\t'):
+                yield (token, b'diff.tab')
+            else:
+                yield (token, label)
+
+        if chompline != stripline:
+            yield (chompline[len(stripline) :], b'diff.trailingwhitespace')
+        if chompline != line:
+            yield (line[len(chompline) :], b'')
+
+
+def diffsinglehunkinline(hunklines):
+    """yield tokens for a list of lines in a single hunk, with inline colors"""
+    # prepare deleted, and inserted content
+    a = bytearray()
+    b = bytearray()
+    for line in hunklines:
+        if line[0:1] == b'-':
+            a += line[1:]
+        elif line[0:1] == b'+':
+            b += line[1:]
+        else:
+            raise error.ProgrammingError(b'unexpected hunk line: %s' % line)
+    # fast path: if either side is empty, use diffsinglehunk
+    if not a or not b:
+        for t in diffsinglehunk(hunklines):
+            yield t
+        return
+    # re-split the content into words
+    al = wordsplitter.findall(bytes(a))
+    bl = wordsplitter.findall(bytes(b))
+    # re-arrange the words to lines since the diff algorithm is line-based
+    aln = [s if s == b'\n' else s + b'\n' for s in al]
+    bln = [s if s == b'\n' else s + b'\n' for s in bl]
+    an = b''.join(aln)
+    bn = b''.join(bln)
+    # run the diff algorithm, prepare atokens and btokens
+    atokens = []
+    btokens = []
+    blocks = mdiff.allblocks(an, bn, lines1=aln, lines2=bln)
+    for (a1, a2, b1, b2), btype in blocks:
+        changed = btype == b'!'
+        for token in mdiff.splitnewlines(b''.join(al[a1:a2])):
+            atokens.append((changed, token))
+        for token in mdiff.splitnewlines(b''.join(bl[b1:b2])):
+            btokens.append((changed, token))
+
+    # yield deleted tokens, then inserted ones
+    for prefix, label, tokens in [
+        (b'-', b'diff.deleted', atokens),
+        (b'+', b'diff.inserted', btokens),
+    ]:
+        nextisnewline = True
+        for changed, token in tokens:
+            if nextisnewline:
+                yield (prefix, label)
+                nextisnewline = False
+            # special handling line end
+            isendofline = token.endswith(b'\n')
+            if isendofline:
+                chomp = token[:-1]  # chomp
+                if chomp.endswith(b'\r'):
+                    chomp = chomp[:-1]
+                endofline = token[len(chomp) :]
+                token = chomp.rstrip()  # detect spaces at the end
+                endspaces = chomp[len(token) :]
+            # scan tabs
+            for maybetab in tabsplitter.findall(token):
+                if b'\t' == maybetab[0:1]:
+                    currentlabel = b'diff.tab'
+                else:
+                    if changed:
+                        currentlabel = label + b'.changed'
+                    else:
+                        currentlabel = label + b'.unchanged'
+                yield (maybetab, currentlabel)
+            if isendofline:
+                if endspaces:
+                    yield (endspaces, b'diff.trailingwhitespace')
+                yield (endofline, b'')
+                nextisnewline = True
+
+
+def difflabel(func, *args, **kw):
+    '''yields 2-tuples of (output, label) based on the output of func()'''
+    if kw.get('opts') and kw['opts'].worddiff:
+        dodiffhunk = diffsinglehunkinline
+    else:
+        dodiffhunk = diffsinglehunk
+    headprefixes = [
+        (b'diff', b'diff.diffline'),
+        (b'copy', b'diff.extended'),
+        (b'rename', b'diff.extended'),
+        (b'old', b'diff.extended'),
+        (b'new', b'diff.extended'),
+        (b'deleted', b'diff.extended'),
+        (b'index', b'diff.extended'),
+        (b'similarity', b'diff.extended'),
+        (b'---', b'diff.file_a'),
+        (b'+++', b'diff.file_b'),
+    ]
+    textprefixes = [
+        (b'@', b'diff.hunk'),
+        # - and + are handled by diffsinglehunk
+    ]
+    head = False
+
+    # buffers a hunk, i.e. adjacent "-", "+" lines without other changes.
+    hunkbuffer = []
+
+    def consumehunkbuffer():
+        if hunkbuffer:
+            for token in dodiffhunk(hunkbuffer):
+                yield token
+            hunkbuffer[:] = []
+
+    for chunk in func(*args, **kw):
+        lines = chunk.split(b'\n')
+        linecount = len(lines)
+        for i, line in enumerate(lines):
+            if head:
+                if line.startswith(b'@'):
+                    head = False
+            else:
+                if line and not line.startswith(
+                    (b' ', b'+', b'-', b'@', b'\\')
+                ):
+                    head = True
+            diffline = False
+            if not head and line and line.startswith((b'+', b'-')):
+                diffline = True
+
+            prefixes = textprefixes
+            if head:
+                prefixes = headprefixes
+            if diffline:
+                # buffered
+                bufferedline = line
+                if i + 1 < linecount:
+                    bufferedline += b"\n"
+                hunkbuffer.append(bufferedline)
+            else:
+                # unbuffered
+                for token in consumehunkbuffer():
+                    yield token
+                stripline = line.rstrip()
+                for prefix, label in prefixes:
+                    if stripline.startswith(prefix):
+                        yield (stripline, label)
+                        if line != stripline:
+                            yield (
+                                line[len(stripline) :],
+                                b'diff.trailingwhitespace',
+                            )
+                        break
+                else:
+                    yield (line, b'')
+                if i + 1 < linecount:
+                    yield (b'\n', b'')
+        for token in consumehunkbuffer():
+            yield token
+
+
+def diffui(*args, **kw):
+    '''like diff(), but yields 2-tuples of (output, label) for ui.write()'''
+    return difflabel(diff, *args, **kw)
+
+
+def _filepairs(modified, added, removed, copy, opts):
+    """generates tuples (f1, f2, copyop), where f1 is the name of the file
+    before and f2 is the the name after. For added files, f1 will be None,
+    and for removed files, f2 will be None. copyop may be set to None, 'copy'
+    or 'rename' (the latter two only if opts.git is set)."""
+    gone = set()
+
+    copyto = {v: k for k, v in copy.items()}
+
+    addedset, removedset = set(added), set(removed)
+
+    for f in sorted(modified + added + removed):
+        copyop = None
+        f1, f2 = f, f
+        if f in addedset:
+            f1 = None
+            if f in copy:
+                if opts.git:
+                    f1 = copy[f]
+                    if f1 in removedset and f1 not in gone:
+                        copyop = b'rename'
+                        gone.add(f1)
+                    else:
+                        copyop = b'copy'
+        elif f in removedset:
+            f2 = None
+            if opts.git:
+                # have we already reported a copy above?
+                if (
+                    f in copyto
+                    and copyto[f] in addedset
+                    and copy[copyto[f]] == f
+                ):
+                    continue
+        yield f1, f2, copyop
+
+
+def _gitindex(text):
+    if not text:
+        text = b""
+    l = len(text)
+    s = hashutil.sha1(b'blob %d\0' % l)
+    s.update(text)
+    return hex(s.digest())
+
+
+_gitmode = {b'l': b'120000', b'x': b'100755', b'': b'100644'}
+
+
+def trydiff(
+    repo,
+    revs,
+    ctx1,
+    ctx2,
+    modified,
+    added,
+    removed,
+    copy,
+    getfilectx,
+    opts,
+    losedatafn,
+    pathfn,
+):
+    """given input data, generate a diff and yield it in blocks
+
+    If generating a diff would lose data like flags or binary data and
+    losedatafn is not None, it will be called.
+
+    pathfn is applied to every path in the diff output.
+    """
+
+    if opts.noprefix:
+        aprefix = bprefix = b''
+    else:
+        aprefix = b'a/'
+        bprefix = b'b/'
+
+    def diffline(f, revs):
+        revinfo = b' '.join([b"-r %s" % rev for rev in revs])
+        return b'diff %s %s' % (revinfo, f)
+
+    def isempty(fctx):
+        return fctx is None or fctx.size() == 0
+
+    date1 = dateutil.datestr(ctx1.date())
+    date2 = dateutil.datestr(ctx2.date())
+
+    if not pathfn:
+        pathfn = lambda f: f
+
+    for f1, f2, copyop in _filepairs(modified, added, removed, copy, opts):
+        content1 = None
+        content2 = None
+        fctx1 = None
+        fctx2 = None
+        flag1 = None
+        flag2 = None
+        if f1:
+            fctx1 = getfilectx(f1, ctx1)
+            if opts.git or losedatafn:
+                flag1 = ctx1.flags(f1)
+        if f2:
+            fctx2 = getfilectx(f2, ctx2)
+            if opts.git or losedatafn:
+                flag2 = ctx2.flags(f2)
+        # if binary is True, output "summary" or "base85", but not "text diff"
+        if opts.text:
+            binary = False
+        else:
+            binary = any(f.isbinary() for f in [fctx1, fctx2] if f is not None)
+
+        if losedatafn and not opts.git:
+            if (
+                binary
+                or
+                # copy/rename
+                f2 in copy
+                or
+                # empty file creation
+                (not f1 and isempty(fctx2))
+                or
+                # empty file deletion
+                (isempty(fctx1) and not f2)

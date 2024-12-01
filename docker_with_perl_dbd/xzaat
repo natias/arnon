@@ -1,0 +1,1000 @@
+
+    @staticmethod
+    def _create_cb_wrapper(callback, /, *args, **kwds):
+        def _exit_wrapper(exc_type, exc, tb):
+            callback(*args, **kwds)
+        return _exit_wrapper
+
+    def __init__(self):
+        self._exit_callbacks = deque()
+
+    def pop_all(self):
+        """Preserve the context stack by transferring it to a new instance."""
+        new_stack = type(self)()
+        new_stack._exit_callbacks = self._exit_callbacks
+        self._exit_callbacks = deque()
+        return new_stack
+
+    def push(self, exit):
+        """Registers a callback with the standard __exit__ method signature.
+
+        Can suppress exceptions the same way __exit__ method can.
+        Also accepts any object with an __exit__ method (registering a call
+        to the method instead of the object itself).
+        """
+        # We use an unbound method rather than a bound method to follow
+        # the standard lookup behaviour for special methods.
+        _cb_type = type(exit)
+
+        try:
+            exit_method = _cb_type.__exit__
+        except AttributeError:
+            # Not a context manager, so assume it's a callable.
+            self._push_exit_callback(exit)
+        else:
+            self._push_cm_exit(exit, exit_method)
+        return exit  # Allow use as a decorator.
+
+    def enter_context(self, cm):
+        """Enters the supplied context manager.
+
+        If successful, also pushes its __exit__ method as a callback and
+        returns the result of the __enter__ method.
+        """
+        # We look up the special methods on the type to match the with
+        # statement.
+        cls = type(cm)
+        try:
+            _enter = cls.__enter__
+            _exit = cls.__exit__
+        except AttributeError:
+            raise TypeError(f"'{cls.__module__}.{cls.__qualname__}' object does "
+                            f"not support the context manager protocol") from None
+        result = _enter(cm)
+        self._push_cm_exit(cm, _exit)
+        return result
+
+    def callback(self, callback, /, *args, **kwds):
+        """Registers an arbitrary callback and arguments.
+
+        Cannot suppress exceptions.
+        """
+        _exit_wrapper = self._create_cb_wrapper(callback, *args, **kwds)
+
+        # We changed the signature, so using @wraps is not appropriate, but
+        # setting __wrapped__ may still help with introspection.
+        _exit_wrapper.__wrapped__ = callback
+        self._push_exit_callback(_exit_wrapper)
+        return callback  # Allow use as a decorator
+
+    def _push_cm_exit(self, cm, cm_exit):
+        """Helper to correctly register callbacks to __exit__ methods."""
+        _exit_wrapper = self._create_exit_wrapper(cm, cm_exit)
+        self._push_exit_callback(_exit_wrapper, True)
+
+    def _push_exit_callback(self, callback, is_sync=True):
+        self._exit_callbacks.append((is_sync, callback))
+
+
+# Inspired by discussions on http://bugs.python.org/issue13585
+class ExitStack(_BaseExitStack, AbstractContextManager):
+    """Context manager for dynamic management of a stack of exit callbacks.
+
+    For example:
+        with ExitStack() as stack:
+            files = [stack.enter_context(open(fname)) for fname in filenames]
+            # All opened files will automatically be closed at the end of
+            # the with statement, even if attempts to open files later
+            # in the list raise an exception.
+    """
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_details):
+        received_exc = exc_details[0] is not None
+
+        # We manipulate the exception state so it behaves as though
+        # we were actually nesting multiple with statements
+        frame_exc = sys.exc_info()[1]
+        def _fix_exception_context(new_exc, old_exc):
+            # Context may not be correct, so find the end of the chain
+            while 1:
+                exc_context = new_exc.__context__
+                if exc_context is None or exc_context is old_exc:
+                    # Context is already set correctly (see issue 20317)
+                    return
+                if exc_context is frame_exc:
+                    break
+                new_exc = exc_context
+            # Change the end of the chain to point to the exception
+            # we expect it to reference
+            new_exc.__context__ = old_exc
+
+        # Callbacks are invoked in LIFO order to match the behaviour of
+        # nested context managers
+        suppressed_exc = False
+        pending_raise = False
+        while self._exit_callbacks:
+            is_sync, cb = self._exit_callbacks.pop()
+            assert is_sync
+            try:
+                if cb(*exc_details):
+                    suppressed_exc = True
+                    pending_raise = False
+                    exc_details = (None, None, None)
+            except:
+                new_exc_details = sys.exc_info()
+                # simulate the stack of exceptions by setting the context
+                _fix_exception_context(new_exc_details[1], exc_details[1])
+                pending_raise = True
+                exc_details = new_exc_details
+        if pending_raise:
+            try:
+                # bare "raise exc_details[1]" replaces our carefully
+                # set-up context
+                fixed_ctx = exc_details[1].__context__
+                raise exc_details[1]
+            except BaseException:
+                exc_details[1].__context__ = fixed_ctx
+                raise
+        return received_exc and suppressed_exc
+
+    def close(self):
+        """Immediately unwind the context stack."""
+        self.__exit__(None, None, None)
+
+
+# Inspired by discussions on https://bugs.python.org/issue29302
+class AsyncExitStack(_BaseExitStack, AbstractAsyncContextManager):
+    """Async context manager for dynamic management of a stack of exit
+    callbacks.
+
+    For example:
+        async with AsyncExitStack() as stack:
+            connections = [await stack.enter_async_context(get_connection())
+                for i in range(5)]
+            # All opened connections will automatically be released at the
+            # end of the async with statement, even if attempts to open a
+            # connection later in the list raise an exception.
+    """
+
+    @staticmethod
+    def _create_async_exit_wrapper(cm, cm_exit):
+        return MethodType(cm_exit, cm)
+
+    @staticmethod
+    def _create_async_cb_wrapper(callback, /, *args, **kwds):
+        async def _exit_wrapper(exc_type, exc, tb):
+            await callback(*args, **kwds)
+        return _exit_wrapper
+
+    async def enter_async_context(self, cm):
+        """Enters the supplied async context manager.
+
+        If successful, also pushes its __aexit__ method as a callback and
+        returns the result of the __aenter__ method.
+        """
+        cls = type(cm)
+        try:
+            _enter = cls.__aenter__
+            _exit = cls.__aexit__
+        except AttributeError:
+            raise TypeError(f"'{cls.__module__}.{cls.__qualname__}' object does "
+                            f"not support the asynchronous context manager protocol"
+                           ) from None
+        result = await _enter(cm)
+        self._push_async_cm_exit(cm, _exit)
+        return result
+
+    def push_async_exit(self, exit):
+        """Registers a coroutine function with the standard __aexit__ method
+        signature.
+
+        Can suppress exceptions the same way __aexit__ method can.
+        Also accepts any object with an __aexit__ method (registering a call
+        to the method instead of the object itself).
+        """
+        _cb_type = type(exit)
+        try:
+            exit_method = _cb_type.__aexit__
+        except AttributeError:
+            # Not an async context manager, so assume it's a coroutine function
+            self._push_exit_callback(exit, False)
+        else:
+            self._push_async_cm_exit(exit, exit_method)
+        return exit  # Allow use as a decorator
+
+    def push_async_callback(self, callback, /, *args, **kwds):
+        """Registers an arbitrary coroutine function and arguments.
+
+        Cannot suppress exceptions.
+        """
+        _exit_wrapper = self._create_async_cb_wrapper(callback, *args, **kwds)
+
+        # We changed the signature, so using @wraps is not appropriate, but
+        # setting __wrapped__ may still help with introspection.
+        _exit_wrapper.__wrapped__ = callback
+        self._push_exit_callback(_exit_wrapper, False)
+        return callback  # Allow use as a decorator
+
+    async def aclose(self):
+        """Immediately unwind the context stack."""
+        await self.__aexit__(None, None, None)
+
+    def _push_async_cm_exit(self, cm, cm_exit):
+        """Helper to correctly register coroutine function to __aexit__
+        method."""
+        _exit_wrapper = self._create_async_exit_wrapper(cm, cm_exit)
+        self._push_exit_callback(_exit_wrapper, False)
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc_details):
+        received_exc = exc_details[0] is not None
+
+        # We manipulate the exception state so it behaves as though
+        # we were actually nesting multiple with statements
+        frame_exc = sys.exc_info()[1]
+        def _fix_exception_context(new_exc, old_exc):
+            # Context may not be correct, so find the end of the chain
+            while 1:
+                exc_context = new_exc.__context__
+                if exc_context is None or exc_context is old_exc:
+                    # Context is already set correctly (see issue 20317)
+                    return
+                if exc_context is frame_exc:
+                    break
+                new_exc = exc_context
+            # Change the end of the chain to point to the exception
+            # we expect it to reference
+            new_exc.__context__ = old_exc
+
+        # Callbacks are invoked in LIFO order to match the behaviour of
+        # nested context managers
+        suppressed_exc = False
+        pending_raise = False
+        while self._exit_callbacks:
+            is_sync, cb = self._exit_callbacks.pop()
+            try:
+                if is_sync:
+                    cb_suppress = cb(*exc_details)
+                else:
+                    cb_suppress = await cb(*exc_details)
+
+                if cb_suppress:
+                    suppressed_exc = True
+                    pending_raise = False
+                    exc_details = (None, None, None)
+            except:
+                new_exc_details = sys.exc_info()
+                # simulate the stack of exceptions by setting the context
+                _fix_exception_context(new_exc_details[1], exc_details[1])
+                pending_raise = True
+                exc_details = new_exc_details
+        if pending_raise:
+            try:
+                # bare "raise exc_details[1]" replaces our carefully
+                # set-up context
+                fixed_ctx = exc_details[1].__context__
+                raise exc_details[1]
+            except BaseException:
+                exc_details[1].__context__ = fixed_ctx
+                raise
+        return received_exc and suppressed_exc
+
+
+class nullcontext(AbstractContextManager, AbstractAsyncContextManager):
+    """Context manager that does no additional processing.
+
+    Used as a stand-in for a normal context manager, when a particular
+    block of code is only sometimes used with a normal context manager:
+
+    cm = optional_cm if condition else nullcontext()
+    with cm:
+        # Perform operation, using optional_cm if condition is True
+    """
+
+    def __init__(self, enter_result=None):
+        self.enter_result = enter_result
+
+    def __enter__(self):
+        return self.enter_result
+
+    def __exit__(self, *excinfo):
+        pass
+
+    async def __aenter__(self):
+        return self.enter_result
+
+    async def __aexit__(self, *excinfo):
+        pass
+
+
+class chdir(AbstractContextManager):
+    """Non thread-safe context manager to change the current working directory."""
+
+    def __init__(self, path):
+        self.path = path
+        self._old_cwd = []
+
+    def __enter__(self):
+        self._old_cwd.append(os.getcwd())
+        os.chdir(self.path)
+
+    def __exit__(self, *excinfo):
+        os.chdir(self._old_cwd.pop())
+                                                            usr/lib/python3.11/contextvars.py                                                                   0000644 0000000 0000000 00000000201 14671176116 015404  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        from _contextvars import Context, ContextVar, Token, copy_context
+
+
+__all__ = ('Context', 'ContextVar', 'Token', 'copy_context')
+                                                                                                                                                                                                                                                                                                                                                                                               usr/lib/python3.11/copy.py                                                                          0000644 0000000 0000000 00000020751 14671176116 014012  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        """Generic (shallow and deep) copying operations.
+
+Interface summary:
+
+        import copy
+
+        x = copy.copy(y)        # make a shallow copy of y
+        x = copy.deepcopy(y)    # make a deep copy of y
+
+For module specific errors, copy.Error is raised.
+
+The difference between shallow and deep copying is only relevant for
+compound objects (objects that contain other objects, like lists or
+class instances).
+
+- A shallow copy constructs a new compound object and then (to the
+  extent possible) inserts *the same objects* into it that the
+  original contains.
+
+- A deep copy constructs a new compound object and then, recursively,
+  inserts *copies* into it of the objects found in the original.
+
+Two problems often exist with deep copy operations that don't exist
+with shallow copy operations:
+
+ a) recursive objects (compound objects that, directly or indirectly,
+    contain a reference to themselves) may cause a recursive loop
+
+ b) because deep copy copies *everything* it may copy too much, e.g.
+    administrative data structures that should be shared even between
+    copies
+
+Python's deep copy operation avoids these problems by:
+
+ a) keeping a table of objects already copied during the current
+    copying pass
+
+ b) letting user-defined classes override the copying operation or the
+    set of components copied
+
+This version does not copy types like module, class, function, method,
+nor stack trace, stack frame, nor file, socket, window, nor any
+similar types.
+
+Classes can use the same interfaces to control copying that they use
+to control pickling: they can define methods called __getinitargs__(),
+__getstate__() and __setstate__().  See the documentation for module
+"pickle" for information on these methods.
+"""
+
+import types
+import weakref
+from copyreg import dispatch_table
+
+class Error(Exception):
+    pass
+error = Error   # backward compatibility
+
+try:
+    from org.python.core import PyStringMap
+except ImportError:
+    PyStringMap = None
+
+__all__ = ["Error", "copy", "deepcopy"]
+
+def copy(x):
+    """Shallow copy operation on arbitrary Python objects.
+
+    See the module's __doc__ string for more info.
+    """
+
+    cls = type(x)
+
+    copier = _copy_dispatch.get(cls)
+    if copier:
+        return copier(x)
+
+    if issubclass(cls, type):
+        # treat it as a regular class:
+        return _copy_immutable(x)
+
+    copier = getattr(cls, "__copy__", None)
+    if copier is not None:
+        return copier(x)
+
+    reductor = dispatch_table.get(cls)
+    if reductor is not None:
+        rv = reductor(x)
+    else:
+        reductor = getattr(x, "__reduce_ex__", None)
+        if reductor is not None:
+            rv = reductor(4)
+        else:
+            reductor = getattr(x, "__reduce__", None)
+            if reductor:
+                rv = reductor()
+            else:
+                raise Error("un(shallow)copyable object of type %s" % cls)
+
+    if isinstance(rv, str):
+        return x
+    return _reconstruct(x, None, *rv)
+
+
+_copy_dispatch = d = {}
+
+def _copy_immutable(x):
+    return x
+for t in (type(None), int, float, bool, complex, str, tuple,
+          bytes, frozenset, type, range, slice, property,
+          types.BuiltinFunctionType, type(Ellipsis), type(NotImplemented),
+          types.FunctionType, weakref.ref):
+    d[t] = _copy_immutable
+t = getattr(types, "CodeType", None)
+if t is not None:
+    d[t] = _copy_immutable
+
+d[list] = list.copy
+d[dict] = dict.copy
+d[set] = set.copy
+d[bytearray] = bytearray.copy
+
+if PyStringMap is not None:
+    d[PyStringMap] = PyStringMap.copy
+
+del d, t
+
+def deepcopy(x, memo=None, _nil=[]):
+    """Deep copy operation on arbitrary Python objects.
+
+    See the module's __doc__ string for more info.
+    """
+
+    if memo is None:
+        memo = {}
+
+    d = id(x)
+    y = memo.get(d, _nil)
+    if y is not _nil:
+        return y
+
+    cls = type(x)
+
+    copier = _deepcopy_dispatch.get(cls)
+    if copier is not None:
+        y = copier(x, memo)
+    else:
+        if issubclass(cls, type):
+            y = _deepcopy_atomic(x, memo)
+        else:
+            copier = getattr(x, "__deepcopy__", None)
+            if copier is not None:
+                y = copier(memo)
+            else:
+                reductor = dispatch_table.get(cls)
+                if reductor:
+                    rv = reductor(x)
+                else:
+                    reductor = getattr(x, "__reduce_ex__", None)
+                    if reductor is not None:
+                        rv = reductor(4)
+                    else:
+                        reductor = getattr(x, "__reduce__", None)
+                        if reductor:
+                            rv = reductor()
+                        else:
+                            raise Error(
+                                "un(deep)copyable object of type %s" % cls)
+                if isinstance(rv, str):
+                    y = x
+                else:
+                    y = _reconstruct(x, memo, *rv)
+
+    # If is its own copy, don't memoize.
+    if y is not x:
+        memo[d] = y
+        _keep_alive(x, memo) # Make sure x lives at least as long as d
+    return y
+
+_deepcopy_dispatch = d = {}
+
+def _deepcopy_atomic(x, memo):
+    return x
+d[type(None)] = _deepcopy_atomic
+d[type(Ellipsis)] = _deepcopy_atomic
+d[type(NotImplemented)] = _deepcopy_atomic
+d[int] = _deepcopy_atomic
+d[float] = _deepcopy_atomic
+d[bool] = _deepcopy_atomic
+d[complex] = _deepcopy_atomic
+d[bytes] = _deepcopy_atomic
+d[str] = _deepcopy_atomic
+d[types.CodeType] = _deepcopy_atomic
+d[type] = _deepcopy_atomic
+d[range] = _deepcopy_atomic
+d[types.BuiltinFunctionType] = _deepcopy_atomic
+d[types.FunctionType] = _deepcopy_atomic
+d[weakref.ref] = _deepcopy_atomic
+d[property] = _deepcopy_atomic
+
+def _deepcopy_list(x, memo, deepcopy=deepcopy):
+    y = []
+    memo[id(x)] = y
+    append = y.append
+    for a in x:
+        append(deepcopy(a, memo))
+    return y
+d[list] = _deepcopy_list
+
+def _deepcopy_tuple(x, memo, deepcopy=deepcopy):
+    y = [deepcopy(a, memo) for a in x]
+    # We're not going to put the tuple in the memo, but it's still important we
+    # check for it, in case the tuple contains recursive mutable structures.
+    try:
+        return memo[id(x)]
+    except KeyError:
+        pass
+    for k, j in zip(x, y):
+        if k is not j:
+            y = tuple(y)
+            break
+    else:
+        y = x
+    return y
+d[tuple] = _deepcopy_tuple
+
+def _deepcopy_dict(x, memo, deepcopy=deepcopy):
+    y = {}
+    memo[id(x)] = y
+    for key, value in x.items():
+        y[deepcopy(key, memo)] = deepcopy(value, memo)
+    return y
+d[dict] = _deepcopy_dict
+if PyStringMap is not None:
+    d[PyStringMap] = _deepcopy_dict
+
+def _deepcopy_method(x, memo): # Copy instance methods
+    return type(x)(x.__func__, deepcopy(x.__self__, memo))
+d[types.MethodType] = _deepcopy_method
+
+del d
+
+def _keep_alive(x, memo):
+    """Keeps a reference to the object x in the memo.
+
+    Because we remember objects by their id, we have
+    to assure that possibly temporary objects are kept
+    alive by referencing them.
+    We store a reference at the id of the memo, which should
+    normally not be used unless someone tries to deepcopy
+    the memo itself...
+    """
+    try:
+        memo[id(memo)].append(x)
+    except KeyError:
+        # aha, this is the first one :-)
+        memo[id(memo)]=[x]
+
+def _reconstruct(x, memo, func, args,
+                 state=None, listiter=None, dictiter=None,
+                 *, deepcopy=deepcopy):
+    deep = memo is not None
+    if deep and args:
+        args = (deepcopy(arg, memo) for arg in args)
+    y = func(*args)
+    if deep:
+        memo[id(x)] = y
+
+    if state is not None:
+        if deep:
+            state = deepcopy(state, memo)
+        if hasattr(y, '__setstate__'):
+            y.__setstate__(state)
+        else:
+            if isinstance(state, tuple) and len(state) == 2:
+                state, slotstate = state
+            else:
+                slotstate = None
+            if state is not None:
+                y.__dict__.update(state)
+            if slotstate is not None:
+                for key, value in slotstate.items():
+                    setattr(y, key, value)
+
+    if listiter is not None:
+        if deep:
+            for item in listiter:
+                item = deepcopy(item, memo)
+                y.append(item)
+        else:
+            for item in listiter:
+                y.append(item)
+    if dictiter is not None:
+        if deep:
+            for key, value in dictiter:
+                key = deepcopy(key, memo)
+                value = deepcopy(value, memo)
+                y[key] = value
+        else:
+            for key, value in dictiter:
+                y[key] = value
+    return y
+
+del types, weakref, PyStringMap
+                       usr/lib/python3.11/copyreg.py                                                                       0000644 0000000 0000000 00000016775 14671176116 014523  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        """Helper to provide extensibility for pickle.
+
+This is only useful to add pickle support for extension types defined in
+C, not for instances of user-defined classes.
+"""
+
+__all__ = ["pickle", "constructor",
+           "add_extension", "remove_extension", "clear_extension_cache"]
+
+dispatch_table = {}
+
+def pickle(ob_type, pickle_function, constructor_ob=None):
+    if not callable(pickle_function):
+        raise TypeError("reduction functions must be callable")
+    dispatch_table[ob_type] = pickle_function
+
+    # The constructor_ob function is a vestige of safe for unpickling.
+    # There is no reason for the caller to pass it anymore.
+    if constructor_ob is not None:
+        constructor(constructor_ob)
+
+def constructor(object):
+    if not callable(object):
+        raise TypeError("constructors must be callable")
+
+# Example: provide pickling support for complex numbers.
+
+try:
+    complex
+except NameError:
+    pass
+else:
+
+    def pickle_complex(c):
+        return complex, (c.real, c.imag)
+
+    pickle(complex, pickle_complex, complex)
+
+def pickle_union(obj):
+    import functools, operator
+    return functools.reduce, (operator.or_, obj.__args__)
+
+pickle(type(int | str), pickle_union)
+
+# Support for pickling new-style objects
+
+def _reconstructor(cls, base, state):
+    if base is object:
+        obj = object.__new__(cls)
+    else:
+        obj = base.__new__(cls, state)
+        if base.__init__ != object.__init__:
+            base.__init__(obj, state)
+    return obj
+
+_HEAPTYPE = 1<<9
+_new_type = type(int.__new__)
+
+# Python code for object.__reduce_ex__ for protocols 0 and 1
+
+def _reduce_ex(self, proto):
+    assert proto < 2
+    cls = self.__class__
+    for base in cls.__mro__:
+        if hasattr(base, '__flags__') and not base.__flags__ & _HEAPTYPE:
+            break
+        new = base.__new__
+        if isinstance(new, _new_type) and new.__self__ is base:
+            break
+    else:
+        base = object # not really reachable
+    if base is object:
+        state = None
+    else:
+        if base is cls:
+            raise TypeError(f"cannot pickle {cls.__name__!r} object")
+        state = base(self)
+    args = (cls, base, state)
+    try:
+        getstate = self.__getstate__
+    except AttributeError:
+        if getattr(self, "__slots__", None):
+            raise TypeError(f"cannot pickle {cls.__name__!r} object: "
+                            f"a class that defines __slots__ without "
+                            f"defining __getstate__ cannot be pickled "
+                            f"with protocol {proto}") from None
+        try:
+            dict = self.__dict__
+        except AttributeError:
+            dict = None
+    else:
+        if (type(self).__getstate__ is object.__getstate__ and
+            getattr(self, "__slots__", None)):
+            raise TypeError("a class that defines __slots__ without "
+                            "defining __getstate__ cannot be pickled")
+        dict = getstate()
+    if dict:
+        return _reconstructor, args, dict
+    else:
+        return _reconstructor, args
+
+# Helper for __reduce_ex__ protocol 2
+
+def __newobj__(cls, *args):
+    return cls.__new__(cls, *args)
+
+def __newobj_ex__(cls, args, kwargs):
+    """Used by pickle protocol 4, instead of __newobj__ to allow classes with
+    keyword-only arguments to be pickled correctly.
+    """
+    return cls.__new__(cls, *args, **kwargs)
+
+def _slotnames(cls):
+    """Return a list of slot names for a given class.
+
+    This needs to find slots defined by the class and its bases, so we
+    can't simply return the __slots__ attribute.  We must walk down
+    the Method Resolution Order and concatenate the __slots__ of each
+    class found there.  (This assumes classes don't modify their
+    __slots__ attribute to misrepresent their slots after the class is
+    defined.)
+    """
+
+    # Get the value from a cache in the class if possible
+    names = cls.__dict__.get("__slotnames__")
+    if names is not None:
+        return names
+
+    # Not cached -- calculate the value
+    names = []
+    if not hasattr(cls, "__slots__"):
+        # This class has no slots
+        pass
+    else:
+        # Slots found -- gather slot names from all base classes
+        for c in cls.__mro__:
+            if "__slots__" in c.__dict__:
+                slots = c.__dict__['__slots__']
+                # if class has a single slot, it can be given as a string
+                if isinstance(slots, str):
+                    slots = (slots,)
+                for name in slots:
+                    # special descriptors
+                    if name in ("__dict__", "__weakref__"):
+                        continue
+                    # mangled names
+                    elif name.startswith('__') and not name.endswith('__'):
+                        stripped = c.__name__.lstrip('_')
+                        if stripped:
+                            names.append('_%s%s' % (stripped, name))
+                        else:
+                            names.append(name)
+                    else:
+                        names.append(name)
+
+    # Cache the outcome in the class if at all possible
+    try:
+        cls.__slotnames__ = names
+    except:
+        pass # But don't die if we can't
+
+    return names
+
+# A registry of extension codes.  This is an ad-hoc compression
+# mechanism.  Whenever a global reference to <module>, <name> is about
+# to be pickled, the (<module>, <name>) tuple is looked up here to see
+# if it is a registered extension code for it.  Extension codes are
+# universal, so that the meaning of a pickle does not depend on
+# context.  (There are also some codes reserved for local use that
+# don't have this restriction.)  Codes are positive ints; 0 is
+# reserved.
+
+_extension_registry = {}                # key -> code
+_inverted_registry = {}                 # code -> key
+_extension_cache = {}                   # code -> object
+# Don't ever rebind those names:  pickling grabs a reference to them when
+# it's initialized, and won't see a rebinding.
+
+def add_extension(module, name, code):
+    """Register an extension code."""
+    code = int(code)
+    if not 1 <= code <= 0x7fffffff:
+        raise ValueError("code out of range")
+    key = (module, name)
+    if (_extension_registry.get(key) == code and
+        _inverted_registry.get(code) == key):
+        return # Redundant registrations are benign
+    if key in _extension_registry:
+        raise ValueError("key %s is already registered with code %s" %
+                         (key, _extension_registry[key]))
+    if code in _inverted_registry:
+        raise ValueError("code %s is already in use for key %s" %
+                         (code, _inverted_registry[code]))
+    _extension_registry[key] = code
+    _inverted_registry[code] = key
+
+def remove_extension(module, name, code):
+    """Unregister an extension code.  For testing only."""
+    key = (module, name)
+    if (_extension_registry.get(key) != code or
+        _inverted_registry.get(code) != key):
+        raise ValueError("key %s is not registered with code %s" %
+                         (key, code))
+    del _extension_registry[key]
+    del _inverted_registry[code]
+    if code in _extension_cache:
+        del _extension_cache[code]
+
+def clear_extension_cache():
+    _extension_cache.clear()
+
+# Standard extension code assignments
+
+# Reserved ranges
+
+# First  Last Count  Purpose
+#     1   127   127  Reserved for Python standard library
+#   128   191    64  Reserved for Zope
+#   192   239    48  Reserved for 3rd parties
+#   240   255    16  Reserved for private use (will never be assigned)
+#   256   Inf   Inf  Reserved for future assignment
+
+# Extension codes are assigned by the Python Software Foundation.
+   usr/lib/python3.11/crypt.py                                                                         0000644 0000000 0000000 00000007511 14671176116 014200  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        """Wrapper to the POSIX crypt library call and associated functionality."""
+
+import sys as _sys
+
+try:
+    import _crypt
+except ModuleNotFoundError:
+    if _sys.platform == 'win32':
+        raise ImportError("The crypt module is not supported on Windows")
+    else:
+        raise ImportError("The required _crypt module was not built as part of CPython")
+
+import errno
+import string as _string
+import warnings
+from random import SystemRandom as _SystemRandom
+from collections import namedtuple as _namedtuple
+
+
+warnings._deprecated(__name__, remove=(3, 13))
+
+
+_saltchars = _string.ascii_letters + _string.digits + './'
+_sr = _SystemRandom()
+
+
+class _Method(_namedtuple('_Method', 'name ident salt_chars total_size')):
+
+    """Class representing a salt method per the Modular Crypt Format or the
+    legacy 2-character crypt method."""
+
+    def __repr__(self):
+        return '<crypt.METHOD_{}>'.format(self.name)
+
+
+def mksalt(method=None, *, rounds=None):
+    """Generate a salt for the specified method.
+
+    If not specified, the strongest available method will be used.
+
+    """
+    if method is None:
+        method = methods[0]
+    if rounds is not None and not isinstance(rounds, int):
+        raise TypeError(f'{rounds.__class__.__name__} object cannot be '
+                        f'interpreted as an integer')
+    if not method.ident:  # traditional
+        s = ''
+    else:  # modular
+        s = f'${method.ident}$'
+
+    if method.ident and method.ident[0] == '2':  # Blowfish variants
+        if rounds is None:
+            log_rounds = 12
+        else:
+            log_rounds = int.bit_length(rounds-1)
+            if rounds != 1 << log_rounds:
+                raise ValueError('rounds must be a power of 2')
+            if not 4 <= log_rounds <= 31:
+                raise ValueError('rounds out of the range 2**4 to 2**31')
+        s += f'{log_rounds:02d}$'
+    elif method.ident in ('5', '6'):  # SHA-2
+        if rounds is not None:
+            if not 1000 <= rounds <= 999_999_999:
+                raise ValueError('rounds out of the range 1000 to 999_999_999')
+            s += f'rounds={rounds}$'
+    elif rounds is not None:
+        raise ValueError(f"{method} doesn't support the rounds argument")
+
+    s += ''.join(_sr.choice(_saltchars) for char in range(method.salt_chars))
+    return s
+
+
+def crypt(word, salt=None):
+    """Return a string representing the one-way hash of a password, with a salt
+    prepended.
+
+    If ``salt`` is not specified or is ``None``, the strongest
+    available method will be selected and a salt generated.  Otherwise,
+    ``salt`` may be one of the ``crypt.METHOD_*`` values, or a string as
+    returned by ``crypt.mksalt()``.
+
+    """
+    if salt is None or isinstance(salt, _Method):
+        salt = mksalt(salt)
+    return _crypt.crypt(word, salt)
+
+
+#  available salting/crypto methods
+methods = []
+
+def _add_method(name, *args, rounds=None):
+    method = _Method(name, *args)
+    globals()['METHOD_' + name] = method
+    salt = mksalt(method, rounds=rounds)
+    result = None
+    try:
+        result = crypt('', salt)
+    except OSError as e:
+        # Not all libc libraries support all encryption methods.
+        if e.errno in {errno.EINVAL, errno.EPERM, errno.ENOSYS}:
+            return False
+        raise
+    if result and len(result) == method.total_size:
+        methods.append(method)
+        return True
+    return False
+
+_add_method('SHA512', '6', 16, 106)
+_add_method('SHA256', '5', 16, 63)
+
+# Choose the strongest supported version of Blowfish hashing.
+# Early versions have flaws.  Version 'a' fixes flaws of
+# the initial implementation, 'b' fixes flaws of 'a'.
+# 'y' is the same as 'b', for compatibility
+# with openwall crypt_blowfish.
+for _v in 'b', 'y', 'a', '':
+    if _add_method('BLOWFISH', '2' + _v, 22, 59 + len(_v), rounds=1<<4):
+        break
+
+_add_method('MD5', '1', 8, 34)
+_add_method('CRYPT', None, 2, 13)
+
+del _v, _add_method
+                                                                                                                                                                                       usr/lib/python3.11/csv.py                                                                           0000644 0000000 0000000 00000037236 14671176116 013641  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        
+"""
+csv.py - read/write/investigate CSV files
+"""
+
+import re
+from _csv import Error, __version__, writer, reader, register_dialect, \
+                 unregister_dialect, get_dialect, list_dialects, \
+                 field_size_limit, \
+                 QUOTE_MINIMAL, QUOTE_ALL, QUOTE_NONNUMERIC, QUOTE_NONE, \
+                 __doc__
+from _csv import Dialect as _Dialect
+
+from io import StringIO
+
+__all__ = ["QUOTE_MINIMAL", "QUOTE_ALL", "QUOTE_NONNUMERIC", "QUOTE_NONE",
+           "Error", "Dialect", "__doc__", "excel", "excel_tab",
+           "field_size_limit", "reader", "writer",

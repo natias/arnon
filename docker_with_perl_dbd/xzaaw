@@ -1,0 +1,1000 @@
+            # some files that are linker scripts and not actual
+            # shared objects. See bpo-41976 for more details
+            if not _is_elf(file):
+                continue
+            return os.fsdecode(file)
+
+
+    if sys.platform == "sunos5":
+        # use /usr/ccs/bin/dump on solaris
+        def _get_soname(f):
+            if not f:
+                return None
+
+            try:
+                proc = subprocess.Popen(("/usr/ccs/bin/dump", "-Lpv", f),
+                                        stdout=subprocess.PIPE,
+                                        stderr=subprocess.DEVNULL)
+            except OSError:  # E.g. command not found
+                return None
+            with proc:
+                data = proc.stdout.read()
+            res = re.search(br'\[.*\]\sSONAME\s+([^\s]+)', data)
+            if not res:
+                return None
+            return os.fsdecode(res.group(1))
+    else:
+        def _get_soname(f):
+            # assuming GNU binutils / ELF
+            if not f:
+                return None
+            objdump = shutil.which('objdump')
+            if not objdump:
+                # objdump is not available, give up
+                return None
+
+            try:
+                proc = subprocess.Popen((objdump, '-p', '-j', '.dynamic', f),
+                                        stdout=subprocess.PIPE,
+                                        stderr=subprocess.DEVNULL)
+            except OSError:  # E.g. bad executable
+                return None
+            with proc:
+                dump = proc.stdout.read()
+            res = re.search(br'\sSONAME\s+([^\s]+)', dump)
+            if not res:
+                return None
+            return os.fsdecode(res.group(1))
+
+    if sys.platform.startswith(("freebsd", "openbsd", "dragonfly")):
+
+        def _num_version(libname):
+            # "libxyz.so.MAJOR.MINOR" => [ MAJOR, MINOR ]
+            parts = libname.split(b".")
+            nums = []
+            try:
+                while parts:
+                    nums.insert(0, int(parts.pop()))
+            except ValueError:
+                pass
+            return nums or [sys.maxsize]
+
+        def find_library(name):
+            ename = re.escape(name)
+            expr = r':-l%s\.\S+ => \S*/(lib%s\.\S+)' % (ename, ename)
+            expr = os.fsencode(expr)
+
+            try:
+                proc = subprocess.Popen(('/sbin/ldconfig', '-r'),
+                                        stdout=subprocess.PIPE,
+                                        stderr=subprocess.DEVNULL)
+            except OSError:  # E.g. command not found
+                data = b''
+            else:
+                with proc:
+                    data = proc.stdout.read()
+
+            res = re.findall(expr, data)
+            if not res:
+                return _get_soname(_findLib_gcc(name))
+            res.sort(key=_num_version)
+            return os.fsdecode(res[-1])
+
+    elif sys.platform == "sunos5":
+
+        def _findLib_crle(name, is64):
+            if not os.path.exists('/usr/bin/crle'):
+                return None
+
+            env = dict(os.environ)
+            env['LC_ALL'] = 'C'
+
+            if is64:
+                args = ('/usr/bin/crle', '-64')
+            else:
+                args = ('/usr/bin/crle',)
+
+            paths = None
+            try:
+                proc = subprocess.Popen(args,
+                                        stdout=subprocess.PIPE,
+                                        stderr=subprocess.DEVNULL,
+                                        env=env)
+            except OSError:  # E.g. bad executable
+                return None
+            with proc:
+                for line in proc.stdout:
+                    line = line.strip()
+                    if line.startswith(b'Default Library Path (ELF):'):
+                        paths = os.fsdecode(line).split()[4]
+
+            if not paths:
+                return None
+
+            for dir in paths.split(":"):
+                libfile = os.path.join(dir, "lib%s.so" % name)
+                if os.path.exists(libfile):
+                    return libfile
+
+            return None
+
+        def find_library(name, is64 = False):
+            return _get_soname(_findLib_crle(name, is64) or _findLib_gcc(name))
+
+    else:
+
+        def _findSoname_ldconfig(name):
+            import struct
+            # XXX this code assumes that we know all unames and that a single
+            # ABI is supported per uname; instead we should find what the
+            # ABI is (e.g. check ABI of current process) or simply ask libc
+            # to load the library for us
+            uname = os.uname()
+            # ARM has a variety of unames, e.g. armv7l
+            if uname.machine.startswith("arm"):
+                machine = "arm"
+            if struct.calcsize('l') == 4:
+                machine = uname.machine + '-32'
+            else:
+                machine = uname.machine + '-64'
+            mach_map = {
+                'x86_64-64': 'libc6,x86-64',
+                'ppc64-64': 'libc6,64bit',
+                'sparc64-64': 'libc6,64bit',
+                's390x-64': 'libc6,64bit',
+                'ia64-64': 'libc6,IA-64',
+                # this actually breaks on biarch or multiarch as the first
+                # library wins; uname doesn't tell us which ABI we're using
+                'arm-32': 'libc6(,hard-float)?',
+                }
+            abi_type = mach_map.get(machine, 'libc6')
+
+            # XXX assuming GLIBC's ldconfig (with option -p)
+            regex = r'\s+(lib%s\.[^\s]+)\s+\(%s'
+            regex = os.fsencode(regex % (re.escape(name), abi_type))
+            try:
+                with subprocess.Popen(['/sbin/ldconfig', '-p'],
+                                      stdin=subprocess.DEVNULL,
+                                      stderr=subprocess.DEVNULL,
+                                      stdout=subprocess.PIPE,
+                                      env={'LC_ALL': 'C', 'LANG': 'C'}) as p:
+                    res = re.search(regex, p.stdout.read())
+                    if res:
+                        return os.fsdecode(res.group(1))
+            except OSError:
+                pass
+
+        def _findLib_ld(name):
+            # See issue #9998 for why this is needed
+            expr = r'[^\(\)\s]*lib%s\.[^\(\)\s]*' % re.escape(name)
+            cmd = ['ld', '-t']
+            libpath = os.environ.get('LD_LIBRARY_PATH')
+            if libpath:
+                for d in libpath.split(':'):
+                    cmd.extend(['-L', d])
+            cmd.extend(['-o', os.devnull, '-l%s' % name])
+            result = None
+            try:
+                p = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                     stderr=subprocess.PIPE,
+                                     universal_newlines=True)
+                out, _ = p.communicate()
+                res = re.findall(expr, os.fsdecode(out))
+                for file in res:
+                    # Check if the given file is an elf file: gcc can report
+                    # some files that are linker scripts and not actual
+                    # shared objects. See bpo-41976 for more details
+                    if not _is_elf(file):
+                        continue
+                    return os.fsdecode(file)
+            except Exception:
+                pass  # result will be None
+            return result
+
+        def find_library(name):
+            # See issue #9998
+            return _findSoname_ldconfig(name) or \
+                   _get_soname(_findLib_gcc(name)) or _get_soname(_findLib_ld(name))
+
+################################################################
+# test code
+
+def test():
+    from ctypes import cdll
+    if os.name == "nt":
+        print(cdll.msvcrt)
+        print(cdll.load("msvcrt"))
+        print(find_library("msvcrt"))
+
+    if os.name == "posix":
+        # find and load_version
+        print(find_library("m"))
+        print(find_library("c"))
+        print(find_library("bz2"))
+
+        # load
+        if sys.platform == "darwin":
+            print(cdll.LoadLibrary("libm.dylib"))
+            print(cdll.LoadLibrary("libcrypto.dylib"))
+            print(cdll.LoadLibrary("libSystem.dylib"))
+            print(cdll.LoadLibrary("System.framework/System"))
+        # issue-26439 - fix broken test call for AIX
+        elif sys.platform.startswith("aix"):
+            from ctypes import CDLL
+            if sys.maxsize < 2**32:
+                print(f"Using CDLL(name, os.RTLD_MEMBER): {CDLL('libc.a(shr.o)', os.RTLD_MEMBER)}")
+                print(f"Using cdll.LoadLibrary(): {cdll.LoadLibrary('libc.a(shr.o)')}")
+                # librpm.so is only available as 32-bit shared library
+                print(find_library("rpm"))
+                print(cdll.LoadLibrary("librpm.so"))
+            else:
+                print(f"Using CDLL(name, os.RTLD_MEMBER): {CDLL('libc.a(shr_64.o)', os.RTLD_MEMBER)}")
+                print(f"Using cdll.LoadLibrary(): {cdll.LoadLibrary('libc.a(shr_64.o)')}")
+            print(f"crypt\t:: {find_library('crypt')}")
+            print(f"crypt\t:: {cdll.LoadLibrary(find_library('crypt'))}")
+            print(f"crypto\t:: {find_library('crypto')}")
+            print(f"crypto\t:: {cdll.LoadLibrary(find_library('crypto'))}")
+        else:
+            print(cdll.LoadLibrary("libm.so"))
+            print(cdll.LoadLibrary("libcrypt.so"))
+            print(find_library("crypt"))
+
+if __name__ == "__main__":
+    test()
+                                                                                                                                                                                                                                                                                                                                                        usr/lib/python3.11/ctypes/wintypes.py                                                               0000644 0000000 0000000 00000012774 14671176116 016237  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        # The most useful windows datatypes
+import ctypes
+
+BYTE = ctypes.c_byte
+WORD = ctypes.c_ushort
+DWORD = ctypes.c_ulong
+
+#UCHAR = ctypes.c_uchar
+CHAR = ctypes.c_char
+WCHAR = ctypes.c_wchar
+UINT = ctypes.c_uint
+INT = ctypes.c_int
+
+DOUBLE = ctypes.c_double
+FLOAT = ctypes.c_float
+
+BOOLEAN = BYTE
+BOOL = ctypes.c_long
+
+class VARIANT_BOOL(ctypes._SimpleCData):
+    _type_ = "v"
+    def __repr__(self):
+        return "%s(%r)" % (self.__class__.__name__, self.value)
+
+ULONG = ctypes.c_ulong
+LONG = ctypes.c_long
+
+USHORT = ctypes.c_ushort
+SHORT = ctypes.c_short
+
+# in the windows header files, these are structures.
+_LARGE_INTEGER = LARGE_INTEGER = ctypes.c_longlong
+_ULARGE_INTEGER = ULARGE_INTEGER = ctypes.c_ulonglong
+
+LPCOLESTR = LPOLESTR = OLESTR = ctypes.c_wchar_p
+LPCWSTR = LPWSTR = ctypes.c_wchar_p
+LPCSTR = LPSTR = ctypes.c_char_p
+LPCVOID = LPVOID = ctypes.c_void_p
+
+# WPARAM is defined as UINT_PTR (unsigned type)
+# LPARAM is defined as LONG_PTR (signed type)
+if ctypes.sizeof(ctypes.c_long) == ctypes.sizeof(ctypes.c_void_p):
+    WPARAM = ctypes.c_ulong
+    LPARAM = ctypes.c_long
+elif ctypes.sizeof(ctypes.c_longlong) == ctypes.sizeof(ctypes.c_void_p):
+    WPARAM = ctypes.c_ulonglong
+    LPARAM = ctypes.c_longlong
+
+ATOM = WORD
+LANGID = WORD
+
+COLORREF = DWORD
+LGRPID = DWORD
+LCTYPE = DWORD
+
+LCID = DWORD
+
+################################################################
+# HANDLE types
+HANDLE = ctypes.c_void_p # in the header files: void *
+
+HACCEL = HANDLE
+HBITMAP = HANDLE
+HBRUSH = HANDLE
+HCOLORSPACE = HANDLE
+HDC = HANDLE
+HDESK = HANDLE
+HDWP = HANDLE
+HENHMETAFILE = HANDLE
+HFONT = HANDLE
+HGDIOBJ = HANDLE
+HGLOBAL = HANDLE
+HHOOK = HANDLE
+HICON = HANDLE
+HINSTANCE = HANDLE
+HKEY = HANDLE
+HKL = HANDLE
+HLOCAL = HANDLE
+HMENU = HANDLE
+HMETAFILE = HANDLE
+HMODULE = HANDLE
+HMONITOR = HANDLE
+HPALETTE = HANDLE
+HPEN = HANDLE
+HRGN = HANDLE
+HRSRC = HANDLE
+HSTR = HANDLE
+HTASK = HANDLE
+HWINSTA = HANDLE
+HWND = HANDLE
+SC_HANDLE = HANDLE
+SERVICE_STATUS_HANDLE = HANDLE
+
+################################################################
+# Some important structure definitions
+
+class RECT(ctypes.Structure):
+    _fields_ = [("left", LONG),
+                ("top", LONG),
+                ("right", LONG),
+                ("bottom", LONG)]
+tagRECT = _RECTL = RECTL = RECT
+
+class _SMALL_RECT(ctypes.Structure):
+    _fields_ = [('Left', SHORT),
+                ('Top', SHORT),
+                ('Right', SHORT),
+                ('Bottom', SHORT)]
+SMALL_RECT = _SMALL_RECT
+
+class _COORD(ctypes.Structure):
+    _fields_ = [('X', SHORT),
+                ('Y', SHORT)]
+
+class POINT(ctypes.Structure):
+    _fields_ = [("x", LONG),
+                ("y", LONG)]
+tagPOINT = _POINTL = POINTL = POINT
+
+class SIZE(ctypes.Structure):
+    _fields_ = [("cx", LONG),
+                ("cy", LONG)]
+tagSIZE = SIZEL = SIZE
+
+def RGB(red, green, blue):
+    return red + (green << 8) + (blue << 16)
+
+class FILETIME(ctypes.Structure):
+    _fields_ = [("dwLowDateTime", DWORD),
+                ("dwHighDateTime", DWORD)]
+_FILETIME = FILETIME
+
+class MSG(ctypes.Structure):
+    _fields_ = [("hWnd", HWND),
+                ("message", UINT),
+                ("wParam", WPARAM),
+                ("lParam", LPARAM),
+                ("time", DWORD),
+                ("pt", POINT)]
+tagMSG = MSG
+MAX_PATH = 260
+
+class WIN32_FIND_DATAA(ctypes.Structure):
+    _fields_ = [("dwFileAttributes", DWORD),
+                ("ftCreationTime", FILETIME),
+                ("ftLastAccessTime", FILETIME),
+                ("ftLastWriteTime", FILETIME),
+                ("nFileSizeHigh", DWORD),
+                ("nFileSizeLow", DWORD),
+                ("dwReserved0", DWORD),
+                ("dwReserved1", DWORD),
+                ("cFileName", CHAR * MAX_PATH),
+                ("cAlternateFileName", CHAR * 14)]
+
+class WIN32_FIND_DATAW(ctypes.Structure):
+    _fields_ = [("dwFileAttributes", DWORD),
+                ("ftCreationTime", FILETIME),
+                ("ftLastAccessTime", FILETIME),
+                ("ftLastWriteTime", FILETIME),
+                ("nFileSizeHigh", DWORD),
+                ("nFileSizeLow", DWORD),
+                ("dwReserved0", DWORD),
+                ("dwReserved1", DWORD),
+                ("cFileName", WCHAR * MAX_PATH),
+                ("cAlternateFileName", WCHAR * 14)]
+
+################################################################
+# Pointer types
+
+LPBOOL = PBOOL = ctypes.POINTER(BOOL)
+PBOOLEAN = ctypes.POINTER(BOOLEAN)
+LPBYTE = PBYTE = ctypes.POINTER(BYTE)
+PCHAR = ctypes.POINTER(CHAR)
+LPCOLORREF = ctypes.POINTER(COLORREF)
+LPDWORD = PDWORD = ctypes.POINTER(DWORD)
+LPFILETIME = PFILETIME = ctypes.POINTER(FILETIME)
+PFLOAT = ctypes.POINTER(FLOAT)
+LPHANDLE = PHANDLE = ctypes.POINTER(HANDLE)
+PHKEY = ctypes.POINTER(HKEY)
+LPHKL = ctypes.POINTER(HKL)
+LPINT = PINT = ctypes.POINTER(INT)
+PLARGE_INTEGER = ctypes.POINTER(LARGE_INTEGER)
+PLCID = ctypes.POINTER(LCID)
+LPLONG = PLONG = ctypes.POINTER(LONG)
+LPMSG = PMSG = ctypes.POINTER(MSG)
+LPPOINT = PPOINT = ctypes.POINTER(POINT)
+PPOINTL = ctypes.POINTER(POINTL)
+LPRECT = PRECT = ctypes.POINTER(RECT)
+LPRECTL = PRECTL = ctypes.POINTER(RECTL)
+LPSC_HANDLE = ctypes.POINTER(SC_HANDLE)
+PSHORT = ctypes.POINTER(SHORT)
+LPSIZE = PSIZE = ctypes.POINTER(SIZE)
+LPSIZEL = PSIZEL = ctypes.POINTER(SIZEL)
+PSMALL_RECT = ctypes.POINTER(SMALL_RECT)
+LPUINT = PUINT = ctypes.POINTER(UINT)
+PULARGE_INTEGER = ctypes.POINTER(ULARGE_INTEGER)
+PULONG = ctypes.POINTER(ULONG)
+PUSHORT = ctypes.POINTER(USHORT)
+PWCHAR = ctypes.POINTER(WCHAR)
+LPWIN32_FIND_DATAA = PWIN32_FIND_DATAA = ctypes.POINTER(WIN32_FIND_DATAA)
+LPWIN32_FIND_DATAW = PWIN32_FIND_DATAW = ctypes.POINTER(WIN32_FIND_DATAW)
+LPWORD = PWORD = ctypes.POINTER(WORD)
+    usr/lib/python3.11/curses/                                                                          0000755 0000000 0000000 00000000000 14714551121 013754  5                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        usr/lib/python3.11/curses/__init__.py                                                               0000644 0000000 0000000 00000006451 14671176116 016104  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        """curses
+
+The main package for curses support for Python.  Normally used by importing
+the package, and perhaps a particular module inside it.
+
+   import curses
+   from curses import textpad
+   curses.initscr()
+   ...
+
+"""
+
+from _curses import *
+import os as _os
+import sys as _sys
+
+# Some constants, most notably the ACS_* ones, are only added to the C
+# _curses module's dictionary after initscr() is called.  (Some
+# versions of SGI's curses don't define values for those constants
+# until initscr() has been called.)  This wrapper function calls the
+# underlying C initscr(), and then copies the constants from the
+# _curses module to the curses package's dictionary.  Don't do 'from
+# curses import *' if you'll be needing the ACS_* constants.
+
+def initscr():
+    import _curses, curses
+    # we call setupterm() here because it raises an error
+    # instead of calling exit() in error cases.
+    setupterm(term=_os.environ.get("TERM", "unknown"),
+              fd=_sys.__stdout__.fileno())
+    stdscr = _curses.initscr()
+    for key, value in _curses.__dict__.items():
+        if key[0:4] == 'ACS_' or key in ('LINES', 'COLS'):
+            setattr(curses, key, value)
+
+    return stdscr
+
+# This is a similar wrapper for start_color(), which adds the COLORS and
+# COLOR_PAIRS variables which are only available after start_color() is
+# called.
+
+def start_color():
+    import _curses, curses
+    retval = _curses.start_color()
+    if hasattr(_curses, 'COLORS'):
+        curses.COLORS = _curses.COLORS
+    if hasattr(_curses, 'COLOR_PAIRS'):
+        curses.COLOR_PAIRS = _curses.COLOR_PAIRS
+    return retval
+
+# Import Python has_key() implementation if _curses doesn't contain has_key()
+
+try:
+    has_key
+except NameError:
+    from .has_key import has_key
+
+# Wrapper for the entire curses-based application.  Runs a function which
+# should be the rest of your curses-based application.  If the application
+# raises an exception, wrapper() will restore the terminal to a sane state so
+# you can read the resulting traceback.
+
+def wrapper(func, /, *args, **kwds):
+    """Wrapper function that initializes curses and calls another function,
+    restoring normal keyboard/screen behavior on error.
+    The callable object 'func' is then passed the main window 'stdscr'
+    as its first argument, followed by any other arguments passed to
+    wrapper().
+    """
+
+    try:
+        # Initialize curses
+        stdscr = initscr()
+
+        # Turn off echoing of keys, and enter cbreak mode,
+        # where no buffering is performed on keyboard input
+        noecho()
+        cbreak()
+
+        # In keypad mode, escape sequences for special keys
+        # (like the cursor keys) will be interpreted and
+        # a special value like curses.KEY_LEFT will be returned
+        stdscr.keypad(1)
+
+        # Start color, too.  Harmless if the terminal doesn't have
+        # color; user can test with has_color() later on.  The try/catch
+        # works around a minor bit of over-conscientiousness in the curses
+        # module -- the error return from C start_color() is ignorable.
+        try:
+            start_color()
+        except:
+            pass
+
+        return func(stdscr, *args, **kwds)
+    finally:
+        # Set everything back to normal
+        if 'stdscr' in locals():
+            stdscr.keypad(0)
+            echo()
+            nocbreak()
+            endwin()
+                                                                                                                                                                                                                       usr/lib/python3.11/curses/__pycache__/                                                              0000755 0000000 0000000 00000000000 14714551121 016164  5                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        usr/lib/python3.11/curses/__pycache__/__init__.cpython-311.pyc                                      0000644 0000000 0000000 00000006236 14714551121 022434  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        §
+    Nüäf)  ã                   ó^   — d Z ddlT ddlZddlZd„ Zd„ Z	 e n# e	$ r	 ddlmZ Y nw xY wd„ Z
+dS )	zØcurses
+
+The main package for curses support for Python.  Normally used by importing
+the package, and perhaps a particular module inside it.
+
+   import curses
+   from curses import textpad
+   curses.initscr()
+   ...
+
+é    )Ú*Nc                  óX  — dd l } dd l}t          t          j                             dd¦  «        t          j                             ¦   «         ¬¦  «         |  	                    ¦   «         }| j
+                             ¦   «         D ](\  }}|dd…         dk    s|dv rt          |||¦  «         Œ)|S )Nr   ÚTERMÚunknown)ÚtermÚfdé   ÚACS_)ÚLINESÚCOLS)Ú_cursesÚcursesÚ	setuptermÚ_osÚenvironÚgetÚ_sysÚ
+__stdout__ÚfilenoÚinitscrÚ__dict__ÚitemsÚsetattr)r   r   ÚstdscrÚkeyÚvalues        ú&/usr/lib/python3.11/curses/__init__.pyr   r      s½   € ØĞĞĞĞĞĞĞõ •3”;—?’? 6¨9Ñ5Ô5İ”×'Ò'Ñ)Ô)ğ+ñ +ô +ğ +à_Š_ÑÔ€FØÔ&×,Ò,Ñ.Ô.ğ (ğ (‰
+ˆˆUØˆqˆsŒ8vÒĞ Ğ(9Ğ!9Ğ!9İF˜C Ñ'Ô'Ğ'øà€Mó    c                  ó®   — dd l } dd l}|                      ¦   «         }t          | d¦  «        r| j        |_        t          | d¦  «        r| j        |_        |S )Nr   ÚCOLORSÚCOLOR_PAIRS)r   r   Ústart_colorÚhasattrr    r!   )r   r   Úretvals      r   r"   r"   *   sh   € ØĞĞĞĞĞĞĞØ× Ò Ñ"Ô"€Fİˆw˜Ñ!Ô!ğ 'ØœˆŒİˆw˜Ñ&Ô&ğ 1Ø$Ô0ˆÔØ€Mr   é   )Úhas_keyc                ó  — 	 t          ¦   «         }t          ¦   «          t          ¦   «          |                     d¦  «         	 t	          ¦   «          n#  Y nxY w | |g|¢R i |¤dt          ¦   «         v r@|                     d¦  «         t          ¦   «          t          ¦   «          t          ¦   «          S S # dt          ¦   «         v r@|                     d¦  «         t          ¦   «          t          ¦   «          t          ¦   «          w w xY w)a  Wrapper function that initializes curses and calls another function,
+    restoring normal keyboard/screen behavior on error.
+    The callable object 'func' is then passed the main window 'stdscr'
+    as its first argument, followed by any other arguments passed to
+    wrapper().
+    r%   r   r   )	r   ÚnoechoÚcbreakÚkeypadr"   ÚlocalsÚechoÚnocbreakÚendwin)ÚfuncÚargsÚkwdsr   s       r   Úwrapperr2   ?   sş   € ğå‘”ˆõ 	‰Œˆİ‰Œˆğ
+ 	ŠaÑÔĞğ	İ‰MŒMˆMˆMøğ	ØˆDøøøàˆtFĞ*˜TĞ*Ğ*Ğ* TĞ*Ğ*ğ •v‘x”xĞĞØMŠM˜!ÑÔĞİ‰FŒFˆFİ‰JŒJˆJİ‰HŒHˆHˆHğ	  øˆ8•v‘x”xĞĞØMŠM˜!ÑÔĞİ‰FŒFˆFİ‰JŒJˆJİ‰HŒHˆHˆHğ	  øøøs$   ‚?B4 ÁA ÁB4 ÁAÁB4 Â4AD)Ú__doc__r   Úosr   Úsysr   r   r"   r&   Ú	NameErrorr2   © r   r   ú<module>r8      s«   ğğ
+ğ 
+ğ Ğ Ğ Ğ Ø Ğ Ğ Ğ Ø Ğ Ğ Ğ ğğ ğ ğ"ğ ğ ğ!Ø€G€GøØğ !ğ !ğ !Ø Ğ Ğ Ğ Ğ Ğ Ğ Ğ ğ!øøøğ&ğ &ğ &ğ &ğ &s   – ™'¦'                                                                                                                                                                                                                                                                                                                                                                  usr/lib/python3.11/curses/__pycache__/ascii.cpython-311.pyc                                         0000644 0000000 0000000 00000013213 14714551121 021756  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        §
+    Nüäfó	  ã                   ó  — d Z dZdZdZdZdZdZdZdZd	Z	d
+Z
+d
+ZdZdZdZdZdZdZdZdZdZdZdZdZdZdZdZdZdZdZdZdZdZ dZ!d Z"d!Z#d"Z$g d#¢Z%d$„ Z&d%„ Z'd&„ Z(d'„ Z)d(„ Z*d)„ Z+d*„ Z,d+„ Z-d,„ Z.d-„ Z/d.„ Z0d/„ Z1d0„ Z2d1„ Z3d2„ Z4d3„ Z5d4„ Z6d5„ Z7d6„ Z8d7„ Z9d8S )9z3Constants and membership tests for ASCII charactersé    é   é   é   é   é   é   é   é   é	   é
+   é   é   é   é   é   é   é   é   é   é   é   é   é   é   é   é   é   é   é   é   é   é    é   )!ÚNULÚSOHÚSTXÚETXÚEOTÚENQÚACKÚBELÚBSÚHTÚLFÚVTÚFFÚCRÚSOÚSIÚDLEÚDC1ÚDC2ÚDC3ÚDC4ÚNAKÚSYNÚETBÚCANÚEMÚSUBÚESCÚFSÚGSÚRSÚUSÚSPc                 ód   — t          | ¦  «        t          d¦  «        k    rt          | ¦  «        S | S )NÚ )ÚtypeÚord©Úcs    ú#/usr/lib/python3.11/curses/ascii.pyÚ_ctoirL   0   s)   € İˆAw„w•$r‘(”(ÒĞİ1‰vŒvˆàˆó    c                 ó>   — t          | ¦  «        pt          | ¦  «        S ©N)ÚisalphaÚisdigitrI   s    rK   ÚisalnumrR   6   ó   € •w˜q‘z”zĞ/¥W¨Q¡Z¤ZĞ/rM   c                 ó>   — t          | ¦  «        pt          | ¦  «        S rO   )ÚisupperÚislowerrI   s    rK   rP   rP   7   rS   rM   c                 ó<   — dt          | ¦  «        cxk    odk    nc S )Nr   r#   ©rL   rI   s    rK   ÚisasciirY   8   s)   € qE !™HœHĞ+Ğ+Ò+Ğ+¨Ò+Ğ+Ğ+Ğ+Ğ+rM   c                 ó$   — t          | ¦  «        dv S )N)r   r"   rX   rI   s    rK   Úisblankr[   9   s   € •u˜Q‘x”x 7Ğ*Ğ*rM   c                 ób   — dt          | ¦  «        cxk    odk    nc pt          | ¦  «        dk    S )Nr   r!   r#   rX   rI   s    rK   Úiscntrlr]   :   s8   € qE !™HœHĞ*Ğ*Ò*Ğ*¨Ò*Ğ*Ğ*Ğ*Ğ=­e°A©h¬h¸#ªoĞ=rM   c                 ó<   — dt          | ¦  «        cxk    odk    nc S )Né0   é9   rX   rI   s    rK   rQ   rQ   ;   ó)   € rU 1™XœXĞ+Ğ+Ò+Ğ+¨Ò+Ğ+Ğ+Ğ+Ğ+rM   c                 ó<   — dt          | ¦  «        cxk    odk    nc S )Né!   é~   rX   rI   s    rK   Úisgraphre   <   ó)   € rU 1™XœXĞ,Ğ,Ò,Ğ,¨Ò,Ğ,Ğ,Ğ,Ğ,rM   c                 ó<   — dt          | ¦  «        cxk    odk    nc S )Néa   éz   rX   rI   s    rK   rV   rV   =   rf   rM   c                 ó<   — dt          | ¦  «        cxk    odk    nc S )Nr"   rd   rX   rI   s    rK   Úisprintrk   >   rf   rM   c                 ó@   — t          | ¦  «        ot          | ¦  «         S rO   )re   rR   rI   s    rK   Úispunctrm   ?   s   € •w˜q‘z”zĞ4­'°!©*¬* nĞ4rM   c                 ó$   — t          | ¦  «        dv S )N)r   r   r   r   r   r"   rX   rI   s    rK   Úisspacero   @   s   € •u˜Q‘x”xĞ#:Ğ:Ğ:rM   c                 ó<   — dt          | ¦  «        cxk    odk    nc S )NéA   éZ   rX   rI   s    rK   rU   rU   A   ra   rM   c                 ó”   — t          | ¦  «        p9dt          | ¦  «        cxk    odk    nc pdt          | ¦  «        cxk    odk    nc S )Nrq   éF   rh   éf   )rQ   rL   rI   s    rK   Úisxdigitrv   B   sc   €  ™
+œ
+ğ 6Ø5‰8Œ8ĞĞÒĞrÒĞĞĞğ6Ø!¥U¨1¡X¤XĞ4Ğ4Ò4Ğ4°Ò4Ğ4Ğ4Ğ4ğ6rM   c                 ó<   — dt          | ¦  «        cxk    odk     nc S )Nr   r"   rX   rI   s    rK   Úisctrlrx   D   s)   € a5 ™8œ8Ğ(Ğ(Ò(Ğ( bÒ(Ğ(Ğ(Ğ(Ğ(rM   c                 ó(   — t          | ¦  «        dk    S )Nr#   rX   rI   s    rK   Úismetarz   E   s   € •e˜A‘h”h ’nĞ$rM   c                 ó¤   — t          | ¦  «        t          d¦  «        k    rt          t          | ¦  «        dz  ¦  «        S t          | ¦  «        dz  S )NrF   r#   ©rG   ÚchrrL   rI   s    rK   Úasciir~   G   óA   € İˆAw„w•$r‘(”(ÒĞİ•5˜‘8”8˜d‘?Ñ#Ô#Ğ#åQ‰xŒx˜$‰ĞrM   c                 ó¤   — t          | ¦  «        t          d¦  «        k    rt          t          | ¦  «        dz  ¦  «        S t          | ¦  «        dz  S )NrF   r!   r|   rI   s    rK   Úctrlr   M   r   rM   c                 ó¤   — t          | ¦  «        t          d¦  «        k    rt          t          | ¦  «        dz  ¦  «        S t          | ¦  «        dz  S )NrF   é€   r|   rI   s    rK   Úaltr„   S   r   rM   c                 óÊ   — t          | ¦  «        }|dk    rd}n@t          |dz  ¦  «        rt          |dz  ¦  «        }ndt          |dz  dz  dz   ¦  «        z   }|dz  rd|z   S |S )Nr#   z^?ú^r"   rƒ   ú!)rL   rk   r}   )rJ   ÚbitsÚreps      rK   ÚunctrlrŠ   Y   s   € İ‰8Œ8€DØˆt‚|€|Øˆˆİ	˜‘Ñ	Ô	ğ 7İ$˜‘+ÑÔˆˆà•C˜$ ™+¨Ñ-°Ñ5Ñ6Ô6Ñ6ˆØˆd{ğ ØS‰yĞØ€JrM   N):Ú__doc__r$   r%   r&   r'   r(   r)   r*   r+   r,   ÚTABr-   r.   ÚNLr/   r0   r1   r2   r3   r4   r5   r6   r7   r8   r9   r:   r;   r<   r=   r>   r?   r@   rA   rB   rC   rD   ÚDELÚcontrolnamesrL   rR   rP   rY   r[   r]   rQ   re   rV   rk   rm   ro   rU   rv   rx   rz   r~   r   r„   rŠ   © rM   rK   ú<module>r‘      s´  ğØ 9Ğ 9à
+€Ø
+€Ø
+€Ø
+€Ø
+€Ø
+€Ø
+€Ø
+€Ø
+€Ø
+€Ø
+€Ø
+€Ø
+€Ø
+€Ø
+€Ø
+€Ø
+€Ø
+€Ø
+€Ø
+€Ø
+€Ø
+€Ø
+€Ø
+€Ø
+€Ø
+€Ø
+€Ø
+€Ø
+€Ø
+€Ø
+€Ø
+€Ø
+€Ø
+€Ø
+€Ø
+€ğğ ğ €ğğ ğ ğ 0Ğ /Ğ /Ø /Ğ /Ğ /Ø +Ğ +Ğ +Ø *Ğ *Ğ *Ø =Ğ =Ğ =Ø +Ğ +Ğ +Ø ,Ğ ,Ğ ,Ø ,Ğ ,Ğ ,Ø ,Ğ ,Ğ ,Ø 4Ğ 4Ğ 4Ø :Ğ :Ğ :Ø +Ğ +Ğ +ğ6ğ 6ğ 6à (Ğ (Ğ (Ø $Ğ $Ğ $ğğ ğ ğğ ğ ğğ ğ ğ
+ğ 
+ğ 
+ğ 
+ğ 
+rM                                                                                                                                                                                                                                                                                                                                                                                        usr/lib/python3.11/curses/__pycache__/has_key.cpython-311.pyc                                       0000644 0000000 0000000 00000021001 14714551121 022303  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        §
+    Nüäf  ã                   óì
+  — d dl Z i e j        d“e j        d“e j        d“e j        d“e j        d“e j        d“e j        d“e j        d	“e j	        d
+“e j
+        d“e j        d“e j        d“e j        d“e j        d“e j        d“e j        d“e j        d“i e j        d“e j        d“e j        d“e j        d“e j        d“e j        d“e j        d“e j        d“e j        d“e j        d“e j        d“e j        d“e j        d“e j        d “e j         d!“e j!        d"“e j"        d#“¥i e j#        d$“e j$        d%“e j%        d&“e j&        d'“e j'        d(“e j(        d)“e j)        d*“e j*        d+“e j+        d,“e j,        d-“e j-        d.“e j.        d/“e j/        d0“e j0        d1“e j1        d2“e j2        d3“e j3        d4“¥i e j4        d5“e j5        d6“e j6        d7“e j7        d8“e j8        d9“e j9        d:“e j:        d;“e j;        d<“e j<        d=“e j=        d>“e j>        d?“e j?        d@“e j@        dA“e jA        dB“e jB        dC“e jC        dD“e jD        dE“¥i e jE        dF“e jF        dG“e jG        dH“e jH        dI“e jI        dJ“e jJ        dK“e jK        dL“e jL        dM“e jM        dN“e jN        dO“e jO        dP“e jP        dQ“e jQ        dR“e jR        dS“e jS        dT“e jT        dU“e jU        dV“¥i e jV        dW“e jW        dX“e jX        dY“e jY        dZ“e jZ        d[“e j[        d\“e j\        d]“e j]        d^“e j^        d_“e j_        d`“e j`        da“e ja        db“e jb        dc“e jc        dd“e jd        de“e je        df“e jf        dg“¥i e jg        dh“e jh        di“e ji        dj“e jj        dk“e jk        dl“e jl        dm“e jm        dn“e jn        do“e jo        dp“e jp        dq“e jq        dr“e jr        ds“e js        dt“e jt        du“e ju        dv“e jv        dw“e jw        dx“¥i e jx        dy“e jy        dz“e jz        d{“e j{        d|“e j|        d}“e j}        d~“e j~        d“e j        d€“e j€        d“e j        d‚“e j‚        dƒ“e jƒ        d„“e j„        d…“e j…        d†“e j†        d‡“e j‡        dˆ“e jˆ        d‰“¥e j‰        dŠe jŠ        d‹e j‹        dŒe jŒ        de j        de j        de j        de j        d‘e j‘        d’e j’        d“e j“        d”e j”        d•e j•        d–i¥Z–d—„ Z—e˜d˜k    r¹	 g Z™ e jš        ¦   «          e– ›                    ¦   «         D ]LZœ e j—        eœ¦  «        Z e—eœ¦  «        Zeek    r)e™ Ÿ                    d™ e j         eœ¦  «        eefz  ¦  «         ŒM	  e j¡        ¦   «          e™D ]Z¢ e£e¢¦  «         ŒdS #  e j¡        ¦   «          e™D ]Z¢ e£e¢¦  «         Œw xY wdS )šé    NÚka1Úka3Úkb2ÚkbsÚkbegÚkcbtÚkc1Úkc3ÚkcanÚktbcÚkclrÚkcloÚkcmdÚkcpyÚkcrtÚkctabÚkdch1Úkdl1Úkcud1ÚkrmirÚkendÚkentÚkelÚkedÚkextÚkf0Úkf1Úkf10Úkf11Úkf12Úkf13Úkf14Úkf15Úkf16Úkf17Úkf18Úkf19Úkf2Úkf20Úkf21Úkf22Úkf23Úkf24Úkf25Úkf26Úkf27Úkf28Úkf29Úkf3Úkf30Úkf31Úkf32Úkf33Úkf34Úkf35Úkf36Úkf37Úkf38Úkf39Úkf4Úkf40Úkf41Úkf42Úkf43Úkf44Úkf45Úkf46Úkf47Úkf48Úkf49Úkf5Úkf50Úkf51Úkf52Úkf53Úkf54Úkf55Úkf56Úkf57Úkf58Úkf59Úkf6Úkf60Úkf61Úkf62Úkf63Úkf7Úkf8Úkf9ÚkfndÚkhlpÚkhomeÚkich1Úkil1Úkcub1ÚkllÚkmrkÚkmsgÚkmovÚknxtÚknpÚkopnÚkoptÚkppÚkprvÚkprtÚkrdoÚkrefÚkrfrÚkrplÚkrstÚkresÚkcuf1ÚksavÚkBEGÚkCANÚkCMDÚkCPYÚkCRTÚkDCÚkDLÚksltÚkENDÚkEOLÚkEXTÚkindÚkFNDÚkHLPÚkHOMÚkICÚkLFTÚkMSGÚkMOVÚkNXTÚkOPTÚkPRVÚkPRTÚkriÚkRDOÚkRPLÚkRITÚkRESÚkSAVÚkSPDÚkhtsÚkUNDÚkspdÚkundÚkcuu1c                 ó¶   — t          | t          ¦  «        rt          | ¦  «        } t                               | ¦  «        }|€dS t          j        |¦  «        rdS dS )NFT)Ú
+isinstanceÚstrÚordÚ_capability_namesÚgetÚ_cursesÚtigetstr)ÚchÚcapability_names     ú%/usr/lib/python3.11/curses/has_key.pyÚhas_keyr£   ¢   s^   € İ"•cÑÔğ İ‰WŒWˆõ (×+Ò+¨BÑ/Ô/€OØĞØˆuõ Ô˜Ñ*Ô*ğ Øˆtàˆuó    Ú__main__z)Mismatch for key %s, system=%i, Python=%i)¤r   ÚKEY_A1ÚKEY_A3ÚKEY_B2ÚKEY_BACKSPACEÚKEY_BEGÚKEY_BTABÚKEY_C1ÚKEY_C3Ú
+KEY_CANCELÚ	KEY_CATABÚ	KEY_CLEARÚ	KEY_CLOSEÚKEY_COMMANDÚKEY_COPYÚ
+KEY_CREATEÚKEY_CTABÚKEY_DCÚKEY_DLÚKEY_DOWNÚKEY_EICÚKEY_ENDÚ	KEY_ENTERÚKEY_EOLÚKEY_EOSÚKEY_EXITÚKEY_F0ÚKEY_F1ÚKEY_F10ÚKEY_F11ÚKEY_F12ÚKEY_F13ÚKEY_F14ÚKEY_F15ÚKEY_F16ÚKEY_F17ÚKEY_F18ÚKEY_F19ÚKEY_F2ÚKEY_F20ÚKEY_F21ÚKEY_F22ÚKEY_F23ÚKEY_F24ÚKEY_F25ÚKEY_F26ÚKEY_F27ÚKEY_F28ÚKEY_F29ÚKEY_F3ÚKEY_F30ÚKEY_F31ÚKEY_F32ÚKEY_F33ÚKEY_F34ÚKEY_F35ÚKEY_F36ÚKEY_F37ÚKEY_F38ÚKEY_F39ÚKEY_F4ÚKEY_F40ÚKEY_F41ÚKEY_F42ÚKEY_F43ÚKEY_F44ÚKEY_F45ÚKEY_F46ÚKEY_F47ÚKEY_F48ÚKEY_F49ÚKEY_F5ÚKEY_F50ÚKEY_F51ÚKEY_F52ÚKEY_F53ÚKEY_F54ÚKEY_F55ÚKEY_F56ÚKEY_F57ÚKEY_F58ÚKEY_F59ÚKEY_F6ÚKEY_F60ÚKEY_F61ÚKEY_F62ÚKEY_F63ÚKEY_F7ÚKEY_F8ÚKEY_F9ÚKEY_FINDÚKEY_HELPÚKEY_HOMEÚKEY_ICÚKEY_ILÚKEY_LEFTÚKEY_LLÚKEY_MARKÚKEY_MESSAGEÚKEY_MOVEÚKEY_NEXTÚ	KEY_NPAGEÚKEY_OPENÚKEY_OPTIONSÚ	KEY_PPAGEÚKEY_PREVIOUSÚ	KEY_PRINTÚKEY_REDOÚKEY_REFERENCEÚKEY_REFRESHÚKEY_REPLACEÚKEY_RESTARTÚ
+KEY_RESUMEÚ	KEY_RIGHTÚKEY_SAVEÚKEY_SBEGÚKEY_SCANCELÚKEY_SCOMMANDÚ	KEY_SCOPYÚKEY_SCREATEÚKEY_SDCÚKEY_SDLÚ
+KEY_SELECTÚKEY_SENDÚKEY_SEOLÚ	KEY_SEXITÚKEY_SFÚ	KEY_SFINDÚ	KEY_SHELPÚ	KEY_SHOMEÚKEY_SICÚ	KEY_SLEFTÚKEY_SMESSAGEÚ	KEY_SMOVEÚ	KEY_SNEXTÚKEY_SOPTIONSÚKEY_SPREVIOUSÚ
+KEY_SPRINTÚKEY_SRÚ	KEY_SREDOÚKEY_SREPLACEÚ
+KEY_SRIGHTÚ
+KEY_SRSUMEÚ	KEY_SSAVEÚKEY_SSUSPENDÚKEY_STABÚ	KEY_SUNDOÚKEY_SUSPENDÚKEY_UNDOÚKEY_UPrœ   r£   Ú__name__ÚLÚinitscrÚkeysÚkeyÚsystemÚpythonÚappendÚkeynameÚendwinÚiÚprint© r¤   r¢   ú<module>rH     s  ğğ €€€ğVØ„NEğVà„NEğVğ „NEğVğ Ô˜5ğ	Vğ
+ „OVğVğ ÔfğVğ „NEğVğ „NEğVğ Ô˜ğVğ ÔvğVğ ÔvğVğ ÔvğVğ Ô˜ğVğ ÔfğVğ Ô˜ğVğ  Ôgğ!Vğ" „NGğ#Vğ Vğ$ „NFğ%Vğ& Ôgğ'Vğ( „OWğ)Vğ* „OVğ+Vğ, Ôvğ-Vğ. „OUğ/Vğ0 „OUğ1Vğ2 Ôfğ3Vğ4 „NEğ5Vğ6 „NEğ7Vğ8 „OVğ9Vğ: „OVğ;Vğ< „OVğ=Vğ> „OVğ?Vğ@ „OVğAVğB „OVğCVğD „OVğEVğ Vğ VğF „OVğGVğH „OVğIVğJ „OVğKVğL „NEğMVğN „OVğOVğP „OVğQVğR „OVğSVğT „OVğUVğV „OVğWVğX „OVğYVğZ „OVğ[Vğ\ „OVğ]Vğ^ „OVğ_Vğ` „OVğaVğb „NEğcVğd „OVğeVğf „OVğgVğ Vğ Vğh „OVğiVğj „OVğkVğl „OVğmVğn „OVğoVğp „OVğqVğr „OVğsVğt „OVğuVğv „OVğwVğx „NEğyVğz „OVğ{Vğ| „OVğ}Vğ~ „OVğVğ@ „OVğAVğB „OVğCVğD „OVğEVğF „OVğGVğH „OVğIVğ Vğ VğJ „OVğKVğL „OVğMVğN „NEğOVğP „OVğQVğR „OVğSVğT „OVğUVğV „OVğWVğX „OVğYVğZ „OVğ[Vğ\ „OVğ]Vğ^ „OVğ_Vğ` „OVğaVğb „OVğcVğd „NEğeVğf „OVğgVğh „OVğiVğj „OVğkVğ Vğ Vğl „OVğmVğn „NEğoVğp „NEğqVğr „NEğsVğt ÔfğuVğv ÔfğwVğx ÔgğyVğz „NGğ{Vğ| „NFğ}Vğ~ ÔgğVğ@ „NEğAVğB ÔfğCVğD Ô˜ğEVğF ÔfğGVğH ÔfğIVğJ ÔuğKVğL ÔfğMVğ Vğ VğN Ô˜ğOVğP ÔuğQVğR Ô˜&ğSVğT ÔvğUVğV ÔfğWVğX Ô˜6ğYVğZ Ô˜ğ[Vğ\ Ô˜ğ]Vğ^ Ô˜ğ_Vğ` Ô˜ğaVğb ÔwğcVğd ÔfğeVğf ÔfğgVğh Ô˜ğiVğj Ô˜&ğkVğl ÔvğmVğn Ô˜ğoVğ Vğ Vğp „OUğqVğr „OUğsVğt Ô˜ğuVğv ÔfğwVğx ÔfğyVğz Ôvğ{Vğ| „NFğ}Vğ~ ÔvğVğ@ ÔvğAVğB ÔvğCVğD „OUğEVğF ÔvğGVğH Ô˜&ğIVğJ ÔvğKVğL ÔvğMVğN Ô˜&ğOVğP Ô˜6ğQVğ VğR Ô˜Ø„NEØÔvØÔ˜&ØÔ˜ØÔ˜ØÔvØÔ˜&ØÔfØÔvØÔ˜ØÔfØ„NGğkVğ VĞ ğpğ ğ ğ  ˆzÒĞğØˆØˆŒÑÔĞØ$×)Ò)Ñ+Ô+ğ 	Gğ 	GˆCØ$W”_ SÑ)Ô)ˆFØW˜S‘\”\ˆFØ˜ÒĞØ—’ĞEØ,˜Wœ_¨cÑ3Ô3°V¸VĞDñEñ Gô Gğ Gøğ		Gğ 	ˆŒÑÔĞØĞĞˆAEE˜!‘H”HHHĞĞøğ 	ˆŒÑÔĞØĞĞˆAEE˜!‘H”HHHĞøøøğ Ğs   Ò<A2U Õ!U1                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               usr/lib/python3.11/curses/__pycache__/panel.cpython-311.pyc                                         0000644 0000000 0000000 00000000404 14714551121 021763  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        §
+    NüäfW   ã                   ó   — d Z ddlT dS )z3curses.panel
+
+Module for using panels with curses.
+é    )Ú*N)Ú__doc__Ú_curses_panel© ó    ú#/usr/lib/python3.11/curses/panel.pyú<module>r	      s#   ğğğ ğ
+ Ğ Ğ Ğ Ğ Ğ r                                                                                                                                                                                                                                                               usr/lib/python3.11/curses/__pycache__/textpad.cpython-311.pyc                                       0000644 0000000 0000000 00000027605 14714551121 022351  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        §
+    Nüäfé  ã                   óš   — d Z ddlZddlZd„ Z G d„ d¦  «        Zedk    r*d„ Z ej        e¦  «        Z e	d e
+e¦  «        ¦  «         dS dS )	z:Simple textbox editing widget with Emacs-like keybindings.é    Nc                 óf  — |                       |dz   |t          j        ||z
+  dz
+  ¦  «         |                      ||dz   t          j        ||z
+  dz
+  ¦  «         |                      ||dz   t          j        ||z
+  dz
+  ¦  «         |                       |dz   |t          j        ||z
+  dz
+  ¦  «         |                      ||t          j        ¦  «         |                      ||t          j        ¦  «         |                      ||t          j        ¦  «         |                      ||t          j	        ¦  «         dS )z^Draw a rectangle with corners at the provided upper-left
+    and lower-right coordinates.
+    é   N)
+ÚvlineÚcursesÚ	ACS_VLINEÚhlineÚ	ACS_HLINEÚaddchÚACS_ULCORNERÚACS_URCORNERÚACS_LRCORNERÚACS_LLCORNER)ÚwinÚulyÚulxÚlryÚlrxs        ú%/usr/lib/python3.11/curses/textpad.pyÚ	rectangler      s
+  € ğ ‡I‚Iˆc!‰eS&Ô*¨C°#©I¸©MÑ:Ô:Ğ:Ø‡I‚Iˆc3q‘5&Ô*¨C°#©I¸©MÑ:Ô:Ğ:Ø‡I‚Iˆc3q‘5&Ô*¨C°#©I¸©MÑ:Ô:Ğ:Ø‡I‚Iˆc!‰eS&Ô*¨C°#©I¸©MÑ:Ô:Ğ:Ø‡I‚Iˆc3Ô+Ñ,Ô,Ğ,Ø‡I‚Iˆc3Ô+Ñ,Ô,Ğ,Ø‡I‚Iˆc3Ô+Ñ,Ô,Ğ,Ø‡I‚Iˆc3Ô+Ñ,Ô,Ğ,Ğ,Ğ,ó    c                   ó@   — e Zd ZdZdd„Zd„ Zd„ Zd„ Zd„ Zd„ Z	dd
+„Z
+d	S )ÚTextboxad  Editing widget using the interior of a window object.
+     Supports the following Emacs-like key bindings:
+
+    Ctrl-A      Go to left edge of window.
+    Ctrl-B      Cursor left, wrapping to previous line if appropriate.
+    Ctrl-D      Delete character under cursor.
+    Ctrl-E      Go to right edge (stripspaces off) or end of line (stripspaces on).
+    Ctrl-F      Cursor right, wrapping to next line when appropriate.
+    Ctrl-G      Terminate, returning the window contents.
+    Ctrl-H      Delete character backward.
+    Ctrl-J      Terminate if the window is 1 line, otherwise insert newline.
+    Ctrl-K      If line is blank, delete it, otherwise clear to end of line.
+    Ctrl-L      Refresh screen.
+    Ctrl-N      Cursor down; move down one line.
+    Ctrl-O      Insert a blank line at cursor location.
+    Ctrl-P      Cursor up; move up one line.
+
+    Move operations do nothing if the cursor is at an edge where the movement
+    is not possible.  The following synonyms are supported where possible:
+
+    KEY_LEFT = Ctrl-B, KEY_RIGHT = Ctrl-F, KEY_UP = Ctrl-P, KEY_DOWN = Ctrl-N
+    KEY_BACKSPACE = Ctrl-h
+    Fc                 ó   — || _         || _        |                      ¦   «          d| _        d | _        |                     d¦  «         d S ©Nr   )r   Úinsert_modeÚ_update_max_yxÚstripspacesÚlastcmdÚkeypad)Úselfr   r   s      r   Ú__init__zTextbox.__init__+   sE   € ØˆŒØ&ˆÔØ×ÒÑÔĞØˆÔØˆŒØ
+Š
+1‰Œˆˆˆr   c                 óf   — | j                              ¦   «         \  }}|dz
+  | _        |dz
+  | _        d S r   )r   ÚgetmaxyxÚmaxyÚmaxx)r    r$   r%   s      r   r   zTextbox._update_max_yx3   s3   € Ø”X×&Ò&Ñ(Ô(‰
+ˆˆdØ˜1‘HˆŒ	Ø˜1‘HˆŒ	ˆ	ˆ	r   c                 ó   — |                       ¦   «          | j        }	 t          j                             | j                             ||¦  «        ¦  «        t          j        j        k    rt          | j        |dz   ¦  «        }n|dk    rn|dz
+  }Œq|S )zuGo to the location of the first blank on the given line,
+        returning the index of the last non-blank character.Tr   r   )r   r%   r   Úasciir   ÚinchÚSPÚmin)r    ÚyÚlasts      r   Ú_end_of_linezTextbox._end_of_line8   sŠ   € ğ 	×ÒÑÔĞØŒyˆğ	İŒ|×!Ò! $¤(§-¢-°°4Ñ"8Ô"8Ñ9Ô9½V¼\¼_ÒLĞLİ˜4œ9 d¨1¡fÑ-Ô-ØØ˜’ØØ˜!‘8ˆDğ	ğ ˆr   c                 ó   — |                       ¦   «          | j                             ¦   «         \  }}d }|| j        k     s|| j        k     r²| j        r| j                             ¦   «         }	 | j                             |¦  «         n# t          j	        $ r Y nw xY w| j        rt          j
+                             |¦  «        sn:|}| j                             ¦   «         \  }}|€||f}|| j        k     °§|| j        k     °²| | j        j        |  d S d S ©N)r   r   Úgetyxr$   r%   r   r(   r
+   r   Úerrorr'   ÚisprintÚmove)r    Úchr+   ÚxÚbackyxÚoldchs         r   Ú_insert_printable_charzTextbox._insert_printable_charF   s&  € Ø×ÒÑÔĞØ”—’Ñ!Ô!‰ˆˆAØˆØ$”)Šmˆm˜q 4¤9š}˜}ØÔğ (ØœŸš™œğØ”—’˜rÑ"Ô"Ğ"Ğ"øİ”<ğ ğ ğ ØğøøøàÔ#ğ ­6¬<×+?Ò+?ÀÑ+FÔ+Fğ ØØˆBØ”X—^’^Ñ%Ô%‰FˆQàˆ~Ø˜A˜ğ! $”)Šmˆm˜q 4¤9š}˜}ğ$ ĞØˆDŒHŒM˜6Ğ"Ğ"Ğ"Ğ"ğ Ğs   Á*B ÂBÂBc                 ó€
+  — |                       ¦   «          | j                             ¦   «         \  }}|| _        t          j                             |¦  «        r-|| j        k     s|| j        k     r|  	                    |¦  «         nº|t          j        j
+        k    r| j                             |d¦  «         nˆ|t          j        j        t          j        t          j        j        t          j        fv rÅ|dk    r| j                             ||dz
+  ¦  «         nf|dk    rn_| j        r5| j                             |dz
+  |                      |dz
+  ¦  «        ¦  «         n#| j                             |dz
+  | j        ¦  «         |t          j        j        t          j        fv r| j                             ¦   «          n‰|t          j        j        k    r| j                             ¦   «          nY|t          j        j        k    rY| j        r0| j                             ||                      |¦  «        ¦  «         n| j                             || j        ¦  «         në|t          j        j        t          j        fv rX|| j        k     r | j                             ||dz   ¦  «         n¡|| j        k    rn”| j                             |dz   d¦  «         nt|t          j        j        k    rdS |t          j        j        k    r8| j        dk    rdS || j        k     r| j                             |dz   d¦  «         n|t          j        j        k    rp|dk    r4|                      |¦  «        dk    r| j                             ¦   «          nÁ| j                             ||¦  «         | j                             ¦   «          n‹|t          j        j        k    r| j                             ¦   «          n[|t          j        j        t          j        fv rz|| j        k     rn| j                             |dz   |¦  «         ||                      |dz   ¦  «        k    r4| j                             |dz   |                      |dz   ¦  «        ¦  «         nÂ|t          j        j         k    r| j         !                    ¦   «          n“|t          j        j"        t          j#        fv rt|dk    rn| j                             |dz
+  |¦  «         ||                      |dz
+  ¦  «        k    r4| j                             |dz
+  |                      |dz
+  ¦  «        ¦  «         dS )z!Process a single editing command.r   r   )$r   r   r0   r   r   r'   r2   r$   r%   r8   ÚSOHr3   ÚSTXÚKEY_LEFTÚBSÚKEY_BACKSPACEr   r-   ÚdelchÚEOTÚENQÚACKÚ	KEY_RIGHTÚBELÚNLÚVTÚdeletelnÚclrtoeolÚFFÚrefreshÚSOÚKEY_DOWNÚSIÚinsertlnÚDLEÚKEY_UP)r    r4   r+   r5   s       r   Ú
+do_commandzTextbox.do_command_   s…  € à×ÒÑÔĞØ”—’Ñ!Ô!‰ˆˆAØˆŒİŒ<×Ò Ñ#Ô#ğ 9	?Ø4”9Š}ˆ}  D¤I¢ Ø×+Ò+¨BÑ/Ô/Ğ/ùØ•6”<Ô#Ò#Ğ#ØŒHMŠM˜!˜QÑÔĞÑØ•F”LÔ$¥V¤_µf´l´oÅfÔFZĞ[Ğ[Ğ[Ø1ŠuˆuØ”—’˜a  1¡Ñ%Ô%Ğ%Ğ%Øa’ØØÔ!ğ .Ø”—’˜a ™c 4×#4Ò#4°Q°q±SÑ#9Ô#9Ñ:Ô:Ğ:Ğ:à”—’˜a ™c 4¤9Ñ-Ô-Ğ-Ø•f”l”o¥vÔ';Ğ<Ğ<Ğ<Ø”—’Ñ Ô Ğ ùØ•6”<Ô#Ò#Ğ#ØŒHNŠNÑÔĞÑØ•6”<Ô#Ò#Ğ#ØÔğ ,Ø”—’˜a ×!2Ò!2°1Ñ!5Ô!5Ñ6Ô6Ğ6Ñ6à”—’˜a ¤Ñ+Ô+Ğ+Ñ+Ø•F”LÔ$¥fÔ&6Ğ7Ğ7Ğ7Ø4”9Š}ˆ}Ø”—’˜a  1¡Ñ%Ô%Ğ%Ñ%Ød”i’Ùà”—’˜a ™c 1Ñ%Ô%Ğ%Ñ%Ø•6”<Ô#Ò#Ğ#Ø1Ø•6”<”?Ò"Ğ"ØŒy˜AŠ~ˆ~ØqØT”Y’Ø”—’˜a ™c 1Ñ%Ô%Ğ%ùØ•6”<”?Ò"Ğ"ØAŠvˆv˜$×+Ò+¨AÑ.Ô.°!Ò3Ğ3Ø”×!Ò!Ñ#Ô#Ğ#Ñ#ğ ”—’˜a Ñ#Ô#Ğ#Ø”×!Ò!Ñ#Ô#Ğ#Ñ#Ø•6”<”?Ò"Ğ"ØŒH×ÒÑÔĞÑØ•F”L”O¥V¤_Ğ5Ğ5Ğ5Ø4”9Š}ˆ}Ø”—’˜a ™c 1Ñ%Ô%Ğ%Øt×(Ò(¨¨1©Ñ-Ô-Ò-Ğ-Ø”H—M’M ! A¡# t×'8Ò'8¸¸1¹Ñ'=Ô'=Ñ>Ô>Ğ>øØ•6”<”?Ò"Ğ"ØŒH×ÒÑÔĞĞØ•F”LÔ$¥f¤mĞ4Ğ4Ğ4Ø1ŠuˆuØ”—’˜a ™c 1Ñ%Ô%Ğ%Øt×(Ò(¨¨1©Ñ-Ô-Ò-Ğ-Ø”H—M’M ! A¡# t×'8Ò'8¸¸1¹Ñ'=Ô'=Ñ>Ô>Ğ>Øˆqr   c                 óä  — d}|                       ¦   «          t          | j        dz   ¦  «        D ]Á}| j                             |d¦  «         |                      |¦  «        }|dk    r| j        rŒ@t          | j        dz   ¦  «        D ]Y}| j        r||k    r nI|t          t          j
+         
+                    | j                             ||¦  «        ¦  «        ¦  «        z   }ŒZ| j        dk    r|dz   }ŒÂ|S )z.Collect and return the contents of the window.Ú r   r   ú
+)r   Úranger$   r   r3   r-   r   r%   Úchrr   r'   r(   )r    Úresultr+   Ústopr5   s        r   ÚgatherzTextbox.gather    s÷   € àˆØ×ÒÑÔĞİt”y ‘{Ñ#Ô#ğ 
+	'ğ 
+	'ˆAØŒHMŠM˜!˜QÑÔĞØ×$Ò$ QÑ'Ô'ˆDØqŠyˆy˜TÔ-ˆyØİ˜4œ9 Q™;Ñ'Ô'ğ Oğ OØÔ#ğ ¨¨Dª¨ØEØ¥#¥f¤l×&8Ò&8¸¼¿ºÀqÈ!Ñ9LÔ9LÑ&MÔ&MÑ"NÔ"NÑNØŒy˜1Š}ˆ}Ø $™øØˆr   Nc                 óŞ   — 	 | j                              ¦   «         }|r ||¦  «        }|sŒ*|                      |¦  «        sn| j                              ¦   «          ŒY|                      ¦   «         S )z2Edit in the widget window and collect the results.)r   ÚgetchrQ   rJ   rY   )r    Úvalidater4   s      r   ÚeditzTextbox.edit±   sx   € ğ	Ø”—’Ñ!Ô!ˆBØğ "ØX˜b‘\”\Øğ ØØ—?’? 2Ñ&Ô&ğ ØØŒH×ÒÑÔĞğ	ğ {Š{‰}Œ}Ğr   )Fr/   )Ú__name__Ú
+__module__Ú__qualname__Ú__doc__r!   r   r-   r8   rQ   rY   r]   © r   r   r   r      s’   € € € € € ğğ ğ.ğ ğ ğ ğğ ğ ğ
+ğ ğ ğ#ğ #ğ #ğ2?ğ ?ğ ?ğBğ ğ ğ"ğ ğ ğ ğ ğ r   r   Ú__main__c                 ó   — d\  }}d\  }}|                       |dz
+  |d¦  «         t          j        ||||¦  «        }t          | |dz
+  |dz
+  ||z   ||z   ¦  «         |                      ¦   «          t          |¦  «                             ¦   «         S )N)é	   é   )é   é   é   zUse Ctrl-G to end editing.r   )Úaddstrr   Únewwinr   rJ   r   r]   )ÚstdscrÚncolsÚnlinesr   r   r   s         r   Útest_editboxro   ¿   s’   € Ø‰ˆˆvØ‰ˆˆSØŠc˜!‘e˜SĞ">Ñ?Ô?Ğ?İŒm˜F E¨3°Ñ4Ô4ˆİ&˜#˜a™%  Q¡¨¨f©°c¸E±kÑBÔBĞBØŠÑÔĞİs‰|Œ|× Ò Ñ"Ô"Ğ"r   zContents of text box:)ra   r   Úcurses.asciir   r   r^   ro   ÚwrapperÚstrÚprintÚreprrb   r   r   ú<module>ru      s¸   ğØ @Ğ @à €€€Ø Ğ Ğ Ğ ğ-ğ -ğ -ğiğ iğ iğ iğ iñ iô iğ iğV ˆzÒĞğ#ğ #ğ #ğ ˆ&Œ.˜Ñ
+&Ô
+&€CØ	€EĞ
+! 4 4¨¡9¤9Ñ-Ô-Ğ-Ğ-Ğ-ğ Ğr                                                                                                                              usr/lib/python3.11/curses/ascii.py                                                                  0000644 0000000 0000000 00000004763 14671176116 015441  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        """Constants and membership tests for ASCII characters"""
+
+NUL     = 0x00  # ^@
+SOH     = 0x01  # ^A
+STX     = 0x02  # ^B
+ETX     = 0x03  # ^C
+EOT     = 0x04  # ^D
+ENQ     = 0x05  # ^E
+ACK     = 0x06  # ^F
+BEL     = 0x07  # ^G
+BS      = 0x08  # ^H
+TAB     = 0x09  # ^I
+HT      = 0x09  # ^I
+LF      = 0x0a  # ^J
+NL      = 0x0a  # ^J
+VT      = 0x0b  # ^K
+FF      = 0x0c  # ^L
+CR      = 0x0d  # ^M
+SO      = 0x0e  # ^N
+SI      = 0x0f  # ^O
+DLE     = 0x10  # ^P
+DC1     = 0x11  # ^Q
+DC2     = 0x12  # ^R
+DC3     = 0x13  # ^S
+DC4     = 0x14  # ^T
+NAK     = 0x15  # ^U
+SYN     = 0x16  # ^V
+ETB     = 0x17  # ^W
+CAN     = 0x18  # ^X
+EM      = 0x19  # ^Y
+SUB     = 0x1a  # ^Z
+ESC     = 0x1b  # ^[
+FS      = 0x1c  # ^\
+GS      = 0x1d  # ^]
+RS      = 0x1e  # ^^
+US      = 0x1f  # ^_
+SP      = 0x20  # space
+DEL     = 0x7f  # delete
+
+controlnames = [
+"NUL", "SOH", "STX", "ETX", "EOT", "ENQ", "ACK", "BEL",
+"BS",  "HT",  "LF",  "VT",  "FF",  "CR",  "SO",  "SI",
+"DLE", "DC1", "DC2", "DC3", "DC4", "NAK", "SYN", "ETB",
+"CAN", "EM",  "SUB", "ESC", "FS",  "GS",  "RS",  "US",
+"SP"
+]
+
+def _ctoi(c):
+    if type(c) == type(""):
+        return ord(c)
+    else:
+        return c
+
+def isalnum(c): return isalpha(c) or isdigit(c)
+def isalpha(c): return isupper(c) or islower(c)
+def isascii(c): return 0 <= _ctoi(c) <= 127          # ?
+def isblank(c): return _ctoi(c) in (9, 32)
+def iscntrl(c): return 0 <= _ctoi(c) <= 31 or _ctoi(c) == 127
+def isdigit(c): return 48 <= _ctoi(c) <= 57
+def isgraph(c): return 33 <= _ctoi(c) <= 126
+def islower(c): return 97 <= _ctoi(c) <= 122
+def isprint(c): return 32 <= _ctoi(c) <= 126
+def ispunct(c): return isgraph(c) and not isalnum(c)
+def isspace(c): return _ctoi(c) in (9, 10, 11, 12, 13, 32)
+def isupper(c): return 65 <= _ctoi(c) <= 90
+def isxdigit(c): return isdigit(c) or \
+    (65 <= _ctoi(c) <= 70) or (97 <= _ctoi(c) <= 102)
+def isctrl(c): return 0 <= _ctoi(c) < 32
+def ismeta(c): return _ctoi(c) > 127
+
+def ascii(c):
+    if type(c) == type(""):
+        return chr(_ctoi(c) & 0x7f)
+    else:
+        return _ctoi(c) & 0x7f
+
+def ctrl(c):
+    if type(c) == type(""):
+        return chr(_ctoi(c) & 0x1f)
+    else:
+        return _ctoi(c) & 0x1f
+
+def alt(c):
+    if type(c) == type(""):
+        return chr(_ctoi(c) | 0x80)
+    else:
+        return _ctoi(c) | 0x80
+
+def unctrl(c):
+    bits = _ctoi(c)
+    if bits == 0x7f:
+        rep = "^?"
+    elif isprint(bits & 0x7f):
+        rep = chr(bits & 0x7f)
+    else:
+        rep = "^" + chr(((bits & 0x7f) | 0x20) + 0x20)
+    if bits & 0x80:
+        return "!" + rep
+    return rep
+             usr/lib/python3.11/curses/has_key.py                                                                0000644 0000000 0000000 00000013002 14671176116 015756  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        
+#
+# Emulation of has_key() function for platforms that don't use ncurses
+#
+
+import _curses
+
+# Table mapping curses keys to the terminfo capability name
+
+_capability_names = {
+    _curses.KEY_A1: 'ka1',
+    _curses.KEY_A3: 'ka3',
+    _curses.KEY_B2: 'kb2',
+    _curses.KEY_BACKSPACE: 'kbs',
+    _curses.KEY_BEG: 'kbeg',
+    _curses.KEY_BTAB: 'kcbt',
+    _curses.KEY_C1: 'kc1',
+    _curses.KEY_C3: 'kc3',
+    _curses.KEY_CANCEL: 'kcan',
+    _curses.KEY_CATAB: 'ktbc',
+    _curses.KEY_CLEAR: 'kclr',
+    _curses.KEY_CLOSE: 'kclo',
+    _curses.KEY_COMMAND: 'kcmd',
+    _curses.KEY_COPY: 'kcpy',
+    _curses.KEY_CREATE: 'kcrt',
+    _curses.KEY_CTAB: 'kctab',
+    _curses.KEY_DC: 'kdch1',
+    _curses.KEY_DL: 'kdl1',
+    _curses.KEY_DOWN: 'kcud1',
+    _curses.KEY_EIC: 'krmir',
+    _curses.KEY_END: 'kend',
+    _curses.KEY_ENTER: 'kent',
+    _curses.KEY_EOL: 'kel',
+    _curses.KEY_EOS: 'ked',
+    _curses.KEY_EXIT: 'kext',
+    _curses.KEY_F0: 'kf0',
+    _curses.KEY_F1: 'kf1',
+    _curses.KEY_F10: 'kf10',
+    _curses.KEY_F11: 'kf11',
+    _curses.KEY_F12: 'kf12',
+    _curses.KEY_F13: 'kf13',
+    _curses.KEY_F14: 'kf14',
+    _curses.KEY_F15: 'kf15',
+    _curses.KEY_F16: 'kf16',
+    _curses.KEY_F17: 'kf17',
+    _curses.KEY_F18: 'kf18',
+    _curses.KEY_F19: 'kf19',
+    _curses.KEY_F2: 'kf2',
+    _curses.KEY_F20: 'kf20',
+    _curses.KEY_F21: 'kf21',
+    _curses.KEY_F22: 'kf22',
+    _curses.KEY_F23: 'kf23',
+    _curses.KEY_F24: 'kf24',
+    _curses.KEY_F25: 'kf25',
+    _curses.KEY_F26: 'kf26',
+    _curses.KEY_F27: 'kf27',
+    _curses.KEY_F28: 'kf28',
+    _curses.KEY_F29: 'kf29',
+    _curses.KEY_F3: 'kf3',
+    _curses.KEY_F30: 'kf30',
+    _curses.KEY_F31: 'kf31',
+    _curses.KEY_F32: 'kf32',
+    _curses.KEY_F33: 'kf33',
+    _curses.KEY_F34: 'kf34',
+    _curses.KEY_F35: 'kf35',
+    _curses.KEY_F36: 'kf36',
+    _curses.KEY_F37: 'kf37',
+    _curses.KEY_F38: 'kf38',
+    _curses.KEY_F39: 'kf39',
+    _curses.KEY_F4: 'kf4',
+    _curses.KEY_F40: 'kf40',
+    _curses.KEY_F41: 'kf41',
+    _curses.KEY_F42: 'kf42',
+    _curses.KEY_F43: 'kf43',
+    _curses.KEY_F44: 'kf44',
+    _curses.KEY_F45: 'kf45',
+    _curses.KEY_F46: 'kf46',
+    _curses.KEY_F47: 'kf47',
+    _curses.KEY_F48: 'kf48',
+    _curses.KEY_F49: 'kf49',
+    _curses.KEY_F5: 'kf5',
+    _curses.KEY_F50: 'kf50',
+    _curses.KEY_F51: 'kf51',
+    _curses.KEY_F52: 'kf52',
+    _curses.KEY_F53: 'kf53',
+    _curses.KEY_F54: 'kf54',
+    _curses.KEY_F55: 'kf55',
+    _curses.KEY_F56: 'kf56',
+    _curses.KEY_F57: 'kf57',
+    _curses.KEY_F58: 'kf58',
+    _curses.KEY_F59: 'kf59',
+    _curses.KEY_F6: 'kf6',
+    _curses.KEY_F60: 'kf60',
+    _curses.KEY_F61: 'kf61',
+    _curses.KEY_F62: 'kf62',
+    _curses.KEY_F63: 'kf63',
+    _curses.KEY_F7: 'kf7',
+    _curses.KEY_F8: 'kf8',
+    _curses.KEY_F9: 'kf9',
+    _curses.KEY_FIND: 'kfnd',
+    _curses.KEY_HELP: 'khlp',
+    _curses.KEY_HOME: 'khome',
+    _curses.KEY_IC: 'kich1',
+    _curses.KEY_IL: 'kil1',
+    _curses.KEY_LEFT: 'kcub1',
+    _curses.KEY_LL: 'kll',
+    _curses.KEY_MARK: 'kmrk',
+    _curses.KEY_MESSAGE: 'kmsg',
+    _curses.KEY_MOVE: 'kmov',
+    _curses.KEY_NEXT: 'knxt',
+    _curses.KEY_NPAGE: 'knp',
+    _curses.KEY_OPEN: 'kopn',
+    _curses.KEY_OPTIONS: 'kopt',
+    _curses.KEY_PPAGE: 'kpp',
+    _curses.KEY_PREVIOUS: 'kprv',
+    _curses.KEY_PRINT: 'kprt',
+    _curses.KEY_REDO: 'krdo',
+    _curses.KEY_REFERENCE: 'kref',
+    _curses.KEY_REFRESH: 'krfr',
+    _curses.KEY_REPLACE: 'krpl',
+    _curses.KEY_RESTART: 'krst',
+    _curses.KEY_RESUME: 'kres',
+    _curses.KEY_RIGHT: 'kcuf1',
+    _curses.KEY_SAVE: 'ksav',
+    _curses.KEY_SBEG: 'kBEG',
+    _curses.KEY_SCANCEL: 'kCAN',
+    _curses.KEY_SCOMMAND: 'kCMD',
+    _curses.KEY_SCOPY: 'kCPY',
+    _curses.KEY_SCREATE: 'kCRT',
+    _curses.KEY_SDC: 'kDC',
+    _curses.KEY_SDL: 'kDL',
+    _curses.KEY_SELECT: 'kslt',
+    _curses.KEY_SEND: 'kEND',
+    _curses.KEY_SEOL: 'kEOL',
+    _curses.KEY_SEXIT: 'kEXT',
+    _curses.KEY_SF: 'kind',
+    _curses.KEY_SFIND: 'kFND',
+    _curses.KEY_SHELP: 'kHLP',
+    _curses.KEY_SHOME: 'kHOM',
+    _curses.KEY_SIC: 'kIC',
+    _curses.KEY_SLEFT: 'kLFT',
+    _curses.KEY_SMESSAGE: 'kMSG',
+    _curses.KEY_SMOVE: 'kMOV',
+    _curses.KEY_SNEXT: 'kNXT',
+    _curses.KEY_SOPTIONS: 'kOPT',
+    _curses.KEY_SPREVIOUS: 'kPRV',
+    _curses.KEY_SPRINT: 'kPRT',
+    _curses.KEY_SR: 'kri',
+    _curses.KEY_SREDO: 'kRDO',
+    _curses.KEY_SREPLACE: 'kRPL',
+    _curses.KEY_SRIGHT: 'kRIT',
+    _curses.KEY_SRSUME: 'kRES',
+    _curses.KEY_SSAVE: 'kSAV',
+    _curses.KEY_SSUSPEND: 'kSPD',
+    _curses.KEY_STAB: 'khts',
+    _curses.KEY_SUNDO: 'kUND',
+    _curses.KEY_SUSPEND: 'kspd',
+    _curses.KEY_UNDO: 'kund',
+    _curses.KEY_UP: 'kcuu1'
+    }
+
+def has_key(ch):
+    if isinstance(ch, str):
+        ch = ord(ch)
+
+    # Figure out the correct capability name for the keycode.
+    capability_name = _capability_names.get(ch)
+    if capability_name is None:
+        return False
+
+    #Check the current terminal description for that capability;
+    #if present, return true, else return false.
+    if _curses.tigetstr( capability_name ):
+        return True
+    else:
+        return False
+
+if __name__ == '__main__':
+    # Compare the output of this implementation and the ncurses has_key,
+    # on platforms where has_key is already available
+    try:
+        L = []
+        _curses.initscr()
+        for key in _capability_names.keys():
+            system = _curses.has_key(key)
+            python = has_key(key)
+            if system != python:
+                L.append( 'Mismatch for key %s, system=%i, Python=%i'
+                          % (_curses.keyname( key ), system, python) )
+    finally:
+        _curses.endwin()
+        for i in L: print(i)
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              usr/lib/python3.11/curses/panel.py                                                                  0000644 0000000 0000000 00000000127 14671176116 015436  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        """curses.panel
+
+Module for using panels with curses.

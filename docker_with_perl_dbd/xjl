@@ -1,0 +1,1000 @@
+configitem(
+    b'mq',
+    b'secret',
+    default=False,
+)
+
+# force load strip extension formerly included in mq and import some utility
+try:
+    extensions.find(b'strip')
+except KeyError:
+    # note: load is lazy so we could avoid the try-except,
+    # but I (marmoute) prefer this explicit code.
+    class dummyui:
+        def debug(self, msg):
+            pass
+
+        def log(self, event, msgfmt, *msgargs, **opts):
+            pass
+
+    extensions.load(dummyui(), b'strip', b'')
+
+strip = strip.strip
+
+
+def checksubstate(repo, baserev=None):
+    """return list of subrepos at a different revision than substate.
+    Abort if any subrepos have uncommitted changes."""
+    inclsubs = []
+    wctx = repo[None]
+    if baserev:
+        bctx = repo[baserev]
+    else:
+        bctx = wctx.p1()
+    for s in sorted(wctx.substate):
+        wctx.sub(s).bailifchanged(True)
+        if s not in bctx.substate or bctx.sub(s).dirty():
+            inclsubs.append(s)
+    return inclsubs
+
+
+# Patch names looks like unix-file names.
+# They must be joinable with queue directory and result in the patch path.
+normname = util.normpath
+
+
+class statusentry:
+    def __init__(self, node, name):
+        self.node, self.name = node, name
+
+    def __bytes__(self):
+        return hex(self.node) + b':' + self.name
+
+    __str__ = encoding.strmethod(__bytes__)
+    __repr__ = encoding.strmethod(__bytes__)
+
+
+# The order of the headers in 'hg export' HG patches:
+HGHEADERS = [
+    #   '# HG changeset patch',
+    b'# User ',
+    b'# Date ',
+    b'#      ',
+    b'# Branch ',
+    b'# Node ID ',
+    b'# Parent  ',  # can occur twice for merges - but that is not relevant for mq
+]
+# The order of headers in plain 'mail style' patches:
+PLAINHEADERS = {
+    b'from': 0,
+    b'date': 1,
+    b'subject': 2,
+}
+
+
+def inserthgheader(lines, header, value):
+    """Assuming lines contains a HG patch header, add a header line with value.
+    >>> try: inserthgheader([], b'# Date ', b'z')
+    ... except ValueError as inst: print("oops")
+    oops
+    >>> inserthgheader([b'# HG changeset patch'], b'# Date ', b'z')
+    ['# HG changeset patch', '# Date z']
+    >>> inserthgheader([b'# HG changeset patch', b''], b'# Date ', b'z')
+    ['# HG changeset patch', '# Date z', '']
+    >>> inserthgheader([b'# HG changeset patch', b'# User y'], b'# Date ', b'z')
+    ['# HG changeset patch', '# User y', '# Date z']
+    >>> inserthgheader([b'# HG changeset patch', b'# Date x', b'# User y'],
+    ...                b'# User ', b'z')
+    ['# HG changeset patch', '# Date x', '# User z']
+    >>> inserthgheader([b'# HG changeset patch', b'# Date y'], b'# Date ', b'z')
+    ['# HG changeset patch', '# Date z']
+    >>> inserthgheader([b'# HG changeset patch', b'', b'# Date y'],
+    ...                b'# Date ', b'z')
+    ['# HG changeset patch', '# Date z', '', '# Date y']
+    >>> inserthgheader([b'# HG changeset patch', b'# Parent  y'],
+    ...                b'# Date ', b'z')
+    ['# HG changeset patch', '# Date z', '# Parent  y']
+    """
+    start = lines.index(b'# HG changeset patch') + 1
+    newindex = HGHEADERS.index(header)
+    bestpos = len(lines)
+    for i in range(start, len(lines)):
+        line = lines[i]
+        if not line.startswith(b'# '):
+            bestpos = min(bestpos, i)
+            break
+        for lineindex, h in enumerate(HGHEADERS):
+            if line.startswith(h):
+                if lineindex == newindex:
+                    lines[i] = header + value
+                    return lines
+                if lineindex > newindex:
+                    bestpos = min(bestpos, i)
+                break  # next line
+    lines.insert(bestpos, header + value)
+    return lines
+
+
+def insertplainheader(lines, header, value):
+    """For lines containing a plain patch header, add a header line with value.
+    >>> insertplainheader([], b'Date', b'z')
+    ['Date: z']
+    >>> insertplainheader([b''], b'Date', b'z')
+    ['Date: z', '']
+    >>> insertplainheader([b'x'], b'Date', b'z')
+    ['Date: z', '', 'x']
+    >>> insertplainheader([b'From: y', b'x'], b'Date', b'z')
+    ['From: y', 'Date: z', '', 'x']
+    >>> insertplainheader([b' date : x', b' from : y', b''], b'From', b'z')
+    [' date : x', 'From: z', '']
+    >>> insertplainheader([b'', b'Date: y'], b'Date', b'z')
+    ['Date: z', '', 'Date: y']
+    >>> insertplainheader([b'foo: bar', b'DATE: z', b'x'], b'From', b'y')
+    ['From: y', 'foo: bar', 'DATE: z', '', 'x']
+    """
+    newprio = PLAINHEADERS[header.lower()]
+    bestpos = len(lines)
+    for i, line in enumerate(lines):
+        if b':' in line:
+            lheader = line.split(b':', 1)[0].strip().lower()
+            lprio = PLAINHEADERS.get(lheader, newprio + 1)
+            if lprio == newprio:
+                lines[i] = b'%s: %s' % (header, value)
+                return lines
+            if lprio > newprio and i < bestpos:
+                bestpos = i
+        else:
+            if line:
+                lines.insert(i, b'')
+            if i < bestpos:
+                bestpos = i
+            break
+    lines.insert(bestpos, b'%s: %s' % (header, value))
+    return lines
+
+
+class patchheader:
+    def __init__(self, pf, plainmode=False):
+        def eatdiff(lines):
+            while lines:
+                l = lines[-1]
+                if (
+                    l.startswith(b"diff -")
+                    or l.startswith(b"Index:")
+                    or l.startswith(b"===========")
+                ):
+                    del lines[-1]
+                else:
+                    break
+
+        def eatempty(lines):
+            while lines:
+                if not lines[-1].strip():
+                    del lines[-1]
+                else:
+                    break
+
+        message = []
+        comments = []
+        user = None
+        date = None
+        parent = None
+        format = None
+        subject = None
+        branch = None
+        nodeid = None
+        diffstart = 0
+
+        for line in open(pf, b'rb'):
+            line = line.rstrip()
+            if line.startswith(b'diff --git') or (
+                diffstart and line.startswith(b'+++ ')
+            ):
+                diffstart = 2
+                break
+            diffstart = 0  # reset
+            if line.startswith(b"--- "):
+                diffstart = 1
+                continue
+            elif format == b"hgpatch":
+                # parse values when importing the result of an hg export
+                if line.startswith(b"# User "):
+                    user = line[7:]
+                elif line.startswith(b"# Date "):
+                    date = line[7:]
+                elif line.startswith(b"# Parent "):
+                    parent = line[9:].lstrip()  # handle double trailing space
+                elif line.startswith(b"# Branch "):
+                    branch = line[9:]
+                elif line.startswith(b"# Node ID "):
+                    nodeid = line[10:]
+                elif not line.startswith(b"# ") and line:
+                    message.append(line)
+                    format = None
+            elif line == b'# HG changeset patch':
+                message = []
+                format = b"hgpatch"
+            elif format != b"tagdone" and (
+                line.startswith(b"Subject: ") or line.startswith(b"subject: ")
+            ):
+                subject = line[9:]
+                format = b"tag"
+            elif format != b"tagdone" and (
+                line.startswith(b"From: ") or line.startswith(b"from: ")
+            ):
+                user = line[6:]
+                format = b"tag"
+            elif format != b"tagdone" and (
+                line.startswith(b"Date: ") or line.startswith(b"date: ")
+            ):
+                date = line[6:]
+                format = b"tag"
+            elif format == b"tag" and line == b"":
+                # when looking for tags (subject: from: etc) they
+                # end once you find a blank line in the source
+                format = b"tagdone"
+            elif message or line:
+                message.append(line)
+            comments.append(line)
+
+        eatdiff(message)
+        eatdiff(comments)
+        # Remember the exact starting line of the patch diffs before consuming
+        # empty lines, for external use by TortoiseHg and others
+        self.diffstartline = len(comments)
+        eatempty(message)
+        eatempty(comments)
+
+        # make sure message isn't empty
+        if format and format.startswith(b"tag") and subject:
+            message.insert(0, subject)
+
+        self.message = message
+        self.comments = comments
+        self.user = user
+        self.date = date
+        self.parent = parent
+        # nodeid and branch are for external use by TortoiseHg and others
+        self.nodeid = nodeid
+        self.branch = branch
+        self.haspatch = diffstart > 1
+        self.plainmode = (
+            plainmode
+            or b'# HG changeset patch' not in self.comments
+            and any(
+                c.startswith(b'Date: ') or c.startswith(b'From: ')
+                for c in self.comments
+            )
+        )
+
+    def setuser(self, user):
+        try:
+            inserthgheader(self.comments, b'# User ', user)
+        except ValueError:
+            if self.plainmode:
+                insertplainheader(self.comments, b'From', user)
+            else:
+                tmp = [b'# HG changeset patch', b'# User ' + user]
+                self.comments = tmp + self.comments
+        self.user = user
+
+    def setdate(self, date):
+        try:
+            inserthgheader(self.comments, b'# Date ', date)
+        except ValueError:
+            if self.plainmode:
+                insertplainheader(self.comments, b'Date', date)
+            else:
+                tmp = [b'# HG changeset patch', b'# Date ' + date]
+                self.comments = tmp + self.comments
+        self.date = date
+
+    def setparent(self, parent):
+        try:
+            inserthgheader(self.comments, b'# Parent  ', parent)
+        except ValueError:
+            if not self.plainmode:
+                tmp = [b'# HG changeset patch', b'# Parent  ' + parent]
+                self.comments = tmp + self.comments
+        self.parent = parent
+
+    def setmessage(self, message):
+        if self.comments:
+            self._delmsg()
+        self.message = [message]
+        if message:
+            if self.plainmode and self.comments and self.comments[-1]:
+                self.comments.append(b'')
+            self.comments.append(message)
+
+    def __bytes__(self):
+        s = b'\n'.join(self.comments).rstrip()
+        if not s:
+            return b''
+        return s + b'\n\n'
+
+    __str__ = encoding.strmethod(__bytes__)
+
+    def _delmsg(self):
+        """Remove existing message, keeping the rest of the comments fields.
+        If comments contains 'subject: ', message will prepend
+        the field and a blank line."""
+        if self.message:
+            subj = b'subject: ' + self.message[0].lower()
+            for i in range(len(self.comments)):
+                if subj == self.comments[i].lower():
+                    del self.comments[i]
+                    self.message = self.message[2:]
+                    break
+        ci = 0
+        for mi in self.message:
+            while mi != self.comments[ci]:
+                ci += 1
+            del self.comments[ci]
+
+
+def newcommit(repo, phase, *args, **kwargs):
+    """helper dedicated to ensure a commit respect mq.secret setting
+
+    It should be used instead of repo.commit inside the mq source for operation
+    creating new changeset.
+    """
+    repo = repo.unfiltered()
+    if phase is None:
+        if repo.ui.configbool(b'mq', b'secret'):
+            phase = phases.secret
+    overrides = {(b'ui', b'allowemptycommit'): True}
+    if phase is not None:
+        overrides[(b'phases', b'new-commit')] = phase
+    with repo.ui.configoverride(overrides, b'mq'):
+        repo.ui.setconfig(b'ui', b'allowemptycommit', True)
+        return repo.commit(*args, **kwargs)
+
+
+class AbortNoCleanup(error.Abort):
+    pass
+
+
+class queue:
+    def __init__(self, ui, baseui, path, patchdir=None):
+        self.basepath = path
+        try:
+            with open(os.path.join(path, b'patches.queue'), 'rb') as fh:
+                cur = fh.read().rstrip()
+
+            if not cur:
+                curpath = os.path.join(path, b'patches')
+            else:
+                curpath = os.path.join(path, b'patches-' + cur)
+        except IOError:
+            curpath = os.path.join(path, b'patches')
+        self.path = patchdir or curpath
+        self.opener = vfsmod.vfs(self.path)
+        self.ui = ui
+        self.baseui = baseui
+        self.applieddirty = False
+        self.seriesdirty = False
+        self.added = []
+        self.seriespath = b"series"
+        self.statuspath = b"status"
+        self.guardspath = b"guards"
+        self.activeguards = None
+        self.guardsdirty = False
+        # Handle mq.git as a bool with extended values
+        gitmode = ui.config(b'mq', b'git').lower()
+        boolmode = stringutil.parsebool(gitmode)
+        if boolmode is not None:
+            if boolmode:
+                gitmode = b'yes'
+            else:
+                gitmode = b'no'
+        self.gitmode = gitmode
+        # deprecated config: mq.plain
+        self.plainmode = ui.configbool(b'mq', b'plain')
+        self.checkapplied = True
+
+    @util.propertycache
+    def applied(self):
+        def parselines(lines):
+            for l in lines:
+                entry = l.split(b':', 1)
+                if len(entry) > 1:
+                    n, name = entry
+                    yield statusentry(bin(n), name)
+                elif l.strip():
+                    self.ui.warn(
+                        _(b'malformated mq status line: %s\n')
+                        % stringutil.pprint(entry)
+                    )
+                # else we ignore empty lines
+
+        try:
+            lines = self.opener.read(self.statuspath).splitlines()
+            return list(parselines(lines))
+        except FileNotFoundError:
+            return []
+
+    @util.propertycache
+    def fullseries(self):
+        try:
+            return self.opener.read(self.seriespath).splitlines()
+        except FileNotFoundError:
+            return []
+
+    @util.propertycache
+    def series(self):
+        self.parseseries()
+        return self.series
+
+    @util.propertycache
+    def seriesguards(self):
+        self.parseseries()
+        return self.seriesguards
+
+    def invalidate(self):
+        for a in 'applied fullseries series seriesguards'.split():
+            if a in self.__dict__:
+                delattr(self, a)
+        self.applieddirty = False
+        self.seriesdirty = False
+        self.guardsdirty = False
+        self.activeguards = None
+
+    def diffopts(self, opts=None, patchfn=None, plain=False):
+        """Return diff options tweaked for this mq use, possibly upgrading to
+        git format, and possibly plain and without lossy options."""
+        diffopts = patchmod.difffeatureopts(
+            self.ui,
+            opts,
+            git=True,
+            whitespace=not plain,
+            formatchanging=not plain,
+        )
+        if self.gitmode == b'auto':
+            diffopts.upgrade = True
+        elif self.gitmode == b'keep':
+            pass
+        elif self.gitmode in (b'yes', b'no'):
+            diffopts.git = self.gitmode == b'yes'
+        else:
+            raise error.Abort(
+                _(b'mq.git option can be auto/keep/yes/no got %s')
+                % self.gitmode
+            )
+        if patchfn:
+            diffopts = self.patchopts(diffopts, patchfn)
+        return diffopts
+
+    def patchopts(self, diffopts, *patches):
+        """Return a copy of input diff options with git set to true if
+        referenced patch is a git patch and should be preserved as such.
+        """
+        diffopts = diffopts.copy()
+        if not diffopts.git and self.gitmode == b'keep':
+            for patchfn in patches:
+                patchf = self.opener(patchfn, b'r')
+                # if the patch was a git patch, refresh it as a git patch
+                diffopts.git = any(
+                    line.startswith(b'diff --git') for line in patchf
+                )
+                patchf.close()
+        return diffopts
+
+    def join(self, *p):
+        return os.path.join(self.path, *p)
+
+    def findseries(self, patch):
+        def matchpatch(l):
+            l = l.split(b'#', 1)[0]
+            return l.strip() == patch
+
+        for index, l in enumerate(self.fullseries):
+            if matchpatch(l):
+                return index
+        return None
+
+    guard_re = re.compile(br'\s?#([-+][^-+# \t\r\n\f][^# \t\r\n\f]*)')
+
+    def parseseries(self):
+        self.series = []
+        self.seriesguards = []
+        for l in self.fullseries:
+            h = l.find(b'#')
+            if h == -1:
+                patch = l
+                comment = b''
+            elif h == 0:
+                continue
+            else:
+                patch = l[:h]
+                comment = l[h:]
+            patch = patch.strip()
+            if patch:
+                if patch in self.series:
+                    raise error.Abort(
+                        _(b'%s appears more than once in %s')
+                        % (patch, self.join(self.seriespath))
+                    )
+                self.series.append(patch)
+                self.seriesguards.append(self.guard_re.findall(comment))
+
+    def checkguard(self, guard):
+        if not guard:
+            return _(b'guard cannot be an empty string')
+        bad_chars = b'# \t\r\n\f'
+        first = guard[0]
+        if first in b'-+':
+            return _(b'guard %r starts with invalid character: %r') % (
+                guard,
+                first,
+            )
+        for c in bad_chars:
+            if c in guard:
+                return _(b'invalid character in guard %r: %r') % (guard, c)
+
+    def setactive(self, guards):
+        for guard in guards:
+            bad = self.checkguard(guard)
+            if bad:
+                raise error.Abort(bad)
+        guards = sorted(set(guards))
+        self.ui.debug(b'active guards: %s\n' % b' '.join(guards))
+        self.activeguards = guards
+        self.guardsdirty = True
+
+    def active(self):
+        if self.activeguards is None:
+            self.activeguards = []
+            try:
+                guards = self.opener.read(self.guardspath).split()
+            except FileNotFoundError:
+                guards = []
+            for i, guard in enumerate(guards):
+                bad = self.checkguard(guard)
+                if bad:
+                    self.ui.warn(
+                        b'%s:%d: %s\n'
+                        % (self.join(self.guardspath), i + 1, bad)
+                    )
+                else:
+                    self.activeguards.append(guard)
+        return self.activeguards
+
+    def setguards(self, idx, guards):
+        for g in guards:
+            if len(g) < 2:
+                raise error.Abort(_(b'guard %r too short') % g)
+            if g[0] not in b'-+':
+                raise error.Abort(_(b'guard %r starts with invalid char') % g)
+            bad = self.checkguard(g[1:])
+            if bad:
+                raise error.Abort(bad)
+        drop = self.guard_re.sub(b'', self.fullseries[idx])
+        self.fullseries[idx] = drop + b''.join([b' #' + g for g in guards])
+        self.parseseries()
+        self.seriesdirty = True
+
+    def pushable(self, idx):
+        if isinstance(idx, bytes):
+            idx = self.series.index(idx)
+        patchguards = self.seriesguards[idx]
+        if not patchguards:
+            return True, None
+        guards = self.active()
+        exactneg = [
+            g for g in patchguards if g.startswith(b'-') and g[1:] in guards
+        ]
+        if exactneg:
+            return False, stringutil.pprint(exactneg[0])
+        pos = [g for g in patchguards if g.startswith(b'+')]
+        exactpos = [g for g in pos if g[1:] in guards]
+        if pos:
+            if exactpos:
+                return True, stringutil.pprint(exactpos[0])
+            return False, b' '.join([stringutil.pprint(p) for p in pos])
+        return True, b''
+
+    def explainpushable(self, idx, all_patches=False):
+        if all_patches:
+            write = self.ui.write
+        else:
+            write = self.ui.warn
+
+        if all_patches or self.ui.verbose:
+            if isinstance(idx, bytes):
+                idx = self.series.index(idx)
+            pushable, why = self.pushable(idx)
+            if all_patches and pushable:
+                if why is None:
+                    write(
+                        _(b'allowing %s - no guards in effect\n')
+                        % self.series[idx]
+                    )
+                else:
+                    if not why:
+                        write(
+                            _(b'allowing %s - no matching negative guards\n')
+                            % self.series[idx]
+                        )
+                    else:
+                        write(
+                            _(b'allowing %s - guarded by %s\n')
+                            % (self.series[idx], why)
+                        )
+            if not pushable:
+                if why:
+                    write(
+                        _(b'skipping %s - guarded by %s\n')
+                        % (self.series[idx], why)
+                    )
+                else:
+                    write(
+                        _(b'skipping %s - no matching guards\n')
+                        % self.series[idx]
+                    )
+
+    def savedirty(self):
+        def writelist(items, path):
+            fp = self.opener(path, b'wb')
+            for i in items:
+                fp.write(b"%s\n" % i)
+            fp.close()
+
+        if self.applieddirty:
+            writelist(map(bytes, self.applied), self.statuspath)
+            self.applieddirty = False
+        if self.seriesdirty:
+            writelist(self.fullseries, self.seriespath)
+            self.seriesdirty = False
+        if self.guardsdirty:
+            writelist(self.activeguards, self.guardspath)
+            self.guardsdirty = False
+        if self.added:
+            qrepo = self.qrepo()
+            if qrepo:
+                qrepo[None].add(f for f in self.added if f not in qrepo[None])
+            self.added = []
+
+    def removeundo(self, repo):
+        undo = repo.sjoin(b'undo')
+        if not os.path.exists(undo):
+            return
+        try:
+            os.unlink(undo)
+        except OSError as inst:
+            self.ui.warn(
+                _(b'error removing undo: %s\n') % stringutil.forcebytestr(inst)
+            )
+
+    def backup(self, repo, files, copy=False):
+        # backup local changes in --force case
+        for f in sorted(files):
+            absf = repo.wjoin(f)
+            if os.path.lexists(absf):
+                absorig = scmutil.backuppath(self.ui, repo, f)
+                self.ui.note(
+                    _(b'saving current version of %s as %s\n')
+                    % (f, os.path.relpath(absorig))
+                )
+
+                if copy:
+                    util.copyfile(absf, absorig)
+                else:
+                    util.rename(absf, absorig)
+
+    def printdiff(
+        self,
+        repo,
+        diffopts,
+        node1,
+        node2=None,
+        files=None,
+        fp=None,
+        changes=None,
+        opts=None,
+    ):
+        if opts is None:
+            opts = {}
+        stat = opts.get(b'stat')
+        m = scmutil.match(repo[node1], files, opts)
+        logcmdutil.diffordiffstat(
+            self.ui,
+            repo,
+            diffopts,
+            repo[node1],
+            repo[node2],
+            m,
+            changes,
+            stat,
+            fp,
+        )
+
+    def mergeone(self, repo, mergeq, head, patch, rev, diffopts):
+        # first try just applying the patch
+        (err, n) = self.apply(
+            repo, [patch], update_status=False, strict=True, merge=rev
+        )
+
+        if err == 0:
+            return (err, n)
+
+        if n is None:
+            raise error.Abort(_(b"apply failed for patch %s") % patch)
+
+        self.ui.warn(_(b"patch didn't work out, merging %s\n") % patch)
+
+        # apply failed, strip away that rev and merge.
+        hg.clean(repo, head)
+        strip(self.ui, repo, [n], update=False, backup=False)
+
+        ctx = repo[rev]
+        ret = hg.merge(ctx, remind=False)
+        if ret:
+            raise error.Abort(_(b"update returned %d") % ret)
+        n = newcommit(repo, None, ctx.description(), ctx.user(), force=True)
+        if n is None:
+            raise error.Abort(_(b"repo commit failed"))
+        try:
+            ph = patchheader(mergeq.join(patch), self.plainmode)
+        except Exception:
+            raise error.Abort(_(b"unable to read %s") % patch)
+
+        diffopts = self.patchopts(diffopts, patch)
+        patchf = self.opener(patch, b"w")
+        comments = bytes(ph)
+        if comments:
+            patchf.write(comments)
+        self.printdiff(repo, diffopts, head, n, fp=patchf)
+        patchf.close()
+        self.removeundo(repo)
+        return (0, n)
+
+    def qparents(self, repo, rev=None):
+        """return the mq handled parent or p1
+
+        In some case where mq get himself in being the parent of a merge the
+        appropriate parent may be p2.
+        (eg: an in progress merge started with mq disabled)
+
+        If no parent are managed by mq, p1 is returned.
+        """
+        if rev is None:
+            (p1, p2) = repo.dirstate.parents()
+            if p2 == repo.nullid:
+                return p1
+            if not self.applied:
+                return None
+            return self.applied[-1].node
+        p1, p2 = repo.changelog.parents(rev)
+        if p2 != repo.nullid and p2 in [x.node for x in self.applied]:
+            return p2
+        return p1
+
+    def mergepatch(self, repo, mergeq, series, diffopts):
+        if not self.applied:
+            # each of the patches merged in will have two parents.  This
+            # can confuse the qrefresh, qdiff, and strip code because it
+            # needs to know which parent is actually in the patch queue.
+            # so, we insert a merge marker with only one parent.  This way
+            # the first patch in the queue is never a merge patch
+            #
+            pname = b".hg.patches.merge.marker"
+            n = newcommit(repo, None, b'[mq]: merge marker', force=True)
+            self.removeundo(repo)
+            self.applied.append(statusentry(n, pname))
+            self.applieddirty = True
+
+        head = self.qparents(repo)
+
+        for patch in series:
+            patch = mergeq.lookup(patch, strict=True)
+            if not patch:
+                self.ui.warn(_(b"patch %s does not exist\n") % patch)
+                return (1, None)
+            pushable, reason = self.pushable(patch)
+            if not pushable:
+                self.explainpushable(patch, all_patches=True)
+                continue
+            info = mergeq.isapplied(patch)
+            if not info:
+                self.ui.warn(_(b"patch %s is not applied\n") % patch)
+                return (1, None)
+            rev = info[1]
+            err, head = self.mergeone(repo, mergeq, head, patch, rev, diffopts)
+            if head:
+                self.applied.append(statusentry(head, patch))
+                self.applieddirty = True
+            if err:
+                return (err, head)
+        self.savedirty()
+        return (0, head)
+
+    def patch(self, repo, patchfile):
+        """Apply patchfile  to the working directory.
+        patchfile: name of patch file"""
+        files = set()
+        try:
+            fuzz = patchmod.patch(
+                self.ui, repo, patchfile, strip=1, files=files, eolmode=None
+            )
+            return (True, list(files), fuzz)
+        except Exception as inst:
+            self.ui.note(stringutil.forcebytestr(inst) + b'\n')
+            if not self.ui.verbose:
+                self.ui.warn(_(b"patch failed, unable to continue (try -v)\n"))
+            self.ui.traceback()
+            return (False, list(files), False)
+
+    def apply(
+        self,
+        repo,
+        series,
+        list=False,
+        update_status=True,
+        strict=False,
+        patchdir=None,
+        merge=None,
+        all_files=None,
+        tobackup=None,
+        keepchanges=False,
+    ):
+        wlock = lock = tr = None
+        try:
+            wlock = repo.wlock()
+            lock = repo.lock()
+            tr = repo.transaction(b"qpush")
+            try:
+                ret = self._apply(
+                    repo,
+                    series,
+                    list,
+                    update_status,
+                    strict,
+                    patchdir,
+                    merge,
+                    all_files=all_files,
+                    tobackup=tobackup,
+                    keepchanges=keepchanges,
+                )
+                tr.close()
+                self.savedirty()
+                return ret
+            except AbortNoCleanup:
+                tr.close()
+                self.savedirty()
+                raise
+            except:  # re-raises
+                try:
+                    tr.abort()
+                finally:
+                    self.invalidate()
+                raise
+        finally:
+            release(tr, lock, wlock)
+            self.removeundo(repo)
+
+    def _apply(
+        self,
+        repo,
+        series,
+        list=False,
+        update_status=True,
+        strict=False,
+        patchdir=None,
+        merge=None,
+        all_files=None,
+        tobackup=None,
+        keepchanges=False,
+    ):
+        """returns (error, hash)
+
+        error = 1 for unable to read, 2 for patch failed, 3 for patch
+        fuzz. tobackup is None or a set of files to backup before they
+        are modified by a patch.
+        """
+        # TODO unify with commands.py
+        if not patchdir:
+            patchdir = self.path
+        err = 0
+        n = None
+        for patchname in series:
+            pushable, reason = self.pushable(patchname)
+            if not pushable:
+                self.explainpushable(patchname, all_patches=True)
+                continue
+            self.ui.status(_(b"applying %s\n") % patchname)
+            pf = os.path.join(patchdir, patchname)
+
+            try:
+                ph = patchheader(self.join(patchname), self.plainmode)
+            except IOError:
+                self.ui.warn(_(b"unable to read %s\n") % patchname)
+                err = 1
+                break
+
+            message = ph.message
+            if not message:
+                # The commit message should not be translated
+                message = b"imported patch %s\n" % patchname
+            else:
+                if list:
+                    # The commit message should not be translated
+                    message.append(b"\nimported patch %s" % patchname)
+                message = b'\n'.join(message)
+
+            if ph.haspatch:
+                if tobackup:
+                    touched = patchmod.changedfiles(self.ui, repo, pf)
+                    touched = set(touched) & tobackup
+                    if touched and keepchanges:
+                        raise AbortNoCleanup(
+                            _(b"conflicting local changes found"),
+                            hint=_(b"did you forget to qrefresh?"),
+                        )
+                    self.backup(repo, touched, copy=True)
+                    tobackup = tobackup - touched
+                (patcherr, files, fuzz) = self.patch(repo, pf)
+                if all_files is not None:
+                    all_files.update(files)
+                patcherr = not patcherr
+            else:
+                self.ui.warn(_(b"patch %s is empty\n") % patchname)
+                patcherr, files, fuzz = 0, [], 0
+
+            if merge and files:
+                # Mark as removed/merged and update dirstate parent info
+                with repo.dirstate.parentchange():
+                    for f in files:
+                        repo.dirstate.update_file_p1(f, p1_tracked=True)
+                    p1 = repo.dirstate.p1()
+                    repo.setparents(p1, merge)
+
+            if all_files and b'.hgsubstate' in all_files:
+                wctx = repo[None]
+                pctx = repo[b'.']
+                overwrite = False
+                mergedsubstate = subrepoutil.submerge(
+                    repo, pctx, wctx, wctx, overwrite
+                )
+                files += mergedsubstate.keys()
+
+            match = scmutil.matchfiles(repo, files or [])
+            oldtip = repo.changelog.tip()
+            n = newcommit(
+                repo, None, message, ph.user, ph.date, match=match, force=True
+            )
+            if repo.changelog.tip() == oldtip:
+                raise error.Abort(
+                    _(b"qpush exactly duplicates child changeset")
+                )
+            if n is None:
+                raise error.Abort(_(b"repository commit failed"))
+
+            if update_status:
+                self.applied.append(statusentry(n, patchname))
+
+            if patcherr:
+                self.ui.warn(
+                    _(b"patch failed, rejects left in working directory\n")
+                )
+                err = 2
+                break
+
+            if fuzz and strict:
+                self.ui.warn(_(b"fuzz found when applying patch, stopping\n"))
+                err = 3
+                break
+        return (err, n)
+
+    def _cleanup(self, patches, numrevs, keep=False):
+        if not keep:
+            r = self.qrepo()
+            if r:
+                r[None].forget(patches)
+            for p in patches:
+                try:
+                    os.unlink(self.join(p))
+                except FileNotFoundError:
+                    pass
+
+        qfinished = []

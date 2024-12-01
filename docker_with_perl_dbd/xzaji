@@ -1,0 +1,1000 @@
+            t.cancel()     # stop the timer's action if it's still waiting
+
+    """
+
+    def __init__(self, interval, function, args=None, kwargs=None):
+        Thread.__init__(self)
+        self.interval = interval
+        self.function = function
+        self.args = args if args is not None else []
+        self.kwargs = kwargs if kwargs is not None else {}
+        self.finished = Event()
+
+    def cancel(self):
+        """Stop the timer if it hasn't finished yet."""
+        self.finished.set()
+
+    def run(self):
+        self.finished.wait(self.interval)
+        if not self.finished.is_set():
+            self.function(*self.args, **self.kwargs)
+        self.finished.set()
+
+
+# Special thread class to represent the main thread
+
+class _MainThread(Thread):
+
+    def __init__(self):
+        Thread.__init__(self, name="MainThread", daemon=False)
+        self._set_tstate_lock()
+        self._started.set()
+        self._set_ident()
+        if _HAVE_THREAD_NATIVE_ID:
+            self._set_native_id()
+        with _active_limbo_lock:
+            _active[self._ident] = self
+
+
+# Dummy thread class to represent threads not started here.
+# These aren't garbage collected when they die, nor can they be waited for.
+# If they invoke anything in threading.py that calls current_thread(), they
+# leave an entry in the _active dict forever after.
+# Their purpose is to return *something* from current_thread().
+# They are marked as daemon threads so we won't wait for them
+# when we exit (conform previous semantics).
+
+class _DummyThread(Thread):
+
+    def __init__(self):
+        Thread.__init__(self, name=_newname("Dummy-%d"), daemon=True)
+
+        self._started.set()
+        self._set_ident()
+        if _HAVE_THREAD_NATIVE_ID:
+            self._set_native_id()
+        with _active_limbo_lock:
+            _active[self._ident] = self
+
+    def _stop(self):
+        pass
+
+    def is_alive(self):
+        assert not self._is_stopped and self._started.is_set()
+        return True
+
+    def join(self, timeout=None):
+        assert False, "cannot join a dummy thread"
+
+
+# Global API functions
+
+def current_thread():
+    """Return the current Thread object, corresponding to the caller's thread of control.
+
+    If the caller's thread of control was not created through the threading
+    module, a dummy thread object with limited functionality is returned.
+
+    """
+    try:
+        return _active[get_ident()]
+    except KeyError:
+        return _DummyThread()
+
+def currentThread():
+    """Return the current Thread object, corresponding to the caller's thread of control.
+
+    This function is deprecated, use current_thread() instead.
+
+    """
+    import warnings
+    warnings.warn('currentThread() is deprecated, use current_thread() instead',
+                  DeprecationWarning, stacklevel=2)
+    return current_thread()
+
+def active_count():
+    """Return the number of Thread objects currently alive.
+
+    The returned count is equal to the length of the list returned by
+    enumerate().
+
+    """
+    with _active_limbo_lock:
+        return len(_active) + len(_limbo)
+
+def activeCount():
+    """Return the number of Thread objects currently alive.
+
+    This function is deprecated, use active_count() instead.
+
+    """
+    import warnings
+    warnings.warn('activeCount() is deprecated, use active_count() instead',
+                  DeprecationWarning, stacklevel=2)
+    return active_count()
+
+def _enumerate():
+    # Same as enumerate(), but without the lock. Internal use only.
+    return list(_active.values()) + list(_limbo.values())
+
+def enumerate():
+    """Return a list of all Thread objects currently alive.
+
+    The list includes daemonic threads, dummy thread objects created by
+    current_thread(), and the main thread. It excludes terminated threads and
+    threads that have not yet been started.
+
+    """
+    with _active_limbo_lock:
+        return list(_active.values()) + list(_limbo.values())
+
+
+_threading_atexits = []
+_SHUTTING_DOWN = False
+
+def _register_atexit(func, *arg, **kwargs):
+    """CPython internal: register *func* to be called before joining threads.
+
+    The registered *func* is called with its arguments just before all
+    non-daemon threads are joined in `_shutdown()`. It provides a similar
+    purpose to `atexit.register()`, but its functions are called prior to
+    threading shutdown instead of interpreter shutdown.
+
+    For similarity to atexit, the registered functions are called in reverse.
+    """
+    if _SHUTTING_DOWN:
+        raise RuntimeError("can't register atexit after shutdown")
+
+    call = functools.partial(func, *arg, **kwargs)
+    _threading_atexits.append(call)
+
+
+from _thread import stack_size
+
+# Create the main thread object,
+# and make it available for the interpreter
+# (Py_Main) as threading._shutdown.
+
+_main_thread = _MainThread()
+
+def _shutdown():
+    """
+    Wait until the Python thread state of all non-daemon threads get deleted.
+    """
+    # Obscure:  other threads may be waiting to join _main_thread.  That's
+    # dubious, but some code does it.  We can't wait for C code to release
+    # the main thread's tstate_lock - that won't happen until the interpreter
+    # is nearly dead.  So we release it here.  Note that just calling _stop()
+    # isn't enough:  other threads may already be waiting on _tstate_lock.
+    if _main_thread._is_stopped:
+        # _shutdown() was already called
+        return
+
+    global _SHUTTING_DOWN
+    _SHUTTING_DOWN = True
+
+    # Call registered threading atexit functions before threads are joined.
+    # Order is reversed, similar to atexit.
+    for atexit_call in reversed(_threading_atexits):
+        atexit_call()
+
+    # Main thread
+    if _main_thread.ident == get_ident():
+        tlock = _main_thread._tstate_lock
+        # The main thread isn't finished yet, so its thread state lock can't
+        # have been released.
+        assert tlock is not None
+        assert tlock.locked()
+        tlock.release()
+        _main_thread._stop()
+    else:
+        # bpo-1596321: _shutdown() must be called in the main thread.
+        # If the threading module was not imported by the main thread,
+        # _main_thread is the thread which imported the threading module.
+        # In this case, ignore _main_thread, similar behavior than for threads
+        # spawned by C libraries or using _thread.start_new_thread().
+        pass
+
+    # Join all non-deamon threads
+    while True:
+        with _shutdown_locks_lock:
+            locks = list(_shutdown_locks)
+            _shutdown_locks.clear()
+
+        if not locks:
+            break
+
+        for lock in locks:
+            # mimic Thread.join()
+            lock.acquire()
+            lock.release()
+
+        # new threads can be spawned while we were waiting for the other
+        # threads to complete
+
+
+def main_thread():
+    """Return the main thread object.
+
+    In normal conditions, the main thread is the thread from which the
+    Python interpreter was started.
+    """
+    return _main_thread
+
+# get thread-local implementation, either from the thread
+# module, or from the python fallback
+
+try:
+    from _thread import _local as local
+except ImportError:
+    from _threading_local import local
+
+
+def _after_fork():
+    """
+    Cleanup threading module state that should not exist after a fork.
+    """
+    # Reset _active_limbo_lock, in case we forked while the lock was held
+    # by another (non-forked) thread.  http://bugs.python.org/issue874900
+    global _active_limbo_lock, _main_thread
+    global _shutdown_locks_lock, _shutdown_locks
+    _active_limbo_lock = RLock()
+
+    # fork() only copied the current thread; clear references to others.
+    new_active = {}
+
+    try:
+        current = _active[get_ident()]
+    except KeyError:
+        # fork() was called in a thread which was not spawned
+        # by threading.Thread. For example, a thread spawned
+        # by thread.start_new_thread().
+        current = _MainThread()
+
+    _main_thread = current
+
+    # reset _shutdown() locks: threads re-register their _tstate_lock below
+    _shutdown_locks_lock = _allocate_lock()
+    _shutdown_locks = set()
+
+    with _active_limbo_lock:
+        # Dangling thread instances must still have their locks reset,
+        # because someone may join() them.
+        threads = set(_enumerate())
+        threads.update(_dangling)
+        for thread in threads:
+            # Any lock/condition variable may be currently locked or in an
+            # invalid state, so we reinitialize them.
+            if thread is current:
+                # There is only one active thread. We reset the ident to
+                # its new value since it can have changed.
+                thread._reset_internal_locks(True)
+                ident = get_ident()
+                thread._ident = ident
+                new_active[ident] = thread
+            else:
+                # All the others are already stopped.
+                thread._reset_internal_locks(False)
+                thread._stop()
+
+        _limbo.clear()
+        _active.clear()
+        _active.update(new_active)
+        assert len(_active) == 1
+
+
+if hasattr(_os, "register_at_fork"):
+    _os.register_at_fork(after_in_child=_after_fork)
+                                      usr/lib/python3.11/timeit.py                                                                        0000755 0000000 0000000 00000032267 14671176116 014343  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        #! /usr/bin/env python3
+
+"""Tool for measuring execution time of small code snippets.
+
+This module avoids a number of common traps for measuring execution
+times.  See also Tim Peters' introduction to the Algorithms chapter in
+the Python Cookbook, published by O'Reilly.
+
+Library usage: see the Timer class.
+
+Command line usage:
+    python timeit.py [-n N] [-r N] [-s S] [-p] [-h] [--] [statement]
+
+Options:
+  -n/--number N: how many times to execute 'statement' (default: see below)
+  -r/--repeat N: how many times to repeat the timer (default 5)
+  -s/--setup S: statement to be executed once initially (default 'pass').
+                Execution time of this setup statement is NOT timed.
+  -p/--process: use time.process_time() (default is time.perf_counter())
+  -v/--verbose: print raw timing results; repeat for more digits precision
+  -u/--unit: set the output time unit (nsec, usec, msec, or sec)
+  -h/--help: print this usage message and exit
+  --: separate options from statement, use when statement starts with -
+  statement: statement to be timed (default 'pass')
+
+A multi-line statement may be given by specifying each line as a
+separate argument; indented lines are possible by enclosing an
+argument in quotes and using leading spaces.  Multiple -s options are
+treated similarly.
+
+If -n is not given, a suitable number of loops is calculated by trying
+increasing numbers from the sequence 1, 2, 5, 10, 20, 50, ... until the
+total time is at least 0.2 seconds.
+
+Note: there is a certain baseline overhead associated with executing a
+pass statement.  It differs between versions.  The code here doesn't try
+to hide it, but you should be aware of it.  The baseline overhead can be
+measured by invoking the program without arguments.
+
+Classes:
+
+    Timer
+
+Functions:
+
+    timeit(string, string) -> float
+    repeat(string, string) -> list
+    default_timer() -> float
+
+"""
+
+import gc
+import sys
+import time
+import itertools
+
+__all__ = ["Timer", "timeit", "repeat", "default_timer"]
+
+dummy_src_name = "<timeit-src>"
+default_number = 1000000
+default_repeat = 5
+default_timer = time.perf_counter
+
+_globals = globals
+
+# Don't change the indentation of the template; the reindent() calls
+# in Timer.__init__() depend on setup being indented 4 spaces and stmt
+# being indented 8 spaces.
+template = """
+def inner(_it, _timer{init}):
+    {setup}
+    _t0 = _timer()
+    for _i in _it:
+        {stmt}
+        pass
+    _t1 = _timer()
+    return _t1 - _t0
+"""
+
+def reindent(src, indent):
+    """Helper to reindent a multi-line statement."""
+    return src.replace("\n", "\n" + " "*indent)
+
+class Timer:
+    """Class for timing execution speed of small code snippets.
+
+    The constructor takes a statement to be timed, an additional
+    statement used for setup, and a timer function.  Both statements
+    default to 'pass'; the timer function is platform-dependent (see
+    module doc string).  If 'globals' is specified, the code will be
+    executed within that namespace (as opposed to inside timeit's
+    namespace).
+
+    To measure the execution time of the first statement, use the
+    timeit() method.  The repeat() method is a convenience to call
+    timeit() multiple times and return a list of results.
+
+    The statements may contain newlines, as long as they don't contain
+    multi-line string literals.
+    """
+
+    def __init__(self, stmt="pass", setup="pass", timer=default_timer,
+                 globals=None):
+        """Constructor.  See class doc string."""
+        self.timer = timer
+        local_ns = {}
+        global_ns = _globals() if globals is None else globals
+        init = ''
+        if isinstance(setup, str):
+            # Check that the code can be compiled outside a function
+            compile(setup, dummy_src_name, "exec")
+            stmtprefix = setup + '\n'
+            setup = reindent(setup, 4)
+        elif callable(setup):
+            local_ns['_setup'] = setup
+            init += ', _setup=_setup'
+            stmtprefix = ''
+            setup = '_setup()'
+        else:
+            raise ValueError("setup is neither a string nor callable")
+        if isinstance(stmt, str):
+            # Check that the code can be compiled outside a function
+            compile(stmtprefix + stmt, dummy_src_name, "exec")
+            stmt = reindent(stmt, 8)
+        elif callable(stmt):
+            local_ns['_stmt'] = stmt
+            init += ', _stmt=_stmt'
+            stmt = '_stmt()'
+        else:
+            raise ValueError("stmt is neither a string nor callable")
+        src = template.format(stmt=stmt, setup=setup, init=init)
+        self.src = src  # Save for traceback display
+        code = compile(src, dummy_src_name, "exec")
+        exec(code, global_ns, local_ns)
+        self.inner = local_ns["inner"]
+
+    def print_exc(self, file=None):
+        """Helper to print a traceback from the timed code.
+
+        Typical use:
+
+            t = Timer(...)       # outside the try/except
+            try:
+                t.timeit(...)    # or t.repeat(...)
+            except:
+                t.print_exc()
+
+        The advantage over the standard traceback is that source lines
+        in the compiled template will be displayed.
+
+        The optional file argument directs where the traceback is
+        sent; it defaults to sys.stderr.
+        """
+        import linecache, traceback
+        if self.src is not None:
+            linecache.cache[dummy_src_name] = (len(self.src),
+                                               None,
+                                               self.src.split("\n"),
+                                               dummy_src_name)
+        # else the source is already stored somewhere else
+
+        traceback.print_exc(file=file)
+
+    def timeit(self, number=default_number):
+        """Time 'number' executions of the main statement.
+
+        To be precise, this executes the setup statement once, and
+        then returns the time it takes to execute the main statement
+        a number of times, as a float measured in seconds.  The
+        argument is the number of times through the loop, defaulting
+        to one million.  The main statement, the setup statement and
+        the timer function to be used are passed to the constructor.
+        """
+        it = itertools.repeat(None, number)
+        gcold = gc.isenabled()
+        gc.disable()
+        try:
+            timing = self.inner(it, self.timer)
+        finally:
+            if gcold:
+                gc.enable()
+        return timing
+
+    def repeat(self, repeat=default_repeat, number=default_number):
+        """Call timeit() a few times.
+
+        This is a convenience function that calls the timeit()
+        repeatedly, returning a list of results.  The first argument
+        specifies how many times to call timeit(), defaulting to 5;
+        the second argument specifies the timer argument, defaulting
+        to one million.
+
+        Note: it's tempting to calculate mean and standard deviation
+        from the result vector and report these.  However, this is not
+        very useful.  In a typical case, the lowest value gives a
+        lower bound for how fast your machine can run the given code
+        snippet; higher values in the result vector are typically not
+        caused by variability in Python's speed, but by other
+        processes interfering with your timing accuracy.  So the min()
+        of the result is probably the only number you should be
+        interested in.  After that, you should look at the entire
+        vector and apply common sense rather than statistics.
+        """
+        r = []
+        for i in range(repeat):
+            t = self.timeit(number)
+            r.append(t)
+        return r
+
+    def autorange(self, callback=None):
+        """Return the number of loops and time taken so that total time >= 0.2.
+
+        Calls the timeit method with increasing numbers from the sequence
+        1, 2, 5, 10, 20, 50, ... until the time taken is at least 0.2
+        second.  Returns (number, time_taken).
+
+        If *callback* is given and is not None, it will be called after
+        each trial with two arguments: ``callback(number, time_taken)``.
+        """
+        i = 1
+        while True:
+            for j in 1, 2, 5:
+                number = i * j
+                time_taken = self.timeit(number)
+                if callback:
+                    callback(number, time_taken)
+                if time_taken >= 0.2:
+                    return (number, time_taken)
+            i *= 10
+
+def timeit(stmt="pass", setup="pass", timer=default_timer,
+           number=default_number, globals=None):
+    """Convenience function to create Timer object and call timeit method."""
+    return Timer(stmt, setup, timer, globals).timeit(number)
+
+def repeat(stmt="pass", setup="pass", timer=default_timer,
+           repeat=default_repeat, number=default_number, globals=None):
+    """Convenience function to create Timer object and call repeat method."""
+    return Timer(stmt, setup, timer, globals).repeat(repeat, number)
+
+def main(args=None, *, _wrap_timer=None):
+    """Main program, used when run as a script.
+
+    The optional 'args' argument specifies the command line to be parsed,
+    defaulting to sys.argv[1:].
+
+    The return value is an exit code to be passed to sys.exit(); it
+    may be None to indicate success.
+
+    When an exception happens during timing, a traceback is printed to
+    stderr and the return value is 1.  Exceptions at other times
+    (including the template compilation) are not caught.
+
+    '_wrap_timer' is an internal interface used for unit testing.  If it
+    is not None, it must be a callable that accepts a timer function
+    and returns another timer function (used for unit testing).
+    """
+    if args is None:
+        args = sys.argv[1:]
+    import getopt
+    try:
+        opts, args = getopt.getopt(args, "n:u:s:r:tcpvh",
+                                   ["number=", "setup=", "repeat=",
+                                    "time", "clock", "process",
+                                    "verbose", "unit=", "help"])
+    except getopt.error as err:
+        print(err)
+        print("use -h/--help for command line help")
+        return 2
+
+    timer = default_timer
+    stmt = "\n".join(args) or "pass"
+    number = 0 # auto-determine
+    setup = []
+    repeat = default_repeat
+    verbose = 0
+    time_unit = None
+    units = {"nsec": 1e-9, "usec": 1e-6, "msec": 1e-3, "sec": 1.0}
+    precision = 3
+    for o, a in opts:
+        if o in ("-n", "--number"):
+            number = int(a)
+        if o in ("-s", "--setup"):
+            setup.append(a)
+        if o in ("-u", "--unit"):
+            if a in units:
+                time_unit = a
+            else:
+                print("Unrecognized unit. Please select nsec, usec, msec, or sec.",
+                    file=sys.stderr)
+                return 2
+        if o in ("-r", "--repeat"):
+            repeat = int(a)
+            if repeat <= 0:
+                repeat = 1
+        if o in ("-p", "--process"):
+            timer = time.process_time
+        if o in ("-v", "--verbose"):
+            if verbose:
+                precision += 1
+            verbose += 1
+        if o in ("-h", "--help"):
+            print(__doc__, end=' ')
+            return 0
+    setup = "\n".join(setup) or "pass"
+
+    # Include the current directory, so that local imports work (sys.path
+    # contains the directory of this script, rather than the current
+    # directory)
+    import os
+    sys.path.insert(0, os.curdir)
+    if _wrap_timer is not None:
+        timer = _wrap_timer(timer)
+
+    t = Timer(stmt, setup, timer)
+    if number == 0:
+        # determine number so that 0.2 <= total time < 2.0
+        callback = None
+        if verbose:
+            def callback(number, time_taken):
+                msg = "{num} loop{s} -> {secs:.{prec}g} secs"
+                plural = (number != 1)
+                print(msg.format(num=number, s='s' if plural else '',
+                                  secs=time_taken, prec=precision))
+        try:
+            number, _ = t.autorange(callback)
+        except:
+            t.print_exc()
+            return 1
+
+        if verbose:
+            print()
+
+    try:
+        raw_timings = t.repeat(repeat, number)
+    except:
+        t.print_exc()
+        return 1
+
+    def format_time(dt):
+        unit = time_unit
+
+        if unit is not None:
+            scale = units[unit]
+        else:
+            scales = [(scale, unit) for unit, scale in units.items()]
+            scales.sort(reverse=True)
+            for scale, unit in scales:
+                if dt >= scale:
+                    break
+
+        return "%.*g %s" % (precision, dt / scale, unit)
+
+    if verbose:
+        print("raw times: %s" % ", ".join(map(format_time, raw_timings)))
+        print()
+    timings = [dt / number for dt in raw_timings]
+
+    best = min(timings)
+    print("%d loop%s, best of %d: %s per loop"
+          % (number, 's' if number != 1 else '',
+             repeat, format_time(best)))
+
+    best = min(timings)
+    worst = max(timings)
+    if worst >= best * 4:
+        import warnings
+        warnings.warn_explicit("The test results are likely unreliable. "
+                               "The worst time (%s) was more than four times "
+                               "slower than the best time (%s)."
+                               % (format_time(worst), format_time(best)),
+                               UserWarning, '', 0)
+    return None
+
+if __name__ == "__main__":
+    sys.exit(main())
+                                                                                                                                                                                                                                                                                                                                         usr/lib/python3.11/token.py                                                                         0000644 0000000 0000000 00000004522 14671176116 014156  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        """Token constants."""
+# Auto-generated by Tools/scripts/generate_token.py
+
+__all__ = ['tok_name', 'ISTERMINAL', 'ISNONTERMINAL', 'ISEOF']
+
+ENDMARKER = 0
+NAME = 1
+NUMBER = 2
+STRING = 3
+NEWLINE = 4
+INDENT = 5
+DEDENT = 6
+LPAR = 7
+RPAR = 8
+LSQB = 9
+RSQB = 10
+COLON = 11
+COMMA = 12
+SEMI = 13
+PLUS = 14
+MINUS = 15
+STAR = 16
+SLASH = 17
+VBAR = 18
+AMPER = 19
+LESS = 20
+GREATER = 21
+EQUAL = 22
+DOT = 23
+PERCENT = 24
+LBRACE = 25
+RBRACE = 26
+EQEQUAL = 27
+NOTEQUAL = 28
+LESSEQUAL = 29
+GREATEREQUAL = 30
+TILDE = 31
+CIRCUMFLEX = 32
+LEFTSHIFT = 33
+RIGHTSHIFT = 34
+DOUBLESTAR = 35
+PLUSEQUAL = 36
+MINEQUAL = 37
+STAREQUAL = 38
+SLASHEQUAL = 39
+PERCENTEQUAL = 40
+AMPEREQUAL = 41
+VBAREQUAL = 42
+CIRCUMFLEXEQUAL = 43
+LEFTSHIFTEQUAL = 44
+RIGHTSHIFTEQUAL = 45
+DOUBLESTAREQUAL = 46
+DOUBLESLASH = 47
+DOUBLESLASHEQUAL = 48
+AT = 49
+ATEQUAL = 50
+RARROW = 51
+ELLIPSIS = 52
+COLONEQUAL = 53
+OP = 54
+AWAIT = 55
+ASYNC = 56
+TYPE_IGNORE = 57
+TYPE_COMMENT = 58
+SOFT_KEYWORD = 59
+# These aren't used by the C tokenizer but are needed for tokenize.py
+ERRORTOKEN = 60
+COMMENT = 61
+NL = 62
+ENCODING = 63
+N_TOKENS = 64
+# Special definitions for cooperation with parser
+NT_OFFSET = 256
+
+tok_name = {value: name
+            for name, value in globals().items()
+            if isinstance(value, int) and not name.startswith('_')}
+__all__.extend(tok_name.values())
+
+EXACT_TOKEN_TYPES = {
+    '!=': NOTEQUAL,
+    '%': PERCENT,
+    '%=': PERCENTEQUAL,
+    '&': AMPER,
+    '&=': AMPEREQUAL,
+    '(': LPAR,
+    ')': RPAR,
+    '*': STAR,
+    '**': DOUBLESTAR,
+    '**=': DOUBLESTAREQUAL,
+    '*=': STAREQUAL,
+    '+': PLUS,
+    '+=': PLUSEQUAL,
+    ',': COMMA,
+    '-': MINUS,
+    '-=': MINEQUAL,
+    '->': RARROW,
+    '.': DOT,
+    '...': ELLIPSIS,
+    '/': SLASH,
+    '//': DOUBLESLASH,
+    '//=': DOUBLESLASHEQUAL,
+    '/=': SLASHEQUAL,
+    ':': COLON,
+    ':=': COLONEQUAL,
+    ';': SEMI,
+    '<': LESS,
+    '<<': LEFTSHIFT,
+    '<<=': LEFTSHIFTEQUAL,
+    '<=': LESSEQUAL,
+    '=': EQUAL,
+    '==': EQEQUAL,
+    '>': GREATER,
+    '>=': GREATEREQUAL,
+    '>>': RIGHTSHIFT,
+    '>>=': RIGHTSHIFTEQUAL,
+    '@': AT,
+    '@=': ATEQUAL,
+    '[': LSQB,
+    ']': RSQB,
+    '^': CIRCUMFLEX,
+    '^=': CIRCUMFLEXEQUAL,
+    '{': LBRACE,
+    '|': VBAR,
+    '|=': VBAREQUAL,
+    '}': RBRACE,
+    '~': TILDE,
+}
+
+def ISTERMINAL(x):
+    return x < NT_OFFSET
+
+def ISNONTERMINAL(x):
+    return x >= NT_OFFSET
+
+def ISEOF(x):
+    return x == ENDMARKER
+                                                                                                                                                                              usr/lib/python3.11/tokenize.py                                                                      0000644 0000000 0000000 00000063340 14671176116 014671  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        """Tokenization help for Python programs.
+
+tokenize(readline) is a generator that breaks a stream of bytes into
+Python tokens.  It decodes the bytes according to PEP-0263 for
+determining source file encoding.
+
+It accepts a readline-like method which is called repeatedly to get the
+next line of input (or b"" for EOF).  It generates 5-tuples with these
+members:
+
+    the token type (see token.py)
+    the token (a string)
+    the starting (row, column) indices of the token (a 2-tuple of ints)
+    the ending (row, column) indices of the token (a 2-tuple of ints)
+    the original line (string)
+
+It is designed to match the working of the Python tokenizer exactly, except
+that it produces COMMENT tokens for comments and gives type OP for all
+operators.  Additionally, all token lists start with an ENCODING token
+which tells you which encoding was used to decode the bytes stream.
+"""
+
+__author__ = 'Ka-Ping Yee <ping@lfw.org>'
+__credits__ = ('GvR, ESR, Tim Peters, Thomas Wouters, Fred Drake, '
+               'Skip Montanaro, Raymond Hettinger, Trent Nelson, '
+               'Michael Foord')
+from builtins import open as _builtin_open
+from codecs import lookup, BOM_UTF8
+import collections
+import functools
+from io import TextIOWrapper
+import itertools as _itertools
+import re
+import sys
+from token import *
+from token import EXACT_TOKEN_TYPES
+
+cookie_re = re.compile(r'^[ \t\f]*#.*?coding[:=][ \t]*([-\w.]+)', re.ASCII)
+blank_re = re.compile(br'^[ \t\f]*(?:[#\r\n]|$)', re.ASCII)
+
+import token
+__all__ = token.__all__ + ["tokenize", "generate_tokens", "detect_encoding",
+                           "untokenize", "TokenInfo"]
+del token
+
+class TokenInfo(collections.namedtuple('TokenInfo', 'type string start end line')):
+    def __repr__(self):
+        annotated_type = '%d (%s)' % (self.type, tok_name[self.type])
+        return ('TokenInfo(type=%s, string=%r, start=%r, end=%r, line=%r)' %
+                self._replace(type=annotated_type))
+
+    @property
+    def exact_type(self):
+        if self.type == OP and self.string in EXACT_TOKEN_TYPES:
+            return EXACT_TOKEN_TYPES[self.string]
+        else:
+            return self.type
+
+def group(*choices): return '(' + '|'.join(choices) + ')'
+def any(*choices): return group(*choices) + '*'
+def maybe(*choices): return group(*choices) + '?'
+
+# Note: we use unicode matching for names ("\w") but ascii matching for
+# number literals.
+Whitespace = r'[ \f\t]*'
+Comment = r'#[^\r\n]*'
+Ignore = Whitespace + any(r'\\\r?\n' + Whitespace) + maybe(Comment)
+Name = r'\w+'
+
+Hexnumber = r'0[xX](?:_?[0-9a-fA-F])+'
+Binnumber = r'0[bB](?:_?[01])+'
+Octnumber = r'0[oO](?:_?[0-7])+'
+Decnumber = r'(?:0(?:_?0)*|[1-9](?:_?[0-9])*)'
+Intnumber = group(Hexnumber, Binnumber, Octnumber, Decnumber)
+Exponent = r'[eE][-+]?[0-9](?:_?[0-9])*'
+Pointfloat = group(r'[0-9](?:_?[0-9])*\.(?:[0-9](?:_?[0-9])*)?',
+                   r'\.[0-9](?:_?[0-9])*') + maybe(Exponent)
+Expfloat = r'[0-9](?:_?[0-9])*' + Exponent
+Floatnumber = group(Pointfloat, Expfloat)
+Imagnumber = group(r'[0-9](?:_?[0-9])*[jJ]', Floatnumber + r'[jJ]')
+Number = group(Imagnumber, Floatnumber, Intnumber)
+
+# Return the empty string, plus all of the valid string prefixes.
+def _all_string_prefixes():
+    # The valid string prefixes. Only contain the lower case versions,
+    #  and don't contain any permutations (include 'fr', but not
+    #  'rf'). The various permutations will be generated.
+    _valid_string_prefixes = ['b', 'r', 'u', 'f', 'br', 'fr']
+    # if we add binary f-strings, add: ['fb', 'fbr']
+    result = {''}
+    for prefix in _valid_string_prefixes:
+        for t in _itertools.permutations(prefix):
+            # create a list with upper and lower versions of each
+            #  character
+            for u in _itertools.product(*[(c, c.upper()) for c in t]):
+                result.add(''.join(u))
+    return result
+
+@functools.lru_cache
+def _compile(expr):
+    return re.compile(expr, re.UNICODE)
+
+# Note that since _all_string_prefixes includes the empty string,
+#  StringPrefix can be the empty string (making it optional).
+StringPrefix = group(*_all_string_prefixes())
+
+# Tail end of ' string.
+Single = r"[^'\\]*(?:\\.[^'\\]*)*'"
+# Tail end of " string.
+Double = r'[^"\\]*(?:\\.[^"\\]*)*"'
+# Tail end of ''' string.
+Single3 = r"[^'\\]*(?:(?:\\.|'(?!''))[^'\\]*)*'''"
+# Tail end of """ string.
+Double3 = r'[^"\\]*(?:(?:\\.|"(?!""))[^"\\]*)*"""'
+Triple = group(StringPrefix + "'''", StringPrefix + '"""')
+# Single-line ' or " string.
+String = group(StringPrefix + r"'[^\n'\\]*(?:\\.[^\n'\\]*)*'",
+               StringPrefix + r'"[^\n"\\]*(?:\\.[^\n"\\]*)*"')
+
+# Sorting in reverse order puts the long operators before their prefixes.
+# Otherwise if = came before ==, == would get recognized as two instances
+# of =.
+Special = group(*map(re.escape, sorted(EXACT_TOKEN_TYPES, reverse=True)))
+Funny = group(r'\r?\n', Special)
+
+PlainToken = group(Number, Funny, String, Name)
+Token = Ignore + PlainToken
+
+# First (or only) line of ' or " string.
+ContStr = group(StringPrefix + r"'[^\n'\\]*(?:\\.[^\n'\\]*)*" +
+                group("'", r'\\\r?\n'),
+                StringPrefix + r'"[^\n"\\]*(?:\\.[^\n"\\]*)*' +
+                group('"', r'\\\r?\n'))
+PseudoExtras = group(r'\\\r?\n|\Z', Comment, Triple)
+PseudoToken = Whitespace + group(PseudoExtras, Number, Funny, ContStr, Name)
+
+# For a given string prefix plus quotes, endpats maps it to a regex
+#  to match the remainder of that string. _prefix can be empty, for
+#  a normal single or triple quoted string (with no prefix).
+endpats = {}
+for _prefix in _all_string_prefixes():
+    endpats[_prefix + "'"] = Single
+    endpats[_prefix + '"'] = Double
+    endpats[_prefix + "'''"] = Single3
+    endpats[_prefix + '"""'] = Double3
+del _prefix
+
+# A set of all of the single and triple quoted string prefixes,
+#  including the opening quotes.
+single_quoted = set()
+triple_quoted = set()
+for t in _all_string_prefixes():
+    for u in (t + '"', t + "'"):
+        single_quoted.add(u)
+    for u in (t + '"""', t + "'''"):
+        triple_quoted.add(u)
+del t, u
+
+tabsize = 8
+
+class TokenError(Exception): pass
+
+class StopTokenizing(Exception): pass
+
+
+class Untokenizer:
+
+    def __init__(self):
+        self.tokens = []
+        self.prev_row = 1
+        self.prev_col = 0
+        self.encoding = None
+
+    def add_whitespace(self, start):
+        row, col = start
+        if row < self.prev_row or row == self.prev_row and col < self.prev_col:
+            raise ValueError("start ({},{}) precedes previous end ({},{})"
+                             .format(row, col, self.prev_row, self.prev_col))
+        row_offset = row - self.prev_row
+        if row_offset:
+            self.tokens.append("\\\n" * row_offset)
+            self.prev_col = 0
+        col_offset = col - self.prev_col
+        if col_offset:
+            self.tokens.append(" " * col_offset)
+
+    def untokenize(self, iterable):
+        it = iter(iterable)
+        indents = []
+        startline = False
+        for t in it:
+            if len(t) == 2:
+                self.compat(t, it)
+                break
+            tok_type, token, start, end, line = t
+            if tok_type == ENCODING:
+                self.encoding = token
+                continue
+            if tok_type == ENDMARKER:
+                break

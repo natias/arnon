@@ -1,0 +1,1000 @@
+            # we read the whole chunk, get another
+            self._safe_read(2)  # toss the CRLF at the end of the chunk
+            chunk_left = None
+
+        # read and discard trailer up to the CRLF terminator
+        ### note: we shouldn't have any trailers!
+        while True:
+            line = self.fp.readline()
+            if not line:
+                # a vanishingly small number of sites EOF without
+                # sending the trailer
+                break
+            if line == b'\r\n':
+                break
+
+        # we read everything; close the "file"
+        self.close()
+
+        return b''.join(parts)
+
+    def readline(self):
+        # Fast path for a line is already available in read buffer.
+        i = self._rbuf.find(b'\n')
+        if i >= 0:
+            i += 1
+            line = self._rbuf[:i]
+            self._rbuf = self._rbuf[i:]
+            return line
+
+        # No newline in local buffer. Read until we find one.
+        # readinto read via readinto will already return _rbuf
+        if self._raw_readinto is None:
+            chunks = [self._rbuf]
+        else:
+            chunks = []
+        i = -1
+        readsize = self._rbufsize
+        while True:
+            new = self._raw_read(readsize)
+            if not new:
+                break
+
+            self.receivedbytescount += len(new)
+            self._connection.receivedbytescount += len(new)
+            try:
+                self._handler.parent.receivedbytescount += len(new)
+            except AttributeError:
+                pass
+
+            chunks.append(new)
+            i = new.find(b'\n')
+            if i >= 0:
+                break
+
+        # We either have exhausted the stream or have a newline in chunks[-1].
+
+        # EOF
+        if i == -1:
+            self._rbuf = b''
+            return b''.join(chunks)
+
+        i += 1
+        self._rbuf = chunks[-1][i:]
+        chunks[-1] = chunks[-1][:i]
+        return b''.join(chunks)
+
+    def readlines(self, sizehint=0):
+        total = 0
+        list = []
+        while True:
+            line = self.readline()
+            if not line:
+                break
+            list.append(line)
+            total += len(line)
+            if sizehint and total >= sizehint:
+                break
+        return list
+
+    def readinto(self, dest):
+        if self._raw_readinto is None:
+            res = self.read(len(dest))
+            if not res:
+                return 0
+            dest[0 : len(res)] = res
+            return len(res)
+        total = len(dest)
+        have = len(self._rbuf)
+        if have >= total:
+            dest[0:total] = self._rbuf[:total]
+            self._rbuf = self._rbuf[total:]
+            return total
+        mv = memoryview(dest)
+        got = self._raw_readinto(mv[have:total])
+
+        self.receivedbytescount += got
+        self._connection.receivedbytescount += got
+        try:
+            self._handler.receivedbytescount += got
+        except AttributeError:
+            pass
+
+        dest[0:have] = self._rbuf
+        got += len(self._rbuf)
+        self._rbuf = b''
+        return got
+
+
+def safesend(self, str):
+    """Send `str' to the server.
+
+    Shamelessly ripped off from httplib to patch a bad behavior.
+    """
+    # _broken_pipe_resp is an attribute we set in this function
+    # if the socket is closed while we're sending data but
+    # the server sent us a response before hanging up.
+    # In that case, we want to pretend to send the rest of the
+    # outgoing data, and then let the user use getresponse()
+    # (which we wrap) to get this last response before
+    # opening a new socket.
+    if getattr(self, '_broken_pipe_resp', None) is not None:
+        return
+
+    if self.sock is None:
+        if self.auto_open:
+            self.connect()
+        else:
+            raise httplib.NotConnected
+
+    # send the data to the server. if we get a broken pipe, then close
+    # the socket. we want to reconnect when somebody tries to send again.
+    #
+    # NOTE: we DO propagate the error, though, because we cannot simply
+    #       ignore the error... the caller will know if they can retry.
+    if self.debuglevel > 0:
+        print(b"send:", repr(str))
+    try:
+        blocksize = 8192
+        read = getattr(str, 'read', None)
+        if read is not None:
+            if self.debuglevel > 0:
+                print(b"sending a read()able")
+            data = read(blocksize)
+            while data:
+                self.sock.sendall(data)
+                self.sentbytescount += len(data)
+                data = read(blocksize)
+        else:
+            self.sock.sendall(str)
+            self.sentbytescount += len(str)
+    except BrokenPipeError:
+        if self._HTTPConnection__state == httplib._CS_REQ_SENT:
+            self._broken_pipe_resp = None
+            self._broken_pipe_resp = self.getresponse()
+            reraise = False
+        else:
+            reraise = True
+        self.close()
+        if reraise:
+            raise
+
+
+def wrapgetresponse(cls):
+    """Wraps getresponse in cls with a broken-pipe sane version."""
+
+    def safegetresponse(self):
+        # In safesend() we might set the _broken_pipe_resp
+        # attribute, in which case the socket has already
+        # been closed and we just need to give them the response
+        # back. Otherwise, we use the normal response path.
+        r = getattr(self, '_broken_pipe_resp', None)
+        if r is not None:
+            return r
+        return cls.getresponse(self)
+
+    safegetresponse.__doc__ = cls.getresponse.__doc__
+    return safegetresponse
+
+
+class HTTPConnection(httplib.HTTPConnection):
+    # url.httpsconnection inherits from this. So when adding/removing
+    # attributes, be sure to audit httpsconnection() for unintended
+    # consequences.
+
+    # use the modified response class
+    response_class = HTTPResponse
+    send = safesend
+    getresponse = wrapgetresponse(httplib.HTTPConnection)
+
+    def __init__(self, *args, **kwargs):
+        httplib.HTTPConnection.__init__(self, *args, **kwargs)
+        self.sentbytescount = 0
+        self.receivedbytescount = 0
+
+    def __repr__(self):
+        base = super(HTTPConnection, self).__repr__()
+        local = "(unconnected)"
+        s = self.sock
+        if s:
+            try:
+                local = "%s:%d" % s.getsockname()
+            except OSError:
+                pass  # Likely not connected
+        return "<%s: %s <--> %s:%d>" % (base, local, self.host, self.port)
+
+
+#########################################################################
+#####   TEST FUNCTIONS
+#########################################################################
+
+
+def continuity(url):
+    md5 = hashlib.md5
+    format = b'%25s: %s'
+
+    # first fetch the file with the normal http handler
+    opener = urlreq.buildopener()
+    urlreq.installopener(opener)
+    fo = urlreq.urlopen(url)
+    foo = fo.read()
+    fo.close()
+    m = md5(foo)
+    print(format % (b'normal urllib', hex(m.digest())))
+
+    # now install the keepalive handler and try again
+    opener = urlreq.buildopener(HTTPHandler())
+    urlreq.installopener(opener)
+
+    fo = urlreq.urlopen(url)
+    foo = fo.read()
+    fo.close()
+    m = md5(foo)
+    print(format % (b'keepalive read', hex(m.digest())))
+
+    fo = urlreq.urlopen(url)
+    foo = b''
+    while True:
+        f = fo.readline()
+        if f:
+            foo = foo + f
+        else:
+            break
+    fo.close()
+    m = md5(foo)
+    print(format % (b'keepalive readline', hex(m.digest())))
+
+
+def comp(N, url):
+    print(b'  making %i connections to:\n  %s' % (N, url))
+
+    procutil.stdout.write(b'  first using the normal urllib handlers')
+    # first use normal opener
+    opener = urlreq.buildopener()
+    urlreq.installopener(opener)
+    t1 = fetch(N, url)
+    print(b'  TIME: %.3f s' % t1)
+
+    procutil.stdout.write(b'  now using the keepalive handler       ')
+    # now install the keepalive handler and try again
+    opener = urlreq.buildopener(HTTPHandler())
+    urlreq.installopener(opener)
+    t2 = fetch(N, url)
+    print(b'  TIME: %.3f s' % t2)
+    print(b'  improvement factor: %.2f' % (t1 / t2))
+
+
+def fetch(N, url, delay=0):
+    import time
+
+    lens = []
+    starttime = time.time()
+    for i in range(N):
+        if delay and i > 0:
+            time.sleep(delay)
+        fo = urlreq.urlopen(url)
+        foo = fo.read()
+        fo.close()
+        lens.append(len(foo))
+    diff = time.time() - starttime
+
+    j = 0
+    for i in lens[1:]:
+        j = j + 1
+        if not i == lens[0]:
+            print(b"WARNING: inconsistent length on read %i: %i" % (j, i))
+
+    return diff
+
+
+def test_timeout(url):
+    global DEBUG
+    dbbackup = DEBUG
+
+    class FakeLogger:
+        def debug(self, msg, *args):
+            print(msg % args)
+
+        info = warning = error = debug
+
+    DEBUG = FakeLogger()
+    print(b"  fetching the file to establish a connection")
+    fo = urlreq.urlopen(url)
+    data1 = fo.read()
+    fo.close()
+
+    i = 20
+    print(b"  waiting %i seconds for the server to close the connection" % i)
+    while i > 0:
+        procutil.stdout.write(b'\r  %2i' % i)
+        procutil.stdout.flush()
+        time.sleep(1)
+        i -= 1
+    procutil.stderr.write(b'\r')
+
+    print(b"  fetching the file a second time")
+    fo = urlreq.urlopen(url)
+    data2 = fo.read()
+    fo.close()
+
+    if data1 == data2:
+        print(b'  data are identical')
+    else:
+        print(b'  ERROR: DATA DIFFER')
+
+    DEBUG = dbbackup
+
+
+def test(url, N=10):
+    print(b"performing continuity test (making sure stuff isn't corrupted)")
+    continuity(url)
+    print(b'')
+    print(b"performing speed comparison")
+    comp(N, url)
+    print(b'')
+    print(b"performing dropped-connection check")
+    test_timeout(url)
+
+
+if __name__ == '__main__':
+    import time
+
+    try:
+        N = int(sys.argv[1])
+        url = sys.argv[2]
+    except (IndexError, ValueError):
+        print(b"%s <integer> <url>" % sys.argv[0])
+    else:
+        test(url, N)
+                                                                                                                                                                                                                                                                               usr/lib/python3/dist-packages/mercurial/linelog.py                                                  0000644 0000000 0000000 00000035521 14355257011 020745  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        # linelog - efficient cache for annotate data
+#
+# Copyright 2018 Google LLC.
+#
+# This software may be used and distributed according to the terms of the
+# GNU General Public License version 2 or any later version.
+"""linelog is an efficient cache for annotate data inspired by SCCS Weaves.
+
+SCCS Weaves are an implementation of
+https://en.wikipedia.org/wiki/Interleaved_deltas. See
+mercurial/helptext/internals/linelog.txt for an exploration of SCCS weaves
+and how linelog works in detail.
+
+Here's a hacker's summary: a linelog is a program which is executed in
+the context of a revision. Executing the program emits information
+about lines, including the revision that introduced them and the line
+number in the file at the introducing revision. When an insertion or
+deletion is performed on the file, a jump instruction is used to patch
+in a new body of annotate information.
+"""
+
+import abc
+import struct
+
+from .thirdparty import attr
+from . import pycompat
+
+_llentry = struct.Struct(b'>II')
+
+
+class LineLogError(Exception):
+    """Error raised when something bad happens internally in linelog."""
+
+
+@attr.s
+class lineinfo:
+    # Introducing revision of this line.
+    rev = attr.ib()
+    # Line number for this line in its introducing revision.
+    linenum = attr.ib()
+    # Private. Offset in the linelog program of this line. Used internally.
+    _offset = attr.ib()
+
+
+@attr.s
+class annotateresult:
+    rev = attr.ib()
+    lines = attr.ib()
+    _eof = attr.ib()
+
+    def __iter__(self):
+        return iter(self.lines)
+
+
+class _llinstruction:  # pytype: disable=ignored-metaclass
+
+    __metaclass__ = abc.ABCMeta
+
+    @abc.abstractmethod
+    def __init__(self, op1, op2):
+        pass
+
+    @abc.abstractmethod
+    def __str__(self):
+        pass
+
+    def __repr__(self):
+        return str(self)
+
+    @abc.abstractmethod
+    def __eq__(self, other):
+        pass
+
+    @abc.abstractmethod
+    def encode(self):
+        """Encode this instruction to the binary linelog format."""
+
+    @abc.abstractmethod
+    def execute(self, rev, pc, emit):
+        """Execute this instruction.
+
+        Args:
+          rev: The revision we're annotating.
+          pc: The current offset in the linelog program.
+          emit: A function that accepts a single lineinfo object.
+
+        Returns:
+          The new value of pc. Returns None if exeuction should stop
+          (that is, we've found the end of the file.)
+        """
+
+
+class _jge(_llinstruction):
+    """If the current rev is greater than or equal to op1, jump to op2."""
+
+    def __init__(self, op1, op2):
+        self._cmprev = op1
+        self._target = op2
+
+    def __str__(self):
+        return 'JGE %d %d' % (self._cmprev, self._target)
+
+    def __eq__(self, other):
+        return (
+            type(self) == type(other)
+            and self._cmprev == other._cmprev
+            and self._target == other._target
+        )
+
+    def encode(self):
+        return _llentry.pack(self._cmprev << 2, self._target)
+
+    def execute(self, rev, pc, emit):
+        if rev >= self._cmprev:
+            return self._target
+        return pc + 1
+
+
+class _jump(_llinstruction):
+    """Unconditional jumps are expressed as a JGE with op1 set to 0."""
+
+    def __init__(self, op1, op2):
+        if op1 != 0:
+            raise LineLogError(b"malformed JUMP, op1 must be 0, got %d" % op1)
+        self._target = op2
+
+    def __str__(self):
+        return 'JUMP %d' % (self._target)
+
+    def __eq__(self, other):
+        return type(self) == type(other) and self._target == other._target
+
+    def encode(self):
+        return _llentry.pack(0, self._target)
+
+    def execute(self, rev, pc, emit):
+        return self._target
+
+
+class _eof(_llinstruction):
+    """EOF is expressed as a JGE that always jumps to 0."""
+
+    def __init__(self, op1, op2):
+        if op1 != 0:
+            raise LineLogError(b"malformed EOF, op1 must be 0, got %d" % op1)
+        if op2 != 0:
+            raise LineLogError(b"malformed EOF, op2 must be 0, got %d" % op2)
+
+    def __str__(self):
+        return r'EOF'
+
+    def __eq__(self, other):
+        return type(self) == type(other)
+
+    def encode(self):
+        return _llentry.pack(0, 0)
+
+    def execute(self, rev, pc, emit):
+        return None
+
+
+class _jl(_llinstruction):
+    """If the current rev is less than op1, jump to op2."""
+
+    def __init__(self, op1, op2):
+        self._cmprev = op1
+        self._target = op2
+
+    def __str__(self):
+        return 'JL %d %d' % (self._cmprev, self._target)
+
+    def __eq__(self, other):
+        return (
+            type(self) == type(other)
+            and self._cmprev == other._cmprev
+            and self._target == other._target
+        )
+
+    def encode(self):
+        return _llentry.pack(1 | (self._cmprev << 2), self._target)
+
+    def execute(self, rev, pc, emit):
+        if rev < self._cmprev:
+            return self._target
+        return pc + 1
+
+
+class _line(_llinstruction):
+    """Emit a line."""
+
+    def __init__(self, op1, op2):
+        # This line was introduced by this revision number.
+        self._rev = op1
+        # This line had the specified line number in the introducing revision.
+        self._origlineno = op2
+
+    def __str__(self):
+        return 'LINE %d %d' % (self._rev, self._origlineno)
+
+    def __eq__(self, other):
+        return (
+            type(self) == type(other)
+            and self._rev == other._rev
+            and self._origlineno == other._origlineno
+        )
+
+    def encode(self):
+        return _llentry.pack(2 | (self._rev << 2), self._origlineno)
+
+    def execute(self, rev, pc, emit):
+        emit(lineinfo(self._rev, self._origlineno, pc))
+        return pc + 1
+
+
+def _decodeone(data, offset):
+    """Decode a single linelog instruction from an offset in a buffer."""
+    try:
+        op1, op2 = _llentry.unpack_from(data, offset)
+    except struct.error as e:
+        raise LineLogError(b'reading an instruction failed: %r' % e)
+    opcode = op1 & 0b11
+    op1 = op1 >> 2
+    if opcode == 0:
+        if op1 == 0:
+            if op2 == 0:
+                return _eof(op1, op2)
+            return _jump(op1, op2)
+        return _jge(op1, op2)
+    elif opcode == 1:
+        return _jl(op1, op2)
+    elif opcode == 2:
+        return _line(op1, op2)
+    raise NotImplementedError(b'Unimplemented opcode %r' % opcode)
+
+
+class linelog:
+    """Efficient cache for per-line history information."""
+
+    def __init__(self, program=None, maxrev=0):
+        if program is None:
+            # We pad the program with an extra leading EOF so that our
+            # offsets will match the C code exactly. This means we can
+            # interoperate with the C code.
+            program = [_eof(0, 0), _eof(0, 0)]
+        self._program = program
+        self._lastannotate = None
+        self._maxrev = maxrev
+
+    def __eq__(self, other):
+        return (
+            type(self) == type(other)
+            and self._program == other._program
+            and self._maxrev == other._maxrev
+        )
+
+    def __repr__(self):
+        return '<linelog at %s: maxrev=%d size=%d>' % (
+            hex(id(self)),
+            self._maxrev,
+            len(self._program),
+        )
+
+    def debugstr(self):
+        fmt = '%%%dd %%s' % len(str(len(self._program)))
+        return pycompat.sysstr(b'\n').join(
+            fmt % (idx, i) for idx, i in enumerate(self._program[1:], 1)
+        )
+
+    @classmethod
+    def fromdata(cls, buf):
+        if len(buf) % _llentry.size != 0:
+            raise LineLogError(
+                b"invalid linelog buffer size %d (must be a multiple of %d)"
+                % (len(buf), _llentry.size)
+            )
+        expected = len(buf) / _llentry.size
+        fakejge = _decodeone(buf, 0)
+        if isinstance(fakejge, _jump):
+            maxrev = 0
+        elif isinstance(fakejge, (_jge, _jl)):
+            maxrev = fakejge._cmprev
+        else:
+            raise LineLogError(
+                'Expected one of _jump, _jge, or _jl. Got %s.'
+                % type(fakejge).__name__
+            )
+        assert isinstance(fakejge, (_jump, _jge, _jl))  # help pytype
+        numentries = fakejge._target
+        if expected != numentries:
+            raise LineLogError(
+                b"corrupt linelog data: claimed"
+                b" %d entries but given data for %d entries"
+                % (expected, numentries)
+            )
+        instructions = [_eof(0, 0)]
+        for offset in range(1, numentries):
+            instructions.append(_decodeone(buf, offset * _llentry.size))
+        return cls(instructions, maxrev=maxrev)
+
+    def encode(self):
+        hdr = _jge(self._maxrev, len(self._program)).encode()
+        return hdr + b''.join(i.encode() for i in self._program[1:])
+
+    def clear(self):
+        self._program = []
+        self._maxrev = 0
+        self._lastannotate = None
+
+    def replacelines_vec(self, rev, a1, a2, blines):
+        return self.replacelines(
+            rev, a1, a2, 0, len(blines), _internal_blines=blines
+        )
+
+    def replacelines(self, rev, a1, a2, b1, b2, _internal_blines=None):
+        """Replace lines [a1, a2) with lines [b1, b2)."""
+        if self._lastannotate:
+            # TODO(augie): make replacelines() accept a revision at
+            # which we're editing as well as a revision to mark
+            # responsible for the edits. In hg-experimental it's
+            # stateful like this, so we're doing the same thing to
+            # retain compatibility with absorb until that's imported.
+            ar = self._lastannotate
+        else:
+            ar = self.annotate(rev)
+            #        ar = self.annotate(self._maxrev)
+        if a1 > len(ar.lines):
+            raise LineLogError(
+                b'%d contains %d lines, tried to access line %d'
+                % (rev, len(ar.lines), a1)
+            )
+        elif a1 == len(ar.lines):
+            # Simulated EOF instruction since we're at EOF, which
+            # doesn't have a "real" line.
+            a1inst = _eof(0, 0)
+            a1info = lineinfo(0, 0, ar._eof)
+        else:
+            a1info = ar.lines[a1]
+            a1inst = self._program[a1info._offset]
+        programlen = self._program.__len__
+        oldproglen = programlen()
+        appendinst = self._program.append
+
+        # insert
+        blineinfos = []
+        bappend = blineinfos.append
+        if b1 < b2:
+            # Determine the jump target for the JGE at the start of
+            # the new block.
+            tgt = oldproglen + (b2 - b1 + 1)
+            # Jump to skip the insert if we're at an older revision.
+            appendinst(_jl(rev, tgt))
+            for linenum in range(b1, b2):
+                if _internal_blines is None:
+                    bappend(lineinfo(rev, linenum, programlen()))
+                    appendinst(_line(rev, linenum))
+                else:
+                    newrev, newlinenum = _internal_blines[linenum]
+                    bappend(lineinfo(newrev, newlinenum, programlen()))
+                    appendinst(_line(newrev, newlinenum))
+        # delete
+        if a1 < a2:
+            if a2 > len(ar.lines):
+                raise LineLogError(
+                    b'%d contains %d lines, tried to access line %d'
+                    % (rev, len(ar.lines), a2)
+                )
+            elif a2 == len(ar.lines):
+                endaddr = ar._eof
+            else:
+                endaddr = ar.lines[a2]._offset
+            if a2 > 0 and rev < self._maxrev:
+                # If we're here, we're deleting a chunk of an old
+                # commit, so we need to be careful and not touch
+                # invisible lines between a2-1 and a2 (IOW, lines that
+                # are added later).
+                endaddr = ar.lines[a2 - 1]._offset + 1
+            appendinst(_jge(rev, endaddr))
+        # copy instruction from a1
+        a1instpc = programlen()
+        appendinst(a1inst)
+        # if a1inst isn't a jump or EOF, then we need to add an unconditional
+        # jump back into the program here.
+        if not isinstance(a1inst, (_jump, _eof)):
+            appendinst(_jump(0, a1info._offset + 1))
+        # Patch instruction at a1, which makes our patch live.
+        self._program[a1info._offset] = _jump(0, oldproglen)
+
+        # Update self._lastannotate in place. This serves as a cache to avoid
+        # expensive "self.annotate" in this function, when "replacelines" is
+        # used continuously.
+        if len(self._lastannotate.lines) > a1:
+            self._lastannotate.lines[a1]._offset = a1instpc
+        else:
+            assert isinstance(a1inst, _eof)
+            self._lastannotate._eof = a1instpc
+        self._lastannotate.lines[a1:a2] = blineinfos
+        self._lastannotate.rev = max(self._lastannotate.rev, rev)
+
+        if rev > self._maxrev:
+            self._maxrev = rev
+
+    def annotate(self, rev):
+        pc = 1
+        lines = []
+        executed = 0
+        # Sanity check: if instructions executed exceeds len(program), we
+        # hit an infinite loop in the linelog program somehow and we
+        # should stop.
+        while pc is not None and executed < len(self._program):
+            inst = self._program[pc]
+            lastpc = pc
+            pc = inst.execute(rev, pc, lines.append)
+            executed += 1
+        if pc is not None:
+            raise LineLogError(
+                r'Probably hit an infinite loop in linelog. Program:\n'
+                + self.debugstr()
+            )
+        ar = annotateresult(rev, lines, lastpc)
+        self._lastannotate = ar
+        return ar
+
+    @property
+    def maxrev(self):
+        return self._maxrev
+
+    # Stateful methods which depend on the value of the last
+    # annotation run. This API is for compatiblity with the original
+    # linelog, and we should probably consider refactoring it.
+    @property
+    def annotateresult(self):
+        """Return the last annotation result. C linelog code exposed this."""
+        return [(l.rev, l.linenum) for l in self._lastannotate.lines]
+
+    def getoffset(self, line):
+        return self._lastannotate.lines[line]._offset
+
+    def getalllines(self, start=0, end=0):
+        """Get all lines that ever occurred in [start, end).
+
+        Passing start == end == 0 means "all lines ever".
+
+        This works in terms of *internal* program offsets, not line numbers.
+        """
+        pc = start or 1
+        lines = []
+        # only take as many steps as there are instructions in the
+        # program - if we don't find an EOF or our stop-line before
+        # then, something is badly broken.
+        for step in range(len(self._program)):
+            inst = self._program[pc]
+            nextpc = pc + 1
+            if isinstance(inst, _jump):
+                nextpc = inst._target
+            elif isinstance(inst, _eof):
+                return lines
+            elif isinstance(inst, (_jl, _jge)):
+                pass
+            elif isinstance(inst, _line):
+                lines.append((inst._rev, inst._origlineno))
+            else:
+                raise LineLogError(b"Illegal instruction %r" % inst)
+            if nextpc == end:
+                return lines
+            pc = nextpc
+        raise LineLogError(b"Failed to perform getalllines")
+                                                                                                                                                                               usr/lib/python3/dist-packages/mercurial/locale/                                                     0000755 0000000 0000000 00000000000 14714551120 020170  5                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        usr/lib/python3/dist-packages/mercurial/locale/da/                                                  0000755 0000000 0000000 00000000000 14714551120 020554  5                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        usr/lib/python3/dist-packages/mercurial/locale/da/LC_MESSAGES/                                      0000755 0000000 0000000 00000000000 14714551120 022341  5                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        usr/lib/python3/dist-packages/mercurial/locale/da/LC_MESSAGES/hg.mo                                 0000644 0000000 0000000 00000677567 14374730616 023343  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        Ş•    Ÿ     =  1
+  z      Ğ¢  !   Ñ¢  !   ó¢  #   £  #   9£  4   ]£  3   ’£  -   Æ£  -   ô£     "¤     7¤  5   G¤     }¤     –¤     ¤¤     ²¤  '   Å¤     í¤  '   ¥  (   /¥  .   X¥  $   ‡¥  #   ¬¥     Ğ¥     a¦  †   ¦  _   §  O   h§  ]   ¸§  N   ¨  A   e¨  '   §¨  $   Ï¨     ô¨     ©  l   ©  ç   ˆ©  h   pª     Ùª  —  îª    †¬  ‰   ‰®  .   ¯  ]   B¯  (    ¯  7   É¯  "   °  S   $°     x°  ´   °     4±  É   O±  ©   ²  ü   Ã²  ş   À³  Õ  ¿´  j   •¶  Œ    ·  Õ  ·  ¯   c¹  ;   º  K   Oº  „   ›º  Ÿ   »    À¼    Î½    à¾  Ÿ   ã¿  ’   ƒÀ  ¿   Á  ?   ÖÁ  F   Â     ]Â  â   lÂ  5  OÃ  [   …Ä  ~   áÄ  l   `Å  r   ÍÅ  Œ   @Æ  h   ÍÆ  m   6Ç  ^   ¤Ç  Ö   È  Ã   ÚÈ  ¼   É  a   [Ê  <   ½Ê  ;   úÊ  s   6Ë    ªË  ¬   ·Ì     dÍ  c   eÎ  v   ÉÎ  z   @Ï  q   »Ï  P   -Ğ  Æ   ~Ğ  Y   EÑ     ŸÑ  R   0Ò  „   ƒÒ  ˆ   Ó  Â   ‘Ó  ‡   TÔ  X   ÜÔ  C   5Õ  C  yÕ  P   ½Ö  µ   ×  8  Ä×  L   ıØ  9   JÙ  O   „Ù     ÔÙ  '   òÙ  ;   Ú     VÚ  ,   uÚ  9   ¢Ú  -   ÜÚ  L   
+Û  C   WÛ  H   ›Û  T   äÛ  7   9Ü  -   qÜ  ?   ŸÜ  e  ßÜ  Ş   EŞ  ›   $ß     Àß  4   Qà  Œ   †à  s   á  Z   ‡á  —   âá  ‚   zâ  š   ıâ  i   ˜ã  B  ä     Eå  9   ãå  ~   æ  >   œæ  R   Ûæ  e   .ç  e   ”ç    úç  ø   é  ‡   
+ê  ™   ’ê  î   ,ë  Ÿ   ì  ¦   »ì  $   bí  ;   ‡í  }   Ãí     Aî  “   àî  ¼   tï  ‚   1ğ  İ   ´ğ    ’ñ  X   ¨ò     ó  }   ó  á   ÿó  â  áô  =  Äö  A   ø  „   Dø  3   Éø  T   ıø  P   Rù    £ù  m   ¿ú  h   -û  m   –û  x   ü  İ   }ü  ·   [ı  »   ş  b   Ïş  ü   2ÿ  Í   /  -  ı  	  + 
+  5    @ C   ` .   ¤    Ó å   ã M   É =    9   U     '   ¯ ,   × F    F   K "  ’ %   µ C   Û M   	 K   m	 >   ¹	   ø	     6   1   h *    !   ª ¤   Ì    q        ¥    »    Ù ÷   õ 6   í N   $ ¤   s     ´   /    ä 2   û S   .    ‚    ¢ 	   ¸ Á   Â    „ *   ¤    Ï    î /    a   7    ™ 3   ¶ -   ê ¸    X   Ñ U   * "   € —   £    ; m   W 	   Å d   Ï ğ   4    % ä   < h   ! e   Š ?   ğ 5   0    f 
+   s    ~ 	   ‡    ‘         ´    Ã    Ò    Ş    ç    ú        #    4    R    X    g "   p *   “ *   ¾    é        
+     
+       %    -    5    =    E    M    U 
+   ^ !   i    ‹    ¡ 	   ¶ 
+   À !   Ë ,   í     
+   6    A !   W    y    ‰    •    ¡ 
+   · 
+   Â    Í    í    ù 
+               9    Y    \    y 1   • 0   Ç    ø        %    E *   Z    … "   ™ )   ¼ $   æ +     &   7  %   ^  -   „  (   ²  +   Û  
+   !    !    (!    >!    U! F   g!     ®! &   Ï!    ö! ,   "     <" !   ]" 	   "    ‰"    ¦" :   ·"    ò"    #    1#    F#    Z#    k#    {#    Œ#    £#    ¹# 3   Ğ#    $    $    4$    K$    \$    x$    $    Ÿ$    µ$    Ò$ '   æ$ "   % %   1%    W%    j% 2   …% &   ¸% *   ß% "   
+&    -&    K&    g&    ‚&     &    ¾&    İ&    ú& '   ı&    %'    ;' $   W'    |' +   •' I   Á'    ( +   '(    S( )   o(    ™(    ³(    ¹( &   Æ( '   í(    ) (   /) +   X) 6   „) A   ») "   ı)     * 5   9*    o* 3   * (   Â* 7   ë* )   #+    M+    \+ "   n+ 1   ‘+    Ã+ *   İ+    , <   ,    S,    f, .   , &   °, F   ×, F   - 4   e- $   š-    ¿- 0   Õ- »   . “  Â.   V0 .  ^1 k   2 *   ù2 4   $3 4   Y3 E   3 #   Ô3 1   ø3 +   *4 B   V4    ™4 %   ¨4 8   Î4 1   5    95    L5    O5 S   İ5 „   16 =   ¶6    ô6    ı6 "   7    '7 Ì   :7    8 !   8    -8    68    K8 #   f8    Š8 8   “8    Ì8    à8 È   ò8    »9    À9 @   Í9    : B   : C   ]:    ¡:    ·:    ¾: #   Ö: 	   ú: $   ; 
+   );   4;    Ã<    È<    Ï<    â< é  ò< H   Ü>    %? B   @? (   ƒ?    ¬?    ¹?    É?    Ú?    é?    ş?    @    @    )@     ,@ $   M@ E   r@   ¸@    ¿A ,   ÌA 
+   ùA L   B    QB -   ÑB 4   ÿB    4C '   OC >   wC Ì   ¶C    ƒD    ˆD    ŒD &   ¢D    ÉD 6   äD    E    !E s   %E    ™E    ¡E O   ªE    úE    ÿE *   F 1   /F )   aF    ‹F    F    ®F    ²F *   ¾F &   éF    G    'G $   9G    ^G    sG    G K   —G    ãG    ìG !   ûG 5   H    SH    qH    ŠH    ¦H =   ¶H =   ôH    2I    ;I    @I +   EI    qI =   €I   ¾I    ÜJ 
+  øJ ü   L     M    M )   9M G  cM   «O (   ÁP 5   êP ª    Q ¬   ËQ   xR N   ˆS ´   ×S *  ŒT ù   ·U )   ±V ’   ÛV    nW ™   sW n   X C   |X 	   ÀX    ÊX '   ÏX    ÷X    Y £   Y    ¾Y    ÇY 4   ãY &   Z    ?Z    TZ    gZ    mZ    ŠZ !   ©Z    ËZ    İZ    ëZ 8   øZ 2   1[ ;   d[     [    ¼[    ×[ 	   à[ <   ê[    '\    0\ 3   >\    r\    ‚\    ‘\ 9   \    Ø\ 	   ç\    ñ\    ]    
+]    ] 6   ']    ^]    o]    ƒ]    ˜]    ¶]    Î]    è] #   ^    '^    F^    [^    w^    Š^     ^    ¹^    Ö^    é^    ò^ 
+   ù^ I   _ 9   N_    ˆ_ .   ¨_ 8   ×_ =   ` 5   N` (   „`    ­` *   À` (   ë` (   a *   =a ,   ha -   •a 4   Ãa    øa 	   b 
+   b    &b    2b    Ab    _b    qb .   ‡b 6   ¶b .   íb    c    ,c #   Hc    lc #   ˆc 1   ¬c +   Şc    
+d *   *d 2   Ud 0   ˆd 0   ¹d .   êd 2   e 
+   Le    We    qe    ‹e    še    ­e    Âe .   Ôe .   f ,   2f    _f    pf "   …f    ¨f "   Åf *   èf    g %   +g 	   Qg    [g    yg    ™g %   ±g    ×g    ôg    h     h 4   >h    sh    €h *   ›h 	   Æh    Ğh    ßh ,   øh (   %i    Ni 1   ci    •i     ¥i    Æi    ßi >   ìi .   +j    Zj %   wj    j 4   ´j "   éj    k    k    .k    ?k <   Sk <   k    Ík    çk    øk    l    l (   %l    Nl !   il    ‹l (   ”l    ½l    ×l 5   ól !   )m $   Km "   pm %   “m     ¹m &   Úm #   n    %n /   7n     gn ?   ˆn $   Èn '   ín +   o &   Ao '   ho &   o    ·o ,   Óo !    p (   "p    Kp    gp /   †p    ¶p #   Òp )   öp     q $   ?q *   dq    q #   ¯q    Óq "   êq    r .   ,r B   [r 9   r $   Ør    ır (   s #   =s    as    }s    —s '   °s    Øs :   òs 2   -t !   `t .   ‚t -   ±t )   ßt +   	u '   5u "   ]u %   €u &   ¦u $   Íu *   òu %   v "   Cv *   fv (   ‘v ;   ºv $   öv 3   w    Ow    kw (   ƒw    ¬w $   Âw    çw    ÿw $   x '   =x    ex 
+   yx    „x    •x    x    ³x    Ãx    ×x    îx    y      y )   Ay    ky    ‹y    ¤y    ¾y %   Úy 
+    z    z     z "   ;z    ^z <   vz #   ³z 6   ×z 9   { ,   H{ &   u{    œ{    ª{ 5   ¹{    ï{    û{    |    3|    E|    X| I   r|    ¼|    Ö|    ö| '   }    0}    N} -   i} 6   —}    Î} 
+   Û}    æ}    û}    
+~    ~ 1   *~    \~    l~ 3   ~~    ²~    Ï~    î~        +    G "   d +   ‡ .   ³ .   â    €    *€    ;€ 
+   S€    ^€    p€ $   …€    ª€ 0   ¸€ C   é€    -     = ,   ^    ‹    §    À +   Ñ +   ı    )‚    A‚    ^‚ ,   l‚ &   ™‚ !   À‚    â‚    ƒ     ƒ    ;ƒ $   Vƒ    {ƒ *   —ƒ    Âƒ -   Ğƒ    şƒ 6   „ #   T„    x„ 	   ”„     „ %   ¿„    å„    ø„ '   … &   5…    \…    r…    ’… +   ¨… '   Ô…    ü… /   †    I† "   h† )   ‹† "   µ†    Ø† )   ë†    ‡ /   -‡    ]‡    }‡    ƒ‡ (   “‡ "   ¼‡ 4   ß‡    ˆ    /ˆ     Cˆ    dˆ    pˆ &   ‚ˆ    ©ˆ    Áˆ )   ßˆ 0   	‰    :‰    O‰    c‰    ‚‰    ‰    ‰    ¶‰    Î‰    â‰ *   ö‰ ?   !Š    aŠ !   zŠ    œŠ +   ³Š    ßŠ    şŠ    ‹    0‹    D‹    X‹ /   x‹    ¨‹    º‹ ,   Ñ‹ -   ş‹ )   ,Œ    VŒ /   lŒ (   œŒ &   ÅŒ    ìŒ    şŒ        . &   F    m     #   –    º !   Ï    ñ -       6    ;    S    p        ‘    §    ¹    Ë    ê             &    .    6    = '   N    v !   • ,   ·    ä    ò      <       [    y 1   ‰     » 8   Ü    ‘    (‘ 
+   .‘ 
+   9‘ 	   D‘ )   N‘ -   x‘    ¦‘ 	   µ‘    ¿‘    Ï‘ $   æ‘    ’    ’    &’    8’    G’    c’    q’    „’     ”’ !   µ’ *   ×’    “    “    5“    C“    W“ -   o“ *   “    È“    Ï“ 
+   ë“ 5   ö“    ,” 3   H” -   |” '   ª”    Ò”    â” $   ş”    #• #   :•    ^•    }•    ›• 2   ­•    à•    û• .   – +   A– !   m–     – !   °– #   Ò–    ö–    — #   2—     V—    w—    ’—    ±— /   Ê—    ú— 8   ˜    N˜ <   a˜    ˜ 0   ¬˜    İ˜ !   ë˜    ™ 0   ™ &   L™ =   s™    ±™    Ì™ 5   æ™ !   š    >š    Oš    \š @   |š    ½š    İš !   òš    ›    › C   ;›    ›    › &   ¥›    Ì›    ç›    ü›    œ    3œ &   Fœ     mœ ,   œ    »œ    Íœ    âœ    ûœ +    (   G '   p    ˜         º !   Ô !   ö     (   5 :   ^    ™    §    ¶ =   Õ '   Ÿ     ;Ÿ    \Ÿ    sŸ 
+   “Ÿ     Ÿ     ¿Ÿ )   àŸ *   
+     5     U  !   l  )        ¸  *   Î  )   ù     #¡    >¡ (   \¡    …¡ '   ¢¡    Ê¡ !   ê¡ !   ¢ 3   .¢ 9   b¢ 5   œ¢ >   Ò¢ 9   £    K£     k£ &   Œ£ $   ³£ #   Ø£    ü£    ¤    '¤    5¤    G¤ +   \¤ !   ˆ¤    ª¤    Â¤    Ó¤    ñ¤    ¥    $¥ -   >¥    l¥    †¥     ¥    °¥    É¥    è¥     ¦    ¦    4¦    D¦    X¦     a¦    ‚¦ !   ™¦    »¦ '   Ó¦    û¦    §    6§    H§    g§    |§ !   “§    µ§ $   Ô§    ù§    ¨    *¨ "   <¨ -   _¨    ¨    ¬¨ "   À¨ #   ã¨    © $   ©    <© Y   P© %   ª©    Ğ©    é© (   ü© 3   %ª    Yª ?   yª    ¹ª    Õª    ïª    « 	    «    *« 7   C«    {«    «    ¢«    ¹« 9   Ò« &   ¬ 	   3¬    =¬ %   J¬    p¬ -   ¬    ¼¬    È¬    á¬    õ¬ 7   	­    A­    \­    w­ "   –­    ¹­    Õ­    æ­ !   ö­    ® )   )®    S® ,   i®    –®    ­® H   Ê® !   ¯ #   5¯ "   Y¯ #   |¯     ¯ "   ³¯ *   Ö¯ 3   ° 6   5° $   l°    ‘° 5   ¬°     â°    ± 
+   ±     ±    8±    J±    b±    ~±    ±    ©±     ¿±    à± 4   õ±    *²    H² A   a²    £²    ¶²    Ç²    á²    ø² %   ³    7³    Q³ )   d³    ³     ³    ¶³    É³    İ³ +   ó³    ´    >´ "   U´ %   x´ "   ´    Á´    Ø´ #   è´ +   µ /   8µ    hµ    …µ    —µ    ­µ    Àµ    Íµ &   ëµ    ¶    (¶ [   4¶ .   ¶ +   ¿¶ <   ë¶ #   (· =   L· -   Š· #   ¸·    Ü· !   î·    ¸    0¸    A¸ 6   S¸ *   Š¸ 1   µ¸    ç¸ =   ó¸ "   1¹ A   T¹    –¹    ³¹ 0   È¹    ù¹ 3   º )   Eº /   oº %   Ÿº    Åº    áº !   ÿº *   !» 5   L» *   ‚» '   ­» $   Õ» 6   ú» O   1¼ "   ¼ -   ¤¼ (   Ò¼ #   û¼    ½    9½ A   Y½ 5   ›½    Ñ½    ï½ 5   ¾    D¾    `¾ "   y¾ "   œ¾    ¿¾    Ó¾    â¾    ê¾    ¿ !   ¿    ;¿ 
+   Y¿    d¿    ~¿    –¿ -   ¯¿ &   İ¿    À    À    /À    HÀ    gÀ    ~À    šÀ "   ³À    ÖÀ *   ìÀ *   Á %   BÁ    hÁ $   ‡Á    ¬Á #   ÃÁ    çÁ     ùÁ "   Â #   =Â )   aÂ $   ‹Â     °Â     ÑÂ    òÂ #   Ã )   &Ã    PÃ    \Ã !   uÃ 0   —Ã     ÈÃ     éÃ    
+Ä    Ä -   0Ä    ^Ä (   vÄ     ŸÄ    ÀÄ !   ÜÄ    şÄ -   Å    GÅ    cÅ    sÅ    Å 2   ©Å #   ÜÅ      Æ $   !Æ !   FÆ !   hÆ ,   ŠÆ    ·Æ     ¿Æ C   àÆ &   $Ç    KÇ    bÇ %   ‚Ç    ¨Ç    ¹Ç    ÒÇ    îÇ )   È %   0È     VÈ "   wÈ    šÈ    §È 8   ·È    ğÈ "   É     $É    EÉ    _É &   nÉ 4   •É *   ÊÉ &   õÉ    Ê    <Ê    [Ê     qÊ    ’Ê     Ê &   ºÊ    áÊ    ÿÊ    Ë    3Ë    EË 
+   UË    `Ë A   ~Ë !   ÀË 3   âË    Ì &   1Ì $   XÌ (   }Ì    ¦Ì 7   ÀÌ    øÌ 	   Í ;   Í 	   [Í    eÍ '   yÍ    ¡Í    ÁÍ !   ßÍ    Î    
+Î    Î '   (Î 2   PÎ    ƒÎ -   Î    ¾Î    ËÎ    àÎ    øÎ    Ï    Ï     .Ï    OÏ    bÏ    vÏ    „Ï    ¡Ï    ¹Ï    ÖÏ    ïÏ    Ğ %   Ğ 4   EĞ 8   zĞ !   ³Ğ    ÕĞ #   íĞ    Ñ '   $Ñ %   LÑ    rÑ    ‡Ñ    ™Ñ )   ¯Ñ (   ÙÑ    Ò    Ò    -Ò #   GÒ *   kÒ 1   –Ò     ÈÒ    éÒ    ÷Ò     Ó #   Ó *   CÓ /   nÓ )   Ó     ÈÓ &   éÓ    Ô    $Ô    6Ô    HÔ    \Ô    sÔ    …Ô    œÔ $   ¬Ô 	   ÑÔ    ÛÔ    ÷Ô    Õ *   !Õ    LÕ (   `Õ %   ‰Õ !   ¯Õ    ÑÕ    ïÕ *   Ö ,   :Ö ?   gÖ *   §Ö    ÒÖ    ëÖ )   ÷Ö    !×    <× #   W×    {×    „×    “×    §× 	   ®× '   ¸×     à×    Ø    Ø    4Ø    PØ -   lØ /   šØ -   ÊØ    øØ "   Ù    7Ù    ?Ù $   QÙ 5   vÙ $   ¬Ù    ÑÙ #   ñÙ    Ú    .Ú 5   LÚ :   ‚Ú    ½Ú )   ÏÚ    ùÚ    
+Û    Û +   %Û 0   QÛ -   ‚Û '   °Û    ØÛ "   êÛ    Ü "   +Ü    NÜ    fÜ &   }Ü (   ¤Ü    ÍÜ    èÜ #   İ    %İ    Eİ +   [İ ?   ‡İ %   Çİ    íİ 1   Ş    ?Ş    WŞ    hŞ    Ş    ™Ş    ³Ş %   ÌŞ    òŞ &   	ß 
+   0ß 7   ;ß 3   sß !   §ß    Éß    åß 	   şß <   à    Eà )   ^à 5   ˆà    ¾à $   Ôà $   ùà %   á $   Dá    iá $   …á .   ªá    Ùá    çá    şá !   â %   =â    câ    â #   ¡â )   Åâ    ïâ $   öâ    ã    /ã /   ;ã    kã !   ‰ã +   «ã    ×ã    îã ,   úã    'ä ,   7ä    dä    wä %   ’ä    ¸ä +   Øä    å     å +   4å    `å    yå    å 5   ”å    Êå /   áå >   æ 6   Pæ 0   ‡æ    ¸æ    Îæ    íæ    şæ    ç .   -ç "   \ç (   ç >   ¨ç    çç    è /   è 1   @è 0   rè )   £è    Íè    åè    é /   é    Né    gé    …é    –é    ¶é    Ëé    áé    şé )   ê $   Dê @   iê ?   ªê    êê    ë %   ë 5   Bë    xë    ’ë    ®ë    Åë -   ßë ,   ì    :ì %   Zì    €ì    –ì    ±ì    Îì    íì 
+   í    í    )í (   =í    fí    ~í    –í "   °í    Óí    òí    î    /î !   Nî    pî    ‚î    •î    ¬î *   Êî !   õî '   ï    ?ï    Yï 6   kï    ¢ï K   ±ï    ıï    ğ    *ğ    ?ğ    Gğ    `ğ    zğ    ‘ğ )   ¥ğ    Ïğ    ëğ    ñ    ñ    +ñ    ?ñ    ]ñ    lñ    †ñ     ñ    µñ    Ëñ    åñ    ùñ    ò     'ò    Hò    Uò -   lò    šò    ·ò @   Îò $   ó 0   4ó    eó    …ó "   Ÿó !   Âó 0   äó    ô     *ô    Kô    ^ô 3   wô 6   «ô .   âô #   õ 3   5õ    iõ    |õ    …õ    ›õ    ¹õ     Íõ    îõ    ö    ö    *ö    Aö %   ]ö =   ƒö +   Áö +   íö B   ÷ 8   \÷ 1   •÷ P   Ç÷ 2   ø    Kø &   kø    ’ø    ¯ø $   Ìø    ñø &   ù )   5ù "   _ù #   ‚ù    ¦ù &   Áù ,   èù )   ú    ?ú 	   ^ú    hú    nú 	   ú    ‰ú    ¨ú    Èú 0   ßú @   û &   Qû 4   xû "   ­û    Ğû    İû B   üû "   ?ü "   bü !   …ü *   §ü &   Òü -   ùü    'ı !   Cı (   eı 4   ı    Ãı    Ğı    ïı 2   ş 2   7ş N   jş @   ¹ş R   úş C   Mÿ G   ‘ÿ *   Ùÿ '     (   ,  +   U  3        µ  &   Í  (   ô  3       Q /   Y    ‰ '   £ 1   Ë P  ı     N    o #    #   ± 1   Õ /    3   7 3   k    Ÿ    ´ 1   Ê    ü        %    4 ,   M    z 1   – (   È .   ñ $     #   E    i     ú ˆ    _   ¤ O    \   T L   ± E   ş '   D	 %   l	    ’	    §	 v   ¸	 ÿ   /
+ h   /    ˜ Æ  ¯ †  v ª   ı .   ¨ s   × 4   K C   € "   Ä S   ç    ; ´   B    ÷ Ø    ½   ë   © C  ®   ò r        Ù   Ø   é M   Â E    ˆ   V ¯  ß O     ß    æ! «   ù"    ¥# Ê   D$ 7   % >   G%    †% û   –% m  ’& [    ( …   \( ¬   â( w   ) †   * a   * …   ğ* h   v+ Ä   ß+ «   ¤, Å   P- [   . P   r. N   Ã. †   / ö   ™/ Á   0 ÿ   R1 k   R2 p   ¾2 z   /3 k   ª3 [   4 ¬   r4 [   5 ¥   {5 J   !6 ­   l6 u   7 «   7 ‰   <8 [   Æ8 P   "9 0  s9 M   ¤: ä   ò: 0  ×; U   = 6   ^= L   •= !   â= 2   > 5   7> !   m> ,   > 1   ¼> A   î> G   0? G   x? L   À? E   @ B   S@ ,   –@ ;   Ã@ v  ÿ@ Ï   vB ©   FC ˆ   ğC :   yD    ´D €   EE \   ÆE §   #F „   ËF    PG b   ïG D  RH °   —I <   HJ x   …J ?   şJ ^   >K    K    +L #  ¹L à   İM ‹   ¾N ”   JO ï   ßO ˜   ÏP ´   hQ 0   R ?   NR ˆ   R ™   S    ±S á   ?T “   !U á   µU   —V W   ®W ‡   X „   X ó   Y ë  Z ±  ó[ L   ¥] •   ò] 1   ˆ^ _   º^ [   _ ÿ   v_ g   v` ^   Ş` {   =a §   ¹a ô   ab Ì   Vc È   #d d   ìd   Qe Ñ   gf -  9g 	  gh 
+  qi    |j C   œj .   àj    k æ   k M   l =   Tl 9   ’l    Ìl '   ìl ,   m V   Am Z   ˜m m  óm %   ao C   ‡o O   Ëo q   p L   p C  Úp    r 6   7r   nr (   ~s !   §s ¤   És    nt    ‹t    ¢t    ¸t    Öt ÷   òt 6   êu N   !v °   pv    !w Æ   8w    ÿw 2   x S   Ix     x    ¾x 	   Ôx Á   Şx     y *   Ày    ëy    
+z /   #z a   Sz    µz 3   Òz -   { ¸   4{ V   í{ [   D| !    | ´   Â|    w} m   “} 
+   ~ v   ~ ğ   ƒ~    t ä   ‹ z   p€ e   ë€ ?   Q 9   ‘    Ë 	   Ú    ä 	   ë    õ    ‚    ‚    $‚ 
+   5‚    @‚    N‚ 
+   d‚    o‚    ‚    Ÿ‚    ½‚    Â‚    Ï‚ '   Ö‚ /   ş‚ -   .ƒ    \ƒ    xƒ    €ƒ    ˆƒ 	   ƒ    šƒ    ¢ƒ    ªƒ    ²ƒ    ºƒ    Âƒ    Êƒ    ×ƒ    ãƒ     „    „    $„ 
+   0„    ;„ ,   [„    ˆ„    §„    ´„    Í„    è„ 
+   ú„    …    … 
+   *… 
+   5…    @…    […    k… 	   |… 	   †…    … %   ¥…    Ë…    Î…     ì… =   † <   K†    ˆ†    ¥†     »†    Ü† .   ğ†    ‡     4‡ "   U‡ "   x‡ $   ›‡    À‡    à‡ &   ÿ‡ !   &ˆ $   Hˆ 	   mˆ    wˆ    “ˆ    ®ˆ    Éˆ N   Ûˆ $   *‰ $   O‰    t‰ 3   ‰ "   Ä‰ %   ç‰ 	   Š    Š    4Š N   LŠ    ›Š &   ºŠ    áŠ    öŠ    ‹    $‹    5‹    F‹    [‹    t‹ 7   Š‹    Â‹    İ‹    ÷‹    Œ (   #Œ    LŒ    bŒ    rŒ    Œ    ªŒ !   »Œ    İŒ &   ùŒ         ; 3   U 1   ‰ ,   » (   è !       3    H "   a    „    ¡    ¿    Ú 9   İ         8 3   X    Œ )   ¦ G   Ğ     -   5    c .        °    Ñ    × '   ã ,   ‘    8‘ '   T‘ 4   |‘ 5   ±‘ :   ç‘ %   "’ !   H’ E   j’ $   °’ C   Õ’ -   “ 6   G“ -   ~“    ¬“    ¼“ &   Ï“ 1   ö“    (” *   D”    o” ?   }”    ½”    Ğ” .   è” '   • R   ?• O   ’• 9   â• !   –    >– 2   T– ê   ‡– ‚  r—   õ˜ K  š m   `› ,   Î› 4   û› 7   0œ S   hœ !   ¼œ 3   Şœ 1    O   D    ” ,   ¢ M   Ï 8       V    m    p J   ş    IŸ H   ËŸ 	          %   #     I  ÿ   [     [¡    _¡ 
+   ¡    Š¡    ¡ *   ½¡ 
+   è¡ B   ó¡    6¢    J¢ Ñ   a¢    3£    8£ @   E£    †£ f   £ b   ô£    W¤    f¤    l¤ /   …¤ 
+   µ¤ $   À¤ 
+   å¤ h  ğ¤    Y¦    ]¦    d¦    z¦ Ò  ¦ H   a¨    ª¨ I   Ä¨ 6   ©    E©    V©    d©    |©    ‹©    £©    ²©    Ä©    Ó© &   Ö© +   ı© R   )ª 9  |ª    ¶« :   Å«     ¬ T   	¬ ”   ^¬ )   ó¬ :   ­    X­ (   t­ ?   ­ ì   İ­    Ê®    Ï®    Ó® ,   ê®    ¯ ;   5¯    q¯    z¯ i   ‚¯    ì¯    û¯ U   °    a°    e° +   j° 3   –° *   Ê°    õ°    û°    ±    ± 3   (± -   \±    Š±    ± /   ®±    Ş± (   ğ±    ² H   "²    k²    s² *   ˆ² B   ³²    ö² &   ³    ;³    [³ G   h³ H   °³    ù³    ´    ´ 3   ´    A´ 8   T´   ´    £µ   Âµ   Ê¶ "   à·    ¸ 0   "¸ ^  S¸ ,  ²º )   ß» 2   	¼ ½   <¼ ²   ú¼   ­½ R   ³¾ à   ¿ j  ç¿   RÁ -   TÂ ’   ‚Â    Ã    Ã ‘   ¸Ã Y   JÄ 	   ¤Ä    ®Ä    µÄ    ÓÄ 	   ñÄ ¡   ûÄ    Å $   ¦Å 9   ËÅ &   Æ    ,Æ    AÆ    ZÆ    `Æ    }Æ +   œÆ    ÈÆ    İÆ    êÆ ;   ÷Æ <   3Ç :   pÇ     «Ç    ÌÇ    æÇ 	   ôÇ :   şÇ    9È    BÈ 2   OÈ    ‚È    ‘È     È B   ¬È    ïÈ 
+   şÈ    	É    É    #É    3É 6   @É    wÉ    ‰É    É    ¶É    ÕÉ    ğÉ    
+Ê +   %Ê    QÊ    qÊ    ‡Ê    £Ê    ¶Ê    ÌÊ    çÊ    Ë    Ë    !Ë 
+   'Ë I   2Ë 9   |Ë "   ¶Ë 2   ÙË ?   Ì G   LÌ >   ”Ì )   ÓÌ    ıÌ -   Í %   GÍ &   mÍ -   ”Í 0   ÂÍ .   óÍ 9   "Î    \Î    |Î    ˆÎ    •Î    £Î !   ´Î    ÖÎ $   éÎ 0   Ï <   ?Ï 8   |Ï    µÏ $   ÅÏ +   êÏ &   Ğ -   =Ğ ?   kĞ 2   «Ğ &   ŞĞ .   Ñ C   4Ñ B   xÑ <   »Ñ ;   øÑ 8   4Ò    mÒ    {Ò    šÒ    ¹Ò    ÉÒ    ßÒ    øÒ :   Ó 2   IÓ 0   |Ó    ­Ó    ¾Ó (   ÙÓ    Ô %   !Ô ,   GÔ    tÔ +   Ô 
+   ¹Ô    ÄÔ    ãÔ    Õ >   Õ    ]Õ    xÕ     Õ     ¯Õ 7   ĞÕ    Ö &   Ö ,   <Ö 	   iÖ    sÖ    ‚Ö (   “Ö %   ¼Ö    âÖ 1   ÷Ö    )× #   <×    `×    y× B   ‰× @   Ì×    Ø +   ,Ø    XØ 4   qØ %   ¦Ø    ÌØ    æØ    Ù    Ù Q   ,Ù O   ~Ù    ÎÙ    èÙ 	   ùÙ    Ú    Ú (   )Ú !   RÚ &   tÚ    ›Ú #   £Ú !   ÇÚ    éÚ ;   Û    ?Û *   [Û )   †Û .   °Û !   ßÛ (   Ü 5   *Ü    `Ü :   vÜ (   ±Ü 9   ÚÜ 1   İ +   Fİ .   rİ 3   ¡İ /   Õİ 0   Ş    6Ş 2   VŞ    ‰Ş &   ¦Ş    ÍŞ (   êŞ 7   ß    Kß (   cß 1   Œß (   ¾ß +   çß .   à -   Bà .   pà    Ÿà     ºà #   Ûà 6   ÿà Y   6á H   á "   Ùá    üá '   â -   ?â    mâ    â    ¬â .   Ìâ    ûâ 7   ã /   Rã /   ‚ã 3   ²ã 2   æã 1   ä 1   Kä .   }ä &   ¬ä *   Óä '   şä '   &å G   Nå (   –å +   ¿å ;   ëå 9   'æ F   aæ ,   ¨æ B   Õæ !   ç    :ç ,   Vç    ƒç !   šç    ¼ç    Öç "   ëç ,   è    ;è 
+   Pè    [è    kè    xè    ‘è    ¥è    ¾è    Üè    úè    é ;   :é    vé    é    £é    Áé    Şé    úé    ê    ê %   +ê    Qê B   mê &   °ê 6   ×ê 7   ë ;   Fë 6   ‚ë    ¹ë    Ìë H   Şë    'ì    4ì    Oì    hì    ~ì %   “ì \   ¹ì (   í $   ?í    dí '   ví #   í    Âí 0   Ùí 2   
+î    =î    Jî    Vî    mî    }î    î >    î    ßî    ïî 0   ï    4ï     Rï &   sï    šï +   ·ï -   ãï *   ğ =   <ğ -   zğ &   ¨ğ    Ïğ    æğ    öğ    ñ    ñ    -ñ #   Bñ    fñ .   sñ Q   ¢ñ    ôñ    ò 0   #ò    Tò    rò    ò ,   Ÿò /   Ìò    üò    ó    1ó *   ?ó 1   jó !   œó    ¾ó    Şó !   ÷ó    ô *   *ô     Uô '   vô    ô :   ®ô 0   éô F   õ 5   aõ !   —õ    ¹õ !   Áõ %   ãõ    	ö    ö 8   7ö &   pö    —ö    ¬ö    Áö B   Òö /   ÷    E÷ .   _÷    ÷ "   §÷ /   Ê÷ "   ú÷    ø )   7ø    aø +   ø !   «ø    Íø    Öø *   çø    ù :   1ù    lù    ˆù %   ¢ù    Èù    Ûù %   ôù    ú    *ú !   Aú 7   cú    ›ú    ±ú !   Èú    êú    ıú    û     $û    Eû    \û +   rû B   û    áû    ü     !ü 0   Bü %   sü %   ™ü    ¿ü    ßü    øü $   ı C   5ı    yı    ı .   ©ı ,   Øı .   ş    4ş ,   Mş "   zş 7   ş    Õş    êş    ÿ    "ÿ *   ;ÿ    fÿ    zÿ #   —ÿ    »ÿ !   Ïÿ    ñÿ +   	     5     :     X     w     ˆ           ¾     Ò     ç             5    ;    C    K    R *   c     #   ¬ 6   Ğ            $ ?   @    €      5   · (   í 6       M    _    k        – 4   ¬ +   á     	       #    4 '   J    r 
+   ƒ             ®    Ê    ×    é !     &   " *   I    t '   ‹    ³    Ã    Ø -   î 3       P    W 
+   s 5   ~    ´ 1   Ï 5    -   7    e    u %   ‘    · #   Î    ò         3 4   D    y    ” 5   ¬ +   â !   	     0	 !   Q	 !   s	 "   •	     ¸	 #   Ù	     ı	    
+    <
+    [
+ 2   t
+    §
+ 9   Æ
+      ;       R 2   `    “ %   ¡    Ç 4   Õ )   
+ <   4     q    ’ 5   ¬ !   â         "   " @   E    †    ¦ "   »    Ş    æ B    #   H    l (   t "       À    Ô     î     #   # (   G /   p         µ    Ê     á *    -   - *   [ 	   † "       ³ %   Ê #   ğ     ,   3 ;   `    œ    « &   ½ <   ä +   !    M    j    ƒ 	   ˜    ¢    Á -   à +       :    X    p .       ½ )   Ó (   ı    & "   A "   d    ‡         ½ $   Ù (   ş 5   ' <   ] ;   š >   Ö 3    !   I +   k +   — &   Ã #   ê        ' 
+   /    :    M &   l    “    ±    Ğ '   á '   	    1    O 3   j        ¸    Ó    ä "   ÿ    "    @    [    z        ¢ &   «    Ò     î     -   $    R    o    Œ    ¡    ¿    Ò 5   î    $ #   B    f    u         œ -   ½    ë     +    #   J    n           a   ´ $       ;    S .   h 8   —    Ğ B   î    1    H "   f    ‰ 
+       ¨ 9   Æ             4    L B   e '   ¨ 	   Ğ    Ú '   í (     1   >     p                ¿  D   ×     !    :! &   X! 8   !    ¸!    ×!    ë! %   ı!    #" 3   6"    j" 7   „"    ¼"     Ï" O   ğ"     @# (   a# %   Š# %   °#    Ö#    è# .   $ 5   6$ ;   l$ 3   ¨$    Ü$ <   ù$ %   6%    \%    q%    %    %    ¶%     Ó%    ô%    &    *& ,   F&    s& ?   &     Ï&    ğ& U   
+'    `'    t'    ‹'    ¦'    Æ' '   â'    
+(    *( -   A(    o(    ‡(    ¥(    ½(    Ö( 6   î(     %)    F) +   d) *   ) %   »)    á)     * )   * .   A* 1   p* !   ¢*    Ä*    Ú*    ò*    + "   + 1   9+    k+    ‡+ i   •+ 8   ÿ+ $   8, F   ], $   ¤, M   É, .   - )   F-    p- *   „- 5   ¯-    å-    ÷- C   . +   L. 7   x.    °. K   ¼. $   / Q   -/ #   /    £/ =   ¼/    ú/ :   0 '   R0 6   z0 #   ±0    Õ0 "   ï0 (   1 1   ;1 C   m1 9   ±1 &   ë1 #   2 4   62 U   k2 %   Á2 5   ç2 (   3 %   F3    l3 !   Š3 N   ¬3 (   û3 %   $4 %   J4 A   p4 '   ²4    Ú4 $   ÷4 (   5    E5    Z5 	   l5    v5    5 ,   ©5 #   Ö5 	   ú5    6    #6    @6 5   Z6 &   6    ·6    Ì6    é6 #   7    +7 #   I7    m7 (   ˆ7    ±7 >   Ï7 1   8 0   @8    q8     8    °8 1   Î8     9    9 !   .9 &   P9 /   w9 ,   §9    Ô9 &   ó9    : '   /: C   W:    ›:    §: )   Ä: 1   î: %    ;    F;    f; #   k; (   ; !   ¸; +   Ú; (   <    /< -   L< !   z< .   œ< &   Ë<    ò<    =    != :   >= ,   y= (   ¦= ,   Ï= -   ü= /   *> 7   Z> 	   ’>    œ> J   ¼> %   ?    -?    E? *   a?    Œ?    š?    ±?    Í? +   ë? (   @    @@    `@    }@    ‹@ U   œ@    ò@ $   A !   'A    IA    gA 2   wA ?   ªA 1   êA ,   B     IB +   jB    –B !   ©B    ËB    áB      C     !C    BC    aC    {C    ŒC 
+   £C    ®C A   ÎC     D 8   1D    jD $   …D 1   ªD +   ÜD    E ?   #E %   cE    ‰E E   ’E    ØE    åE )   F -   ,F $   ZF *   F    ªF    ¸F    ÉF '   çF 5   G    EG ,   VG    ƒG    G    ¦G    ÀG    ÓG    éG    ıG    H    0H    DH    MH    lH    ˆH    ¢H    µH    ÊH ,   àH >   I B   LI     I    °I .   ÌI    ûI +   J %   FJ    lJ    J    J .   ¦J $   ÕJ     úJ    K    .K '   FK 8   nK 5   §K %   İK    L    L "   L %   BL &   hL )   L (   ¹L    âL '   M    *M    FM    dM    M    ™M    ¸M +   ×M    N /   N 
+   MN    XN    wN    •N +   ²N    ŞN 2   úN #   -O "   QO #   tO &   ˜O )   ¿O )   éO ;   P )   OP    yP 
+   –P )   ¡P     ËP    ìP '   Q    .Q    6Q    DQ    VQ    [Q '   bQ     ŠQ    «Q     ÃQ    äQ    ÿQ 0   R -   IR 6   wR $   ®R #   ÓR    ÷R    şR #   S >   3S 4   rS %   §S ,   ÍS    úS    T :   )T 7   dT    œT '   ­T    ÕT    çT    öT %   ÿT 3   %U -   YU    ‡U    §U *   »U    æU $   V    &V    BV !   YV +   {V    §V    ÂV "   ŞV    W    W +   7W =   cW #   ¡W    ÅW /   äW    X    -X    FX    ]X    tX    ‘X    ­X    ÃX &   ÜX    Y 9   Y :   JY )   …Y    ¯Y    ÎY    èY 9   öY    0Z (   BZ 6   kZ    ¢Z '   ¶Z (   ŞZ '   [ -   /[    ][ &   {[ 1   ¢[    Ô[ $   ä[ #   	\ *   -\ +   X\ "   „\ $   §\ '   Ì\ +   ô\     ] 2   ']    Z]    w] 2   „]    ·] "   ×] '   ú]    "^ 
+   2^ (   =^    f^ 5   t^    ª^ )   É^    ó^ &   _ '   8_    `_     {_ ,   œ_    É_    â_    ÷_ 5   `    =` 5   W` 7   ` 4   Å` <   ú`    7a '   Ma    ua    †a $   —a 2   ¼a "   ïa '   b =   :b "   xb    ›b 1   §b 1   Ùb 0   c @   <c    }c (   œc '   Åc /   íc    d     <d    ]d !   od    ‘d    ¥d %   ³d    Ùd ,   ÷d '   $e <   Le 8   ‰e #   Âe    æe "    f 2   #f     Vf "   wf    šf    ²f .   Îf 4   ıf *   2g +   ]g    ‰g     ¡g .   Âg 2   ñg    $h 
+   Ah "   Lh    oh '   Šh    ²h    Ïh    ëh (   i (   0i !   Yi #   {i    Ÿi     ½i    Şi    ûi    j    &j -   Cj &   qj &   ˜j    ¿j    İj ?   ÷j    7k G   Dk    Œk    šk    ¯k    Ák    Èk    Ük    òk    l $   l    Bl    ]l    rl    ƒl    ˜l    «l    Æl    ×l    ôl    m    &m    ;m    Vm    qm    †m (   Ÿm    Èm    Ôm 2   ém &   n    Cn J   Wn '   ¢n 6   Ên &   o    (o "   Ho "   ko D   o    Óo %   éo    p    )p @   Dp 9   …p <   ¿p $   üp 3   !q    Uq 	   hq    rq $   Šq    ¯q    Åq    äq    úq    r    $r    ;r )   Ur L   r ,   Ìr 0   ùr K   *s @   vs B   ·s c   ús ;   ^t &   št 1   Át "   ót    u 9   (u    bu &   u (   ¦u +   Ïu     ûu     v )   =v *   gv /   ’v    Âv    Şv    ïv    ÷v    w &   w '   ;w    cw /   |w C   ¬w    ğw =   x "   Lx    ox !   }x K   Ÿx %   ëx %   y )   7y &   ay 2   ˆy @   »y #   üy      z 2   Az =   tz    ²z    Áz    àz N   íz N   <{ M   ‹{ L   Ù{ Y   &| F   €| V   Ç| -   } $   L} #   q} 1   •} ;   Ç}    ~ '   ~ )   A~ 5   k~    ¡~ >   ©~    è~ /    >   8    /  ¿  º   ?           ï   ™  •         Q    Í  V  8  |  ¼  ¨  A  ô  I  ¨  l          Y     µ  W    h      ë        ,    ø  r  o      ½  ê  <     h      X           É  "  ,  3      Š  ş      Û      E          n  ÷  ¦      Ø    ~  K      A      à  =  ‹  ø  g  û    +  r   æ  ¨   ò    h      f  œ      H      >   y  /  ´  ’  ©  «    M  A  ¸      `  i  ä  ±        G     ®  µ    õ  /   <      œ      €                ÿ      J  †  `  Ë  m   Ü  :              ˆ      {  Ì  •    #      {                    <            –            ˆ  Š  ]        ¢                      ±   ’  —  Ğ        “  ©  Ü  é  ”      Ó  $  Ì           -  Œ  {  )     /  Ø  ò   b   P  b  q            ~              ,    Ê  ²                      ‘  û         •  à  ¯      Ñ  À  à  .  ª   >  Æ      ®  )   ¢      û  8  Y      t  a  Y      İ  [      ‰      0         „  ›  ¢  ï  F  ”  W    y  Y  C  .  û   È  ğ  Z  ½           u       À    Ë  Ù  ¢       K  ¦          ô  Ø  Ä        \  Ô  ú  E  K            +  ÷  X  
+   ¦      £  3  å  è  °         u      O  Ø  '  3  ^      z  ¨      7      ‘  x  _      ù  ÷      ¹    *  ò      =  ­  ´  ß  d       u       ÷  7  È         ‚  &   ó  &  	  ³  .  ¾      P          é  ™      s        0         ™       w  ‡  ·   9  °  ½  #  §  Î  ¼  x      h      .      ¯  Ò  7  (  '   J  t  E  v  -      z          n  U  O  ú          ?  O          q  Ú  T   e  “  N  «      
+      *                %      L    :  ²       F     ‚  :  |                    Í          [   "  Ü          1  a  ?  Ç  ğ      E      «   ê  ·    â   L    Ï          J  H   u  ,       •  !      c  É   *    £  +            q  ^  ©  á  Ş        ?      G  ‰          -                  T  ğ         _   "          L   ¥  p      ;        b    n      ü  Ô      ß   ò  ä   U      ë  Å  ö  ƒ  Ê  •  ª  ¬   }  ş  –       ™      å             Á     Ì           —      6  p      2  !       q   N      o      ×       R      «          Ñ  ß  9  N         ù          è  Ş  +    Á  q  “   4  ±  –  «  í   P  o  8       ¹  	        ‚      ‰  T  Ğ      Ú      #      V    #      ›  d      a  l  t          C          k  d      (  W   #      S  $   „  ²      0      '  º  +  “  Z  S  Ù  á  Ï  9      9      É  ‡  ®      Õ   œ  P  …      ~  ”  ñ  f  Ó   Á  Å  (  ­  »  ©  ˜     P  I  °  @  »       4         š            h    >  İ  Õ  Æ      s  ƒ            ¾  ¾      …  r  Œ    ˜  ö            å      8       e  Q  R   b  c  “        °  ÷    ì  ™  )          e              ë   0  Ø  X  —      Ä        Ÿ  €  ö  ñ   (  *  ¡  /    *    Ò   ˜   N   d  õ        '  \   Ş  E  1  c       ³  G  U  ê    ¥  `  :   ó  -      "          è  ı  ­  ş     ê  ü   ‹  ¾      ?  º          r           >  ü  p  ¤  _  ô         ¡  B  ¨  L  ]  Ş      œ     Ò    R  K    U      E  ¯  e  È  Ô       o        Ï        j    v            p  d      S        Ÿ          ÷      T  W      s      Š  P   ´  ç      F  Ñ  S  ‰  
+          :    Ö        ß  |  —        ¸  J  â  £    ~  r  c  ¤      á  Î  N  
+      Â  Z  Õ        %  Ö       ×  @  >  ‘          I          §  ü  Ä      c      “  l  <      Ó    X  ÿ              ¿  Z  %  …  Û  ÿ  ›      l  Â  	  †        ‘   Z  õ  ’  Î  r  k      á       X  $  Ô  +  ›              è  ï  D  j   1  ¬  _      &  İ      *   ‹  [      ú  ,  Æ  Š  ‰      5  ò  M    Í           9       ù              :          g  ½      ·  !    ˜  b  ı  ¯   H      ”  Ğ  œ  ­   „      …        Å  I   €    Ù  0          Ì  ª  9                 }          y  =              A              „  ©      ¾      4  –  ,  Ô    Â  ï  Â  ©   Í  Ü  X  Ú         ‡   "          i      f   ¥   î   ª  Œ  Û  ½   ˜  È  Ç  C         G  è                    c                  Í  ™           s  Ú  –    ì      8  ]     ‘      g  j  À   z  ¸      ô  ñ        Ş              £      c  -  Ÿ   |  ¯          R    (  ´        ©  î  Œ  o  S    ¯    à      ‚  a    e       È  ğ  q    j  Ç       ¸   Å  ‚  ‚     ^    Ş          ñ  t   Ù      s           š       Ï  ¦  §           à   å  M      .   j                Æ    Y  Î  (          0  $  D    „      ä  ı      `  …   ş  Ì  W    ¢  µ        A  »  á  „                É  »      ¬  {  é  m        ë                  W  b    ß  u  Y  A  L  x  é   @  º  b  1              [  í      6      Š  1   z      ­      æ  a  7  §  ~   ?  ¬      ğ  6  Õ  Ã          U      ü        ;  ¶  Î  C  C  t      ×  Œ  ƒ    ï  T  ¸           [  ^            b     ;      a      ´            G                Å   ó  	           s            ¿   ;      v  „   A     y   H            Õ  R      Œ      K  ‘  Ò      æ           w          U  â  W      D  m  Ë  Ê  V  l    ã  ¶  Å  ƒ  w  P  ¤  ú    v  Ä  m  ó  æ    …  µ      µ   X  -  .        V   Ø   \  Â  n       â          ã  {      ã      ä  ì  –  Ğ  ·  "  g  Ê       ”   Ó  	      †  Ö  k      é  E       Ö     ˆ  \  ¡  `    g       ¸  Ğ  £   ö  2  p       í  n  Ö  /  ü  ‰  F  ¹   €  è              <  ?      y  Ş        ²          å  U   ¹  ®  C  Ç  ®    =            \          §  ê  Ç  G  Ğ  k   $  ¼  ˆ        ä  }  ë      p        ÷           €      T  u  =  ›     Ù  H            K      ƒ    h  É    k      ó      Ì  ®   B   i  §      Õ      Î  ˜  ª  ¡             †  3  >      ¾  6       ’   7  #  Ù   '  Ë      ]   ·  Î   L  À  ¶        O  J        =  ³  Ô          J   ²  r      	  ñ        ,  ×      ß  «  ±  Õ  ‡       š      ¡       M  Ï   x      f  š  ]      Q         $    Ü  ä                ş              ‡  ¬  ø        X  ;      .  )      f    m  Z   n  d  I  î  -   !  Š      ¬  t                  •  Ä      Z  L  í  ‡  ]  ±  ™      ‡  Ù  *  i  î  y                &  y  İ  )  Ä   N  £  …      <  ¥  0      7        ÿ  {  Ã      È  â      !  à  ^  B  İ  Ğ       í  o    “  ÿ   6          š  Ò  ¨  3   ]  ²  1  i          ^  B    I  ”  ¬              Š        ø      #   o    œ  T  C  ›        `  D  ^  [  ˜      ï                                ¡  Á   x        Ú  5   é  „  ê      Ÿ  Á    ¼   D  %     5  8  ®          ¨          u    Ñ          Œ  ·      V      B  ‹   æ  Í  ;         ã     ?  Ñ  $    6  Û           Ö  ï  †     Ò      a   B          Ÿ    ô  æ  p  Œ  ¹  G              g    ş   í          ±  O     %   5  Ø      5  â  Á        Š  f  ú  –      j      ƒ   ¼  }  <  d  Ë               ª      “    ¾   f      ‰   ­  ì       *  4        õ   }  g  À  2  ;  œ  ²  ò  Y  z   ³      ‚  …  É          ×  8  F      ‘  }  [  ú           O  ~  _  <  ˆ    \  R  k    a  l  æ  (  C  h      ê       &  S       y      ¶  ¿  3      Ÿ  x  "  M  É      q  °    z  @  #  V      K   Q           6          ñ  K  ÿ    Æ      Â   Á  ½  f  ë          .          ì  Æ           ¥                  ã  5  ø      w  ³  D          å  i  ù   5  ó   4             F       e     ¿              ğ  €  2  ¦  
+          i  T          ˆ  m  á  ù  @  k  Ã  n  Ï  B      Ï        t      &           ¿    Ê  H      È  û      Ú    Û  ã    W                  Q  š     ÿ  ˜      ¹     j  ¦       î  9          ç  :  †  ä  3  Ã  v  ö    Ÿ  ‘    ×      è   q  ’      I  ƒ  0  ”  Ç      ´   Í          ˆ     Ç  ~  €      "         R  ç    ë  ú  '  İ  j     |            é      ³      M       w   —       ¤   :        	  Ñ   @           ‹  ö   )      ß  l   ,  2    Ã                      û  —          H              ˆ  )    t      ¶              ‰    |      å  O  ¤            º  }       °              m  Q  v  M  Å  œ  1     F  ¢      ™  7       H  $    ^   ñ      
+  ¶   }  §      ¡      ¦  x   u  À  1  ô       +  µ  z  U                ò     Ü   »  °  û  «                 s  J      (        ø   n          ‹  >      ¯  Ü  ±  _  ı  2      -  ‹        ”              @     Ò  |   {      ç  O    î       4             3      •  2  Y    9        Ê          †       õ  •   c    ù  Ñ  ¿  ¤  _  ø      Ã  g    ‡  z  A  š  Ä  à      ì  	  D  ¤  >  €   Q   5  õ  N  |      =   ×              
+                  ş                š      Q  8  †  ’  ‹  x      P      p  7  Â  Æ  Û  6  _     k  %  ô      ¸      ;  s         r            I  4  o       !      Ê  V     G        º  Ë  ]  h   J  '  \  İ   N  »      ã             ›    &  S  ³     S      =  Û         R      V  Ó  Ö  ¼  ½  õ  w  ~  –  v   ı  ’    Z  ¶  i   î      +      À          
+    ­  e  /  ì      4            ı      µ  í  m  Ó  ·  &      l          ù    %  /                Ã      »  F  '        ›  L  ¥  ª  ’        `  ‚  —  \  e          Ÿ            á  w          ¼  ƒ  D   ç      Ë      )  ¢      ö  %      ç   M        2   {   ğ                º  ¥  ´  ü            Ó  â  !  —  [          @      ı   `   Ì      d  ó      B  ¹     w  !  E      ç  Ú   Ô  £      v   	disabling current template maps
+ 	extending current template maps
+ 	overriding default cvs keywordset
+ 	overriding default svn keywordset
+ 
+	configuration using current keyword template maps
+ 
+	configuration using custom keyword template maps
+ 
+	configuration using default cvs keywordset
+ 
+	configuration using default svn keywordset
+ 
+	keywords expanded
+ 
+Final summary: 
+Write the introductory message for the patch series. 
+additional help topics: 
+aliases: %s
+ 
+broken pipe
+ 
+diffs (%d lines): 
+diffs (truncated from %d to %d lines): 
+keywords written to %s:
+ 
+use "hg -v help %s" to show more info
+           hg clone http://selenic.com/hg           hg log -r "a21ccf and ancestor(1.9)"           hg log -r "bisect(pruned)"           hg log -r "bisect(range)"          $ ls
+         foo.c
+         $ hg status
+         ? foo.c
+         $ hg add
+         adding foo.c
+         $ hg status
+         A foo.c         $ cp -al REPO REPOCLONE         qguard foo.patch -- -stable    (negative guard)
+        qguard bar.patch    +stable    (positive guard)
+        qselect stable        An example showing how new (unknown) files are added
+       automatically by :hg:`add`::       # display activity of developers by month
+      hg churn -f '%Y-%m' -s -c       # display count of changed lines for every committer
+      hg churn -t '{author|email}'       # display count of lines changed in every year
+      hg churn -f '%Y' -s       # display daily activity graph
+      hg churn -f '%H' -s -c       (transplanted from CHANGESETHASH)       <alias email> = <actual email>       ? - display help       Examples:       In some cases, you can clone repositories and the working
+      directory using full hardlinks with ::       M = modified
+      A = added
+      R = removed
+      C = clean
+      ! = missing (deleted by non-hg command, but still tracked)
+      ? = not tracked
+      I = ignored
+        = origin of the previous file listed as A (added)       Mercurial will update the working directory to the first applicable
+      revision from this list:       Some examples:       This is the fastest way to clone, but it is not always safe. The
+      operation is not atomic (making sure REPO is not modified during
+      the operation is up to you) and you have to make sure your
+      editor breaks hardlinks (Emacs and most Linux Kernel tools do
+      so). Also, this is not compatible with certain extensions that
+      place their metadata under the .hg directory, such as mq.       a) null if -U or the source repository has no changesets
+      b) if -u . and the source repository is local, the first parent of
+         the source repository's working directory
+      c) the changeset specified with -u (if a branch name, this means the
+         latest head of that branch)
+      d) the changeset specified with -r
+      e) the tipmost head specified with -b
+      f) the tipmost head specified with the url#branch source syntax
+      g) the tipmost head of the default branch
+      h) tip       d - done, skip remaining changes and files
+      a - record all changes to all remaining files
+      q - quit, recording no changes       hg qguard other.patch -- +2.6.17 -stable       s - skip remaining changes to this file
+      f - record remaining changes to this file       source author = destination author       y - record this change
+      n - skip this change     $ hg log -r1 --style changelog     $ hg log -r1 --template "{node}\n"
+    b56ce7b07c52de7d5fd79fb89701ea538af65746     %s     - Mercurial [hg]
+    - CVS [cvs]
+    - Darcs [darcs]
+    - git [git]
+    - Subversion [svn]
+    - Monotone [mtn]
+    - GNU Arch [gnuarch]
+    - Bazaar [bzr]
+    - Perforce [p4]     .. container:: verbose     .. note::
+       diff may generate unexpected results for merges, as it will
+       default to comparing against the working directory's first
+       parent changeset if no revisions are specified.     .. note::
+       export may generate unexpected diff output for merge
+       changesets, as it will compare the merge changeset against its
+       first parent only.     .. note::
+       log -p/--patch may generate unexpected diff output for merge
+       changesets, as it will only compare the merge changeset against
+       its first parent. Also, only files different from BOTH parents
+       will appear in files:.     .. note::
+       status may appear to disagree with diff if permissions have
+       changed or a merge has occurred. The standard diff format does
+       not report permission changes and diff only reports changes
+       relative to one merge parent.     1. If neither -c/--check nor -C/--clean is specified, and if
+       the requested changeset is an ancestor or descendant of
+       the working directory's parent, the uncommitted changes
+       are merged into the requested changeset and the merged
+       result is left uncommitted. If the requested changeset is
+       not an ancestor or descendant (that is, it is on another
+       branch), the update is aborted and the uncommitted changes
+       are preserved.     2. With the -c/--check option, the update is aborted and the

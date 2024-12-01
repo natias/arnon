@@ -1,0 +1,1000 @@
+            if not scmutil.istreemanifest(repo):
+                raise error.InputError(
+                    _(
+                        b"--dir can only be used on repos with "
+                        b"treemanifest enabled"
+                    )
+                )
+            if not dir.endswith(b'/'):
+                dir = dir + b'/'
+            dirlog = repo.manifestlog.getstorage(dir)
+            if len(dirlog):
+                r = dirlog
+        elif mf:
+            r = repo.manifestlog.getstorage(b'')
+        elif file_:
+            filelog = repo.file(file_)
+            if len(filelog):
+                r = filelog
+
+        # Not all storage may be revlogs. If requested, try to return an actual
+        # revlog instance.
+        if returnrevlog:
+            if isinstance(r, revlog.revlog):
+                pass
+            elif util.safehasattr(r, b'_revlog'):
+                r = r._revlog  # pytype: disable=attribute-error
+            elif r is not None:
+                raise error.InputError(
+                    _(b'%r does not appear to be a revlog') % r
+                )
+
+    if not r:
+        if not returnrevlog:
+            raise error.InputError(_(b'cannot give path to non-revlog'))
+
+        if not file_:
+            raise error.CommandError(cmd, _(b'invalid arguments'))
+        if not os.path.isfile(file_):
+            raise error.InputError(_(b"revlog '%s' not found") % file_)
+
+        target = (revlog_constants.KIND_OTHER, b'free-form:%s' % file_)
+        r = revlog.revlog(
+            vfsmod.vfs(encoding.getcwd(), audit=False),
+            target=target,
+            radix=file_[:-2],
+        )
+    return r
+
+
+def openrevlog(repo, cmd, file_, opts):
+    """Obtain a revlog backing storage of an item.
+
+    This is similar to ``openstorage()`` except it always returns a revlog.
+
+    In most cases, a caller cares about the main storage object - not the
+    revlog backing it. Therefore, this function should only be used by code
+    that needs to examine low-level revlog implementation details. e.g. debug
+    commands.
+    """
+    return openstorage(repo, cmd, file_, opts, returnrevlog=True)
+
+
+def copy(ui, repo, pats, opts, rename=False):
+    check_incompatible_arguments(opts, b'forget', [b'dry_run'])
+
+    # called with the repo lock held
+    #
+    # hgsep => pathname that uses "/" to separate directories
+    # ossep => pathname that uses os.sep to separate directories
+    cwd = repo.getcwd()
+    targets = {}
+    forget = opts.get(b"forget")
+    after = opts.get(b"after")
+    dryrun = opts.get(b"dry_run")
+    rev = opts.get(b'at_rev')
+    if rev:
+        if not forget and not after:
+            # TODO: Remove this restriction and make it also create the copy
+            #       targets (and remove the rename source if rename==True).
+            raise error.InputError(_(b'--at-rev requires --after'))
+        ctx = logcmdutil.revsingle(repo, rev)
+        if len(ctx.parents()) > 1:
+            raise error.InputError(
+                _(b'cannot mark/unmark copy in merge commit')
+            )
+    else:
+        ctx = repo[None]
+
+    pctx = ctx.p1()
+
+    uipathfn = scmutil.getuipathfn(repo, legacyrelativevalue=True)
+
+    if forget:
+        if ctx.rev() is None:
+            new_ctx = ctx
+        else:
+            if len(ctx.parents()) > 1:
+                raise error.InputError(_(b'cannot unmark copy in merge commit'))
+            # avoid cycle context -> subrepo -> cmdutil
+            from . import context
+
+            rewriteutil.precheck(repo, [ctx.rev()], b'uncopy')
+            new_ctx = context.overlayworkingctx(repo)
+            new_ctx.setbase(ctx.p1())
+            mergemod.graft(repo, ctx, wctx=new_ctx)
+
+        match = scmutil.match(ctx, pats, opts)
+
+        current_copies = ctx.p1copies()
+        current_copies.update(ctx.p2copies())
+
+        uipathfn = scmutil.getuipathfn(repo)
+        for f in ctx.walk(match):
+            if f in current_copies:
+                new_ctx[f].markcopied(None)
+            elif match.exact(f):
+                ui.warn(
+                    _(
+                        b'%s: not unmarking as copy - file is not marked as copied\n'
+                    )
+                    % uipathfn(f)
+                )
+
+        if ctx.rev() is not None:
+            with repo.lock():
+                mem_ctx = new_ctx.tomemctx_for_amend(ctx)
+                new_node = mem_ctx.commit()
+
+                if repo.dirstate.p1() == ctx.node():
+                    with repo.dirstate.parentchange():
+                        scmutil.movedirstate(repo, repo[new_node])
+                replacements = {ctx.node(): [new_node]}
+                scmutil.cleanupnodes(
+                    repo, replacements, b'uncopy', fixphase=True
+                )
+
+        return
+
+    pats = scmutil.expandpats(pats)
+    if not pats:
+        raise error.InputError(_(b'no source or destination specified'))
+    if len(pats) == 1:
+        raise error.InputError(_(b'no destination specified'))
+    dest = pats.pop()
+
+    def walkpat(pat):
+        srcs = []
+        # TODO: Inline and simplify the non-working-copy version of this code
+        # since it shares very little with the working-copy version of it.
+        ctx_to_walk = ctx if ctx.rev() is None else pctx
+        m = scmutil.match(ctx_to_walk, [pat], opts, globbed=True)
+        for abs in ctx_to_walk.walk(m):
+            rel = uipathfn(abs)
+            exact = m.exact(abs)
+            if abs not in ctx:
+                if abs in pctx:
+                    if not after:
+                        if exact:
+                            ui.warn(
+                                _(
+                                    b'%s: not copying - file has been marked '
+                                    b'for remove\n'
+                                )
+                                % rel
+                            )
+                        continue
+                else:
+                    if exact:
+                        ui.warn(
+                            _(b'%s: not copying - file is not managed\n') % rel
+                        )
+                    continue
+
+            # abs: hgsep
+            # rel: ossep
+            srcs.append((abs, rel, exact))
+        return srcs
+
+    if ctx.rev() is not None:
+        rewriteutil.precheck(repo, [ctx.rev()], b'uncopy')
+        absdest = pathutil.canonpath(repo.root, cwd, dest)
+        if ctx.hasdir(absdest):
+            raise error.InputError(
+                _(b'%s: --at-rev does not support a directory as destination')
+                % uipathfn(absdest)
+            )
+        if absdest not in ctx:
+            raise error.InputError(
+                _(b'%s: copy destination does not exist in %s')
+                % (uipathfn(absdest), ctx)
+            )
+
+        # avoid cycle context -> subrepo -> cmdutil
+        from . import context
+
+        copylist = []
+        for pat in pats:
+            srcs = walkpat(pat)
+            if not srcs:
+                continue
+            for abs, rel, exact in srcs:
+                copylist.append(abs)
+
+        if not copylist:
+            raise error.InputError(_(b'no files to copy'))
+        # TODO: Add support for `hg cp --at-rev . foo bar dir` and
+        # `hg cp --at-rev . dir1 dir2`, preferably unifying the code with the
+        # existing functions below.
+        if len(copylist) != 1:
+            raise error.InputError(_(b'--at-rev requires a single source'))
+
+        new_ctx = context.overlayworkingctx(repo)
+        new_ctx.setbase(ctx.p1())
+        mergemod.graft(repo, ctx, wctx=new_ctx)
+
+        new_ctx.markcopied(absdest, copylist[0])
+
+        with repo.lock():
+            mem_ctx = new_ctx.tomemctx_for_amend(ctx)
+            new_node = mem_ctx.commit()
+
+            if repo.dirstate.p1() == ctx.node():
+                with repo.dirstate.parentchange():
+                    scmutil.movedirstate(repo, repo[new_node])
+            replacements = {ctx.node(): [new_node]}
+            scmutil.cleanupnodes(repo, replacements, b'copy', fixphase=True)
+
+        return
+
+    # abssrc: hgsep
+    # relsrc: ossep
+    # otarget: ossep
+    def copyfile(abssrc, relsrc, otarget, exact):
+        abstarget = pathutil.canonpath(repo.root, cwd, otarget)
+        if b'/' in abstarget:
+            # We cannot normalize abstarget itself, this would prevent
+            # case only renames, like a => A.
+            abspath, absname = abstarget.rsplit(b'/', 1)
+            abstarget = repo.dirstate.normalize(abspath) + b'/' + absname
+        reltarget = repo.pathto(abstarget, cwd)
+        target = repo.wjoin(abstarget)
+        src = repo.wjoin(abssrc)
+        entry = repo.dirstate.get_entry(abstarget)
+
+        already_commited = entry.tracked and not entry.added
+
+        scmutil.checkportable(ui, abstarget)
+
+        # check for collisions
+        prevsrc = targets.get(abstarget)
+        if prevsrc is not None:
+            ui.warn(
+                _(b'%s: not overwriting - %s collides with %s\n')
+                % (
+                    reltarget,
+                    repo.pathto(abssrc, cwd),
+                    repo.pathto(prevsrc, cwd),
+                )
+            )
+            return True  # report a failure
+
+        # check for overwrites
+        exists = os.path.lexists(target)
+        samefile = False
+        if exists and abssrc != abstarget:
+            if repo.dirstate.normalize(abssrc) == repo.dirstate.normalize(
+                abstarget
+            ):
+                if not rename:
+                    ui.warn(_(b"%s: can't copy - same file\n") % reltarget)
+                    return True  # report a failure
+                exists = False
+                samefile = True
+
+        if not after and exists or after and already_commited:
+            if not opts[b'force']:
+                if already_commited:
+                    msg = _(b'%s: not overwriting - file already committed\n')
+                    # Check if if the target was added in the parent and the
+                    # source already existed in the grandparent.
+                    looks_like_copy_in_pctx = abstarget in pctx and any(
+                        abssrc in gpctx and abstarget not in gpctx
+                        for gpctx in pctx.parents()
+                    )
+                    if looks_like_copy_in_pctx:
+                        if rename:
+                            hint = _(
+                                b"('hg rename --at-rev .' to record the rename "
+                                b"in the parent of the working copy)\n"
+                            )
+                        else:
+                            hint = _(
+                                b"('hg copy --at-rev .' to record the copy in "
+                                b"the parent of the working copy)\n"
+                            )
+                    else:
+                        if after:
+                            flags = b'--after --force'
+                        else:
+                            flags = b'--force'
+                        if rename:
+                            hint = (
+                                _(
+                                    b"('hg rename %s' to replace the file by "
+                                    b'recording a rename)\n'
+                                )
+                                % flags
+                            )
+                        else:
+                            hint = (
+                                _(
+                                    b"('hg copy %s' to replace the file by "
+                                    b'recording a copy)\n'
+                                )
+                                % flags
+                            )
+                else:
+                    msg = _(b'%s: not overwriting - file exists\n')
+                    if rename:
+                        hint = _(
+                            b"('hg rename --after' to record the rename)\n"
+                        )
+                    else:
+                        hint = _(b"('hg copy --after' to record the copy)\n")
+                ui.warn(msg % reltarget)
+                ui.warn(hint)
+                return True  # report a failure
+
+        if after:
+            if not exists:
+                if rename:
+                    ui.warn(
+                        _(b'%s: not recording move - %s does not exist\n')
+                        % (relsrc, reltarget)
+                    )
+                else:
+                    ui.warn(
+                        _(b'%s: not recording copy - %s does not exist\n')
+                        % (relsrc, reltarget)
+                    )
+                return True  # report a failure
+        elif not dryrun:
+            try:
+                if exists:
+                    os.unlink(target)
+                targetdir = os.path.dirname(target) or b'.'
+                if not os.path.isdir(targetdir):
+                    os.makedirs(targetdir)
+                if samefile:
+                    tmp = target + b"~hgrename"
+                    os.rename(src, tmp)
+                    os.rename(tmp, target)
+                else:
+                    # Preserve stat info on renames, not on copies; this matches
+                    # Linux CLI behavior.
+                    util.copyfile(src, target, copystat=rename)
+                srcexists = True
+            except IOError as inst:
+                if inst.errno == errno.ENOENT:
+                    ui.warn(_(b'%s: deleted in working directory\n') % relsrc)
+                    srcexists = False
+                else:
+                    ui.warn(
+                        _(b'%s: cannot copy - %s\n')
+                        % (relsrc, encoding.strtolocal(inst.strerror))
+                    )
+                    return True  # report a failure
+
+        if ui.verbose or not exact:
+            if rename:
+                ui.status(_(b'moving %s to %s\n') % (relsrc, reltarget))
+            else:
+                ui.status(_(b'copying %s to %s\n') % (relsrc, reltarget))
+
+        targets[abstarget] = abssrc
+
+        # fix up dirstate
+        scmutil.dirstatecopy(
+            ui, repo, ctx, abssrc, abstarget, dryrun=dryrun, cwd=cwd
+        )
+        if rename and not dryrun:
+            if not after and srcexists and not samefile:
+                rmdir = repo.ui.configbool(b'experimental', b'removeemptydirs')
+                repo.wvfs.unlinkpath(abssrc, rmdir=rmdir)
+            ctx.forget([abssrc])
+
+    # pat: ossep
+    # dest ossep
+    # srcs: list of (hgsep, hgsep, ossep, bool)
+    # return: function that takes hgsep and returns ossep
+    def targetpathfn(pat, dest, srcs):
+        if os.path.isdir(pat):
+            abspfx = pathutil.canonpath(repo.root, cwd, pat)
+            abspfx = util.localpath(abspfx)
+            if destdirexists:
+                striplen = len(os.path.split(abspfx)[0])
+            else:
+                striplen = len(abspfx)
+            if striplen:
+                striplen += len(pycompat.ossep)
+            res = lambda p: os.path.join(dest, util.localpath(p)[striplen:])
+        elif destdirexists:
+            res = lambda p: os.path.join(
+                dest, os.path.basename(util.localpath(p))
+            )
+        else:
+            res = lambda p: dest
+        return res
+
+    # pat: ossep
+    # dest ossep
+    # srcs: list of (hgsep, hgsep, ossep, bool)
+    # return: function that takes hgsep and returns ossep
+    def targetpathafterfn(pat, dest, srcs):
+        if matchmod.patkind(pat):
+            # a mercurial pattern
+            res = lambda p: os.path.join(
+                dest, os.path.basename(util.localpath(p))
+            )
+        else:
+            abspfx = pathutil.canonpath(repo.root, cwd, pat)
+            if len(abspfx) < len(srcs[0][0]):
+                # A directory. Either the target path contains the last
+                # component of the source path or it does not.
+                def evalpath(striplen):
+                    score = 0
+                    for s in srcs:
+                        t = os.path.join(dest, util.localpath(s[0])[striplen:])
+                        if os.path.lexists(t):
+                            score += 1
+                    return score
+
+                abspfx = util.localpath(abspfx)
+                striplen = len(abspfx)
+                if striplen:
+                    striplen += len(pycompat.ossep)
+                if os.path.isdir(os.path.join(dest, os.path.split(abspfx)[1])):
+                    score = evalpath(striplen)
+                    striplen1 = len(os.path.split(abspfx)[0])
+                    if striplen1:
+                        striplen1 += len(pycompat.ossep)
+                    if evalpath(striplen1) > score:
+                        striplen = striplen1
+                res = lambda p: os.path.join(dest, util.localpath(p)[striplen:])
+            else:
+                # a file
+                if destdirexists:
+                    res = lambda p: os.path.join(
+                        dest, os.path.basename(util.localpath(p))
+                    )
+                else:
+                    res = lambda p: dest
+        return res
+
+    destdirexists = os.path.isdir(dest) and not os.path.islink(dest)
+    if not destdirexists:
+        if len(pats) > 1 or matchmod.patkind(pats[0]):
+            raise error.InputError(
+                _(
+                    b'with multiple sources, destination must be an '
+                    b'existing directory'
+                )
+            )
+        if util.endswithsep(dest):
+            raise error.InputError(
+                _(b'destination %s is not a directory') % dest
+            )
+
+    tfn = targetpathfn
+    if after:
+        tfn = targetpathafterfn
+    copylist = []
+    for pat in pats:
+        srcs = walkpat(pat)
+        if not srcs:
+            continue
+        copylist.append((tfn(pat, dest, srcs), srcs))
+    if not copylist:
+        hint = None
+        if rename:
+            hint = _(b'maybe you meant to use --after --at-rev=.')
+        raise error.InputError(_(b'no files to copy'), hint=hint)
+
+    errors = 0
+    for targetpath, srcs in copylist:
+        for abssrc, relsrc, exact in srcs:
+            if copyfile(abssrc, relsrc, targetpath(abssrc), exact):
+                errors += 1
+
+    return errors != 0
+
+
+## facility to let extension process additional data into an import patch
+# list of identifier to be executed in order
+extrapreimport = []  # run before commit
+extrapostimport = []  # run after commit
+# mapping from identifier to actual import function
+#
+# 'preimport' are run before the commit is made and are provided the following
+# arguments:
+# - repo: the localrepository instance,
+# - patchdata: data extracted from patch header (cf m.patch.patchheadermap),
+# - extra: the future extra dictionary of the changeset, please mutate it,
+# - opts: the import options.
+# XXX ideally, we would just pass an ctx ready to be computed, that would allow
+# mutation of in memory commit and more. Feel free to rework the code to get
+# there.
+extrapreimportmap = {}
+# 'postimport' are run after the commit is made and are provided the following
+# argument:
+# - ctx: the changectx created by import.
+extrapostimportmap = {}
+
+
+def tryimportone(ui, repo, patchdata, parents, opts, msgs, updatefunc):
+    """Utility function used by commands.import to import a single patch
+
+    This function is explicitly defined here to help the evolve extension to
+    wrap this part of the import logic.
+
+    The API is currently a bit ugly because it a simple code translation from
+    the import command. Feel free to make it better.
+
+    :patchdata: a dictionary containing parsed patch data (such as from
+                ``patch.extract()``)
+    :parents: nodes that will be parent of the created commit
+    :opts: the full dict of option passed to the import command
+    :msgs: list to save commit message to.
+           (used in case we need to save it when failing)
+    :updatefunc: a function that update a repo to a given node
+                 updatefunc(<repo>, <node>)
+    """
+    # avoid cycle context -> subrepo -> cmdutil
+    from . import context
+
+    tmpname = patchdata.get(b'filename')
+    message = patchdata.get(b'message')
+    user = opts.get(b'user') or patchdata.get(b'user')
+    date = opts.get(b'date') or patchdata.get(b'date')
+    branch = patchdata.get(b'branch')
+    nodeid = patchdata.get(b'nodeid')
+    p1 = patchdata.get(b'p1')
+    p2 = patchdata.get(b'p2')
+
+    nocommit = opts.get(b'no_commit')
+    importbranch = opts.get(b'import_branch')
+    update = not opts.get(b'bypass')
+    strip = opts[b"strip"]
+    prefix = opts[b"prefix"]
+    sim = float(opts.get(b'similarity') or 0)
+
+    if not tmpname:
+        return None, None, False
+
+    rejects = False
+
+    cmdline_message = logmessage(ui, opts)
+    if cmdline_message:
+        # pickup the cmdline msg
+        message = cmdline_message
+    elif message:
+        # pickup the patch msg
+        message = message.strip()
+    else:
+        # launch the editor
+        message = None
+    ui.debug(b'message:\n%s\n' % (message or b''))
+
+    if len(parents) == 1:
+        parents.append(repo[nullrev])
+    if opts.get(b'exact'):
+        if not nodeid or not p1:
+            raise error.InputError(_(b'not a Mercurial patch'))
+        p1 = repo[p1]
+        p2 = repo[p2 or nullrev]
+    elif p2:
+        try:
+            p1 = repo[p1]
+            p2 = repo[p2]
+            # Without any options, consider p2 only if the
+            # patch is being applied on top of the recorded
+            # first parent.
+            if p1 != parents[0]:
+                p1 = parents[0]
+                p2 = repo[nullrev]
+        except error.RepoError:
+            p1, p2 = parents
+        if p2.rev() == nullrev:
+            ui.warn(
+                _(
+                    b"warning: import the patch as a normal revision\n"
+                    b"(use --exact to import the patch as a merge)\n"
+                )
+            )
+    else:
+        p1, p2 = parents
+
+    n = None
+    if update:
+        if p1 != parents[0]:
+            updatefunc(repo, p1.node())
+        if p2 != parents[1]:
+            repo.setparents(p1.node(), p2.node())
+
+        if opts.get(b'exact') or importbranch:
+            repo.dirstate.setbranch(branch or b'default')
+
+        partial = opts.get(b'partial', False)
+        files = set()
+        try:
+            patch.patch(
+                ui,
+                repo,
+                tmpname,
+                strip=strip,
+                prefix=prefix,
+                files=files,
+                eolmode=None,
+                similarity=sim / 100.0,
+            )
+        except error.PatchParseError as e:
+            raise error.InputError(
+                pycompat.bytestr(e),
+                hint=_(
+                    b'check that whitespace in the patch has not been mangled'
+                ),
+            )
+        except error.PatchApplicationError as e:
+            if not partial:
+                raise error.StateError(pycompat.bytestr(e))
+            if partial:
+                rejects = True
+
+        files = list(files)
+        if nocommit:
+            if message:
+                msgs.append(message)
+        else:
+            if opts.get(b'exact') or p2:
+                # If you got here, you either use --force and know what
+                # you are doing or used --exact or a merge patch while
+                # being updated to its first parent.
+                m = None
+            else:
+                m = scmutil.matchfiles(repo, files or [])
+            editform = mergeeditform(repo[None], b'import.normal')
+            if opts.get(b'exact'):
+                editor = None
+            else:
+                editor = getcommiteditor(
+                    editform=editform, **pycompat.strkwargs(opts)
+                )
+            extra = {}
+            for idfunc in extrapreimport:
+                extrapreimportmap[idfunc](repo, patchdata, extra, opts)
+            overrides = {}
+            if partial:
+                overrides[(b'ui', b'allowemptycommit')] = True
+            if opts.get(b'secret'):
+                overrides[(b'phases', b'new-commit')] = b'secret'
+            with repo.ui.configoverride(overrides, b'import'):
+                n = repo.commit(
+                    message, user, date, match=m, editor=editor, extra=extra
+                )
+                for idfunc in extrapostimport:
+                    extrapostimportmap[idfunc](repo[n])
+    else:
+        if opts.get(b'exact') or importbranch:
+            branch = branch or b'default'
+        else:
+            branch = p1.branch()
+        store = patch.filestore()
+        try:
+            files = set()
+            try:
+                patch.patchrepo(
+                    ui,
+                    repo,
+                    p1,
+                    store,
+                    tmpname,
+                    strip,
+                    prefix,
+                    files,
+                    eolmode=None,
+                )
+            except error.PatchParseError as e:
+                raise error.InputError(
+                    stringutil.forcebytestr(e),
+                    hint=_(
+                        b'check that whitespace in the patch has not been mangled'
+                    ),
+                )
+            except error.PatchApplicationError as e:
+                raise error.StateError(stringutil.forcebytestr(e))
+            if opts.get(b'exact'):
+                editor = None
+            else:
+                editor = getcommiteditor(editform=b'import.bypass')
+            memctx = context.memctx(
+                repo,
+                (p1.node(), p2.node()),
+                message,
+                files=files,
+                filectxfn=store,
+                user=user,
+                date=date,
+                branch=branch,
+                editor=editor,
+            )
+
+            overrides = {}
+            if opts.get(b'secret'):
+                overrides[(b'phases', b'new-commit')] = b'secret'
+            with repo.ui.configoverride(overrides, b'import'):
+                n = memctx.commit()
+        finally:
+            store.close()
+    if opts.get(b'exact') and nocommit:
+        # --exact with --no-commit is still useful in that it does merge
+        # and branch bits
+        ui.warn(_(b"warning: can't check exact import with --no-commit\n"))
+    elif opts.get(b'exact') and (not n or hex(n) != nodeid):
+        raise error.Abort(_(b'patch is damaged or loses information'))
+    msg = _(b'applied to working directory')
+    if n:
+        # i18n: refers to a short changeset id
+        msg = _(b'created %s') % short(n)
+    return msg, n, rejects
+
+
+# facility to let extensions include additional data in an exported patch
+# list of identifiers to be executed in order
+extraexport = []
+# mapping from identifier to actual export function
+# function as to return a string to be added to the header or None
+# it is given two arguments (sequencenumber, changectx)
+extraexportmap = {}
+
+
+def _exportsingle(repo, ctx, fm, match, switch_parent, seqno, diffopts):
+    node = scmutil.binnode(ctx)
+    parents = [p.node() for p in ctx.parents() if p]
+    branch = ctx.branch()
+    if switch_parent:
+        parents.reverse()
+
+    if parents:
+        prev = parents[0]
+    else:
+        prev = repo.nullid
+
+    fm.context(ctx=ctx)
+    fm.plain(b'# HG changeset patch\n')
+    fm.write(b'user', b'# User %s\n', ctx.user())
+    fm.plain(b'# Date %d %d\n' % ctx.date())
+    fm.write(b'date', b'#      %s\n', fm.formatdate(ctx.date()))
+    fm.condwrite(
+        branch and branch != b'default', b'branch', b'# Branch %s\n', branch
+    )
+    fm.write(b'node', b'# Node ID %s\n', hex(node))
+    fm.plain(b'# Parent  %s\n' % hex(prev))
+    if len(parents) > 1:
+        fm.plain(b'# Parent  %s\n' % hex(parents[1]))
+    fm.data(parents=fm.formatlist(pycompat.maplist(hex, parents), name=b'node'))
+
+    # TODO: redesign extraexportmap function to support formatter
+    for headerid in extraexport:
+        header = extraexportmap[headerid](seqno, ctx)
+        if header is not None:
+            fm.plain(b'# %s\n' % header)
+
+    fm.write(b'desc', b'%s\n', ctx.description().rstrip())
+    fm.plain(b'\n')
+
+    if fm.isplain():
+        chunkiter = patch.diffui(repo, prev, node, match, opts=diffopts)
+        for chunk, label in chunkiter:
+            fm.plain(chunk, label=label)
+    else:
+        chunkiter = patch.diff(repo, prev, node, match, opts=diffopts)
+        # TODO: make it structured?
+        fm.data(diff=b''.join(chunkiter))
+
+
+def _exportfile(repo, revs, fm, dest, switch_parent, diffopts, match):
+    """Export changesets to stdout or a single file"""
+    for seqno, rev in enumerate(revs, 1):
+        ctx = repo[rev]
+        if not dest.startswith(b'<'):
+            repo.ui.note(b"%s\n" % dest)
+        fm.startitem()
+        _exportsingle(repo, ctx, fm, match, switch_parent, seqno, diffopts)
+
+
+def _exportfntemplate(
+    repo, revs, basefm, fntemplate, switch_parent, diffopts, match
+):
+    """Export changesets to possibly multiple files"""
+    total = len(revs)
+    revwidth = max(len(str(rev)) for rev in revs)
+    filemap = util.sortdict()  # filename: [(seqno, rev), ...]
+
+    for seqno, rev in enumerate(revs, 1):
+        ctx = repo[rev]
+        dest = makefilename(
+            ctx, fntemplate, total=total, seqno=seqno, revwidth=revwidth
+        )
+        filemap.setdefault(dest, []).append((seqno, rev))
+
+    for dest in filemap:
+        with formatter.maybereopen(basefm, dest) as fm:
+            repo.ui.note(b"%s\n" % dest)
+            for seqno, rev in filemap[dest]:
+                fm.startitem()
+                ctx = repo[rev]
+                _exportsingle(
+                    repo, ctx, fm, match, switch_parent, seqno, diffopts
+                )
+
+
+def _prefetchchangedfiles(repo, revs, match):
+    allfiles = set()
+    for rev in revs:
+        for file in repo[rev].files():
+            if not match or match(file):
+                allfiles.add(file)
+    match = scmutil.matchfiles(repo, allfiles)
+    revmatches = [(rev, match) for rev in revs]
+    scmutil.prefetchfiles(repo, revmatches)
+
+
+def export(
+    repo,
+    revs,
+    basefm,
+    fntemplate=b'hg-%h.patch',
+    switch_parent=False,
+    opts=None,
+    match=None,
+):
+    """export changesets as hg patches
+
+    Args:
+      repo: The repository from which we're exporting revisions.
+      revs: A list of revisions to export as revision numbers.
+      basefm: A formatter to which patches should be written.
+      fntemplate: An optional string to use for generating patch file names.
+      switch_parent: If True, show diffs against second parent when not nullid.
+                     Default is false, which always shows diff against p1.
+      opts: diff options to use for generating the patch.
+      match: If specified, only export changes to files matching this matcher.
+
+    Returns:
+      Nothing.
+
+    Side Effect:
+      "HG Changeset Patch" data is emitted to one of the following
+      destinations:
+        fntemplate specified: Each rev is written to a unique file named using
+                            the given template.
+        Otherwise: All revs will be written to basefm.
+    """
+    _prefetchchangedfiles(repo, revs, match)
+
+    if not fntemplate:
+        _exportfile(
+            repo, revs, basefm, b'<unnamed>', switch_parent, opts, match
+        )
+    else:
+        _exportfntemplate(
+            repo, revs, basefm, fntemplate, switch_parent, opts, match
+        )
+
+
+def exportfile(repo, revs, fp, switch_parent=False, opts=None, match=None):
+    """Export changesets to the given file stream"""
+    _prefetchchangedfiles(repo, revs, match)
+
+    dest = getattr(fp, 'name', b'<unnamed>')
+    with formatter.formatter(repo.ui, fp, b'export', {}) as fm:
+        _exportfile(repo, revs, fm, dest, switch_parent, opts, match)
+
+
+def showmarker(fm, marker, index=None):
+    """utility function to display obsolescence marker in a readable way
+
+    To be used by debug function."""
+    if index is not None:
+        fm.write(b'index', b'%i ', index)
+    fm.write(b'prednode', b'%s ', hex(marker.prednode()))
+    succs = marker.succnodes()
+    fm.condwrite(
+        succs,
+        b'succnodes',
+        b'%s ',
+        fm.formatlist(map(hex, succs), name=b'node'),
+    )
+    fm.write(b'flag', b'%X ', marker.flags())
+    parents = marker.parentnodes()
+    if parents is not None:
+        fm.write(
+            b'parentnodes',
+            b'{%s} ',
+            fm.formatlist(map(hex, parents), name=b'node', sep=b', '),
+        )
+    fm.write(b'date', b'(%s) ', fm.formatdate(marker.date()))
+    meta = marker.metadata().copy()
+    meta.pop(b'date', None)
+    smeta = pycompat.rapply(pycompat.maybebytestr, meta)
+    fm.write(
+        b'metadata', b'{%s}', fm.formatdict(smeta, fmt=b'%r: %r', sep=b', ')
+    )
+    fm.plain(b'\n')
+
+
+def finddate(ui, repo, date):
+    """Find the tipmost changeset that matches the given date spec"""
+    mrevs = repo.revs(b'date(%s)', date)
+    try:
+        rev = mrevs.max()
+    except ValueError:
+        raise error.InputError(_(b"revision matching date not found"))
+
+    ui.status(
+        _(b"found revision %d from %s\n")
+        % (rev, dateutil.datestr(repo[rev].date()))
+    )
+    return b'%d' % rev
+
+
+def add(ui, repo, match, prefix, uipathfn, explicitonly, **opts):
+    bad = []
+
+    badfn = lambda x, y: bad.append(x) or match.bad(x, y)
+    names = []
+    wctx = repo[None]
+    cca = None
+    abort, warn = scmutil.checkportabilityalert(ui)
+    if abort or warn:
+        cca = scmutil.casecollisionauditor(ui, abort, repo.dirstate)
+
+    match = repo.narrowmatch(match, includeexact=True)
+    badmatch = matchmod.badmatch(match, badfn)
+    dirstate = repo.dirstate
+    # We don't want to just call wctx.walk here, since it would return a lot of
+    # clean files, which we aren't interested in and takes time.
+    for f in sorted(
+        dirstate.walk(
+            badmatch,
+            subrepos=sorted(wctx.substate),
+            unknown=True,
+            ignored=False,
+            full=False,
+        )
+    ):
+        exact = match.exact(f)
+        if exact or not explicitonly and f not in wctx and repo.wvfs.lexists(f):
+            if cca:
+                cca(f)
+            names.append(f)
+            if ui.verbose or not exact:
+                ui.status(
+                    _(b'adding %s\n') % uipathfn(f), label=b'ui.addremove.added'
+                )
+
+    for subpath in sorted(wctx.substate):
+        sub = wctx.sub(subpath)
+        try:
+            submatch = matchmod.subdirmatcher(subpath, match)
+            subprefix = repo.wvfs.reljoin(prefix, subpath)
+            subuipathfn = scmutil.subdiruipathfn(subpath, uipathfn)
+            if opts.get('subrepos'):
+                bad.extend(
+                    sub.add(ui, submatch, subprefix, subuipathfn, False, **opts)
+                )
+            else:
+                bad.extend(
+                    sub.add(ui, submatch, subprefix, subuipathfn, True, **opts)
+                )
+        except error.LookupError:
+            ui.status(
+                _(b"skipping missing subrepository: %s\n") % uipathfn(subpath)
+            )
+
+    if not opts.get('dry_run'):
+        rejected = wctx.add(names, prefix)
+        bad.extend(f for f in rejected if f in match.files())
+    return bad
+
+
+def addwebdirpath(repo, serverpath, webconf):
+    webconf[serverpath] = repo.root
+    repo.ui.debug(b'adding %s = %s\n' % (serverpath, repo.root))
+
+    for r in repo.revs(b'filelog("path:.hgsub")'):
+        ctx = repo[r]
+        for subpath in ctx.substate:
+            ctx.sub(subpath).addwebdirpath(serverpath, webconf)
+

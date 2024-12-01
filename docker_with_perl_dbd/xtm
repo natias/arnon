@@ -1,0 +1,1000 @@
+nodes that will maximize the number of nodes that will be
+classified with it (since all ancestors or descendants will be marked as well).
+"""
+
+
+import collections
+import random
+
+from .i18n import _
+from .node import nullrev
+from . import (
+    error,
+    policy,
+    util,
+)
+
+
+def _updatesample(revs, heads, sample, parentfn, quicksamplesize=0):
+    """update an existing sample to match the expected size
+
+    The sample is updated with revs exponentially distant from each head of the
+    <revs> set. (H~1, H~2, H~4, H~8, etc).
+
+    If a target size is specified, the sampling will stop once this size is
+    reached. Otherwise sampling will happen until roots of the <revs> set are
+    reached.
+
+    :revs:  set of revs we want to discover (if None, assume the whole dag)
+    :heads: set of DAG head revs
+    :sample: a sample to update
+    :parentfn: a callable to resolve parents for a revision
+    :quicksamplesize: optional target size of the sample"""
+    dist = {}
+    visit = collections.deque(heads)
+    seen = set()
+    factor = 1
+    while visit:
+        curr = visit.popleft()
+        if curr in seen:
+            continue
+        d = dist.setdefault(curr, 1)
+        if d > factor:
+            factor *= 2
+        if d == factor:
+            sample.add(curr)
+            if quicksamplesize and (len(sample) >= quicksamplesize):
+                return
+        seen.add(curr)
+
+        for p in parentfn(curr):
+            if p != nullrev and (not revs or p in revs):
+                dist.setdefault(p, d + 1)
+                visit.append(p)
+
+
+def _limitsample(sample, desiredlen, randomize=True):
+    """return a random subset of sample of at most desiredlen item.
+
+    If randomize is False, though, a deterministic subset is returned.
+    This is meant for integration tests.
+    """
+    if len(sample) <= desiredlen:
+        return sample
+    sample = list(sample)
+    if randomize:
+        return set(random.sample(sample, desiredlen))
+    sample.sort()
+    return set(sample[:desiredlen])
+
+
+class partialdiscovery:
+    """an object representing ongoing discovery
+
+    Feed with data from the remote repository, this object keep track of the
+    current set of changeset in various states:
+
+    - common:    revs also known remotely
+    - undecided: revs we don't have information on yet
+    - missing:   revs missing remotely
+    (all tracked revisions are known locally)
+    """
+
+    def __init__(self, repo, targetheads, respectsize, randomize=True):
+        self._repo = repo
+        self._targetheads = targetheads
+        self._common = repo.changelog.incrementalmissingrevs()
+        self._undecided = None
+        self.missing = set()
+        self._childrenmap = None
+        self._respectsize = respectsize
+        self.randomize = randomize
+
+    def addcommons(self, commons):
+        """register nodes known as common"""
+        self._common.addbases(commons)
+        if self._undecided is not None:
+            self._common.removeancestorsfrom(self._undecided)
+
+    def addmissings(self, missings):
+        """register some nodes as missing"""
+        newmissing = self._repo.revs(b'%ld::%ld', missings, self.undecided)
+        if newmissing:
+            self.missing.update(newmissing)
+            self.undecided.difference_update(newmissing)
+
+    def addinfo(self, sample):
+        """consume an iterable of (rev, known) tuples"""
+        common = set()
+        missing = set()
+        for rev, known in sample:
+            if known:
+                common.add(rev)
+            else:
+                missing.add(rev)
+        if common:
+            self.addcommons(common)
+        if missing:
+            self.addmissings(missing)
+
+    def hasinfo(self):
+        """return True is we have any clue about the remote state"""
+        return self._common.hasbases()
+
+    def iscomplete(self):
+        """True if all the necessary data have been gathered"""
+        return self._undecided is not None and not self._undecided
+
+    @property
+    def undecided(self):
+        if self._undecided is not None:
+            return self._undecided
+        self._undecided = set(self._common.missingancestors(self._targetheads))
+        return self._undecided
+
+    def stats(self):
+        return {
+            'undecided': len(self.undecided),
+        }
+
+    def commonheads(self):
+        """the heads of the known common set"""
+        # heads(common) == heads(common.bases) since common represents
+        # common.bases and all its ancestors
+        return self._common.basesheads()
+
+    def _parentsgetter(self):
+        getrev = self._repo.changelog.index.__getitem__
+
+        def getparents(r):
+            return getrev(r)[5:7]
+
+        return getparents
+
+    def _childrengetter(self):
+
+        if self._childrenmap is not None:
+            # During discovery, the `undecided` set keep shrinking.
+            # Therefore, the map computed for an iteration N will be
+            # valid for iteration N+1. Instead of computing the same
+            # data over and over we cached it the first time.
+            return self._childrenmap.__getitem__
+
+        # _updatesample() essentially does interaction over revisions to look
+        # up their children. This lookup is expensive and doing it in a loop is
+        # quadratic. We precompute the children for all relevant revisions and
+        # make the lookup in _updatesample() a simple dict lookup.
+        self._childrenmap = children = {}
+
+        parentrevs = self._parentsgetter()
+        revs = self.undecided
+
+        for rev in sorted(revs):
+            # Always ensure revision has an entry so we don't need to worry
+            # about missing keys.
+            children[rev] = []
+            for prev in parentrevs(rev):
+                if prev == nullrev:
+                    continue
+                c = children.get(prev)
+                if c is not None:
+                    c.append(rev)
+        return children.__getitem__
+
+    def takequicksample(self, headrevs, size):
+        """takes a quick sample of size <size>
+
+        It is meant for initial sampling and focuses on querying heads and close
+        ancestors of heads.
+
+        :headrevs: set of head revisions in local DAG to consider
+        :size: the maximum size of the sample"""
+        revs = self.undecided
+        if len(revs) <= size:
+            return list(revs)
+        sample = set(self._repo.revs(b'heads(%ld)', revs))
+
+        if len(sample) >= size:
+            return _limitsample(sample, size, randomize=self.randomize)
+
+        _updatesample(
+            None, headrevs, sample, self._parentsgetter(), quicksamplesize=size
+        )
+        return sample
+
+    def takefullsample(self, headrevs, size):
+        revs = self.undecided
+        if len(revs) <= size:
+            return list(revs)
+        repo = self._repo
+        sample = set(repo.revs(b'heads(%ld)', revs))
+        parentrevs = self._parentsgetter()
+
+        # update from heads
+        revsheads = sample.copy()
+        _updatesample(revs, revsheads, sample, parentrevs)
+
+        # update from roots
+        revsroots = set(repo.revs(b'roots(%ld)', revs))
+        childrenrevs = self._childrengetter()
+        _updatesample(revs, revsroots, sample, childrenrevs)
+        assert sample
+
+        if not self._respectsize:
+            size = max(size, min(len(revsroots), len(revsheads)))
+
+        sample = _limitsample(sample, size, randomize=self.randomize)
+        if len(sample) < size:
+            more = size - len(sample)
+            takefrom = list(revs - sample)
+            if self.randomize:
+                sample.update(random.sample(takefrom, more))
+            else:
+                takefrom.sort()
+                sample.update(takefrom[:more])
+        return sample
+
+
+pure_partialdiscovery = partialdiscovery
+
+partialdiscovery = policy.importrust(
+    'discovery', member='PartialDiscovery', default=partialdiscovery
+)
+
+
+def findcommonheads(
+    ui,
+    local,
+    remote,
+    abortwhenunrelated=True,
+    ancestorsof=None,
+    audit=None,
+):
+    """Return a tuple (common, anyincoming, remoteheads) used to identify
+    missing nodes from or in remote.
+
+    The audit argument is an optional dictionnary that a caller can pass. it
+    will be updated with extra data about the discovery, this is useful for
+    debug.
+    """
+
+    samplegrowth = float(ui.config(b'devel', b'discovery.grow-sample.rate'))
+
+    if audit is not None:
+        audit[b'total-queries'] = 0
+
+    start = util.timer()
+
+    roundtrips = 0
+    cl = local.changelog
+    clnode = cl.node
+    clrev = cl.rev
+
+    if ancestorsof is not None:
+        ownheads = [clrev(n) for n in ancestorsof]
+    else:
+        ownheads = [rev for rev in cl.headrevs() if rev != nullrev]
+
+    initial_head_exchange = ui.configbool(b'devel', b'discovery.exchange-heads')
+    initialsamplesize = ui.configint(b'devel', b'discovery.sample-size.initial')
+    fullsamplesize = ui.configint(b'devel', b'discovery.sample-size')
+    # We also ask remote about all the local heads. That set can be arbitrarily
+    # large, so we used to limit it size to `initialsamplesize`. We no longer
+    # do as it proved counter productive. The skipped heads could lead to a
+    # large "undecided" set, slower to be clarified than if we asked the
+    # question for all heads right away.
+    #
+    # We are already fetching all server heads using the `heads` commands,
+    # sending a equivalent number of heads the other way should not have a
+    # significant impact.  In addition, it is very likely that we are going to
+    # have to issue "known" request for an equivalent amount of revisions in
+    # order to decide if theses heads are common or missing.
+    #
+    # find a detailled analysis below.
+    #
+    # Case A: local and server both has few heads
+    #
+    #     Ownheads is below initialsamplesize, limit would not have any effect.
+    #
+    # Case B: local has few heads and server has many
+    #
+    #     Ownheads is below initialsamplesize, limit would not have any effect.
+    #
+    # Case C: local and server both has many heads
+    #
+    #     We now transfert some more data, but not significantly more than is
+    #     already transfered to carry the server heads.
+    #
+    # Case D: local has many heads, server has few
+    #
+    #   D.1 local heads are mostly known remotely
+    #
+    #     All the known head will have be part of a `known` request at some
+    #     point for the discovery to finish. Sending them all earlier is
+    #     actually helping.
+    #
+    #     (This case is fairly unlikely, it requires the numerous heads to all
+    #     be merged server side in only a few heads)
+    #
+    #   D.2 local heads are mostly missing remotely
+    #
+    #     To determine that the heads are missing, we'll have to issue `known`
+    #     request for them or one of their ancestors. This amount of `known`
+    #     request will likely be in the same order of magnitude than the amount
+    #     of local heads.
+    #
+    #     The only case where we can be more efficient using `known` request on
+    #     ancestors are case were all the "missing" local heads are based on a
+    #     few changeset, also "missing".  This means we would have a "complex"
+    #     graph (with many heads) attached to, but very independant to a the
+    #     "simple" graph on the server. This is a fairly usual case and have
+    #     not been met in the wild so far.
+    if initial_head_exchange:
+        if remote.limitedarguments:
+            sample = _limitsample(ownheads, initialsamplesize)
+            # indices between sample and externalized version must match
+            sample = list(sample)
+        else:
+            sample = ownheads
+
+        ui.debug(b"query 1; heads\n")
+        roundtrips += 1
+        with remote.commandexecutor() as e:
+            fheads = e.callcommand(b'heads', {})
+            if audit is not None:
+                audit[b'total-queries'] += len(sample)
+            fknown = e.callcommand(
+                b'known',
+                {
+                    b'nodes': [clnode(r) for r in sample],
+                },
+            )
+
+        srvheadhashes, yesno = fheads.result(), fknown.result()
+
+        if audit is not None:
+            audit[b'total-roundtrips'] = 1
+
+        if cl.tiprev() == nullrev:
+            if srvheadhashes != [cl.nullid]:
+                return [cl.nullid], True, srvheadhashes
+            return [cl.nullid], False, []
+    else:
+        # we still need the remote head for the function return
+        with remote.commandexecutor() as e:
+            fheads = e.callcommand(b'heads', {})
+        srvheadhashes = fheads.result()
+
+    # start actual discovery (we note this before the next "if" for
+    # compatibility reasons)
+    ui.status(_(b"searching for changes\n"))
+
+    knownsrvheads = []  # revnos of remote heads that are known locally
+    for node in srvheadhashes:
+        if node == cl.nullid:
+            continue
+
+        try:
+            knownsrvheads.append(clrev(node))
+        # Catches unknown and filtered nodes.
+        except error.LookupError:
+            continue
+
+    if initial_head_exchange:
+        # early exit if we know all the specified remote heads already
+        if len(knownsrvheads) == len(srvheadhashes):
+            ui.debug(b"all remote heads known locally\n")
+            return srvheadhashes, False, srvheadhashes
+
+        if len(sample) == len(ownheads) and all(yesno):
+            ui.note(_(b"all local changesets known remotely\n"))
+            ownheadhashes = [clnode(r) for r in ownheads]
+            return ownheadhashes, True, srvheadhashes
+
+    # full blown discovery
+
+    # if the server has a limit to its arguments size, we can't grow the sample.
+    configbool = local.ui.configbool
+    grow_sample = configbool(b'devel', b'discovery.grow-sample')
+    grow_sample = grow_sample and not remote.limitedarguments
+
+    dynamic_sample = configbool(b'devel', b'discovery.grow-sample.dynamic')
+    hard_limit_sample = not (dynamic_sample or remote.limitedarguments)
+
+    randomize = ui.configbool(b'devel', b'discovery.randomize')
+    if cl.index.rust_ext_compat:
+        pd = partialdiscovery
+    else:
+        pd = pure_partialdiscovery
+    disco = pd(local, ownheads, hard_limit_sample, randomize=randomize)
+    if initial_head_exchange:
+        # treat remote heads (and maybe own heads) as a first implicit sample
+        # response
+        disco.addcommons(knownsrvheads)
+        disco.addinfo(zip(sample, yesno))
+
+    full = not initial_head_exchange
+    progress = ui.makeprogress(_(b'searching'), unit=_(b'queries'))
+    while not disco.iscomplete():
+
+        if full or disco.hasinfo():
+            if full:
+                ui.note(_(b"sampling from both directions\n"))
+            else:
+                ui.debug(b"taking initial sample\n")
+            samplefunc = disco.takefullsample
+            targetsize = fullsamplesize
+            if grow_sample:
+                fullsamplesize = int(fullsamplesize * samplegrowth)
+        else:
+            # use even cheaper initial sample
+            ui.debug(b"taking quick initial sample\n")
+            samplefunc = disco.takequicksample
+            targetsize = initialsamplesize
+        sample = samplefunc(ownheads, targetsize)
+
+        roundtrips += 1
+        progress.update(roundtrips)
+        stats = disco.stats()
+        ui.debug(
+            b"query %i; still undecided: %i, sample size is: %i\n"
+            % (roundtrips, stats['undecided'], len(sample))
+        )
+
+        # indices between sample and externalized version must match
+        sample = list(sample)
+
+        with remote.commandexecutor() as e:
+            if audit is not None:
+                audit[b'total-queries'] += len(sample)
+            yesno = e.callcommand(
+                b'known',
+                {
+                    b'nodes': [clnode(r) for r in sample],
+                },
+            ).result()
+
+        full = True
+
+        disco.addinfo(zip(sample, yesno))
+
+    result = disco.commonheads()
+    elapsed = util.timer() - start
+    progress.complete()
+    ui.debug(b"%d total queries in %.4fs\n" % (roundtrips, elapsed))
+    msg = (
+        b'found %d common and %d unknown server heads,'
+        b' %d roundtrips in %.4fs\n'
+    )
+    missing = set(result) - set(knownsrvheads)
+    ui.log(b'discovery', msg, len(result), len(missing), roundtrips, elapsed)
+
+    if audit is not None:
+        audit[b'total-roundtrips'] = roundtrips
+
+    if not result and srvheadhashes != [cl.nullid]:
+        if abortwhenunrelated:
+            raise error.Abort(_(b"repository is unrelated"))
+        else:
+            ui.warn(_(b"warning: repository is unrelated\n"))
+        return (
+            {cl.nullid},
+            True,
+            srvheadhashes,
+        )
+
+    anyincoming = srvheadhashes != [cl.nullid]
+    result = {clnode(r) for r in result}
+    return result, anyincoming, srvheadhashes
+                                                                                                                                                                                                                                                                                                                          usr/lib/python3/dist-packages/mercurial/shelve.py                                                   0000644 0000000 0000000 00000115231 14355257011 020577  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        # shelve.py - save/restore working directory state
+#
+# Copyright 2013 Facebook, Inc.
+#
+# This software may be used and distributed according to the terms of the
+# GNU General Public License version 2 or any later version.
+
+"""save and restore changes to the working directory
+
+The "hg shelve" command saves changes made to the working directory
+and reverts those changes, resetting the working directory to a clean
+state.
+
+Later on, the "hg unshelve" command restores the changes saved by "hg
+shelve". Changes can be restored even after updating to a different
+parent, in which case Mercurial's merge machinery will resolve any
+conflicts if necessary.
+
+You can have more than one shelved change outstanding at a time; each
+shelved change has a distinct name. For details, see the help for "hg
+shelve".
+"""
+
+import collections
+import io
+import itertools
+import stat
+
+from .i18n import _
+from .node import (
+    bin,
+    hex,
+    nullrev,
+)
+from . import (
+    bookmarks,
+    bundle2,
+    changegroup,
+    cmdutil,
+    discovery,
+    error,
+    exchange,
+    hg,
+    lock as lockmod,
+    mdiff,
+    merge,
+    mergestate as mergestatemod,
+    patch,
+    phases,
+    pycompat,
+    repair,
+    scmutil,
+    templatefilters,
+    util,
+    vfs as vfsmod,
+)
+from .utils import (
+    dateutil,
+    stringutil,
+)
+
+backupdir = b'shelve-backup'
+shelvedir = b'shelved'
+shelvefileextensions = [b'hg', b'patch', b'shelve']
+
+# we never need the user, so we use a
+# generic user for all shelve operations
+shelveuser = b'shelve@localhost'
+
+
+class ShelfDir:
+    def __init__(self, repo, for_backups=False):
+        if for_backups:
+            self.vfs = vfsmod.vfs(repo.vfs.join(backupdir))
+        else:
+            self.vfs = vfsmod.vfs(repo.vfs.join(shelvedir))
+
+    def get(self, name):
+        return Shelf(self.vfs, name)
+
+    def listshelves(self):
+        """return all shelves in repo as list of (time, name)"""
+        try:
+            names = self.vfs.listdir()
+        except FileNotFoundError:
+            return []
+        info = []
+        seen = set()
+        for filename in names:
+            name = filename.rsplit(b'.', 1)[0]
+            if name in seen:
+                continue
+            seen.add(name)
+            shelf = self.get(name)
+            if not shelf.exists():
+                continue
+            mtime = shelf.mtime()
+            info.append((mtime, name))
+        return sorted(info, reverse=True)
+
+
+def _use_internal_phase(repo):
+    return (
+        phases.supportinternal(repo)
+        and repo.ui.config(b'shelve', b'store') == b'internal'
+    )
+
+
+def _target_phase(repo):
+    return phases.internal if _use_internal_phase(repo) else phases.secret
+
+
+class Shelf:
+    """Represents a shelf, including possibly multiple files storing it.
+
+    Old shelves will have a .patch and a .hg file. Newer shelves will
+    also have a .shelve file. This class abstracts away some of the
+    differences and lets you work with the shelf as a whole.
+    """
+
+    def __init__(self, vfs, name):
+        self.vfs = vfs
+        self.name = name
+
+    def exists(self):
+        return self._exists(b'.shelve') or self._exists(b'.patch', b'.hg')
+
+    def _exists(self, *exts):
+        return all(self.vfs.exists(self.name + ext) for ext in exts)
+
+    def mtime(self):
+        try:
+            return self._stat(b'.shelve')[stat.ST_MTIME]
+        except FileNotFoundError:
+            return self._stat(b'.patch')[stat.ST_MTIME]
+
+    def _stat(self, ext):
+        return self.vfs.stat(self.name + ext)
+
+    def writeinfo(self, info):
+        scmutil.simplekeyvaluefile(self.vfs, self.name + b'.shelve').write(info)
+
+    def hasinfo(self):
+        return self.vfs.exists(self.name + b'.shelve')
+
+    def readinfo(self):
+        return scmutil.simplekeyvaluefile(
+            self.vfs, self.name + b'.shelve'
+        ).read()
+
+    def writebundle(self, repo, bases, node):
+        cgversion = changegroup.safeversion(repo)
+        if cgversion == b'01':
+            btype = b'HG10BZ'
+            compression = None
+        else:
+            btype = b'HG20'
+            compression = b'BZ'
+
+        repo = repo.unfiltered()
+
+        outgoing = discovery.outgoing(
+            repo, missingroots=bases, ancestorsof=[node]
+        )
+        cg = changegroup.makechangegroup(repo, outgoing, cgversion, b'shelve')
+
+        bundle_filename = self.vfs.join(self.name + b'.hg')
+        bundle2.writebundle(
+            repo.ui,
+            cg,
+            bundle_filename,
+            btype,
+            self.vfs,
+            compression=compression,
+        )
+
+    def applybundle(self, repo, tr):
+        filename = self.name + b'.hg'
+        fp = self.vfs(filename)
+        try:
+            targetphase = _target_phase(repo)
+            gen = exchange.readbundle(repo.ui, fp, filename, self.vfs)
+            pretip = repo[b'tip']
+            bundle2.applybundle(
+                repo,
+                gen,
+                tr,
+                source=b'unshelve',
+                url=b'bundle:' + self.vfs.join(filename),
+                targetphase=targetphase,
+            )
+            shelvectx = repo[b'tip']
+            if pretip == shelvectx:
+                shelverev = tr.changes[b'revduplicates'][-1]
+                shelvectx = repo[shelverev]
+            return shelvectx
+        finally:
+            fp.close()
+
+    def open_patch(self, mode=b'rb'):
+        return self.vfs(self.name + b'.patch', mode)
+
+    def patch_from_node(self, repo, node):
+        repo = repo.unfiltered()
+        match = _optimized_match(repo, node)
+        fp = io.BytesIO()
+        cmdutil.exportfile(
+            repo,
+            [node],
+            fp,
+            opts=mdiff.diffopts(git=True),
+            match=match,
+        )
+        fp.seek(0)
+        return fp
+
+    def load_patch(self, repo):
+        try:
+            # prefer node-based shelf
+            return self.patch_from_node(repo, self.readinfo()[b'node'])
+        except (FileNotFoundError, error.RepoLookupError):
+            return self.open_patch()
+
+    def _backupfilename(self, backupvfs, filename):
+        def gennames(base):
+            yield base
+            base, ext = base.rsplit(b'.', 1)
+            for i in itertools.count(1):
+                yield b'%s-%d.%s' % (base, i, ext)
+
+        for n in gennames(filename):
+            if not backupvfs.exists(n):
+                return backupvfs.join(n)
+
+    def movetobackup(self, backupvfs):
+        if not backupvfs.isdir():
+            backupvfs.makedir()
+        for suffix in shelvefileextensions:
+            filename = self.name + b'.' + suffix
+            if self.vfs.exists(filename):
+                util.rename(
+                    self.vfs.join(filename),
+                    self._backupfilename(backupvfs, filename),
+                )
+
+    def delete(self):
+        for ext in shelvefileextensions:
+            self.vfs.tryunlink(self.name + b'.' + ext)
+
+
+def _optimized_match(repo, node):
+    """
+    Create a matcher so that prefetch doesn't attempt to fetch
+    the entire repository pointlessly, and as an optimisation
+    for movedirstate, if needed.
+    """
+    return scmutil.matchfiles(repo, repo[node].files())
+
+
+class shelvedstate:
+    """Handle persistence during unshelving operations.
+
+    Handles saving and restoring a shelved state. Ensures that different
+    versions of a shelved state are possible and handles them appropriately.
+    """
+
+    _version = 2
+    _filename = b'shelvedstate'
+    _keep = b'keep'
+    _nokeep = b'nokeep'
+    # colon is essential to differentiate from a real bookmark name
+    _noactivebook = b':no-active-bookmark'
+    _interactive = b'interactive'
+
+    @classmethod
+    def _verifyandtransform(cls, d):
+        """Some basic shelvestate syntactic verification and transformation"""
+        try:
+            d[b'originalwctx'] = bin(d[b'originalwctx'])
+            d[b'pendingctx'] = bin(d[b'pendingctx'])
+            d[b'parents'] = [bin(h) for h in d[b'parents'].split(b' ') if h]
+            d[b'nodestoremove'] = [
+                bin(h) for h in d[b'nodestoremove'].split(b' ') if h
+            ]
+        except (ValueError, KeyError) as err:
+            raise error.CorruptedState(stringutil.forcebytestr(err))
+
+    @classmethod
+    def _getversion(cls, repo):
+        """Read version information from shelvestate file"""
+        fp = repo.vfs(cls._filename)
+        try:
+            version = int(fp.readline().strip())
+        except ValueError as err:
+            raise error.CorruptedState(stringutil.forcebytestr(err))
+        finally:
+            fp.close()
+        return version
+
+    @classmethod
+    def _readold(cls, repo):
+        """Read the old position-based version of a shelvestate file"""
+        # Order is important, because old shelvestate file uses it
+        # to detemine values of fields (i.g. name is on the second line,
+        # originalwctx is on the third and so forth). Please do not change.
+        keys = [
+            b'version',
+            b'name',
+            b'originalwctx',
+            b'pendingctx',
+            b'parents',
+            b'nodestoremove',
+            b'branchtorestore',
+            b'keep',
+            b'activebook',
+        ]
+        # this is executed only seldomly, so it is not a big deal
+        # that we open this file twice
+        fp = repo.vfs(cls._filename)
+        d = {}
+        try:
+            for key in keys:
+                d[key] = fp.readline().strip()
+        finally:
+            fp.close()
+        return d
+
+    @classmethod
+    def load(cls, repo):
+        version = cls._getversion(repo)
+        if version < cls._version:
+            d = cls._readold(repo)
+        elif version == cls._version:
+            d = scmutil.simplekeyvaluefile(repo.vfs, cls._filename).read(
+                firstlinenonkeyval=True
+            )
+        else:
+            raise error.Abort(
+                _(
+                    b'this version of shelve is incompatible '
+                    b'with the version used in this repo'
+                )
+            )
+
+        cls._verifyandtransform(d)
+        try:
+            obj = cls()
+            obj.name = d[b'name']
+            obj.wctx = repo[d[b'originalwctx']]
+            obj.pendingctx = repo[d[b'pendingctx']]
+            obj.parents = d[b'parents']
+            obj.nodestoremove = d[b'nodestoremove']
+            obj.branchtorestore = d.get(b'branchtorestore', b'')
+            obj.keep = d.get(b'keep') == cls._keep
+            obj.activebookmark = b''
+            if d.get(b'activebook', b'') != cls._noactivebook:
+                obj.activebookmark = d.get(b'activebook', b'')
+            obj.interactive = d.get(b'interactive') == cls._interactive
+        except (error.RepoLookupError, KeyError) as err:
+            raise error.CorruptedState(pycompat.bytestr(err))
+
+        return obj
+
+    @classmethod
+    def save(
+        cls,
+        repo,
+        name,
+        originalwctx,
+        pendingctx,
+        nodestoremove,
+        branchtorestore,
+        keep=False,
+        activebook=b'',
+        interactive=False,
+    ):
+        info = {
+            b"name": name,
+            b"originalwctx": hex(originalwctx.node()),
+            b"pendingctx": hex(pendingctx.node()),
+            b"parents": b' '.join([hex(p) for p in repo.dirstate.parents()]),
+            b"nodestoremove": b' '.join([hex(n) for n in nodestoremove]),
+            b"branchtorestore": branchtorestore,
+            b"keep": cls._keep if keep else cls._nokeep,
+            b"activebook": activebook or cls._noactivebook,
+        }
+        if interactive:
+            info[b'interactive'] = cls._interactive
+        scmutil.simplekeyvaluefile(repo.vfs, cls._filename).write(
+            info, firstline=(b"%d" % cls._version)
+        )
+
+    @classmethod
+    def clear(cls, repo):
+        repo.vfs.unlinkpath(cls._filename, ignoremissing=True)
+
+
+def cleanupoldbackups(repo):
+    maxbackups = repo.ui.configint(b'shelve', b'maxbackups')
+    backup_dir = ShelfDir(repo, for_backups=True)
+    hgfiles = backup_dir.listshelves()
+    if maxbackups > 0 and maxbackups < len(hgfiles):
+        bordermtime = hgfiles[maxbackups - 1][0]
+    else:
+        bordermtime = None
+    for mtime, name in hgfiles[maxbackups:]:
+        if mtime == bordermtime:
+            # keep it, because timestamp can't decide exact order of backups
+            continue
+        backup_dir.get(name).delete()
+
+
+def _backupactivebookmark(repo):
+    activebookmark = repo._activebookmark
+    if activebookmark:
+        bookmarks.deactivate(repo)
+    return activebookmark
+
+
+def _restoreactivebookmark(repo, mark):
+    if mark:
+        bookmarks.activate(repo, mark)
+
+
+def _aborttransaction(repo, tr):
+    """Abort current transaction for shelve/unshelve, but keep dirstate"""
+    dirstatebackupname = b'dirstate.shelve'
+    repo.dirstate.savebackup(None, dirstatebackupname)
+    tr.abort()
+    repo.dirstate.restorebackup(None, dirstatebackupname)
+
+
+def getshelvename(repo, parent, opts):
+    """Decide on the name this shelve is going to have"""
+
+    def gennames():
+        yield label
+        for i in itertools.count(1):
+            yield b'%s-%02d' % (label, i)
+
+    name = opts.get(b'name')
+    label = repo._activebookmark or parent.branch() or b'default'
+    # slashes aren't allowed in filenames, therefore we rename it
+    label = label.replace(b'/', b'_')
+    label = label.replace(b'\\', b'_')
+    # filenames must not start with '.' as it should not be hidden
+    if label.startswith(b'.'):
+        label = label.replace(b'.', b'_', 1)
+
+    if name:
+        if ShelfDir(repo).get(name).exists():
+            e = _(b"a shelved change named '%s' already exists") % name
+            raise error.Abort(e)
+
+        # ensure we are not creating a subdirectory or a hidden file
+        if b'/' in name or b'\\' in name:
+            raise error.Abort(
+                _(b'shelved change names can not contain slashes')
+            )
+        if name.startswith(b'.'):
+            raise error.Abort(_(b"shelved change names can not start with '.'"))
+
+    else:
+        shelf_dir = ShelfDir(repo)
+        for n in gennames():
+            if not shelf_dir.get(n).exists():
+                name = n
+                break
+
+    return name
+
+
+def mutableancestors(ctx):
+    """return all mutable ancestors for ctx (included)
+
+    Much faster than the revset ancestors(ctx) & draft()"""
+    seen = {nullrev}
+    visit = collections.deque()
+    visit.append(ctx)
+    while visit:
+        ctx = visit.popleft()
+        yield ctx.node()
+        for parent in ctx.parents():
+            rev = parent.rev()
+            if rev not in seen:
+                seen.add(rev)
+                if parent.mutable():
+                    visit.append(parent)
+
+
+def getcommitfunc(extra, interactive, editor=False):
+    def commitfunc(ui, repo, message, match, opts):
+        hasmq = util.safehasattr(repo, b'mq')
+        if hasmq:
+            saved, repo.mq.checkapplied = repo.mq.checkapplied, False
+
+        targetphase = _target_phase(repo)
+        overrides = {(b'phases', b'new-commit'): targetphase}
+        try:
+            editor_ = False
+            if editor:
+                editor_ = cmdutil.getcommiteditor(
+                    editform=b'shelve.shelve', **pycompat.strkwargs(opts)
+                )
+            with repo.ui.configoverride(overrides):
+                return repo.commit(
+                    message,
+                    shelveuser,
+                    opts.get(b'date'),
+                    match,
+                    editor=editor_,
+                    extra=extra,

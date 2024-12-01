@@ -1,0 +1,1000 @@
+
+def browserevs(ui, repo, nodes, opts):
+    '''interactively transplant changesets'''
+    displayer = logcmdutil.changesetdisplayer(ui, repo, opts)
+    transplants = []
+    merges = []
+    prompt = _(
+        b'apply changeset? [ynmpcq?]:'
+        b'$$ &yes, transplant this changeset'
+        b'$$ &no, skip this changeset'
+        b'$$ &merge at this changeset'
+        b'$$ show &patch'
+        b'$$ &commit selected changesets'
+        b'$$ &quit and cancel transplant'
+        b'$$ &? (show this help)'
+    )
+    for node in nodes:
+        displayer.show(repo[node])
+        action = None
+        while not action:
+            choice = ui.promptchoice(prompt)
+            action = b'ynmpcq?'[choice : choice + 1]
+            if action == b'?':
+                for c, t in ui.extractchoices(prompt)[1]:
+                    ui.write(b'%s: %s\n' % (c, t))
+                action = None
+            elif action == b'p':
+                parent = repo.changelog.parents(node)[0]
+                for chunk in patch.diff(repo, parent, node):
+                    ui.write(chunk)
+                action = None
+        if action == b'y':
+            transplants.append(node)
+        elif action == b'm':
+            merges.append(node)
+        elif action == b'c':
+            break
+        elif action == b'q':
+            transplants = ()
+            merges = ()
+            break
+    displayer.close()
+    return (transplants, merges)
+
+
+@command(
+    b'transplant',
+    [
+        (
+            b's',
+            b'source',
+            b'',
+            _(b'transplant changesets from REPO'),
+            _(b'REPO'),
+        ),
+        (
+            b'b',
+            b'branch',
+            [],
+            _(b'use this source changeset as head'),
+            _(b'REV'),
+        ),
+        (
+            b'a',
+            b'all',
+            None,
+            _(b'pull all changesets up to the --branch revisions'),
+        ),
+        (b'p', b'prune', [], _(b'skip over REV'), _(b'REV')),
+        (b'm', b'merge', [], _(b'merge at REV'), _(b'REV')),
+        (
+            b'',
+            b'parent',
+            b'',
+            _(b'parent to choose when transplanting merge'),
+            _(b'REV'),
+        ),
+        (b'e', b'edit', False, _(b'invoke editor on commit messages')),
+        (b'', b'log', None, _(b'append transplant info to log message')),
+        (b'', b'stop', False, _(b'stop interrupted transplant')),
+        (
+            b'c',
+            b'continue',
+            None,
+            _(b'continue last transplant session after fixing conflicts'),
+        ),
+        (
+            b'',
+            b'filter',
+            b'',
+            _(b'filter changesets through command'),
+            _(b'CMD'),
+        ),
+    ],
+    _(
+        b'hg transplant [-s REPO] [-b BRANCH [-a]] [-p REV] '
+        b'[-m REV] [REV]...'
+    ),
+    helpcategory=command.CATEGORY_CHANGE_MANAGEMENT,
+)
+def transplant(ui, repo, *revs, **opts):
+    """transplant changesets from another branch
+
+    Selected changesets will be applied on top of the current working
+    directory with the log of the original changeset. The changesets
+    are copied and will thus appear twice in the history with different
+    identities.
+
+    Consider using the graft command if everything is inside the same
+    repository - it will use merges and will usually give a better result.
+    Use the rebase extension if the changesets are unpublished and you want
+    to move them instead of copying them.
+
+    If --log is specified, log messages will have a comment appended
+    of the form::
+
+      (transplanted from CHANGESETHASH)
+
+    You can rewrite the changelog message with the --filter option.
+    Its argument will be invoked with the current changelog message as
+    $1 and the patch as $2.
+
+    --source/-s specifies another repository to use for selecting changesets,
+    just as if it temporarily had been pulled.
+    If --branch/-b is specified, these revisions will be used as
+    heads when deciding which changesets to transplant, just as if only
+    these revisions had been pulled.
+    If --all/-a is specified, all the revisions up to the heads specified
+    with --branch will be transplanted.
+
+    Example:
+
+    - transplant all changes up to REV on top of your current revision::
+
+        hg transplant --branch REV --all
+
+    You can optionally mark selected transplanted changesets as merge
+    changesets. You will not be prompted to transplant any ancestors
+    of a merged transplant, and you can merge descendants of them
+    normally instead of transplanting them.
+
+    Merge changesets may be transplanted directly by specifying the
+    proper parent changeset by calling :hg:`transplant --parent`.
+
+    If no merges or revisions are provided, :hg:`transplant` will
+    start an interactive changeset browser.
+
+    If a changeset application fails, you can fix the merge by hand
+    and then resume where you left off by calling :hg:`transplant
+    --continue/-c`.
+    """
+    with repo.wlock():
+        return _dotransplant(ui, repo, *revs, **opts)
+
+
+def _dotransplant(ui, repo, *revs, **opts):
+    def incwalk(repo, csets, match=util.always):
+        for node in csets:
+            if match(node):
+                yield node
+
+    def transplantwalk(repo, dest, heads, match=util.always):
+        """Yield all nodes that are ancestors of a head but not ancestors
+        of dest.
+        If no heads are specified, the heads of repo will be used."""
+        if not heads:
+            heads = repo.heads()
+        ancestors = []
+        ctx = repo[dest]
+        for head in heads:
+            ancestors.append(ctx.ancestor(repo[head]).node())
+        for node in repo.changelog.nodesbetween(ancestors, heads)[0]:
+            if match(node):
+                yield node
+
+    def checkopts(opts, revs):
+        if opts.get(b'continue'):
+            cmdutil.check_incompatible_arguments(
+                opts, b'continue', [b'branch', b'all', b'merge']
+            )
+            return
+        if opts.get(b'stop'):
+            cmdutil.check_incompatible_arguments(
+                opts, b'stop', [b'branch', b'all', b'merge']
+            )
+            return
+        if not (
+            opts.get(b'source')
+            or revs
+            or opts.get(b'merge')
+            or opts.get(b'branch')
+        ):
+            raise error.Abort(
+                _(
+                    b'no source URL, branch revision, or revision '
+                    b'list provided'
+                )
+            )
+        if opts.get(b'all'):
+            if not opts.get(b'branch'):
+                raise error.Abort(_(b'--all requires a branch revision'))
+            if revs:
+                raise error.Abort(
+                    _(b'--all is incompatible with a revision list')
+                )
+
+    opts = pycompat.byteskwargs(opts)
+    checkopts(opts, revs)
+
+    if not opts.get(b'log'):
+        # deprecated config: transplant.log
+        opts[b'log'] = ui.config(b'transplant', b'log')
+    if not opts.get(b'filter'):
+        # deprecated config: transplant.filter
+        opts[b'filter'] = ui.config(b'transplant', b'filter')
+
+    tp = transplanter(ui, repo, opts)
+
+    p1 = repo.dirstate.p1()
+    if len(repo) > 0 and p1 == repo.nullid:
+        raise error.Abort(_(b'no revision checked out'))
+    if opts.get(b'continue'):
+        if not tp.canresume():
+            raise error.StateError(_(b'no transplant to continue'))
+    elif opts.get(b'stop'):
+        if not tp.canresume():
+            raise error.StateError(_(b'no interrupted transplant found'))
+        return tp.stop(ui, repo)
+    else:
+        cmdutil.checkunfinished(repo)
+        cmdutil.bailifchanged(repo)
+
+    sourcerepo = opts.get(b'source')
+    if sourcerepo:
+        u = urlutil.get_unique_pull_path(b'transplant', repo, ui, sourcerepo)[0]
+        peer = hg.peer(repo, opts, u)
+        heads = pycompat.maplist(peer.lookup, opts.get(b'branch', ()))
+        target = set(heads)
+        for r in revs:
+            try:
+                target.add(peer.lookup(r))
+            except error.RepoError:
+                pass
+        source, csets, cleanupfn = bundlerepo.getremotechanges(
+            ui, repo, peer, onlyheads=sorted(target), force=True
+        )
+    else:
+        source = repo
+        heads = pycompat.maplist(source.lookup, opts.get(b'branch', ()))
+        cleanupfn = None
+
+    try:
+        if opts.get(b'continue'):
+            tp.resume(repo, source, opts)
+            return
+
+        tf = tp.transplantfilter(repo, source, p1)
+        if opts.get(b'prune'):
+            prune = {
+                source[r].node()
+                for r in logcmdutil.revrange(source, opts.get(b'prune'))
+            }
+            matchfn = lambda x: tf(x) and x not in prune
+        else:
+            matchfn = tf
+        merges = pycompat.maplist(source.lookup, opts.get(b'merge', ()))
+        revmap = {}
+        if revs:
+            for r in logcmdutil.revrange(source, revs):
+                revmap[int(r)] = source[r].node()
+        elif opts.get(b'all') or not merges:
+            if source != repo:
+                alltransplants = incwalk(source, csets, match=matchfn)
+            else:
+                alltransplants = transplantwalk(
+                    source, p1, heads, match=matchfn
+                )
+            if opts.get(b'all'):
+                revs = alltransplants
+            else:
+                revs, newmerges = browserevs(ui, source, alltransplants, opts)
+                merges.extend(newmerges)
+            for r in revs:
+                revmap[source.changelog.rev(r)] = r
+        for r in merges:
+            revmap[source.changelog.rev(r)] = r
+
+        tp.apply(repo, source, revmap, merges, opts)
+    finally:
+        if cleanupfn:
+            cleanupfn()
+
+
+def continuecmd(ui, repo):
+    """logic to resume an interrupted transplant using
+    'hg continue'"""
+    with repo.wlock():
+        tp = transplanter(ui, repo, {})
+        return tp.resume(repo, repo, {})
+
+
+revsetpredicate = registrar.revsetpredicate()
+
+
+@revsetpredicate(b'transplanted([set])')
+def revsettransplanted(repo, subset, x):
+    """Transplanted changesets in set, or all transplanted changesets."""
+    if x:
+        s = revset.getset(repo, subset, x)
+    else:
+        s = subset
+    return smartset.baseset(
+        [r for r in s if repo[r].extra().get(b'transplant_source')]
+    )
+
+
+templatekeyword = registrar.templatekeyword()
+
+
+@templatekeyword(b'transplanted', requires={b'ctx'})
+def kwtransplanted(context, mapping):
+    """String. The node identifier of the transplanted
+    changeset if any."""
+    ctx = context.resource(mapping, b'ctx')
+    n = ctx.extra().get(b'transplant_source')
+    return n and hex(n) or b''
+
+
+def extsetup(ui):
+    statemod.addunfinished(
+        b'transplant',
+        fname=b'transplant/journal',
+        clearable=True,
+        continuefunc=continuecmd,
+        statushint=_(
+            b'To continue:    hg transplant --continue\n'
+            b'To stop:        hg transplant --stop'
+        ),
+        cmdhint=_(b"use 'hg transplant --continue' or 'hg transplant --stop'"),
+    )
+
+
+# tell hggettext to extract docstrings from these functions:
+i18nfunctions = [revsettransplanted, kwtransplanted]
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    usr/lib/python3/dist-packages/hgext/uncommit.py                                                     0000644 0000000 0000000 00000024110 14355257011 020273  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        # uncommit - undo the actions of a commit
+#
+# Copyright 2011 Peter Arrenbrecht <peter.arrenbrecht@gmail.com>
+#                Logilab SA        <contact@logilab.fr>
+#                Pierre-Yves David <pierre-yves.david@ens-lyon.org>
+#                Patrick Mezard <patrick@mezard.eu>
+# Copyright 2016 Facebook, Inc.
+#
+# This software may be used and distributed according to the terms of the
+# GNU General Public License version 2 or any later version.
+
+"""uncommit part or all of a local changeset (EXPERIMENTAL)
+
+This command undoes the effect of a local commit, returning the affected
+files to their uncommitted state. This means that files modified, added or
+removed in the changeset will be left unchanged, and so will remain modified,
+added and removed in the working directory.
+"""
+
+
+from mercurial.i18n import _
+
+from mercurial import (
+    cmdutil,
+    commands,
+    context,
+    copies as copiesmod,
+    error,
+    obsutil,
+    pathutil,
+    pycompat,
+    registrar,
+    rewriteutil,
+    scmutil,
+)
+
+cmdtable = {}
+command = registrar.command(cmdtable)
+
+configtable = {}
+configitem = registrar.configitem(configtable)
+
+configitem(
+    b'experimental',
+    b'uncommitondirtywdir',
+    default=False,
+)
+configitem(
+    b'experimental',
+    b'uncommit.keep',
+    default=False,
+)
+
+# Note for extension authors: ONLY specify testedwith = 'ships-with-hg-core' for
+# extensions which SHIP WITH MERCURIAL. Non-mainline extensions should
+# be specifying the version(s) of Mercurial they are tested with, or
+# leave the attribute unspecified.
+testedwith = b'ships-with-hg-core'
+
+
+def _commitfiltered(
+    repo, ctx, match, keepcommit, message=None, user=None, date=None
+):
+    """Recommit ctx with changed files not in match. Return the new
+    node identifier, or None if nothing changed.
+    """
+    base = ctx.p1()
+    # ctx
+    initialfiles = set(ctx.files())
+    exclude = {f for f in initialfiles if match(f)}
+
+    # No files matched commit, so nothing excluded
+    if not exclude:
+        return None
+
+    # return the p1 so that we don't create an obsmarker later
+    if not keepcommit:
+        return ctx.p1().node()
+
+    files = initialfiles - exclude
+    # Filter copies
+    copied = copiesmod.pathcopies(base, ctx)
+    copied = {dst: src for dst, src in copied.items() if dst in files}
+
+    def filectxfn(repo, memctx, path, contentctx=ctx, redirect=()):
+        if path not in contentctx:
+            return None
+        fctx = contentctx[path]
+        mctx = context.memfilectx(
+            repo,
+            memctx,
+            fctx.path(),
+            fctx.data(),
+            fctx.islink(),
+            fctx.isexec(),
+            copysource=copied.get(path),
+        )
+        return mctx
+
+    if not files:
+        repo.ui.status(_(b"note: keeping empty commit\n"))
+
+    if message is None:
+        message = ctx.description()
+    if not user:
+        user = ctx.user()
+    if not date:
+        date = ctx.date()
+
+    new = context.memctx(
+        repo,
+        parents=[base.node(), repo.nullid],
+        text=message,
+        files=files,
+        filectxfn=filectxfn,
+        user=user,
+        date=date,
+        extra=ctx.extra(),
+    )
+    return repo.commitctx(new)
+
+
+@command(
+    b'uncommit',
+    [
+        (b'', b'keep', None, _(b'allow an empty commit after uncommitting')),
+        (
+            b'',
+            b'allow-dirty-working-copy',
+            False,
+            _(b'allow uncommit with outstanding changes'),
+        ),
+        (b'n', b'note', b'', _(b'store a note on uncommit'), _(b'TEXT')),
+    ]
+    + commands.walkopts
+    + commands.commitopts
+    + commands.commitopts2
+    + commands.commitopts3,
+    _(b'[OPTION]... [FILE]...'),
+    helpcategory=command.CATEGORY_CHANGE_MANAGEMENT,
+)
+def uncommit(ui, repo, *pats, **opts):
+    """uncommit part or all of a local changeset
+
+    This command undoes the effect of a local commit, returning the affected
+    files to their uncommitted state. This means that files modified or
+    deleted in the changeset will be left unchanged, and so will remain
+    modified in the working directory.
+
+    If no files are specified, the commit will be pruned, unless --keep is
+    given.
+    """
+    cmdutil.check_note_size(opts)
+    cmdutil.resolve_commit_options(ui, opts)
+    opts = pycompat.byteskwargs(opts)
+
+    with repo.wlock(), repo.lock():
+
+        st = repo.status()
+        m, a, r, d = st.modified, st.added, st.removed, st.deleted
+        isdirtypath = any(set(m + a + r + d) & set(pats))
+        allowdirtywcopy = opts[
+            b'allow_dirty_working_copy'
+        ] or repo.ui.configbool(b'experimental', b'uncommitondirtywdir')
+        if not allowdirtywcopy and (not pats or isdirtypath):
+            cmdutil.bailifchanged(
+                repo,
+                hint=_(b'requires --allow-dirty-working-copy to uncommit'),
+            )
+        old = repo[b'.']
+        rewriteutil.precheck(repo, [old.rev()], b'uncommit')
+        if len(old.parents()) > 1:
+            raise error.InputError(_(b"cannot uncommit merge changeset"))
+
+        match = scmutil.match(old, pats, opts)
+
+        # Check all explicitly given files; abort if there's a problem.
+        if match.files():
+            s = old.status(old.p1(), match, listclean=True)
+            eligible = set(s.added) | set(s.modified) | set(s.removed)
+
+            badfiles = set(match.files()) - eligible
+
+            # Naming a parent directory of an eligible file is OK, even
+            # if not everything tracked in that directory can be
+            # uncommitted.
+            if badfiles:
+                badfiles -= {f for f in pathutil.dirs(eligible)}
+
+            for f in sorted(badfiles):
+                if f in s.clean:
+                    hint = _(
+                        b"file was not changed in working directory parent"
+                    )
+                elif repo.wvfs.exists(f):
+                    hint = _(b"file was untracked in working directory parent")
+                else:
+                    hint = _(b"file does not exist")
+
+                raise error.InputError(
+                    _(b'cannot uncommit "%s"') % scmutil.getuipathfn(repo)(f),
+                    hint=hint,
+                )
+
+        with repo.transaction(b'uncommit'):
+            if not (opts[b'message'] or opts[b'logfile']):
+                opts[b'message'] = old.description()
+            message = cmdutil.logmessage(ui, opts)
+
+            keepcommit = pats
+            if not keepcommit:
+                if opts.get(b'keep') is not None:
+                    keepcommit = opts.get(b'keep')
+                else:
+                    keepcommit = ui.configbool(
+                        b'experimental', b'uncommit.keep'
+                    )
+            newid = _commitfiltered(
+                repo,
+                old,
+                match,
+                keepcommit,
+                message=message,
+                user=opts.get(b'user'),
+                date=opts.get(b'date'),
+            )
+            if newid is None:
+                ui.status(_(b"nothing to uncommit\n"))
+                return 1
+
+            mapping = {}
+            if newid != old.p1().node():
+                # Move local changes on filtered changeset
+                mapping[old.node()] = (newid,)
+            else:
+                # Fully removed the old commit
+                mapping[old.node()] = ()
+
+            with repo.dirstate.parentchange():
+                scmutil.movedirstate(repo, repo[newid], match)
+
+            scmutil.cleanupnodes(repo, mapping, b'uncommit', fixphase=True)
+
+
+def predecessormarkers(ctx):
+    """yields the obsolete markers marking the given changeset as a successor"""
+    for data in ctx.repo().obsstore.predecessors.get(ctx.node(), ()):
+        yield obsutil.marker(ctx.repo(), data)
+
+
+@command(
+    b'unamend',
+    [],
+    helpcategory=command.CATEGORY_CHANGE_MANAGEMENT,
+    helpbasic=True,
+)
+def unamend(ui, repo, **opts):
+    """undo the most recent amend operation on a current changeset
+
+    This command will roll back to the previous version of a changeset,
+    leaving working directory in state in which it was before running
+    `hg amend` (e.g. files modified as part of an amend will be
+    marked as modified `hg status`)
+    """
+
+    unfi = repo.unfiltered()
+    with repo.wlock(), repo.lock(), repo.transaction(b'unamend'):
+
+        # identify the commit from which to unamend
+        curctx = repo[b'.']
+
+        rewriteutil.precheck(repo, [curctx.rev()], b'unamend')
+        if len(curctx.parents()) > 1:
+            raise error.InputError(_(b"cannot unamend merge changeset"))
+
+        expected_keys = (b'amend_source', b'unamend_source')
+        if not any(key in curctx.extra() for key in expected_keys):
+            raise error.InputError(
+                _(
+                    b"working copy parent was not created by 'hg amend' or "
+                    b"'hg unamend'"
+                )
+            )
+
+        # identify the commit to which to unamend
+        markers = list(predecessormarkers(curctx))
+        if len(markers) != 1:
+            e = _(b"changeset must have one predecessor, found %i predecessors")
+            raise error.InputError(e % len(markers))
+
+        prednode = markers[0].prednode()
+        predctx = unfi[prednode]
+
+        # add an extra so that we get a new hash
+        # note: allowing unamend to undo an unamend is an intentional feature
+        extras = predctx.extra()
+        extras[b'unamend_source'] = curctx.hex()
+
+        def filectxfn(repo, ctx_, path):
+            try:
+                return predctx.filectx(path)
+            except KeyError:
+                return None
+
+        # Make a new commit same as predctx
+        newctx = context.memctx(
+            repo,
+            parents=(predctx.p1(), predctx.p2()),
+            text=predctx.description(),
+            files=predctx.files(),
+            filectxfn=filectxfn,
+            user=predctx.user(),
+            date=predctx.date(),
+            extra=extras,
+        )
+        newprednode = repo.commitctx(newctx)
+        newpredctx = repo[newprednode]
+        dirstate = repo.dirstate
+
+        with dirstate.parentchange():
+            scmutil.movedirstate(repo, newpredctx)
+
+        mapping = {curctx.node(): (newprednode,)}
+        scmutil.cleanupnodes(repo, mapping, b'unamend', fixphase=True)
+                                                                                                                                                                                                                                                                                                                                                                                                                                                        usr/lib/python3/dist-packages/hgext/win32mbcs.py                                                    0000644 0000000 0000000 00000015637 14355257011 020265  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        # win32mbcs.py -- MBCS filename support for Mercurial
+#
+# Copyright (c) 2008 Shun-ichi Goto <shunichi.goto@gmail.com>
+#
+# Version: 0.3
+# Author:  Shun-ichi Goto <shunichi.goto@gmail.com>
+#
+# This software may be used and distributed according to the terms of the
+# GNU General Public License version 2 or any later version.
+#
+
+'''allow the use of MBCS paths with problematic encodings
+
+Some MBCS encodings are not good for some path operations (i.e.
+splitting path, case conversion, etc.) with its encoded bytes. We call
+such a encoding (i.e. shift_jis and big5) as "problematic encoding".
+This extension can be used to fix the issue with those encodings by
+wrapping some functions to convert to Unicode string before path
+operation.
+
+This extension is useful for:
+
+- Japanese Windows users using shift_jis encoding.
+- Chinese Windows users using big5 encoding.
+- All users who use a repository with one of problematic encodings on
+  case-insensitive file system.
+
+This extension is not needed for:
+
+- Any user who use only ASCII chars in path.
+- Any user who do not use any of problematic encodings.
+
+Note that there are some limitations on using this extension:
+
+- You should use single encoding in one repository.
+- If the repository path ends with 0x5c, .hg/hgrc cannot be read.
+- win32mbcs is not compatible with fixutf8 extension.
+
+By default, win32mbcs uses encoding.encoding decided by Mercurial.
+You can specify the encoding by config option::
+
+ [win32mbcs]
+ encoding = sjis
+
+It is useful for the users who want to commit with UTF-8 log message.
+'''
+
+import os
+import sys
+
+from mercurial.i18n import _
+from mercurial.pycompat import getattr, setattr
+from mercurial import (
+    encoding,
+    error,
+    pycompat,
+    registrar,
+)
+
+# Note for extension authors: ONLY specify testedwith = 'ships-with-hg-core' for
+# extensions which SHIP WITH MERCURIAL. Non-mainline extensions should
+# be specifying the version(s) of Mercurial they are tested with, or
+# leave the attribute unspecified.
+testedwith = b'ships-with-hg-core'
+
+configtable = {}
+configitem = registrar.configitem(configtable)
+
+# Encoding.encoding may be updated by --encoding option.
+# Use a lambda do delay the resolution.
+configitem(
+    b'win32mbcs',
+    b'encoding',
+    default=lambda: encoding.encoding,
+)
+
+_encoding = None  # see extsetup
+
+
+def decode(arg):
+    if isinstance(arg, bytes):
+        uarg = arg.decode(_encoding)
+        if arg == uarg.encode(_encoding):
+            return uarg
+        raise UnicodeError(b"Not local encoding")
+    elif isinstance(arg, tuple):
+        return tuple(map(decode, arg))
+    elif isinstance(arg, list):
+        return map(decode, arg)
+    elif isinstance(arg, dict):
+        for k, v in arg.items():
+            arg[k] = decode(v)
+    return arg
+
+
+def encode(arg):
+    if isinstance(arg, str):
+        return arg.encode(_encoding)
+    elif isinstance(arg, tuple):
+        return tuple(map(encode, arg))
+    elif isinstance(arg, list):
+        return map(encode, arg)
+    elif isinstance(arg, dict):
+        for k, v in arg.items():
+            arg[k] = encode(v)
+    return arg
+
+
+def appendsep(s):
+    # ensure the path ends with os.sep, appending it if necessary.
+    try:
+        us = decode(s)
+    except UnicodeError:
+        us = s
+    if us and us[-1] not in b':/\\':
+        s += pycompat.ossep
+    return s
+
+
+def basewrapper(func, argtype, enc, dec, args, kwds):
+    # check check already converted, then call original
+    for arg in args:
+        if isinstance(arg, argtype):
+            return func(*args, **kwds)
+
+    try:
+        # convert string arguments, call func, then convert back the
+        # return value.
+        return enc(func(*dec(args), **dec(kwds)))
+    except UnicodeError:
+        raise error.Abort(
+            _(b"[win32mbcs] filename conversion failed with %s encoding\n")
+            % _encoding
+        )
+
+
+def wrapper(func, args, kwds):
+    return basewrapper(func, str, encode, decode, args, kwds)
+
+
+def reversewrapper(func, args, kwds):
+    return basewrapper(func, str, decode, encode, args, kwds)
+
+
+def wrapperforlistdir(func, args, kwds):
+    # Ensure 'path' argument ends with os.sep to avoids
+    # misinterpreting last 0x5c of MBCS 2nd byte as path separator.
+    if args:
+        args = list(args)
+        args[0] = appendsep(args[0])
+    if b'path' in kwds:
+        kwds[b'path'] = appendsep(kwds[b'path'])
+    return func(*args, **kwds)
+
+
+def wrapname(name, wrapper):
+    module, name = name.rsplit(b'.', 1)
+    module = sys.modules[module]
+    func = getattr(module, name)
+
+    def f(*args, **kwds):
+        return wrapper(func, args, kwds)
+
+    f.__name__ = func.__name__
+    setattr(module, name, f)
+
+
+# List of functions to be wrapped.
+# NOTE: os.path.dirname() and os.path.basename() are safe because
+#       they use result of os.path.split()
+funcs = b'''os.path.join os.path.split os.path.splitext
+ os.path.normpath os.makedirs mercurial.util.endswithsep
+ mercurial.util.splitpath mercurial.util.fscasesensitive
+ mercurial.util.fspath mercurial.util.pconvert mercurial.util.normpath
+ mercurial.util.checkwinfilename mercurial.util.checkosfilename
+ mercurial.util.split'''
+
+# These functions are required to be called with local encoded string
+# because they expects argument is local encoded string and cause
+# problem with unicode string.
+rfuncs = b'''mercurial.encoding.upper mercurial.encoding.lower
+ mercurial.util._filenamebytestr'''
+
+# List of Windows specific functions to be wrapped.
+winfuncs = b'''os.path.splitunc'''
+
+# codec and alias names of sjis and big5 to be faked.
+problematic_encodings = b'''big5 big5-tw csbig5 big5hkscs big5-hkscs
+ hkscs cp932 932 ms932 mskanji ms-kanji shift_jis csshiftjis shiftjis
+ sjis s_jis shift_jis_2004 shiftjis2004 sjis_2004 sjis2004
+ shift_jisx0213 shiftjisx0213 sjisx0213 s_jisx0213 950 cp950 ms950 '''
+
+
+def extsetup(ui):
+    # TODO: decide use of config section for this extension
+    if (not os.path.supports_unicode_filenames) and (
+        pycompat.sysplatform != b'cygwin'
+    ):
+        ui.warn(_(b"[win32mbcs] cannot activate on this platform.\n"))
+        return
+    # determine encoding for filename
+    global _encoding
+    _encoding = ui.config(b'win32mbcs', b'encoding')
+    # fake is only for relevant environment.
+    if _encoding.lower() in problematic_encodings.split():
+        for f in funcs.split():
+            wrapname(f, wrapper)
+        if pycompat.iswindows:
+            for f in winfuncs.split():
+                wrapname(f, wrapper)
+        wrapname(b"mercurial.util.listdir", wrapperforlistdir)
+        wrapname(b"mercurial.windows.listdir", wrapperforlistdir)
+        # wrap functions to be called with local byte string arguments
+        for f in rfuncs.split():
+            wrapname(f, reversewrapper)
+        # Check sys.args manually instead of using ui.debug() because
+        # command line options is not yet applied when
+        # extensions.loadall() is called.
+        if b'--debug' in sys.argv:
+            ui.writenoi18n(
+                b"[win32mbcs] activated with encoding: %s\n" % _encoding
+            )
+                                                                                                 usr/lib/python3/dist-packages/hgext/win32text.py                                                    0000644 0000000 0000000 00000016126 14355257011 020317  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        # win32text.py - LF <-> CRLF/CR translation utilities for Windows/Mac users
+#
+#  Copyright 2005, 2007-2009 Olivia Mackall <olivia@selenic.com> and others
+#
+# This software may be used and distributed according to the terms of the
+# GNU General Public License version 2 or any later version.
+
+'''perform automatic newline conversion (DEPRECATED)
+
+  Deprecation: The win32text extension requires each user to configure
+  the extension again and again for each clone since the configuration
+  is not copied when cloning.
+
+  We have therefore made the ``eol`` as an alternative. The ``eol``
+  uses a version controlled file for its configuration and each clone
+  will therefore use the right settings from the start.
+
+To perform automatic newline conversion, use::
+
+  [extensions]
+  win32text =
+  [encode]
+  ** = cleverencode:
+  # or ** = macencode:
+
+  [decode]
+  ** = cleverdecode:
+  # or ** = macdecode:
+
+If not doing conversion, to make sure you do not commit CRLF/CR by accident::
+
+  [hooks]
+  pretxncommit.crlf = python:hgext.win32text.forbidcrlf
+  # or pretxncommit.cr = python:hgext.win32text.forbidcr
+
+To do the same check on a server to prevent CRLF/CR from being
+pushed or pulled::
+
+  [hooks]
+  pretxnchangegroup.crlf = python:hgext.win32text.forbidcrlf
+  # or pretxnchangegroup.cr = python:hgext.win32text.forbidcr
+'''
+
+
+import re
+from mercurial.i18n import _
+from mercurial.node import short
+from mercurial import (
+    cmdutil,
+    extensions,
+    registrar,
+)
+from mercurial.utils import stringutil
+
+# Note for extension authors: ONLY specify testedwith = 'ships-with-hg-core' for
+# extensions which SHIP WITH MERCURIAL. Non-mainline extensions should
+# be specifying the version(s) of Mercurial they are tested with, or
+# leave the attribute unspecified.
+testedwith = b'ships-with-hg-core'
+
+configtable = {}
+configitem = registrar.configitem(configtable)
+
+configitem(
+    b'win32text',
+    b'warn',
+    default=True,
+)
+
+# regexp for single LF without CR preceding.
+re_single_lf = re.compile(b'(^|[^\r])\n', re.MULTILINE)
+
+newlinestr = {b'\r\n': b'CRLF', b'\r': b'CR'}
+filterstr = {b'\r\n': b'clever', b'\r': b'mac'}
+
+
+def checknewline(s, newline, ui=None, repo=None, filename=None):
+    # warn if already has 'newline' in repository.
+    # it might cause unexpected eol conversion.
+    # see issue 302:
+    #   https://bz.mercurial-scm.org/302
+    if newline in s and ui and filename and repo:
+        ui.warn(
+            _(
+                b'WARNING: %s already has %s line endings\n'
+                b'and does not need EOL conversion by the win32text plugin.\n'
+                b'Before your next commit, please reconsider your '
+                b'encode/decode settings in \nMercurial.ini or %s.\n'
+            )
+            % (filename, newlinestr[newline], repo.vfs.join(b'hgrc'))
+        )
+
+
+def dumbdecode(s, cmd, **kwargs):
+    checknewline(s, b'\r\n', **kwargs)
+    # replace single LF to CRLF
+    return re_single_lf.sub(b'\\1\r\n', s)
+
+
+def dumbencode(s, cmd):
+    return s.replace(b'\r\n', b'\n')
+
+
+def macdumbdecode(s, cmd, **kwargs):
+    checknewline(s, b'\r', **kwargs)
+    return s.replace(b'\n', b'\r')
+
+
+def macdumbencode(s, cmd):
+    return s.replace(b'\r', b'\n')

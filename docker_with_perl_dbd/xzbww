@@ -1,0 +1,1000 @@
+
+use 5.005_04;
+use strict;
+
+use Cwd 'getcwd';
+use File::Basename ();
+use File::Spec     ();
+
+BEGIN {
+    if ( $] < 5.006 ) {
+
+        # can't say 'opendir my $dh, $dirname'
+        # need to initialise $dh
+        eval 'use Symbol';
+    }
+}
+
+use Exporter ();
+use vars qw($VERSION @ISA @EXPORT @EXPORT_OK);
+$VERSION   = '2.18';
+$VERSION   = eval $VERSION;
+@ISA       = qw(Exporter);
+@EXPORT    = qw(mkpath rmtree);
+@EXPORT_OK = qw(make_path remove_tree);
+
+BEGIN {
+  for (qw(VMS MacOS MSWin32 os2)) {
+    no strict 'refs';
+    *{"_IS_\U$_"} = $^O eq $_ ? sub () { 1 } : sub () { 0 };
+  }
+
+  # These OSes complain if you want to remove a file that you have no
+  # write permission to:
+  *_FORCE_WRITABLE = (
+    grep { $^O eq $_ } qw(amigaos dos epoc MSWin32 MacOS os2)
+  ) ? sub () { 1 } : sub () { 0 };
+
+  # Unix-like systems need to stat each directory in order to detect
+  # race condition. MS-Windows is immune to this particular attack.
+  *_NEED_STAT_CHECK = !(_IS_MSWIN32()) ? sub () { 1 } : sub () { 0 };
+}
+
+sub _carp {
+    require Carp;
+    goto &Carp::carp;
+}
+
+sub _croak {
+    require Carp;
+    goto &Carp::croak;
+}
+
+sub _error {
+    my $arg     = shift;
+    my $message = shift;
+    my $object  = shift;
+
+    if ( $arg->{error} ) {
+        $object = '' unless defined $object;
+        $message .= ": $!" if $!;
+        push @{ ${ $arg->{error} } }, { $object => $message };
+    }
+    else {
+        _carp( defined($object) ? "$message for $object: $!" : "$message: $!" );
+    }
+}
+
+sub __is_arg {
+    my ($arg) = @_;
+
+    # If client code blessed an array ref to HASH, this will not work
+    # properly. We could have done $arg->isa() wrapped in eval, but
+    # that would be expensive. This implementation should suffice.
+    # We could have also used Scalar::Util:blessed, but we choose not
+    # to add this dependency
+    return ( ref $arg eq 'HASH' );
+}
+
+sub make_path {
+    push @_, {} unless @_ and __is_arg( $_[-1] );
+    goto &mkpath;
+}
+
+sub mkpath {
+    my $old_style = !( @_ and __is_arg( $_[-1] ) );
+
+    my $data;
+    my $paths;
+
+    if ($old_style) {
+        my ( $verbose, $mode );
+        ( $paths, $verbose, $mode ) = @_;
+        $paths = [$paths] unless UNIVERSAL::isa( $paths, 'ARRAY' );
+        $data->{verbose} = $verbose;
+        $data->{mode} = defined $mode ? $mode : oct '777';
+    }
+    else {
+        my %args_permitted = map { $_ => 1 } ( qw|
+            chmod
+            error
+            group
+            mask
+            mode
+            owner
+            uid
+            user
+            verbose
+        | );
+        my %not_on_win32_args = map { $_ => 1 } ( qw|
+            group
+            owner
+            uid
+            user
+        | );
+        my @bad_args = ();
+        my @win32_implausible_args = ();
+        my $arg = pop @_;
+        for my $k (sort keys %{$arg}) {
+            if (! $args_permitted{$k}) {
+                push @bad_args, $k;
+            }
+            elsif ($not_on_win32_args{$k} and _IS_MSWIN32) {
+                push @win32_implausible_args, $k;
+            }
+            else {
+                $data->{$k} = $arg->{$k};
+            }
+        }
+        _carp("Unrecognized option(s) passed to mkpath() or make_path(): @bad_args")
+            if @bad_args;
+        _carp("Option(s) implausible on Win32 passed to mkpath() or make_path(): @win32_implausible_args")
+            if @win32_implausible_args;
+        $data->{mode} = delete $data->{mask} if exists $data->{mask};
+        $data->{mode} = oct '777' unless exists $data->{mode};
+        ${ $data->{error} } = [] if exists $data->{error};
+        unless (@win32_implausible_args) {
+            $data->{owner} = delete $data->{user} if exists $data->{user};
+            $data->{owner} = delete $data->{uid}  if exists $data->{uid};
+            if ( exists $data->{owner} and $data->{owner} =~ /\D/ ) {
+                my $uid = ( getpwnam $data->{owner} )[2];
+                if ( defined $uid ) {
+                    $data->{owner} = $uid;
+                }
+                else {
+                    _error( $data,
+                            "unable to map $data->{owner} to a uid, ownership not changed"
+                          );
+                    delete $data->{owner};
+                }
+            }
+            if ( exists $data->{group} and $data->{group} =~ /\D/ ) {
+                my $gid = ( getgrnam $data->{group} )[2];
+                if ( defined $gid ) {
+                    $data->{group} = $gid;
+                }
+                else {
+                    _error( $data,
+                            "unable to map $data->{group} to a gid, group ownership not changed"
+                    );
+                    delete $data->{group};
+                }
+            }
+            if ( exists $data->{owner} and not exists $data->{group} ) {
+                $data->{group} = -1;    # chown will leave group unchanged
+            }
+            if ( exists $data->{group} and not exists $data->{owner} ) {
+                $data->{owner} = -1;    # chown will leave owner unchanged
+            }
+        }
+        $paths = [@_];
+    }
+    return _mkpath( $data, $paths );
+}
+
+sub _mkpath {
+    my $data   = shift;
+    my $paths = shift;
+
+    my ( @created );
+    foreach my $path ( @{$paths} ) {
+        next unless defined($path) and length($path);
+        $path .= '/' if _IS_OS2 and $path =~ /^\w:\z/s; # feature of CRT
+
+        # Logic wants Unix paths, so go with the flow.
+        if (_IS_VMS) {
+            next if $path eq '/';
+            $path = VMS::Filespec::unixify($path);
+        }
+        next if -d $path;
+        my $parent = File::Basename::dirname($path);
+        # Coverage note:  It's not clear how we would test the condition:
+        # '-d $parent or $path eq $parent'
+        unless ( -d $parent or $path eq $parent ) {
+            push( @created, _mkpath( $data, [$parent] ) );
+        }
+        print "mkdir $path\n" if $data->{verbose};
+        if ( mkdir( $path, $data->{mode} ) ) {
+            push( @created, $path );
+            if ( exists $data->{owner} ) {
+
+                # NB: $data->{group} guaranteed to be set during initialisation
+                if ( !chown $data->{owner}, $data->{group}, $path ) {
+                    _error( $data,
+                        "Cannot change ownership of $path to $data->{owner}:$data->{group}"
+                    );
+                }
+            }
+            if ( exists $data->{chmod} ) {
+                # Coverage note:  It's not clear how we would trigger the next
+                # 'if' block.  Failure of 'chmod' might first result in a
+                # system error: "Permission denied".
+                if ( !chmod $data->{chmod}, $path ) {
+                    _error( $data,
+                        "Cannot change permissions of $path to $data->{chmod}" );
+                }
+            }
+        }
+        else {
+            my $save_bang = $!;
+
+            # From 'perldoc perlvar': $EXTENDED_OS_ERROR ($^E) is documented
+            # as:
+            # Error information specific to the current operating system. At the
+            # moment, this differs from "$!" under only VMS, OS/2, and Win32
+            # (and for MacPerl). On all other platforms, $^E is always just the
+            # same as $!.
+
+            my ( $e, $e1 ) = ( $save_bang, $^E );
+            $e .= "; $e1" if $e ne $e1;
+
+            # allow for another process to have created it meanwhile
+            if ( ! -d $path ) {
+                $! = $save_bang;
+                if ( $data->{error} ) {
+                    push @{ ${ $data->{error} } }, { $path => $e };
+                }
+                else {
+                    _croak("mkdir $path: $e");
+                }
+            }
+        }
+    }
+    return @created;
+}
+
+sub remove_tree {
+    push @_, {} unless @_ and __is_arg( $_[-1] );
+    goto &rmtree;
+}
+
+sub _is_subdir {
+    my ( $dir, $test ) = @_;
+
+    my ( $dv, $dd ) = File::Spec->splitpath( $dir,  1 );
+    my ( $tv, $td ) = File::Spec->splitpath( $test, 1 );
+
+    # not on same volume
+    return 0 if $dv ne $tv;
+
+    my @d = File::Spec->splitdir($dd);
+    my @t = File::Spec->splitdir($td);
+
+    # @t can't be a subdir if it's shorter than @d
+    return 0 if @t < @d;
+
+    return join( '/', @d ) eq join( '/', splice @t, 0, +@d );
+}
+
+sub rmtree {
+    my $old_style = !( @_ and __is_arg( $_[-1] ) );
+
+    my ($arg, $data, $paths);
+
+    if ($old_style) {
+        my ( $verbose, $safe );
+        ( $paths, $verbose, $safe ) = @_;
+        $data->{verbose} = $verbose;
+        $data->{safe} = defined $safe ? $safe : 0;
+
+        if ( defined($paths) and length($paths) ) {
+            $paths = [$paths] unless UNIVERSAL::isa( $paths, 'ARRAY' );
+        }
+        else {
+            _carp("No root path(s) specified\n");
+            return 0;
+        }
+    }
+    else {
+        my %args_permitted = map { $_ => 1 } ( qw|
+            error
+            keep_root
+            result
+            safe
+            verbose
+        | );
+        my @bad_args = ();
+        my $arg = pop @_;
+        for my $k (sort keys %{$arg}) {
+            if (! $args_permitted{$k}) {
+                push @bad_args, $k;
+            }
+            else {
+                $data->{$k} = $arg->{$k};
+            }
+        }
+        _carp("Unrecognized option(s) passed to remove_tree(): @bad_args")
+            if @bad_args;
+        ${ $data->{error} }  = [] if exists $data->{error};
+        ${ $data->{result} } = [] if exists $data->{result};
+
+        # Wouldn't it make sense to do some validation on @_ before assigning
+        # to $paths here?
+        # In the $old_style case we guarantee that each path is both defined
+        # and non-empty.  We don't check that here, which means we have to
+        # check it later in the first condition in this line:
+        #     if ( $ortho_root_length && _is_subdir( $ortho_root, $ortho_cwd ) ) {
+        # Granted, that would be a change in behavior for the two
+        # non-old-style interfaces.
+
+        $paths = [@_];
+    }
+
+    $data->{prefix} = '';
+    $data->{depth}  = 0;
+
+    my @clean_path;
+    $data->{cwd} = getcwd() or do {
+        _error( $data, "cannot fetch initial working directory" );
+        return 0;
+    };
+    for ( $data->{cwd} ) { /\A(.*)\Z/s; $_ = $1 }    # untaint
+
+    for my $p (@$paths) {
+
+        # need to fixup case and map \ to / on Windows
+        my $ortho_root = _IS_MSWIN32 ? _slash_lc($p) : $p;
+        my $ortho_cwd =
+          _IS_MSWIN32 ? _slash_lc( $data->{cwd} ) : $data->{cwd};
+        my $ortho_root_length = length($ortho_root);
+        $ortho_root_length-- if _IS_VMS;   # don't compare '.' with ']'
+        if ( $ortho_root_length && _is_subdir( $ortho_root, $ortho_cwd ) ) {
+            local $! = 0;
+            _error( $data, "cannot remove path when cwd is $data->{cwd}", $p );
+            next;
+        }
+
+        if (_IS_MACOS) {
+            $p = ":$p" unless $p =~ /:/;
+            $p .= ":" unless $p =~ /:\z/;
+        }
+        elsif ( _IS_MSWIN32 ) {
+            $p =~ s{[/\\]\z}{};
+        }
+        else {
+            $p =~ s{/\z}{};
+        }
+        push @clean_path, $p;
+    }
+
+    @{$data}{qw(device inode)} = ( lstat $data->{cwd} )[ 0, 1 ] or do {
+        _error( $data, "cannot stat initial working directory", $data->{cwd} );
+        return 0;
+    };
+
+    return _rmtree( $data, \@clean_path );
+}
+
+sub _rmtree {
+    my $data   = shift;
+    my $paths = shift;
+
+    my $count  = 0;
+    my $curdir = File::Spec->curdir();
+    my $updir  = File::Spec->updir();
+
+    my ( @files, $root );
+  ROOT_DIR:
+    foreach my $root (@$paths) {
+
+        # since we chdir into each directory, it may not be obvious
+        # to figure out where we are if we generate a message about
+        # a file name. We therefore construct a semi-canonical
+        # filename, anchored from the directory being unlinked (as
+        # opposed to being truly canonical, anchored from the root (/).
+
+        my $canon =
+          $data->{prefix}
+          ? File::Spec->catfile( $data->{prefix}, $root )
+          : $root;
+
+        my ( $ldev, $lino, $perm ) = ( lstat $root )[ 0, 1, 2 ]
+          or next ROOT_DIR;
+
+        if ( -d _ ) {
+            $root = VMS::Filespec::vmspath( VMS::Filespec::pathify($root) )
+              if _IS_VMS;
+
+            if ( !chdir($root) ) {
+
+                # see if we can escalate privileges to get in
+                # (e.g. funny protection mask such as -w- instead of rwx)
+                # This uses fchmod to avoid traversing outside of the proper
+                # location (CVE-2017-6512)
+                my $root_fh;
+                if (open($root_fh, '<', $root)) {
+                    my ($fh_dev, $fh_inode) = (stat $root_fh )[0,1];
+                    $perm &= oct '7777';
+                    my $nperm = $perm | oct '700';
+                    local $@;
+                    if (
+                        !(
+                            $data->{safe}
+                           or $nperm == $perm
+                           or !-d _
+                           or $fh_dev ne $ldev
+                           or $fh_inode ne $lino
+                           or eval { chmod( $nperm, $root_fh ) }
+                        )
+                      )
+                    {
+                        _error( $data,
+                            "cannot make child directory read-write-exec", $canon );
+                        next ROOT_DIR;
+                    }
+                    close $root_fh;
+                }
+                if ( !chdir($root) ) {
+                    _error( $data, "cannot chdir to child", $canon );
+                    next ROOT_DIR;
+                }
+            }
+
+            my ( $cur_dev, $cur_inode, $perm ) = ( stat $curdir )[ 0, 1, 2 ]
+              or do {
+                _error( $data, "cannot stat current working directory", $canon );
+                next ROOT_DIR;
+              };
+
+            if (_NEED_STAT_CHECK) {
+                ( $ldev eq $cur_dev and $lino eq $cur_inode )
+                  or _croak(
+"directory $canon changed before chdir, expected dev=$ldev ino=$lino, actual dev=$cur_dev ino=$cur_inode, aborting."
+                  );
+            }
+
+            $perm &= oct '7777';    # don't forget setuid, setgid, sticky bits
+            my $nperm = $perm | oct '700';
+
+            # notabene: 0700 is for making readable in the first place,
+            # it's also intended to change it to writable in case we have
+            # to recurse in which case we are better than rm -rf for
+            # subtrees with strange permissions
+
+            if (
+                !(
+                       $data->{safe}
+                    or $nperm == $perm
+                    or chmod( $nperm, $curdir )
+                )
+              )
+            {
+                _error( $data, "cannot make directory read+writeable", $canon );
+                $nperm = $perm;
+            }
+
+            my $d;
+            $d = gensym() if $] < 5.006;
+            if ( !opendir $d, $curdir ) {
+                _error( $data, "cannot opendir", $canon );
+                @files = ();
+            }
+            else {
+                if ( !defined ${^TAINT} or ${^TAINT} ) {
+                    # Blindly untaint dir names if taint mode is active
+                    @files = map { /\A(.*)\z/s; $1 } readdir $d;
+                }
+                else {
+                    @files = readdir $d;
+                }
+                closedir $d;
+            }
+
+            if (_IS_VMS) {
+
+                # Deleting large numbers of files from VMS Files-11
+                # filesystems is faster if done in reverse ASCIIbetical order.
+                # include '.' to '.;' from blead patch #31775
+                @files = map { $_ eq '.' ? '.;' : $_ } reverse @files;
+            }
+
+            @files = grep { $_ ne $updir and $_ ne $curdir } @files;
+
+            if (@files) {
+
+                # remove the contained files before the directory itself
+                my $narg = {%$data};
+                @{$narg}{qw(device inode cwd prefix depth)} =
+                  ( $cur_dev, $cur_inode, $updir, $canon, $data->{depth} + 1 );
+                $count += _rmtree( $narg, \@files );
+            }
+
+            # restore directory permissions of required now (in case the rmdir
+            # below fails), while we are still in the directory and may do so
+            # without a race via '.'
+            if ( $nperm != $perm and not chmod( $perm, $curdir ) ) {
+                _error( $data, "cannot reset chmod", $canon );
+            }
+
+            # don't leave the client code in an unexpected directory
+            chdir( $data->{cwd} )
+              or
+              _croak("cannot chdir to $data->{cwd} from $canon: $!, aborting.");
+
+            # ensure that a chdir upwards didn't take us somewhere other
+            # than we expected (see CVE-2002-0435)
+            ( $cur_dev, $cur_inode ) = ( stat $curdir )[ 0, 1 ]
+              or _croak(
+                "cannot stat prior working directory $data->{cwd}: $!, aborting."
+              );
+
+            if (_NEED_STAT_CHECK) {
+                ( $data->{device} eq $cur_dev and $data->{inode} eq $cur_inode )
+                  or _croak(  "previous directory $data->{cwd} "
+                            . "changed before entering $canon, "
+                            . "expected dev=$ldev ino=$lino, "
+                            . "actual dev=$cur_dev ino=$cur_inode, aborting."
+                  );
+            }
+
+            if ( $data->{depth} or !$data->{keep_root} ) {
+                if ( $data->{safe}
+                    && ( _IS_VMS
+                        ? !&VMS::Filespec::candelete($root)
+                        : !-w $root ) )
+                {
+                    print "skipped $root\n" if $data->{verbose};
+                    next ROOT_DIR;
+                }
+                if ( _FORCE_WRITABLE and !chmod $perm | oct '700', $root ) {
+                    _error( $data, "cannot make directory writeable", $canon );
+                }
+                print "rmdir $root\n" if $data->{verbose};
+                if ( rmdir $root ) {
+                    push @{ ${ $data->{result} } }, $root if $data->{result};
+                    ++$count;
+                }
+                else {
+                    _error( $data, "cannot remove directory", $canon );
+                    if (
+                        _FORCE_WRITABLE
+                        && !chmod( $perm,
+                            ( _IS_VMS ? VMS::Filespec::fileify($root) : $root )
+                        )
+                      )
+                    {
+                        _error(
+                            $data,
+                            sprintf( "cannot restore permissions to 0%o",
+                                $perm ),
+                            $canon
+                        );
+                    }
+                }
+            }
+        }
+        else {
+            # not a directory
+            $root = VMS::Filespec::vmsify("./$root")
+              if _IS_VMS
+              && !File::Spec->file_name_is_absolute($root)
+              && ( $root !~ m/(?<!\^)[\]>]+/ );    # not already in VMS syntax
+
+            if (
+                $data->{safe}
+                && (
+                    _IS_VMS
+                    ? !&VMS::Filespec::candelete($root)
+                    : !( -l $root || -w $root )
+                )
+              )
+            {
+                print "skipped $root\n" if $data->{verbose};
+                next ROOT_DIR;
+            }
+
+            my $nperm = $perm & oct '7777' | oct '600';
+            if (    _FORCE_WRITABLE
+                and $nperm != $perm
+                and not chmod $nperm, $root )
+            {
+                _error( $data, "cannot make file writeable", $canon );
+            }
+            print "unlink $canon\n" if $data->{verbose};
+
+            # delete all versions under VMS
+            for ( ; ; ) {
+                if ( unlink $root ) {
+                    push @{ ${ $data->{result} } }, $root if $data->{result};
+                }
+                else {
+                    _error( $data, "cannot unlink file", $canon );
+                    _FORCE_WRITABLE and chmod( $perm, $root )
+                      or _error( $data,
+                        sprintf( "cannot restore permissions to 0%o", $perm ),
+                        $canon );
+                    last;
+                }
+                ++$count;
+                last unless _IS_VMS && lstat $root;
+            }
+        }
+    }
+    return $count;
+}
+
+sub _slash_lc {
+
+    # fix up slashes and case on MSWin32 so that we can determine that
+    # c:\path\to\dir is underneath C:/Path/To
+    my $path = shift;
+    $path =~ tr{\\}{/};
+    return lc($path);
+}
+
+1;
+
+__END__
+
+=head1 NAME
+
+File::Path - Create or remove directory trees
+
+=head1 VERSION
+
+2.18 - released November 4 2020.
+
+=head1 SYNOPSIS
+
+    use File::Path qw(make_path remove_tree);
+
+    @created = make_path('foo/bar/baz', '/zug/zwang');
+    @created = make_path('foo/bar/baz', '/zug/zwang', {
+        verbose => 1,
+        mode => 0711,
+    });
+    make_path('foo/bar/baz', '/zug/zwang', {
+        chmod => 0777,
+    });
+
+    $removed_count = remove_tree('foo/bar/baz', '/zug/zwang', {
+        verbose => 1,
+        error  => \my $err_list,
+        safe => 1,
+    });
+
+    # legacy (interface promoted before v2.00)
+    @created = mkpath('/foo/bar/baz');
+    @created = mkpath('/foo/bar/baz', 1, 0711);
+    @created = mkpath(['/foo/bar/baz', 'blurfl/quux'], 1, 0711);
+    $removed_count = rmtree('foo/bar/baz', 1, 1);
+    $removed_count = rmtree(['foo/bar/baz', 'blurfl/quux'], 1, 1);
+
+    # legacy (interface promoted before v2.06)
+    @created = mkpath('foo/bar/baz', '/zug/zwang', { verbose => 1, mode => 0711 });
+    $removed_count = rmtree('foo/bar/baz', '/zug/zwang', { verbose => 1, mode => 0711 });
+
+=head1 DESCRIPTION
+
+This module provides a convenient way to create directories of
+arbitrary depth and to delete an entire directory subtree from the
+filesystem.
+
+The following functions are provided:
+
+=over
+
+=item make_path( $dir1, $dir2, .... )
+
+=item make_path( $dir1, $dir2, ...., \%opts )
+
+The C<make_path> function creates the given directories if they don't
+exist before, much like the Unix command C<mkdir -p>.
+
+The function accepts a list of directories to be created. Its
+behaviour may be tuned by an optional hashref appearing as the last
+parameter on the call.
+
+The function returns the list of directories actually created during
+the call; in scalar context the number of directories created.
+
+The following keys are recognised in the option hash:
+
+=over
+
+=item mode => $num
+
+The numeric permissions mode to apply to each created directory
+(defaults to C<0777>), to be modified by the current C<umask>. If the
+directory already exists (and thus does not need to be created),
+the permissions will not be modified.
+
+C<mask> is recognised as an alias for this parameter.
+
+=item chmod => $num
+
+Takes a numeric mode to apply to each created directory (not
+modified by the current C<umask>). If the directory already exists
+(and thus does not need to be created), the permissions will
+not be modified.
+
+=item verbose => $bool
+
+If present, will cause C<make_path> to print the name of each directory
+as it is created. By default nothing is printed.
+
+=item error => \$err
+
+If present, it should be a reference to a scalar.
+This scalar will be made to reference an array, which will
+be used to store any errors that are encountered.  See the L</"ERROR
+HANDLING"> section for more information.
+
+If this parameter is not used, certain error conditions may raise
+a fatal error that will cause the program to halt, unless trapped
+in an C<eval> block.
+
+=item owner => $owner
+
+=item user => $owner
+
+=item uid => $owner
+
+If present, will cause any created directory to be owned by C<$owner>.
+If the value is numeric, it will be interpreted as a uid; otherwise a
+username is assumed. An error will be issued if the username cannot be
+mapped to a uid, the uid does not exist or the process lacks the
+privileges to change ownership.
+
+Ownership of directories that already exist will not be changed.
+
+C<user> and C<uid> are aliases of C<owner>.
+
+=item group => $group
+
+If present, will cause any created directory to be owned by the group
+C<$group>.  If the value is numeric, it will be interpreted as a gid;
+otherwise a group name is assumed. An error will be issued if the
+group name cannot be mapped to a gid, the gid does not exist or the
+process lacks the privileges to change group ownership.
+
+Group ownership of directories that already exist will not be changed.
+
+    make_path '/var/tmp/webcache', {owner=>'nobody', group=>'nogroup'};
+
+=back
+
+=item mkpath( $dir )
+
+=item mkpath( $dir, $verbose, $mode )
+
+=item mkpath( [$dir1, $dir2,...], $verbose, $mode )
+
+=item mkpath( $dir1, $dir2,..., \%opt )
+
+The C<mkpath()> function provide the legacy interface of
+C<make_path()> with a different interpretation of the arguments
+passed.  The behaviour and return value of the function is otherwise
+identical to C<make_path()>.
+
+=item remove_tree( $dir1, $dir2, .... )
+
+=item remove_tree( $dir1, $dir2, ...., \%opts )
+
+The C<remove_tree> function deletes the given directories and any
+files and subdirectories they might contain, much like the Unix
+command C<rm -rf> or the Windows commands C<rmdir /s> and C<rd /s>.
+
+The function accepts a list of directories to be removed. (In point of fact,
+it will also accept filesystem entries which are not directories, such as
+regular files and symlinks.  But, as its name suggests, its intent is to
+remove trees rather than individual files.)
+
+C<remove_tree()>'s behaviour may be tuned by an optional hashref
+appearing as the last parameter on the call.  If an empty string is
+passed to C<remove_tree>, an error will occur.
+
+B<NOTE:>  For security reasons, we strongly advise use of the
+hashref-as-final-argument syntax -- specifically, with a setting of the C<safe>
+element to a true value.
+
+    remove_tree( $dir1, $dir2, ....,
+        {
+            safe => 1,
+            ...         # other key-value pairs
+        },
+    );
+
+The function returns the number of files successfully deleted.
+
+The following keys are recognised in the option hash:
+
+=over
+
+=item verbose => $bool
+
+If present, will cause C<remove_tree> to print the name of each file as
+it is unlinked. By default nothing is printed.
+
+=item safe => $bool
+
+When set to a true value, will cause C<remove_tree> to skip the files
+for which the process lacks the required privileges needed to delete
+files, such as delete privileges on VMS. In other words, the code
+will make no attempt to alter file permissions. Thus, if the process
+is interrupted, no filesystem object will be left in a more
+permissive mode.
+
+=item keep_root => $bool
+
+When set to a true value, will cause all files and subdirectories
+to be removed, except the initially specified directories. This comes
+in handy when cleaning out an application's scratch directory.
+
+    remove_tree( '/tmp', {keep_root => 1} );
+
+=item result => \$res
+
+If present, it should be a reference to a scalar.
+This scalar will be made to reference an array, which will
+be used to store all files and directories unlinked
+during the call. If nothing is unlinked, the array will be empty.
+
+    remove_tree( '/tmp', {result => \my $list} );
+    print "unlinked $_\n" for @$list;
+
+This is a useful alternative to the C<verbose> key.
+
+=item error => \$err
+
+If present, it should be a reference to a scalar.
+This scalar will be made to reference an array, which will
+be used to store any errors that are encountered.  See the L</"ERROR
+HANDLING"> section for more information.
+
+Removing things is a much more dangerous proposition than
+creating things. As such, there are certain conditions that
+C<remove_tree> may encounter that are so dangerous that the only
+sane action left is to kill the program.
+
+Use C<error> to trap all that is reasonable (problems with
+permissions and the like), and let it die if things get out
+of hand. This is the safest course of action.
+
+=back
+
+=item rmtree( $dir )
+
+=item rmtree( $dir, $verbose, $safe )
+
+=item rmtree( [$dir1, $dir2,...], $verbose, $safe )
+
+=item rmtree( $dir1, $dir2,..., \%opt )
+
+The C<rmtree()> function provide the legacy interface of
+C<remove_tree()> with a different interpretation of the arguments
+passed. The behaviour and return value of the function is otherwise
+identical to C<remove_tree()>.
+
+B<NOTE:>  For security reasons, we strongly advise use of the
+hashref-as-final-argument syntax, specifically with a setting of the C<safe>
+element to a true value.
+
+    rmtree( $dir1, $dir2, ....,
+        {
+            safe => 1,
+            ...         # other key-value pairs
+        },
+    );
+
+=back
+
+=head2 ERROR HANDLING
+
+=over 4
+
+=item B<NOTE:>
+
+The following error handling mechanism is consistent throughout all
+code paths EXCEPT in cases where the ROOT node is nonexistent.  In
+version 2.11 the maintainers attempted to rectify this inconsistency
+but too many downstream modules encountered problems.  In such case,
+if you require root node evaluation or error checking prior to calling
+C<make_path> or C<remove_tree>, you should take additional precautions.
+
+=back
+
+If C<make_path> or C<remove_tree> encounters an error, a diagnostic
+message will be printed to C<STDERR> via C<carp> (for non-fatal
+errors) or via C<croak> (for fatal errors).
+
+If this behaviour is not desirable, the C<error> attribute may be
+used to hold a reference to a variable, which will be used to store
+the diagnostics. The variable is made a reference to an array of hash
+references.  Each hash contain a single key/value pair where the key
+is the name of the file, and the value is the error message (including
+the contents of C<$!> when appropriate).  If a general error is
+encountered the diagnostic key will be empty.
+
+An example usage looks like:
+
+  remove_tree( 'foo/bar', 'bar/rat', {error => \my $err} );
+  if ($err && @$err) {
+      for my $diag (@$err) {
+          my ($file, $message) = %$diag;
+          if ($file eq '') {
+              print "general error: $message\n";
+          }
+          else {
+              print "problem unlinking $file: $message\n";
+          }
+      }
+  }
+  else {
+      print "No error encountered\n";
+  }
+
+Note that if no errors are encountered, C<$err> will reference an
+empty array.  This means that C<$err> will always end up TRUE; so you
+need to test C<@$err> to determine if errors occurred.
+
+=head2 NOTES
+
+C<File::Path> blindly exports C<mkpath> and C<rmtree> into the
+current namespace. These days, this is considered bad style, but
+to change it now would break too much code. Nonetheless, you are
+invited to specify what it is you are expecting to use:
+
+  use File::Path 'rmtree';
+
+The routines C<make_path> and C<remove_tree> are B<not> exported
+by default. You must specify which ones you want to use.
+
+  use File::Path 'remove_tree';
+
+Note that a side-effect of the above is that C<mkpath> and C<rmtree>
+are no longer exported at all. This is due to the way the C<Exporter>
+module works. If you are migrating a codebase to use the new
+interface, you will have to list everything explicitly. But that's
+just good practice anyway.
+
+  use File::Path qw(remove_tree rmtree);
+
+=head3 API CHANGES
+
+The API was changed in the 2.0 branch. For a time, C<mkpath> and
+C<rmtree> tried, unsuccessfully, to deal with the two different
+calling mechanisms. This approach was considered a failure.
+
+The new semantics are now only available with C<make_path> and
+C<remove_tree>. The old semantics are only available through
+C<mkpath> and C<rmtree>. Users are strongly encouraged to upgrade
+to at least 2.08 in order to avoid surprises.
+
+=head3 SECURITY CONSIDERATIONS
+
+There were race conditions in the 1.x implementations of File::Path's
+C<rmtree> function (although sometimes patched depending on the OS
+distribution or platform). The 2.0 version contains code to avoid the
+problem mentioned in CVE-2002-0435.
+
+See the following pages for more information:
+
+    http://bugs.debian.org/cgi-bin/bugreport.cgi?bug=286905
+    http://www.nntp.perl.org/group/perl.perl5.porters/2005/01/msg97623.html
+    http://www.debian.org/security/2005/dsa-696
+
+Additionally, unless the C<safe> parameter is set (or the
+third parameter in the traditional interface is TRUE), should a
+C<remove_tree> be interrupted, files that were originally in read-only
+mode may now have their permissions set to a read-write (or "delete
+OK") mode.
+
+The following CVE reports were previously filed against File-Path and are
+believed to have been addressed:
+
+=over 4
+
+=item * L<http://cve.circl.lu/cve/CVE-2004-0452>
+
+=item * L<http://cve.circl.lu/cve/CVE-2005-0448>
+
+=back
+
+In February 2017 the cPanel Security Team reported an additional vulnerability
+in File-Path.  The C<chmod()> logic to make directories traversable can be
+abused to set the mode on an attacker-chosen file to an attacker-chosen value.
+This is due to the time-of-check-to-time-of-use (TOCTTOU) race condition
+(L<https://en.wikipedia.org/wiki/Time_of_check_to_time_of_use>) between the
+C<stat()> that decides the inode is a directory and the C<chmod()> that tries
+to make it user-rwx.  CPAN versions 2.13 and later incorporate a patch

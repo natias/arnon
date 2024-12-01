@@ -1,0 +1,1000 @@
+
+    def get_code(self, fullname):
+        return compile('', '<string>', 'exec', dont_inherit=True)
+
+    def create_module(self, spec):
+        """Use default semantics for module creation."""
+
+    def exec_module(self, module):
+        pass
+
+    def load_module(self, fullname):
+        """Load a namespace module.
+
+        This method is deprecated.  Use exec_module() instead.
+
+        """
+        # The import system never calls this method.
+        _bootstrap._verbose_message('namespace module loaded with path {!r}',
+                                    self._path)
+        # Warning implemented in _load_module_shim().
+        return _bootstrap._load_module_shim(self, fullname)
+
+    def get_resource_reader(self, module):
+        from importlib.readers import NamespaceReader
+        return NamespaceReader(self._path)
+
+
+# We use this exclusively in module_from_spec() for backward-compatibility.
+_NamespaceLoader = NamespaceLoader
+
+
+# Finders #####################################################################
+
+class PathFinder:
+
+    """Meta path finder for sys.path and package __path__ attributes."""
+
+    @staticmethod
+    def invalidate_caches():
+        """Call the invalidate_caches() method on all path entry finders
+        stored in sys.path_importer_caches (where implemented)."""
+        for name, finder in list(sys.path_importer_cache.items()):
+            # Drop entry if finder name is a relative path. The current
+            # working directory may have changed.
+            if finder is None or not _path_isabs(name):
+                del sys.path_importer_cache[name]
+            elif hasattr(finder, 'invalidate_caches'):
+                finder.invalidate_caches()
+        # Also invalidate the caches of _NamespacePaths
+        # https://bugs.python.org/issue45703
+        _NamespacePath._epoch += 1
+
+    @staticmethod
+    def _path_hooks(path):
+        """Search sys.path_hooks for a finder for 'path'."""
+        if sys.path_hooks is not None and not sys.path_hooks:
+            _warnings.warn('sys.path_hooks is empty', ImportWarning)
+        for hook in sys.path_hooks:
+            try:
+                return hook(path)
+            except ImportError:
+                continue
+        else:
+            return None
+
+    @classmethod
+    def _path_importer_cache(cls, path):
+        """Get the finder for the path entry from sys.path_importer_cache.
+
+        If the path entry is not in the cache, find the appropriate finder
+        and cache it. If no finder is available, store None.
+
+        """
+        if path == '':
+            try:
+                path = _os.getcwd()
+            except FileNotFoundError:
+                # Don't cache the failure as the cwd can easily change to
+                # a valid directory later on.
+                return None
+        try:
+            finder = sys.path_importer_cache[path]
+        except KeyError:
+            finder = cls._path_hooks(path)
+            sys.path_importer_cache[path] = finder
+        return finder
+
+    @classmethod
+    def _legacy_get_spec(cls, fullname, finder):
+        # This would be a good place for a DeprecationWarning if
+        # we ended up going that route.
+        if hasattr(finder, 'find_loader'):
+            msg = (f"{_bootstrap._object_name(finder)}.find_spec() not found; "
+                    "falling back to find_loader()")
+            _warnings.warn(msg, ImportWarning)
+            loader, portions = finder.find_loader(fullname)
+        else:
+            msg = (f"{_bootstrap._object_name(finder)}.find_spec() not found; "
+                    "falling back to find_module()")
+            _warnings.warn(msg, ImportWarning)
+            loader = finder.find_module(fullname)
+            portions = []
+        if loader is not None:
+            return _bootstrap.spec_from_loader(fullname, loader)
+        spec = _bootstrap.ModuleSpec(fullname, None)
+        spec.submodule_search_locations = portions
+        return spec
+
+    @classmethod
+    def _get_spec(cls, fullname, path, target=None):
+        """Find the loader or namespace_path for this module/package name."""
+        # If this ends up being a namespace package, namespace_path is
+        #  the list of paths that will become its __path__
+        namespace_path = []
+        for entry in path:
+            if not isinstance(entry, str):
+                continue
+            finder = cls._path_importer_cache(entry)
+            if finder is not None:
+                if hasattr(finder, 'find_spec'):
+                    spec = finder.find_spec(fullname, target)
+                else:
+                    spec = cls._legacy_get_spec(fullname, finder)
+                if spec is None:
+                    continue
+                if spec.loader is not None:
+                    return spec
+                portions = spec.submodule_search_locations
+                if portions is None:
+                    raise ImportError('spec missing loader')
+                # This is possibly part of a namespace package.
+                #  Remember these path entries (if any) for when we
+                #  create a namespace package, and continue iterating
+                #  on path.
+                namespace_path.extend(portions)
+        else:
+            spec = _bootstrap.ModuleSpec(fullname, None)
+            spec.submodule_search_locations = namespace_path
+            return spec
+
+    @classmethod
+    def find_spec(cls, fullname, path=None, target=None):
+        """Try to find a spec for 'fullname' on sys.path or 'path'.
+
+        The search is based on sys.path_hooks and sys.path_importer_cache.
+        """
+        if path is None:
+            path = sys.path
+        spec = cls._get_spec(fullname, path, target)
+        if spec is None:
+            return None
+        elif spec.loader is None:
+            namespace_path = spec.submodule_search_locations
+            if namespace_path:
+                # We found at least one namespace path.  Return a spec which
+                # can create the namespace package.
+                spec.origin = None
+                spec.submodule_search_locations = _NamespacePath(fullname, namespace_path, cls._get_spec)
+                return spec
+            else:
+                return None
+        else:
+            return spec
+
+    @classmethod
+    def find_module(cls, fullname, path=None):
+        """find the module on sys.path or 'path' based on sys.path_hooks and
+        sys.path_importer_cache.
+
+        This method is deprecated.  Use find_spec() instead.
+
+        """
+        _warnings.warn("PathFinder.find_module() is deprecated and "
+                       "slated for removal in Python 3.12; use find_spec() instead",
+                       DeprecationWarning)
+        spec = cls.find_spec(fullname, path)
+        if spec is None:
+            return None
+        return spec.loader
+
+    @staticmethod
+    def find_distributions(*args, **kwargs):
+        """
+        Find distributions.
+
+        Return an iterable of all Distribution instances capable of
+        loading the metadata for packages matching ``context.name``
+        (or all names if ``None`` indicated) along the paths in the list
+        of directories ``context.path``.
+        """
+        from importlib.metadata import MetadataPathFinder
+        return MetadataPathFinder.find_distributions(*args, **kwargs)
+
+
+class FileFinder:
+
+    """File-based finder.
+
+    Interactions with the file system are cached for performance, being
+    refreshed when the directory the finder is handling has been modified.
+
+    """
+
+    def __init__(self, path, *loader_details):
+        """Initialize with the path to search on and a variable number of
+        2-tuples containing the loader and the file suffixes the loader
+        recognizes."""
+        loaders = []
+        for loader, suffixes in loader_details:
+            loaders.extend((suffix, loader) for suffix in suffixes)
+        self._loaders = loaders
+        # Base (directory) path
+        if not path or path == '.':
+            self.path = _os.getcwd()
+        elif not _path_isabs(path):
+            self.path = _path_join(_os.getcwd(), path)
+        else:
+            self.path = path
+        self._path_mtime = -1
+        self._path_cache = set()
+        self._relaxed_path_cache = set()
+
+    def invalidate_caches(self):
+        """Invalidate the directory mtime."""
+        self._path_mtime = -1
+
+    find_module = _find_module_shim
+
+    def find_loader(self, fullname):
+        """Try to find a loader for the specified module, or the namespace
+        package portions. Returns (loader, list-of-portions).
+
+        This method is deprecated.  Use find_spec() instead.
+
+        """
+        _warnings.warn("FileFinder.find_loader() is deprecated and "
+                       "slated for removal in Python 3.12; use find_spec() instead",
+                       DeprecationWarning)
+        spec = self.find_spec(fullname)
+        if spec is None:
+            return None, []
+        return spec.loader, spec.submodule_search_locations or []
+
+    def _get_spec(self, loader_class, fullname, path, smsl, target):
+        loader = loader_class(fullname, path)
+        return spec_from_file_location(fullname, path, loader=loader,
+                                       submodule_search_locations=smsl)
+
+    def find_spec(self, fullname, target=None):
+        """Try to find a spec for the specified module.
+
+        Returns the matching spec, or None if not found.
+        """
+        is_namespace = False
+        tail_module = fullname.rpartition('.')[2]
+        try:
+            mtime = _path_stat(self.path or _os.getcwd()).st_mtime
+        except OSError:
+            mtime = -1
+        if mtime != self._path_mtime:
+            self._fill_cache()
+            self._path_mtime = mtime
+        # tail_module keeps the original casing, for __file__ and friends
+        if _relax_case():
+            cache = self._relaxed_path_cache
+            cache_module = tail_module.lower()
+        else:
+            cache = self._path_cache
+            cache_module = tail_module
+        # Check if the module is the name of a directory (and thus a package).
+        if cache_module in cache:
+            base_path = _path_join(self.path, tail_module)
+            for suffix, loader_class in self._loaders:
+                init_filename = '__init__' + suffix
+                full_path = _path_join(base_path, init_filename)
+                if _path_isfile(full_path):
+                    return self._get_spec(loader_class, fullname, full_path, [base_path], target)
+            else:
+                # If a namespace package, return the path if we don't
+                #  find a module in the next section.
+                is_namespace = _path_isdir(base_path)
+        # Check for a file w/ a proper suffix exists.
+        for suffix, loader_class in self._loaders:
+            try:
+                full_path = _path_join(self.path, tail_module + suffix)
+            except ValueError:
+                return None
+            _bootstrap._verbose_message('trying {}', full_path, verbosity=2)
+            if cache_module + suffix in cache:
+                if _path_isfile(full_path):
+                    return self._get_spec(loader_class, fullname, full_path,
+                                          None, target)
+        if is_namespace:
+            _bootstrap._verbose_message('possible namespace for {}', base_path)
+            spec = _bootstrap.ModuleSpec(fullname, None)
+            spec.submodule_search_locations = [base_path]
+            return spec
+        return None
+
+    def _fill_cache(self):
+        """Fill the cache of potential modules and packages for this directory."""
+        path = self.path
+        try:
+            contents = _os.listdir(path or _os.getcwd())
+        except (FileNotFoundError, PermissionError, NotADirectoryError):
+            # Directory has either been removed, turned into a file, or made
+            # unreadable.
+            contents = []
+        # We store two cached versions, to handle runtime changes of the
+        # PYTHONCASEOK environment variable.
+        if not sys.platform.startswith('win'):
+            self._path_cache = set(contents)
+        else:
+            # Windows users can import modules with case-insensitive file
+            # suffixes (for legacy reasons). Make the suffix lowercase here
+            # so it's done once instead of for every import. This is safe as
+            # the specified suffixes to check against are always specified in a
+            # case-sensitive manner.
+            lower_suffix_contents = set()
+            for item in contents:
+                name, dot, suffix = item.partition('.')
+                if dot:
+                    new_name = '{}.{}'.format(name, suffix.lower())
+                else:
+                    new_name = name
+                lower_suffix_contents.add(new_name)
+            self._path_cache = lower_suffix_contents
+        if sys.platform.startswith(_CASE_INSENSITIVE_PLATFORMS):
+            self._relaxed_path_cache = {fn.lower() for fn in contents}
+
+    @classmethod
+    def path_hook(cls, *loader_details):
+        """A class method which returns a closure to use on sys.path_hook
+        which will return an instance using the specified loaders and the path
+        called on the closure.
+
+        If the path called on the closure is not a directory, ImportError is
+        raised.
+
+        """
+        def path_hook_for_FileFinder(path):
+            """Path hook for importlib.machinery.FileFinder."""
+            if not _path_isdir(path):
+                raise ImportError('only directories are supported', path=path)
+            return cls(path, *loader_details)
+
+        return path_hook_for_FileFinder
+
+    def __repr__(self):
+        return 'FileFinder({!r})'.format(self.path)
+
+
+# Import setup ###############################################################
+
+def _fix_up_module(ns, name, pathname, cpathname=None):
+    # This function is used by PyImport_ExecCodeModuleObject().
+    loader = ns.get('__loader__')
+    spec = ns.get('__spec__')
+    if not loader:
+        if spec:
+            loader = spec.loader
+        elif pathname == cpathname:
+            loader = SourcelessFileLoader(name, pathname)
+        else:
+            loader = SourceFileLoader(name, pathname)
+    if not spec:
+        spec = spec_from_file_location(name, pathname, loader=loader)
+    try:
+        ns['__spec__'] = spec
+        ns['__loader__'] = loader
+        ns['__file__'] = pathname
+        ns['__cached__'] = cpathname
+    except Exception:
+        # Not important enough to report.
+        pass
+
+
+def _get_supported_file_loaders():
+    """Returns a list of file-based module loaders.
+
+    Each item is a tuple (loader, suffixes).
+    """
+    extensions = ExtensionFileLoader, _imp.extension_suffixes()
+    source = SourceFileLoader, SOURCE_SUFFIXES
+    bytecode = SourcelessFileLoader, BYTECODE_SUFFIXES
+    return [extensions, source, bytecode]
+
+
+def _set_bootstrap_module(_bootstrap_module):
+    global _bootstrap
+    _bootstrap = _bootstrap_module
+
+
+def _install(_bootstrap_module):
+    """Install the path-based import components."""
+    _set_bootstrap_module(_bootstrap_module)
+    supported_loaders = _get_supported_file_loaders()
+    sys.path_hooks.extend([FileFinder.path_hook(*supported_loaders)])
+    sys.meta_path.append(PathFinder)
+                                                                                                                                                                                                                                                                        usr/lib/python3.11/importlib/abc.py                                                                 0000644 0000000 0000000 00000025331 14671176116 015565  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        """Abstract base classes related to import."""
+from . import _bootstrap_external
+from . import machinery
+try:
+    import _frozen_importlib
+except ImportError as exc:
+    if exc.name != '_frozen_importlib':
+        raise
+    _frozen_importlib = None
+try:
+    import _frozen_importlib_external
+except ImportError:
+    _frozen_importlib_external = _bootstrap_external
+from ._abc import Loader
+import abc
+import warnings
+
+# for compatibility with Python 3.10
+from .resources.abc import ResourceReader, Traversable, TraversableResources
+
+
+__all__ = [
+    'Loader', 'Finder', 'MetaPathFinder', 'PathEntryFinder',
+    'ResourceLoader', 'InspectLoader', 'ExecutionLoader',
+    'FileLoader', 'SourceLoader',
+
+    # for compatibility with Python 3.10
+    'ResourceReader', 'Traversable', 'TraversableResources',
+]
+
+
+def _register(abstract_cls, *classes):
+    for cls in classes:
+        abstract_cls.register(cls)
+        if _frozen_importlib is not None:
+            try:
+                frozen_cls = getattr(_frozen_importlib, cls.__name__)
+            except AttributeError:
+                frozen_cls = getattr(_frozen_importlib_external, cls.__name__)
+            abstract_cls.register(frozen_cls)
+
+
+class Finder(metaclass=abc.ABCMeta):
+
+    """Legacy abstract base class for import finders.
+
+    It may be subclassed for compatibility with legacy third party
+    reimplementations of the import system.  Otherwise, finder
+    implementations should derive from the more specific MetaPathFinder
+    or PathEntryFinder ABCs.
+
+    Deprecated since Python 3.3
+    """
+
+    def __init__(self):
+        warnings.warn("the Finder ABC is deprecated and "
+                       "slated for removal in Python 3.12; use MetaPathFinder "
+                       "or PathEntryFinder instead",
+                       DeprecationWarning)
+
+    @abc.abstractmethod
+    def find_module(self, fullname, path=None):
+        """An abstract method that should find a module.
+        The fullname is a str and the optional path is a str or None.
+        Returns a Loader object or None.
+        """
+        warnings.warn("importlib.abc.Finder along with its find_module() "
+                      "method are deprecated and "
+                       "slated for removal in Python 3.12; use "
+                       "MetaPathFinder.find_spec() or "
+                       "PathEntryFinder.find_spec() instead",
+                       DeprecationWarning)
+
+
+class MetaPathFinder(metaclass=abc.ABCMeta):
+
+    """Abstract base class for import finders on sys.meta_path."""
+
+    # We don't define find_spec() here since that would break
+    # hasattr checks we do to support backward compatibility.
+
+    def find_module(self, fullname, path):
+        """Return a loader for the module.
+
+        If no module is found, return None.  The fullname is a str and
+        the path is a list of strings or None.
+
+        This method is deprecated since Python 3.4 in favor of
+        finder.find_spec(). If find_spec() exists then backwards-compatible
+        functionality is provided for this method.
+
+        """
+        warnings.warn("MetaPathFinder.find_module() is deprecated since Python "
+                      "3.4 in favor of MetaPathFinder.find_spec() and is "
+                      "slated for removal in Python 3.12",
+                      DeprecationWarning,
+                      stacklevel=2)
+        if not hasattr(self, 'find_spec'):
+            return None
+        found = self.find_spec(fullname, path)
+        return found.loader if found is not None else None
+
+    def invalidate_caches(self):
+        """An optional method for clearing the finder's cache, if any.
+        This method is used by importlib.invalidate_caches().
+        """
+
+_register(MetaPathFinder, machinery.BuiltinImporter, machinery.FrozenImporter,
+          machinery.PathFinder, machinery.WindowsRegistryFinder)
+
+
+class PathEntryFinder(metaclass=abc.ABCMeta):
+
+    """Abstract base class for path entry finders used by PathFinder."""
+
+    # We don't define find_spec() here since that would break
+    # hasattr checks we do to support backward compatibility.
+
+    def find_loader(self, fullname):
+        """Return (loader, namespace portion) for the path entry.
+
+        The fullname is a str.  The namespace portion is a sequence of
+        path entries contributing to part of a namespace package. The
+        sequence may be empty.  If loader is not None, the portion will
+        be ignored.
+
+        The portion will be discarded if another path entry finder
+        locates the module as a normal module or package.
+
+        This method is deprecated since Python 3.4 in favor of
+        finder.find_spec(). If find_spec() is provided than backwards-compatible
+        functionality is provided.
+        """
+        warnings.warn("PathEntryFinder.find_loader() is deprecated since Python "
+                      "3.4 in favor of PathEntryFinder.find_spec() "
+                      "(available since 3.4)",
+                      DeprecationWarning,
+                      stacklevel=2)
+        if not hasattr(self, 'find_spec'):
+            return None, []
+        found = self.find_spec(fullname)
+        if found is not None:
+            if not found.submodule_search_locations:
+                portions = []
+            else:
+                portions = found.submodule_search_locations
+            return found.loader, portions
+        else:
+            return None, []
+
+    find_module = _bootstrap_external._find_module_shim
+
+    def invalidate_caches(self):
+        """An optional method for clearing the finder's cache, if any.
+        This method is used by PathFinder.invalidate_caches().
+        """
+
+_register(PathEntryFinder, machinery.FileFinder)
+
+
+class ResourceLoader(Loader):
+
+    """Abstract base class for loaders which can return data from their
+    back-end storage.
+
+    This ABC represents one of the optional protocols specified by PEP 302.
+
+    """
+
+    @abc.abstractmethod
+    def get_data(self, path):
+        """Abstract method which when implemented should return the bytes for
+        the specified path.  The path must be a str."""
+        raise OSError
+
+
+class InspectLoader(Loader):
+
+    """Abstract base class for loaders which support inspection about the
+    modules they can load.
+
+    This ABC represents one of the optional protocols specified by PEP 302.
+
+    """
+
+    def is_package(self, fullname):
+        """Optional method which when implemented should return whether the
+        module is a package.  The fullname is a str.  Returns a bool.
+
+        Raises ImportError if the module cannot be found.
+        """
+        raise ImportError
+
+    def get_code(self, fullname):
+        """Method which returns the code object for the module.
+
+        The fullname is a str.  Returns a types.CodeType if possible, else
+        returns None if a code object does not make sense
+        (e.g. built-in module). Raises ImportError if the module cannot be
+        found.
+        """
+        source = self.get_source(fullname)
+        if source is None:
+            return None
+        return self.source_to_code(source)
+
+    @abc.abstractmethod
+    def get_source(self, fullname):
+        """Abstract method which should return the source code for the
+        module.  The fullname is a str.  Returns a str.
+
+        Raises ImportError if the module cannot be found.
+        """
+        raise ImportError
+
+    @staticmethod
+    def source_to_code(data, path='<string>'):
+        """Compile 'data' into a code object.
+
+        The 'data' argument can be anything that compile() can handle. The'path'
+        argument should be where the data was retrieved (when applicable)."""
+        return compile(data, path, 'exec', dont_inherit=True)
+
+    exec_module = _bootstrap_external._LoaderBasics.exec_module
+    load_module = _bootstrap_external._LoaderBasics.load_module
+
+_register(InspectLoader, machinery.BuiltinImporter, machinery.FrozenImporter, machinery.NamespaceLoader)
+
+
+class ExecutionLoader(InspectLoader):
+
+    """Abstract base class for loaders that wish to support the execution of
+    modules as scripts.
+
+    This ABC represents one of the optional protocols specified in PEP 302.
+
+    """
+
+    @abc.abstractmethod
+    def get_filename(self, fullname):
+        """Abstract method which should return the value that __file__ is to be
+        set to.
+
+        Raises ImportError if the module cannot be found.
+        """
+        raise ImportError
+
+    def get_code(self, fullname):
+        """Method to return the code object for fullname.
+
+        Should return None if not applicable (e.g. built-in module).
+        Raise ImportError if the module cannot be found.
+        """
+        source = self.get_source(fullname)
+        if source is None:
+            return None
+        try:
+            path = self.get_filename(fullname)
+        except ImportError:
+            return self.source_to_code(source)
+        else:
+            return self.source_to_code(source, path)
+
+_register(ExecutionLoader, machinery.ExtensionFileLoader)
+
+
+class FileLoader(_bootstrap_external.FileLoader, ResourceLoader, ExecutionLoader):
+
+    """Abstract base class partially implementing the ResourceLoader and
+    ExecutionLoader ABCs."""
+
+_register(FileLoader, machinery.SourceFileLoader,
+            machinery.SourcelessFileLoader)
+
+
+class SourceLoader(_bootstrap_external.SourceLoader, ResourceLoader, ExecutionLoader):
+
+    """Abstract base class for loading source code (and optionally any
+    corresponding bytecode).
+
+    To support loading from source code, the abstractmethods inherited from
+    ResourceLoader and ExecutionLoader need to be implemented. To also support
+    loading from bytecode, the optional methods specified directly by this ABC
+    is required.
+
+    Inherited abstractmethods not implemented in this ABC:
+
+        * ResourceLoader.get_data
+        * ExecutionLoader.get_filename
+
+    """
+
+    def path_mtime(self, path):
+        """Return the (int) modification time for the path (str)."""
+        if self.path_stats.__func__ is SourceLoader.path_stats:
+            raise OSError
+        return int(self.path_stats(path)['mtime'])
+
+    def path_stats(self, path):
+        """Return a metadata dict for the source pointed to by the path (str).
+        Possible keys:
+        - 'mtime' (mandatory) is the numeric timestamp of last source
+          code modification;
+        - 'size' (optional) is the size in bytes of the source code.
+        """
+        if self.path_mtime.__func__ is SourceLoader.path_mtime:
+            raise OSError
+        return {'mtime': self.path_mtime(path)}
+
+    def set_data(self, path, data):
+        """Write the bytes to the path (if possible).
+
+        Accepts a str path and data as bytes.
+
+        Any needed intermediary directories are to be created. If for some
+        reason the file cannot be written because of permissions, fail
+        silently.
+        """
+
+_register(SourceLoader, machinery.SourceFileLoader)
+                                                                                                                                                                                                                                                                                                       usr/lib/python3.11/importlib/machinery.py                                                           0000644 0000000 0000000 00000001560 14671176116 017015  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        """The machinery of importlib: finders, loaders, hooks, etc."""
+
+from ._bootstrap import ModuleSpec
+from ._bootstrap import BuiltinImporter
+from ._bootstrap import FrozenImporter
+from ._bootstrap_external import (SOURCE_SUFFIXES, DEBUG_BYTECODE_SUFFIXES,
+                     OPTIMIZED_BYTECODE_SUFFIXES, BYTECODE_SUFFIXES,
+                     EXTENSION_SUFFIXES)
+from ._bootstrap_external import WindowsRegistryFinder
+from ._bootstrap_external import PathFinder
+from ._bootstrap_external import FileFinder
+from ._bootstrap_external import SourceFileLoader
+from ._bootstrap_external import SourcelessFileLoader
+from ._bootstrap_external import ExtensionFileLoader
+from ._bootstrap_external import NamespaceLoader
+
+
+def all_suffixes():
+    """Returns a list of all recognized module suffixes for this process"""
+    return SOURCE_SUFFIXES + BYTECODE_SUFFIXES + EXTENSION_SUFFIXES
+                                                                                                                                                usr/lib/python3.11/importlib/metadata/                                                              0000755 0000000 0000000 00000000000 14714551116 016235  5                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        usr/lib/python3.11/importlib/metadata/__init__.py                                                   0000644 0000000 0000000 00000074564 14671176116 020373  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        import os
+import re
+import abc
+import csv
+import sys
+import email
+import pathlib
+import zipfile
+import operator
+import textwrap
+import warnings
+import functools
+import itertools
+import posixpath
+import collections
+
+from . import _adapters, _meta
+from ._collections import FreezableDefaultDict, Pair
+from ._functools import method_cache, pass_none
+from ._itertools import always_iterable, unique_everseen
+from ._meta import PackageMetadata, SimplePath
+
+from contextlib import suppress
+from importlib import import_module
+from importlib.abc import MetaPathFinder
+from itertools import starmap
+from typing import List, Mapping, Optional, Union
+
+
+__all__ = [
+    'Distribution',
+    'DistributionFinder',
+    'PackageMetadata',
+    'PackageNotFoundError',
+    'distribution',
+    'distributions',
+    'entry_points',
+    'files',
+    'metadata',
+    'packages_distributions',
+    'requires',
+    'version',
+]
+
+
+class PackageNotFoundError(ModuleNotFoundError):
+    """The package was not found."""
+
+    def __str__(self):
+        return f"No package metadata was found for {self.name}"
+
+    @property
+    def name(self):
+        (name,) = self.args
+        return name
+
+
+class Sectioned:
+    """
+    A simple entry point config parser for performance
+
+    >>> for item in Sectioned.read(Sectioned._sample):
+    ...     print(item)
+    Pair(name='sec1', value='# comments ignored')
+    Pair(name='sec1', value='a = 1')
+    Pair(name='sec1', value='b = 2')
+    Pair(name='sec2', value='a = 2')
+
+    >>> res = Sectioned.section_pairs(Sectioned._sample)
+    >>> item = next(res)
+    >>> item.name
+    'sec1'
+    >>> item.value
+    Pair(name='a', value='1')
+    >>> item = next(res)
+    >>> item.value
+    Pair(name='b', value='2')
+    >>> item = next(res)
+    >>> item.name
+    'sec2'
+    >>> item.value
+    Pair(name='a', value='2')
+    >>> list(res)
+    []
+    """
+
+    _sample = textwrap.dedent(
+        """
+        [sec1]
+        # comments ignored
+        a = 1
+        b = 2
+
+        [sec2]
+        a = 2
+        """
+    ).lstrip()
+
+    @classmethod
+    def section_pairs(cls, text):
+        return (
+            section._replace(value=Pair.parse(section.value))
+            for section in cls.read(text, filter_=cls.valid)
+            if section.name is not None
+        )
+
+    @staticmethod
+    def read(text, filter_=None):
+        lines = filter(filter_, map(str.strip, text.splitlines()))
+        name = None
+        for value in lines:
+            section_match = value.startswith('[') and value.endswith(']')
+            if section_match:
+                name = value.strip('[]')
+                continue
+            yield Pair(name, value)
+
+    @staticmethod
+    def valid(line):
+        return line and not line.startswith('#')
+
+
+class DeprecatedTuple:
+    """
+    Provide subscript item access for backward compatibility.
+
+    >>> recwarn = getfixture('recwarn')
+    >>> ep = EntryPoint(name='name', value='value', group='group')
+    >>> ep[:]
+    ('name', 'value', 'group')
+    >>> ep[0]
+    'name'
+    >>> len(recwarn)
+    1
+    """
+
+    _warn = functools.partial(
+        warnings.warn,
+        "EntryPoint tuple interface is deprecated. Access members by name.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+
+    def __getitem__(self, item):
+        self._warn()
+        return self._key()[item]
+
+
+class EntryPoint(DeprecatedTuple):
+    """An entry point as defined by Python packaging conventions.
+
+    See `the packaging docs on entry points
+    <https://packaging.python.org/specifications/entry-points/>`_
+    for more information.
+
+    >>> ep = EntryPoint(
+    ...     name=None, group=None, value='package.module:attr [extra1, extra2]')
+    >>> ep.module
+    'package.module'
+    >>> ep.attr
+    'attr'
+    >>> ep.extras
+    ['extra1', 'extra2']
+    """
+
+    pattern = re.compile(
+        r'(?P<module>[\w.]+)\s*'
+        r'(:\s*(?P<attr>[\w.]+)\s*)?'
+        r'((?P<extras>\[.*\])\s*)?$'
+    )
+    """
+    A regular expression describing the syntax for an entry point,
+    which might look like:
+
+        - module
+        - package.module
+        - package.module:attribute
+        - package.module:object.attribute
+        - package.module:attr [extra1, extra2]
+
+    Other combinations are possible as well.
+
+    The expression is lenient about whitespace around the ':',
+    following the attr, and following any extras.
+    """
+
+    name: str
+    value: str
+    group: str
+
+    dist: Optional['Distribution'] = None
+
+    def __init__(self, name, value, group):
+        vars(self).update(name=name, value=value, group=group)
+
+    def load(self):
+        """Load the entry point from its definition. If only a module
+        is indicated by the value, return that module. Otherwise,
+        return the named object.
+        """
+        match = self.pattern.match(self.value)
+        module = import_module(match.group('module'))
+        attrs = filter(None, (match.group('attr') or '').split('.'))
+        return functools.reduce(getattr, attrs, module)
+
+    @property
+    def module(self):
+        match = self.pattern.match(self.value)
+        return match.group('module')
+
+    @property
+    def attr(self):
+        match = self.pattern.match(self.value)
+        return match.group('attr')
+
+    @property
+    def extras(self):
+        match = self.pattern.match(self.value)
+        return re.findall(r'\w+', match.group('extras') or '')
+
+    def _for(self, dist):
+        vars(self).update(dist=dist)
+        return self
+
+    def __iter__(self):
+        """
+        Supply iter so one may construct dicts of EntryPoints by name.
+        """
+        msg = (
+            "Construction of dict of EntryPoints is deprecated in "
+            "favor of EntryPoints."
+        )
+        warnings.warn(msg, DeprecationWarning)
+        return iter((self.name, self))
+
+    def matches(self, **params):
+        """
+        EntryPoint matches the given parameters.
+
+        >>> ep = EntryPoint(group='foo', name='bar', value='bing:bong [extra1, extra2]')
+        >>> ep.matches(group='foo')
+        True
+        >>> ep.matches(name='bar', value='bing:bong [extra1, extra2]')
+        True
+        >>> ep.matches(group='foo', name='other')
+        False
+        >>> ep.matches()
+        True
+        >>> ep.matches(extras=['extra1', 'extra2'])
+        True
+        >>> ep.matches(module='bing')
+        True
+        >>> ep.matches(attr='bong')
+        True
+        """
+        attrs = (getattr(self, param) for param in params)
+        return all(map(operator.eq, params.values(), attrs))
+
+    def _key(self):
+        return self.name, self.value, self.group
+

@@ -1,0 +1,1000 @@
+            do3way=do3way,
+            parent1=path1a,
+            plabel1=label1a,
+            parent2=path1b,
+            plabel2=label1b,
+            child=path2,
+            clabel=label2,
+        )
+
+        if confirm or not guitool:
+            # Run the comparison program and wait for it to exit
+            # before we show the next file.
+            # This is because either we need to wait for confirmation
+            # from the user between each invocation, or because, as far
+            # as we know, the tool doesn't have a GUI, in which case
+            # we can't run multiple CLI programs at the same time.
+            ui.debug(
+                b'running %r in %s\n' % (pycompat.bytestr(curcmdline), tmproot)
+            )
+            ui.system(curcmdline, cwd=tmproot, blockedtag=b'extdiff')
+        else:
+            # Run the comparison program but don't wait, as we're
+            # going to rapid-fire each file diff and then wait on
+            # the whole group.
+            ui.debug(
+                b'running %r in %s (backgrounded)\n'
+                % (pycompat.bytestr(curcmdline), tmproot)
+            )
+            proc = _systembackground(curcmdline, cwd=tmproot)
+            waitprocs.append(proc)
+
+    if waitprocs:
+        with ui.timeblockedsection(b'extdiff'):
+            for proc in waitprocs:
+                proc.wait()
+
+
+def diffpatch(ui, repo, node1, node2, tmproot, matcher, cmdline):
+    template = b'hg-%h.patch'
+    # write patches to temporary files
+    with formatter.nullformatter(ui, b'extdiff', {}) as fm:
+        cmdutil.export(
+            repo,
+            [repo[node1].rev(), repo[node2].rev()],
+            fm,
+            fntemplate=repo.vfs.reljoin(tmproot, template),
+            match=matcher,
+        )
+    label1 = cmdutil.makefilename(repo[node1], template)
+    label2 = cmdutil.makefilename(repo[node2], template)
+    file1 = repo.vfs.reljoin(tmproot, label1)
+    file2 = repo.vfs.reljoin(tmproot, label2)
+    cmdline = formatcmdline(
+        cmdline,
+        repo.root,
+        # no 3way while comparing patches
+        do3way=False,
+        parent1=file1,
+        plabel1=label1,
+        # while comparing patches, there is no second parent
+        parent2=None,
+        plabel2=None,
+        child=file2,
+        clabel=label2,
+    )
+    ui.debug(b'running %r in %s\n' % (pycompat.bytestr(cmdline), tmproot))
+    ui.system(cmdline, cwd=tmproot, blockedtag=b'extdiff')
+    return 1
+
+
+def diffrevs(
+    ui,
+    repo,
+    ctx1a,
+    ctx1b,
+    ctx2,
+    matcher,
+    tmproot,
+    cmdline,
+    do3way,
+    guitool,
+    opts,
+):
+
+    subrepos = opts.get(b'subrepos')
+
+    # calculate list of files changed between both revs
+    st = ctx1a.status(ctx2, matcher, listsubrepos=subrepos)
+    mod_a, add_a, rem_a = set(st.modified), set(st.added), set(st.removed)
+    if do3way:
+        stb = ctx1b.status(ctx2, matcher, listsubrepos=subrepos)
+        mod_b, add_b, rem_b = (
+            set(stb.modified),
+            set(stb.added),
+            set(stb.removed),
+        )
+    else:
+        mod_b, add_b, rem_b = set(), set(), set()
+    modadd = mod_a | add_a | mod_b | add_b
+    common = modadd | rem_a | rem_b
+    if not common:
+        return 0
+
+    # Always make a copy of ctx1a (and ctx1b, if applicable)
+    # dir1a should contain files which are:
+    #   * modified or removed from ctx1a to ctx2
+    #   * modified or added from ctx1b to ctx2
+    #     (except file added from ctx1a to ctx2 as they were not present in
+    #     ctx1a)
+    dir1a_files = mod_a | rem_a | ((mod_b | add_b) - add_a)
+    dir1a = snapshot(ui, repo, dir1a_files, ctx1a.node(), tmproot, subrepos)[0]
+    rev1a = b'' if ctx1a.rev() is None else b'@%d' % ctx1a.rev()
+    if do3way:
+        # file calculation criteria same as dir1a
+        dir1b_files = mod_b | rem_b | ((mod_a | add_a) - add_b)
+        dir1b = snapshot(
+            ui, repo, dir1b_files, ctx1b.node(), tmproot, subrepos
+        )[0]
+        rev1b = b'@%d' % ctx1b.rev()
+    else:
+        dir1b = None
+        rev1b = b''
+
+    fnsandstat = []
+
+    # If ctx2 is not the wc or there is >1 change, copy it
+    dir2root = b''
+    rev2 = b''
+    if ctx2.node() is not None:
+        dir2 = snapshot(ui, repo, modadd, ctx2.node(), tmproot, subrepos)[0]
+        rev2 = b'@%d' % ctx2.rev()
+    elif len(common) > 1:
+        # we only actually need to get the files to copy back to
+        # the working dir in this case (because the other cases
+        # are: diffing 2 revisions or single file -- in which case
+        # the file is already directly passed to the diff tool).
+        dir2, fnsandstat = snapshot(ui, repo, modadd, None, tmproot, subrepos)
+    else:
+        # This lets the diff tool open the changed file directly
+        dir2 = b''
+        dir2root = repo.root
+
+    label1a = rev1a
+    label1b = rev1b
+    label2 = rev2
+
+    if not opts.get(b'per_file'):
+        # If only one change, diff the files instead of the directories
+        # Handle bogus modifies correctly by checking if the files exist
+        if len(common) == 1:
+            common_file = util.localpath(common.pop())
+            dir1a = os.path.join(tmproot, dir1a, common_file)
+            label1a = common_file + rev1a
+            if not os.path.isfile(dir1a):
+                dir1a = pycompat.osdevnull
+            if do3way:
+                dir1b = os.path.join(tmproot, dir1b, common_file)
+                label1b = common_file + rev1b
+                if not os.path.isfile(dir1b):
+                    dir1b = pycompat.osdevnull
+            dir2 = os.path.join(dir2root, dir2, common_file)
+            label2 = common_file + rev2
+
+        # Run the external tool on the 2 temp directories or the patches
+        cmdline = formatcmdline(
+            cmdline,
+            repo.root,
+            do3way=do3way,
+            parent1=dir1a,
+            plabel1=label1a,
+            parent2=dir1b,
+            plabel2=label1b,
+            child=dir2,
+            clabel=label2,
+        )
+        ui.debug(b'running %r in %s\n' % (pycompat.bytestr(cmdline), tmproot))
+        ui.system(cmdline, cwd=tmproot, blockedtag=b'extdiff')
+    else:
+        # Run the external tool once for each pair of files
+        _runperfilediff(
+            cmdline,
+            repo.root,
+            ui,
+            guitool=guitool,
+            do3way=do3way,
+            confirm=opts.get(b'confirm'),
+            commonfiles=common,
+            tmproot=tmproot,
+            dir1a=os.path.join(tmproot, dir1a),
+            dir1b=os.path.join(tmproot, dir1b) if do3way else None,
+            dir2=os.path.join(dir2root, dir2),
+            rev1a=rev1a,
+            rev1b=rev1b,
+            rev2=rev2,
+        )
+
+    for copy_fn, working_fn, st in fnsandstat:
+        cpstat = os.lstat(copy_fn)
+        # Some tools copy the file and attributes, so mtime may not detect
+        # all changes.  A size check will detect more cases, but not all.
+        # The only certain way to detect every case is to diff all files,
+        # which could be expensive.
+        # copyfile() carries over the permission, so the mode check could
+        # be in an 'elif' branch, but for the case where the file has
+        # changed without affecting mtime or size.
+        if (
+            cpstat[stat.ST_MTIME] != st[stat.ST_MTIME]
+            or cpstat.st_size != st.st_size
+            or (cpstat.st_mode & 0o100) != (st.st_mode & 0o100)
+        ):
+            ui.debug(
+                b'file changed while diffing. '
+                b'Overwriting: %s (src: %s)\n' % (working_fn, copy_fn)
+            )
+            util.copyfile(copy_fn, working_fn)
+
+    return 1
+
+
+def dodiff(ui, repo, cmdline, pats, opts, guitool=False):
+    """Do the actual diff:
+
+    - copy to a temp structure if diffing 2 internal revisions
+    - copy to a temp structure if diffing working revision with
+      another one and more than 1 file is changed
+    - just invoke the diff for a single file in the working dir
+    """
+
+    cmdutil.check_at_most_one_arg(opts, b'rev', b'change')
+    revs = opts.get(b'rev')
+    from_rev = opts.get(b'from')
+    to_rev = opts.get(b'to')
+    change = opts.get(b'change')
+    do3way = b'$parent2' in cmdline
+
+    if change:
+        ctx2 = logcmdutil.revsingle(repo, change, None)
+        ctx1a, ctx1b = ctx2.p1(), ctx2.p2()
+    elif from_rev or to_rev:
+        repo = scmutil.unhidehashlikerevs(
+            repo, [from_rev] + [to_rev], b'nowarn'
+        )
+        ctx1a = logcmdutil.revsingle(repo, from_rev, None)
+        ctx1b = repo[nullrev]
+        ctx2 = logcmdutil.revsingle(repo, to_rev, None)
+    else:
+        ctx1a, ctx2 = logcmdutil.revpair(repo, revs)
+        if not revs:
+            ctx1b = repo[None].p2()
+        else:
+            ctx1b = repo[nullrev]
+
+    # Disable 3-way merge if there is only one parent
+    if do3way:
+        if ctx1b.rev() == nullrev:
+            do3way = False
+
+    matcher = scmutil.match(ctx2, pats, opts)
+
+    if opts.get(b'patch'):
+        if opts.get(b'subrepos'):
+            raise error.Abort(_(b'--patch cannot be used with --subrepos'))
+        if opts.get(b'per_file'):
+            raise error.Abort(_(b'--patch cannot be used with --per-file'))
+        if ctx2.node() is None:
+            raise error.Abort(_(b'--patch requires two revisions'))
+
+    tmproot = pycompat.mkdtemp(prefix=b'extdiff.')
+    try:
+        if opts.get(b'patch'):
+            return diffpatch(
+                ui, repo, ctx1a.node(), ctx2.node(), tmproot, matcher, cmdline
+            )
+
+        return diffrevs(
+            ui,
+            repo,
+            ctx1a,
+            ctx1b,
+            ctx2,
+            matcher,
+            tmproot,
+            cmdline,
+            do3way,
+            guitool,
+            opts,
+        )
+
+    finally:
+        ui.note(_(b'cleaning up temp directory\n'))
+        shutil.rmtree(tmproot)
+
+
+extdiffopts = (
+    [
+        (
+            b'o',
+            b'option',
+            [],
+            _(b'pass option to comparison program'),
+            _(b'OPT'),
+        ),
+        (b'r', b'rev', [], _(b'revision (DEPRECATED)'), _(b'REV')),
+        (b'', b'from', b'', _(b'revision to diff from'), _(b'REV1')),
+        (b'', b'to', b'', _(b'revision to diff to'), _(b'REV2')),
+        (b'c', b'change', b'', _(b'change made by revision'), _(b'REV')),
+        (
+            b'',
+            b'per-file',
+            False,
+            _(b'compare each file instead of revision snapshots'),
+        ),
+        (
+            b'',
+            b'confirm',
+            False,
+            _(b'prompt user before each external program invocation'),
+        ),
+        (b'', b'patch', None, _(b'compare patches for two revisions')),
+    ]
+    + cmdutil.walkopts
+    + cmdutil.subrepoopts
+)
+
+
+@command(
+    b'extdiff',
+    [
+        (b'p', b'program', b'', _(b'comparison program to run'), _(b'CMD')),
+    ]
+    + extdiffopts,
+    _(b'hg extdiff [OPT]... [FILE]...'),
+    helpcategory=command.CATEGORY_FILE_CONTENTS,
+    inferrepo=True,
+)
+def extdiff(ui, repo, *pats, **opts):
+    """use external program to diff repository (or selected files)
+
+    Show differences between revisions for the specified files, using
+    an external program. The default program used is diff, with
+    default options "-Npru".
+
+    To select a different program, use the -p/--program option. The
+    program will be passed the names of two directories to compare,
+    unless the --per-file option is specified (see below). To pass
+    additional options to the program, use -o/--option. These will be
+    passed before the names of the directories or files to compare.
+
+    The --from, --to, and --change options work the same way they do for
+    :hg:`diff`.
+
+    The --per-file option runs the external program repeatedly on each
+    file to diff, instead of once on two directories. By default,
+    this happens one by one, where the next file diff is open in the
+    external program only once the previous external program (for the
+    previous file diff) has exited. If the external program has a
+    graphical interface, it can open all the file diffs at once instead
+    of one by one. See :hg:`help -e extdiff` for information about how
+    to tell Mercurial that a given program has a graphical interface.
+
+    The --confirm option will prompt the user before each invocation of
+    the external program. It is ignored if --per-file isn't specified.
+    """
+    opts = pycompat.byteskwargs(opts)
+    program = opts.get(b'program')
+    option = opts.get(b'option')
+    if not program:
+        program = b'diff'
+        option = option or [b'-Npru']
+    cmdline = b' '.join(map(procutil.shellquote, [program] + option))
+    return dodiff(ui, repo, cmdline, pats, opts)
+
+
+class savedcmd:
+    """use external program to diff repository (or selected files)
+
+    Show differences between revisions for the specified files, using
+    the following program::
+
+        %(path)s
+
+    When two revision arguments are given, then changes are shown
+    between those revisions. If only one revision is specified then
+    that revision is compared to the working directory, and, when no
+    revisions are specified, the working directory files are compared
+    to its parent.
+    """
+
+    def __init__(self, path, cmdline, isgui):
+        # We can't pass non-ASCII through docstrings (and path is
+        # in an unknown encoding anyway), but avoid double separators on
+        # Windows
+        docpath = stringutil.escapestr(path).replace(b'\\\\', b'\\')
+        self.__doc__ %= {'path': pycompat.sysstr(stringutil.uirepr(docpath))}
+        self._cmdline = cmdline
+        self._isgui = isgui
+
+    def __call__(self, ui, repo, *pats, **opts):
+        opts = pycompat.byteskwargs(opts)
+        options = b' '.join(map(procutil.shellquote, opts[b'option']))
+        if options:
+            options = b' ' + options
+        return dodiff(
+            ui, repo, self._cmdline + options, pats, opts, guitool=self._isgui
+        )
+
+
+def _gettooldetails(ui, cmd, path):
+    """
+    returns following things for a
+    ```
+    [extdiff]
+    <cmd> = <path>
+    ```
+    entry:
+
+    cmd: command/tool name
+    path: path to the tool
+    cmdline: the command which should be run
+    isgui: whether the tool uses GUI or not
+
+    Reads all external tools related configs, whether it be extdiff section,
+    diff-tools or merge-tools section, or its specified in an old format or
+    the latest format.
+    """
+    path = util.expandpath(path)
+    if cmd.startswith(b'cmd.'):
+        cmd = cmd[4:]
+        if not path:
+            path = procutil.findexe(cmd)
+            if path is None:
+                path = filemerge.findexternaltool(ui, cmd) or cmd
+        diffopts = ui.config(b'extdiff', b'opts.' + cmd)
+        cmdline = procutil.shellquote(path)
+        if diffopts:
+            cmdline += b' ' + diffopts
+        isgui = ui.configbool(b'extdiff', b'gui.' + cmd)
+    else:
+        if path:
+            # case "cmd = path opts"
+            cmdline = path
+            diffopts = len(pycompat.shlexsplit(cmdline)) > 1
+        else:
+            # case "cmd ="
+            path = procutil.findexe(cmd)
+            if path is None:
+                path = filemerge.findexternaltool(ui, cmd) or cmd
+            cmdline = procutil.shellquote(path)
+            diffopts = False
+        isgui = ui.configbool(b'extdiff', b'gui.' + cmd)
+    # look for diff arguments in [diff-tools] then [merge-tools]
+    if not diffopts:
+        key = cmd + b'.diffargs'
+        for section in (b'diff-tools', b'merge-tools'):
+            args = ui.config(section, key)
+            if args:
+                cmdline += b' ' + args
+                if isgui is None:
+                    isgui = ui.configbool(section, cmd + b'.gui') or False
+                break
+    return cmd, path, cmdline, isgui
+
+
+def uisetup(ui):
+    for cmd, path in ui.configitems(b'extdiff'):
+        if cmd.startswith(b'opts.') or cmd.startswith(b'gui.'):
+            continue
+        cmd, path, cmdline, isgui = _gettooldetails(ui, cmd, path)
+        command(
+            cmd,
+            extdiffopts[:],
+            _(b'hg %s [OPTION]... [FILE]...') % cmd,
+            helpcategory=command.CATEGORY_FILE_CONTENTS,
+            inferrepo=True,
+        )(savedcmd(path, cmdline, isgui))
+
+
+# tell hggettext to extract docstrings from these functions:
+i18nfunctions = [savedcmd]
+                                                                                                                                                                     usr/lib/python3/dist-packages/hgext/factotum.py                                                     0000644 0000000 0000000 00000011524 14355257011 020267  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        # factotum.py - Plan 9 factotum integration for Mercurial
+#
+# Copyright (C) 2012 Steven Stallion <sstallion@gmail.com>
+#
+# This program is free software; you can redistribute it and/or modify it
+# under the terms of the GNU General Public License as published by the
+# Free Software Foundation; either version 2 of the License, or (at your
+# option) any later version.
+#
+# This program is distributed in the hope that it will be useful, but
+# WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General
+# Public License for more details.
+#
+# You should have received a copy of the GNU General Public License along
+# with this program; if not, write to the Free Software Foundation, Inc.,
+# 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
+
+'''http authentication with factotum
+
+This extension allows the factotum(4) facility on Plan 9 from Bell Labs
+platforms to provide authentication information for HTTP access. Configuration
+entries specified in the auth section as well as authentication information
+provided in the repository URL are fully supported. If no prefix is specified,
+a value of "*" will be assumed.
+
+By default, keys are specified as::
+
+  proto=pass service=hg prefix=<prefix> user=<username> !password=<password>
+
+If the factotum extension is unable to read the required key, one will be
+requested interactively.
+
+A configuration section is available to customize runtime behavior. By
+default, these entries are::
+
+  [factotum]
+  executable = /bin/auth/factotum
+  mountpoint = /mnt/factotum
+  service = hg
+
+The executable entry defines the full path to the factotum binary. The
+mountpoint entry defines the path to the factotum file service. Lastly, the
+service entry controls the service name used when reading keys.
+
+'''
+
+
+import os
+from mercurial.i18n import _
+from mercurial.pycompat import setattr
+from mercurial.utils import procutil
+from mercurial import (
+    error,
+    httpconnection,
+    registrar,
+    url,
+    util,
+)
+
+urlreq = util.urlreq
+passwordmgr = url.passwordmgr
+
+ERRMAX = 128
+
+_executable = _mountpoint = _service = None
+
+configtable = {}
+configitem = registrar.configitem(configtable)
+
+configitem(
+    b'factotum',
+    b'executable',
+    default=b'/bin/auth/factotum',
+)
+configitem(
+    b'factotum',
+    b'mountpoint',
+    default=b'/mnt/factotum',
+)
+configitem(
+    b'factotum',
+    b'service',
+    default=b'hg',
+)
+
+
+def auth_getkey(self, params):
+    if not self.ui.interactive():
+        raise error.Abort(_(b'factotum not interactive'))
+    if b'user=' not in params:
+        params = b'%s user?' % params
+    params = b'%s !password?' % params
+    os.system(procutil.tonativestr(b"%s -g '%s'" % (_executable, params)))
+
+
+def auth_getuserpasswd(self, getkey, params):
+    params = b'proto=pass %s' % params
+    while True:
+        fd = os.open(b'%s/rpc' % _mountpoint, os.O_RDWR)
+        try:
+            os.write(fd, b'start %s' % params)
+            l = os.read(fd, ERRMAX).split()
+            if l[0] == b'ok':
+                os.write(fd, b'read')
+                status, user, passwd = os.read(fd, ERRMAX).split(None, 2)
+                if status == b'ok':
+                    if passwd.startswith(b"'"):
+                        if passwd.endswith(b"'"):
+                            passwd = passwd[1:-1].replace(b"''", b"'")
+                        else:
+                            raise error.Abort(_(b'malformed password string'))
+                    return (user, passwd)
+        except (OSError, IOError):
+            raise error.Abort(_(b'factotum not responding'))
+        finally:
+            os.close(fd)
+        getkey(self, params)
+
+
+def monkeypatch_method(cls):
+    def decorator(func):
+        setattr(cls, func.__name__, func)
+        return func
+
+    return decorator
+
+
+@monkeypatch_method(passwordmgr)
+def find_user_password(self, realm, authuri):
+    user, passwd = self.passwddb.find_user_password(realm, authuri)
+    if user and passwd:
+        self._writedebug(user, passwd)
+        return (user, passwd)
+
+    prefix = b''
+    res = httpconnection.readauthforuri(self.ui, authuri, user)
+    if res:
+        _, auth = res
+        prefix = auth.get(b'prefix')
+        user, passwd = auth.get(b'username'), auth.get(b'password')
+    if not user or not passwd:
+        if not prefix:
+            prefix = realm.split(b' ')[0].lower()
+        params = b'service=%s prefix=%s' % (_service, prefix)
+        if user:
+            params = b'%s user=%s' % (params, user)
+        user, passwd = auth_getuserpasswd(self, auth_getkey, params)
+
+    self.add_password(realm, authuri, user, passwd)
+    self._writedebug(user, passwd)
+    return (user, passwd)
+
+
+def uisetup(ui):
+    global _executable
+    _executable = ui.config(b'factotum', b'executable')
+    global _mountpoint
+    _mountpoint = ui.config(b'factotum', b'mountpoint')
+    global _service
+    _service = ui.config(b'factotum', b'service')
+                                                                                                                                                                            usr/lib/python3/dist-packages/hgext/fastannotate/                                                   0000755 0000000 0000000 00000000000 14714551121 020555  5                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        usr/lib/python3/dist-packages/hgext/fastannotate/__init__.py                                        0000644 0000000 0000000 00000014604 14355257011 022675  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        # Copyright 2016-present Facebook. All Rights Reserved.
+#
+# fastannotate: faster annotate implementation using linelog
+#
+# This software may be used and distributed according to the terms of the
+# GNU General Public License version 2 or any later version.
+"""yet another annotate implementation that might be faster (EXPERIMENTAL)
+
+The fastannotate extension provides a 'fastannotate' command that makes
+use of the linelog data structure as a cache layer and is expected to
+be faster than the vanilla 'annotate' if the cache is present.
+
+In most cases, fastannotate requires a setup that mainbranch is some pointer
+that always moves forward, to be most efficient.
+
+Using fastannotate together with linkrevcache would speed up building the
+annotate cache greatly. Run "debugbuildlinkrevcache" before
+"debugbuildannotatecache".
+
+::
+
+    [fastannotate]
+    # specify the main branch head. the internal linelog will only contain
+    # the linear (ignoring p2) "mainbranch". since linelog cannot move
+    # backwards without a rebuild, this should be something that always moves
+    # forward, usually it is "master" or "@".
+    mainbranch = master
+
+    # fastannotate supports different modes to expose its feature.
+    # a list of combination:
+    # - fastannotate: expose the feature via the "fastannotate" command which
+    #   deals with everything in a most efficient way, and provides extra
+    #   features like --deleted etc.
+    # - fctx: replace fctx.annotate implementation. note:
+    #     a. it is less efficient than the "fastannotate" command
+    #     b. it will make it practically impossible to access the old (disk
+    #        side-effect free) annotate implementation
+    #     c. it implies "hgweb".
+    # - hgweb: replace hgweb's annotate implementation. conflict with "fctx".
+    # (default: fastannotate)
+    modes = fastannotate
+
+    # default format when no format flags are used (default: number)
+    defaultformat = changeset, user, date
+
+    # serve the annotate cache via wire protocol (default: False)
+    # tip: the .hg/fastannotate directory is portable - can be rsynced
+    server = True
+
+    # build annotate cache on demand for every client request (default: True)
+    # disabling it could make server response faster, useful when there is a
+    # cronjob building the cache.
+    serverbuildondemand = True
+
+    # update local annotate cache from remote on demand
+    client = False
+
+    # path to use when connecting to the remote server (default: default)
+    remotepath = default
+
+    # minimal length of the history of a file required to fetch linelog from
+    # the server. (default: 10)
+    clientfetchthreshold = 10
+
+    # for "fctx" mode, always follow renames regardless of command line option.
+    # this is a BC with the original command but will reduced the space needed
+    # for annotate cache, and is useful for client-server setup since the
+    # server will only provide annotate cache with default options (i.e. with
+    # follow). do not affect "fastannotate" mode. (default: True)
+    forcefollow = True
+
+    # for "fctx" mode, always treat file as text files, to skip the "isbinary"
+    # check. this is consistent with the "fastannotate" command and could help
+    # to avoid a file fetch if remotefilelog is used. (default: True)
+    forcetext = True
+
+    # use unfiltered repo for better performance.
+    unfilteredrepo = True
+
+    # sacrifice correctness in some corner cases for performance. it does not
+    # affect the correctness of the annotate cache being built. the option
+    # is experimental and may disappear in the future (default: False)
+    perfhack = True
+"""
+
+# TODO from import:
+# * `branch` is probably the wrong term, throughout the code.
+#
+# * replace the fastannotate `modes` configuration with a collection
+#   of booleans.
+#
+# * Use the templater instead of bespoke formatting
+#
+# * rename the config knob for updating the local cache from a remote server
+#
+# * revise wireprotocol for sharing annotate files
+#
+# * figure out a sensible default for `mainbranch` (with the caveat
+#   that we probably also want to figure out a better term than
+#   `branch`, see above)
+#
+# * format changes to the revmap file (maybe use length-encoding
+#   instead of null-terminated file paths at least?)
+
+from mercurial.i18n import _
+from mercurial import (
+    error as hgerror,
+    localrepo,
+    registrar,
+)
+
+from . import (
+    commands,
+    protocol,
+)
+
+# Note for extension authors: ONLY specify testedwith = 'ships-with-hg-core' for
+# extensions which SHIP WITH MERCURIAL. Non-mainline extensions should
+# be specifying the version(s) of Mercurial they are tested with, or
+# leave the attribute unspecified.
+testedwith = b'ships-with-hg-core'
+
+cmdtable = commands.cmdtable
+
+configtable = {}
+configitem = registrar.configitem(configtable)
+
+configitem(b'fastannotate', b'modes', default=[b'fastannotate'])
+configitem(b'fastannotate', b'server', default=False)
+configitem(b'fastannotate', b'client', default=False)
+configitem(b'fastannotate', b'unfilteredrepo', default=True)
+configitem(b'fastannotate', b'defaultformat', default=[b'number'])
+configitem(b'fastannotate', b'perfhack', default=False)
+configitem(b'fastannotate', b'mainbranch')
+configitem(b'fastannotate', b'forcetext', default=True)
+configitem(b'fastannotate', b'forcefollow', default=True)
+configitem(b'fastannotate', b'clientfetchthreshold', default=10)
+configitem(b'fastannotate', b'serverbuildondemand', default=True)
+configitem(b'fastannotate', b'remotepath', default=b'default')
+
+
+def uisetup(ui):
+    modes = set(ui.configlist(b'fastannotate', b'modes'))
+    if b'fctx' in modes:
+        modes.discard(b'hgweb')
+    for name in modes:
+        if name == b'fastannotate':
+            commands.registercommand()
+        elif name == b'hgweb':
+            from . import support
+
+            support.replacehgwebannotate()
+        elif name == b'fctx':
+            from . import support
+
+            support.replacefctxannotate()
+            commands.wrapdefault()
+        else:
+            raise hgerror.Abort(_(b'fastannotate: invalid mode: %s') % name)
+
+    if ui.configbool(b'fastannotate', b'server'):
+        protocol.serveruisetup(ui)
+
+
+def extsetup(ui):
+    # fastannotate has its own locking, without depending on repo lock
+    # TODO: avoid mutating this unless the specific repo has it enabled
+    localrepo.localrepository._wlockfreeprefix.add(b'fastannotate/')
+
+
+def reposetup(ui, repo):
+    if ui.configbool(b'fastannotate', b'client'):
+        protocol.clientreposetup(ui, repo)
+                                                                                                                            usr/lib/python3/dist-packages/hgext/fastannotate/__pycache__/                                       0000755 0000000 0000000 00000000000 14714551121 022765  5                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        usr/lib/python3/dist-packages/hgext/fastannotate/__pycache__/__init__.cpython-311.pyc               0000644 0000000 0000000 00000015013 14714551121 027226  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        §
+    	^µc„  ã                   óÒ  — d Z ddlmZ ddlmZmZmZ ddlm	Z	m
+Z
+ dZe	j        Zi Z ej        e¦  «        Z edddg¬	¦  «          edd
+d¬	¦  «          eddd¬	¦  «          eddd¬	¦  «          edddg¬	¦  «          eddd¬	¦  «          edd¦  «          eddd¬	¦  «          eddd¬	¦  «          eddd¬	¦  «          eddd¬	¦  «          eddd¬	¦  «         d„ Zd„ Zd„ ZdS )a*  yet another annotate implementation that might be faster (EXPERIMENTAL)
+
+The fastannotate extension provides a 'fastannotate' command that makes
+use of the linelog data structure as a cache layer and is expected to
+be faster than the vanilla 'annotate' if the cache is present.
+
+In most cases, fastannotate requires a setup that mainbranch is some pointer
+that always moves forward, to be most efficient.
+
+Using fastannotate together with linkrevcache would speed up building the
+annotate cache greatly. Run "debugbuildlinkrevcache" before
+"debugbuildannotatecache".
+
+::
+
+    [fastannotate]
+    # specify the main branch head. the internal linelog will only contain
+    # the linear (ignoring p2) "mainbranch". since linelog cannot move
+    # backwards without a rebuild, this should be something that always moves
+    # forward, usually it is "master" or "@".
+    mainbranch = master
+
+    # fastannotate supports different modes to expose its feature.
+    # a list of combination:
+    # - fastannotate: expose the feature via the "fastannotate" command which
+    #   deals with everything in a most efficient way, and provides extra
+    #   features like --deleted etc.
+    # - fctx: replace fctx.annotate implementation. note:
+    #     a. it is less efficient than the "fastannotate" command
+    #     b. it will make it practically impossible to access the old (disk
+    #        side-effect free) annotate implementation
+    #     c. it implies "hgweb".
+    # - hgweb: replace hgweb's annotate implementation. conflict with "fctx".
+    # (default: fastannotate)
+    modes = fastannotate
+
+    # default format when no format flags are used (default: number)
+    defaultformat = changeset, user, date
+
+    # serve the annotate cache via wire protocol (default: False)
+    # tip: the .hg/fastannotate directory is portable - can be rsynced
+    server = True
+
+    # build annotate cache on demand for every client request (default: True)
+    # disabling it could make server response faster, useful when there is a
+    # cronjob building the cache.
+    serverbuildondemand = True
+
+    # update local annotate cache from remote on demand
+    client = False
+
+    # path to use when connecting to the remote server (default: default)
+    remotepath = default
+
+    # minimal length of the history of a file required to fetch linelog from
+    # the server. (default: 10)
+    clientfetchthreshold = 10
+
+    # for "fctx" mode, always follow renames regardless of command line option.
+    # this is a BC with the original command but will reduced the space needed
+    # for annotate cache, and is useful for client-server setup since the
+    # server will only provide annotate cache with default options (i.e. with
+    # follow). do not affect "fastannotate" mode. (default: True)
+    forcefollow = True
+
+    # for "fctx" mode, always treat file as text files, to skip the "isbinary"
+    # check. this is consistent with the "fastannotate" command and could help
+    # to avoid a file fetch if remotefilelog is used. (default: True)
+    forcetext = True
+
+    # use unfiltered repo for better performance.
+    unfilteredrepo = True
+
+    # sacrifice correctness in some corner cases for performance. it does not
+    # affect the correctness of the annotate cache being built. the option
+    # is experimental and may disappear in the future (default: False)
+    perfhack = True
+é    )Ú_)ÚerrorÚ	localrepoÚ	registraré   )ÚcommandsÚprotocols   ships-with-hg-coreó   fastannotateó   modes)Údefaultó   serverFó   clients   unfilteredrepoTs   defaultformats   numbers   perfhacks
+   mainbranchs	   forcetexts   forcefollows   clientfetchthresholdé
+   s   serverbuildondemands
+   remotepaths   defaultc                 ó  — t          |                      dd¦  «        ¦  «        }d|v r|                     d¦  «         |D ]”}|dk    rt          j        ¦   «          Œ|dk    rddlm} |                     ¦   «          Œ=|dk    r.ddlm} |                     ¦   «          t          j	        ¦   «          Œqt          j        t          d¦  «        |z  ¦  «        ‚|                      dd¦  «        rt          j        | ¦  «         d S d S )	Nr
+   r   s   fctxs   hgwebr   )Úsupports   fastannotate: invalid mode: %sr   )ÚsetÚ
+configlistÚdiscardr   ÚregistercommandÚ r   ÚreplacehgwebannotateÚreplacefctxannotateÚwrapdefaultÚhgerrorÚAbortr   Ú
+configboolr	   Úserveruisetup)ÚuiÚmodesÚnamer   s       ú=/usr/lib/python3/dist-packages/hgext/fastannotate/__init__.pyÚuisetupr"      s.  € İ—’˜o¨xÑ8Ô8Ñ9Ô9€EØ%ĞĞØŠhÑÔĞØğ Mğ MˆØ?Ò"Ğ"İÔ$Ñ&Ô&Ğ&Ğ&ØXÒĞØ!Ğ!Ğ!Ğ!Ğ!Ğ!à×(Ò(Ñ*Ô*Ğ*Ğ*ØWŠ_ˆ_Ø!Ğ!Ğ!Ğ!Ğ!Ğ!à×'Ò'Ñ)Ô)Ğ)İÔ Ñ"Ô"Ğ"Ğ"å”-¥Ğ"CÑ DÔ DÀtÑ KÑLÔLĞLà	‡}‚}_ iÑ0Ô0ğ #İÔ˜rÑ"Ô"Ğ"Ğ"Ğ"ğ#ğ #ó    c                 óN   — t           j        j                             d¦  «         d S )Ns   fastannotate/)r   ÚlocalrepositoryÚ_wlockfreeprefixÚadd)r   s    r!   Úextsetupr(   ¥   s%   € õ ÔÔ.×2Ò2Ğ3CÑDÔDĞDĞDĞDr#   c                 ó`   — |                       dd¦  «        rt          j        | |¦  «         d S d S )Nr
+   r   )r   r	   Úclientreposetup)r   Úrepos     r!   Ú	reposetupr,   «   s;   € Ø	‡}‚}_ iÑ0Ô0ğ +İÔ   TÑ*Ô*Ğ*Ğ*Ğ*ğ+ğ +r#   N)Ú__doc__Úmercurial.i18nr   Ú	mercurialr   r   r   r   r   r   r	   Ú
+testedwithÚcmdtableÚconfigtableÚ
+configitemr"   r(   r,   © r#   r!   ú<module>r5      sø  ğğMğ MğD Ğ Ğ Ğ Ğ Ğ ğğ ğ ğ ğ ğ ğ ğ ğ ğ ğğ ğ ğ ğ ğ ğ ğ ğ #€
+àÔ€à€Ø!ˆYÔ! +Ñ.Ô.€
+à 
+€
+ˆ?˜H¨Ğ.?Ğ @Ñ @Ô @Ğ @Ø 
+€
+ˆ?˜I¨uĞ 5Ñ 5Ô 5Ğ 5Ø 
+€
+ˆ?˜I¨uĞ 5Ñ 5Ô 5Ğ 5Ø 
+€
+ˆ?Ğ-°tĞ <Ñ <Ô <Ğ <Ø 
+€
+ˆ?Ğ,°y°kĞ BÑ BÔ BĞ BØ 
+€
+ˆ?˜K°Ğ 7Ñ 7Ô 7Ğ 7Ø 
+€
+ˆ?˜MÑ *Ô *Ğ *Ø 
+€
+ˆ?˜L°$Ğ 7Ñ 7Ô 7Ğ 7Ø 
+€
+ˆ?˜N°DĞ 9Ñ 9Ô 9Ğ 9Ø 
+€
+ˆ?Ğ3¸RĞ @Ñ @Ô @Ğ @Ø 
+€
+ˆ?Ğ2¸DĞ AÑ AÔ AĞ AØ 
+€
+ˆ?˜M°:Ğ >Ñ >Ô >Ğ >ğ#ğ #ğ #ğ.Eğ Eğ Eğ+ğ +ğ +ğ +ğ +r#                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        usr/lib/python3/dist-packages/hgext/fastannotate/__pycache__/commands.cpython-311.pyc               0000644 0000000 0000000 00000037650 14714551121 027303  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        §
+    	^µcz/  ã                   óB  — d dl Z d dlmZ d dlmZmZmZmZmZm	Z	m
+Z
+mZmZmZ ddlmZmZmZ i Z ej        e¦  «        Zej        fd„Zddd	 ed
+¦  «         ed¦  «        fddd ed¦  «        fddd ed¦  «        fddd ed¦  «        fddd ed¦  «        fddd ed¦  «        fddd ed¦  «        fddd ed ¦  «        fd!d"d ed#¦  «        fd!d$d ed%¦  «        fd!d&d ed'¦  «        fd!d(d ed)¦  «        fd!d*d ed+¦  «        fgej        z   ej        z   ej        z    ed,¦  «        d-d.œZd/„ Z e¦   «         Zd0„ ed1         ej        z   D ¦   «         Z d2„ Z!d3„ Z"d4„ Z# ed5ddd! ed6¦  «         ed¦  «        fgej        z    ed7¦  «        ¦  «        d8„ ¦   «         Z$dS )9é    N)Ú_)
+ÚcommandsÚencodingÚerrorÚ
+extensionsÚ
+logcmdutilÚpatchÚpycompatÚ	registrarÚscmutilÚutilé   )Úcontextr   Ú	formatterc              #   óœ  ‡ ‡‡‡K  — ‰ j                              dd¦  «        }|r±t          j                             ‰ j        ¦  «        Št          j                             t          j        ¦   «         ‰¦  «        }|dk    rd}t          ˆfd„t          j
+        D ¦   «         ¦  «        rd}n,ˆfd„|D ¦   «         }t          ˆˆ fd„|D ¦   «         ¦  «        rd}|r)|D ]$}t          j                             ||¦  «        V — Œ%dS d	„ }	t          j        ‰ |¦  «        }
+t          j        |
+|‰|	¬
+¦  «        }|
+                     |¦  «        D ]}|V — ŒdS )z&generate paths matching given patternsó   fastannotates   perfhackó   .ó    c              3   óN   •K  — | ]}‰                      |d          ¦  «        V — Œ dS )r   N©Úget)Ú.0ÚoÚoptss     €ú=/usr/lib/python3/dist-packages/hgext/fastannotate/commands.pyú	<genexpr>z_matchpaths.<locals>.<genexpr>1   s1   øè è € Ğ9Ğ9 !ˆtxŠx˜˜!œ‰~Œ~Ğ9Ğ9Ğ9Ğ9Ğ9Ğ9r   Fc                 ó’   •— g | ]C}t           j                             |¦  «        r t           j                             |‰¦  «        n|‘ŒDS © )ÚosÚpathÚisabsÚrelpath)r   ÚpÚreporoots     €r   ú
+<listcomp>z_matchpaths.<locals>.<listcomp>4   sQ   ø€ ğ ğ ğ àõ 13´·²¸aÑ0@Ô0@ĞG•”—’  8Ñ,Ô,Ğ,Àağğ ğ r   c              3   ó’   •K  — | ]A}d |v p8t           j                             t          j        ‰|‰¦  «        j        ¦  «         V — ŒBdS )s   ..N)r   r    ÚisfileÚ	facontextÚ
+pathhelperÚlinelogpath)r   ÚfÚaoptsÚrepos     €€r   r   z_matchpaths.<locals>.<genexpr>9   so   øè è € ğ ğ ğ ğ ˜QJğ İœ7Ÿ>š>İ!Ô,¨T°1°eÑ<Ô<ÔHñô ğ ğğ ğ ğ ğ ğ r   c                 ó4   — t          j        d| |fz  ¦  «        ‚)Ns   %s: %s)r   ÚAbort)ÚxÚys     r   Úbadz_matchpaths.<locals>.badK   s   € İ”+˜i¨1¨a¨&Ñ0Ñ1Ô1Ğ1r   )ÚbadfnN)ÚuiÚ
+configboolr   r    Údirnamer"   r   ÚgetcwdÚanyr   ÚwalkoptsÚjoinr   Ú	revsingler   ÚmatchÚwalk)r-   ÚrevÚpatsr   r,   ÚperfhackÚreldirÚrelpatsr#   r2   ÚctxÚmr$   s   `  ``       @r   Ú_matchpathsrE   #   sµ  øøøøè è € àŒw×!Ò! /°;Ñ?Ô?€Hğ ğ !å”7—?’? 4¤9Ñ-Ô-ˆİ”—’¥¤Ñ!2Ô!2°HÑ=Ô=ˆØTŠ>ˆ>ØˆFİĞ9Ğ9Ğ9Ğ9¥xÔ'8Ğ9Ñ9Ô9Ñ9Ô9ğ 	!ØˆHˆHğğ ğ ğ àğñ ô ˆGõ
+ ğ ğ ğ ğ ğ ğ !ğñ ô ñ ô ğ 	!ğ !ğ ğ Øğ 	*ğ 	*ˆAİ”'—,’,˜v qÑ)Ô)Ğ)Ğ)Ğ)Ğ)ğ	*ğ 	*ğ	2ğ 	2ğ 	2õ Ô" 4¨Ñ-Ô-ˆİŒM˜#˜t T°Ğ5Ñ5Ô5ˆØ—’˜!‘”ğ 	ğ 	ˆAØˆGˆGˆGˆGğ	ğ 	r   ó   ró   revr   s   annotate the specified revisionó   REVó   uó   users   list the author (long with -v)ó   fó   files   list the filenameó   dó   dates   list the date (short with -q)ó   nó   numbers"   list the revision number (default)ó   có	   changesets   list the changesetó   ls   line-numbers(   show line number at the first appearanceó   eó   deleteds(   show deleted lines (slow) (EXPERIMENTAL)r   s
+   no-contents'   do not show file content (EXPERIMENTAL)s	   no-follows   don't follow copies and renamesó   linearsE   enforce linear history, ignore second parent of merges (EXPERIMENTAL)s	   long-hashs'   show long changeset hash (EXPERIMENTAL)ó   rebuilds.   rebuild cache even if it exists (EXPERIMENTAL)s3   [-r REV] [-f] [-a] [-u] [-d] [-n] [-c] [-l] FILE...T)ÚoptionsÚsynopsisÚ	inferrepoc           	      ó  ‡— |s!t          j        t          d¦  «        ¦  «        ‚|                      dd¦  «        r|                     ¦   «         }t          j        ‰¦  «        Š‰                     dd¦  «        }‰                     dd¦  «        }t          j	        | ‰dd	¬
+¦  «        }t          j        |‰                     dd¦  «         ‰                     dd¦  «         ¬¦  «        }t          ˆfd„dD ¦   «         ¦  «        s |                      dddg¦  «        D ]}d	‰|<   Œ|                      d¦  «         ‰                     d¦  «        }	|	dk    rt          j        | |‰¦  «        }
+nt          j        | |‰¦  «        }
+‰                     dd¦  «        }t%          ‰                     d¦  «        ¦  «         }‰                     dd¦  «        }|                      dd¦  «        p|}t)          t+          |||‰|¦  «        ¦  «        }t-          j        |d¦  «        r|                     |¦  «         |D ]Á}dx}x}}	 	 t          j        ||||¦  «        5 }|                     ||||o| ¬¦  «        }|r$d„ |D ¦   «         }|                     |||¬¦  «        }ddd¦  «         n# 1 swxY w Y   n&# t8          j        t8          j        f$ r |r‚ d	}Y Œ–w xY w|r|\  }}|
+                     |||¬¦  «         ŒÂ|
+                      ¦   «          dS )aà  show changeset information by line for each file
+
+    List changes in files, showing the revision id responsible for each line.
+
+    This command is useful for discovering when a change was made and by whom.
+
+    By default this command prints revision numbers. If you include --file,
+    --user, or --date, the revision number is suppressed unless you also
+    include --number. The default format can also be customized by setting
+    fastannotate.defaultformat.
+
+    Returns 0 on success.
+
+    .. container:: verbose
+
+        This command uses an implementation different from the vanilla annotate
+        command, which may produce slightly different (while still reasonable)
+        outputs for some cases.
+
+        Unlike the vanilla anootate, fastannotate follows rename regardless of
+        the existence of --file.
+
+        For the best performance when running on a full repo, use -c, -l,
+        avoid -u, -d, -n. Use --linear and --no-content to make it even faster.
+
+        For the best performance when running on a shallow (remotefilelog)
+        repo, avoid --linear, --no-follow, or any diff options. As the server
+        won't be able to populate annotate cache when non-default options
+        affecting results are used.
+    s,   at least one filename or pattern is requiredr   ó   unfilteredreporG   r   rW   Fó   annotateT)ÚsectionÚ
+whitespacerV   s	   no_follow)ÚdiffoptsÚfollowmergeÚfollowrenamec              3   óB   •K  — | ]}‰                      |¦  «        V — Œd S )Nr   )r   Úsr   s     €r   r   zfastannotate.<locals>.<genexpr>Á   sA   øè è € ğ ğ àğ 	Š‰Œğğ ğ ğ ğ ğ r   )rJ   rN   rL   rP   rR   s   defaultformatrP   s   templates   jsonrU   s
+   no_contentrL   ó
+   mainbranchÚprefetchfastannotateN)ÚmasterÚshowpathÚ	showlinesc                 ó.   — h | ]}|d          |d         f’ŒS )r   r   r   )r   Úls     r   ú	<setcomp>zfastannotate.<locals>.<setcomp>ì   s$   € Ğ(FĞ(FĞ(F¸!¨!¨A¬$°°!´¨Ğ(FĞ(FĞ(Fr   )rh   ri   )Úexistinglines)!r   r/   r   r5   Ú
+unfilteredr
+   Úbyteskwargsr   r	   Údifffeatureoptsr(   Úannotateoptsr8   Ú
+configlistÚpagerÚfaformatterÚjsonformatterÚdefaultformatterÚboolÚconfigÚlistrE   r   Úsafehasattrrf   ÚannotatecontextÚannotateÚannotatealllinesÚfaerrorÚCannotReuseErrorÚCorruptedFileErrorÚwriteÚend)r4   r-   r?   r   r>   Úrebuildr`   r,   ÚnameÚtemplater   Úshowdeletedri   rh   rg   Úpathsr    ÚresultÚlinesrm   Úas      `                 r   Úfastannotater‹      sÕ  ø€ ğ> ğ NİŒk!ĞKÑLÔLÑMÔMĞMğ 
+‡}‚}_Ğ&7Ñ8Ô8ğ !ØŠÑ Ô ˆåÔ Ñ%Ô%€Dà
+(Š(6˜4Ñ
+ Ô
+ €CØhŠhz 5Ñ)Ô)€GåÔ$Ø
+ˆD˜+°$ğñ ô €Hõ Ô"ØØŸš ¨EÑ2Ô2Ğ2ØŸš ,°Ñ6Ô6Ğ6ğñ ô €Eõ ğ ğ ğ ğ àEğñ ô ñ ô ğ 	ğ —M’MØĞ-°	¨{ñ
+ô 
+ğ 	ğ 	ˆDğ ˆD‰JˆJà‡H‚Hˆ_ÑÔĞØxŠx˜Ñ$Ô$€HØ7ÒĞİÔ-¨b°$¸Ñ=Ô=ˆ	ˆ	åÔ0°°T¸4Ñ@Ô@ˆ	Ø—(’(˜: uÑ-Ô-€Kİ˜Ÿš -Ñ0Ô0Ñ1Ô1Ğ1€IØxŠx˜ Ñ'Ô'€Hğ YŠY¨Ñ6Ô6Ğ=¸#€Fõ •˜T 3¨¨d°EÑ:Ô:Ñ;Ô;€Eõ Ô˜Ğ4Ñ5Ô5ğ )Ø×!Ò! %Ñ(Ô(Ğ(àğ Dğ DˆØ)-Ğ-ˆĞ-˜ğ	ğİÔ.¨t°T¸5À'ÑJÔJğ ÈaØŸZšZØØ%Ø!)Ø#,Ğ#@°[°ğ	 (ñ ô Fğ #ğ Ø(FĞ(F¸vĞ(FÑ(FÔ(F˜Ø!"×!3Ò!3Ø¨(¸iğ "4ñ "ô "˜ğğ ğ ñ ô ğ ğ ğ ğ ğ ğ øøøğ ğ ğ ğ ğ øİÔ,­gÔ.HĞIğ ğ ğ ğ ğ Øà"GØHğøøøğ ğ 	#Ø"‰MˆFEàŠ˜ °]ˆÑCÔCĞCĞCØ‡M‚MO„O€O€O€Os7   È=J/ÉAJ#ÊJ/Ê#J'	Ê'J/Ê*J'	Ê+J/Ê/ KËKc                 óF   — h | ]}|d                                dd¦  «        ’ŒS )r   ó   -ó   _)Úreplace)r   Úopts     r   rl   rl     s:   € ğ ğ ğ àğ ˆ„F‡N‚N4˜ÑÔğğ ğ r   rX   c           
+      óŠ  — |                      dd¦  «        r|                     ¦   «         }|                      dd¦  «        rd|d<   |                     d¦  «        }t          j        |d¦  «        rH|Ft          t          |||t          j        |¦  «        ¦  «        ¦  «        }| 	                    |¦  «          | ||g|¢R i |¤S )zused by wrapdefaultr   r\   s	   forcetextTÚtextr>   rf   )
+r5   rn   r   r   rz   ry   rE   r
+   ro   rf   )Úorigr4   r-   r?   r   r>   r‡   s          r   Ú_annotatewrapperr”     sÒ   € ğ 
+‡}‚}_Ğ&7Ñ8Ô8ğ !ØŠÑ Ô ˆğ 
+‡}‚}_ lÑ3Ô3ğ ØˆˆV‰ğ (Š(5‰/Œ/€CİÔ˜Ğ4Ñ5Ô5ğ )¸#¸/İ•[  s¨Dµ(Ô2FÀtÑ2LÔ2LÑMÔMÑNÔNˆØ×!Ò! %Ñ(Ô(Ğ(àˆ4DĞ(˜4Ğ(Ğ(Ğ( 4Ğ(Ğ(Ğ(r   c                  óN   — d}  t          | fddit          ¤t          ¦  «         dS )z!register the fastannotate commands   fastannotate|fastblame|faÚ	helpbasicTN)ÚcommandÚfastannotatecommandargsr‹   )r„   s    r   Úregistercommandr™     s3   € à'€DØ<…GˆDĞ<Ğ<˜DĞ<Õ$;Ğ<Ğ<½\ÑJÔJĞJĞJĞJr   c                  óP   — t          j        t          j        dt          ¦  «         dS )z>wrap the default annotate command, to be aware of the protocolr]   N)r   Úwrapcommandr   Útabler”   r   r   r   Úwrapdefaultr   !  s    € åÔ8œ>¨;Õ8HÑIÔIĞIĞIĞIr   s   debugbuildannotatecaches!   build up to the specific revisions   [-r REV] FILE...c           	      ó  — t          j        |¦  «        }|                     d¦  «        p|                      dd¦  «        }|s0t	          j        t          d¦  «        t          d¦  «        ¬¦  «        ‚|                      dd¦  «        r|                     ¦   «         }t          j
+        ||¦  «        }t          j        |||¦  «        }t          |                     |¦  «        ¦  «        }t          j        |d¦  «        rM|                     d¦  «        r!t	          j        t          d	¦  «        ¦  «        ‚|                     |¦  «         dS |                      t          d

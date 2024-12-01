@@ -1,0 +1,1000 @@
+debugdir="${RPM_BUILD_ROOT}/usr/lib/debug"
+
+strip_to_debug()
+{
+  local g=
+  local r=
+  $strip_r && r=--reloc-debug-sections
+  $strip_g && case "$(file -bi "$2")" in
+  application/x-sharedlib*) g=-g ;;
+  application/x-executable*) g=-g ;;
+  application/x-pie-executable*) g=-g ;;
+  esac
+  $strip_glibs && case "$(file -bi "$2")" in
+    application/x-sharedlib*) g=-g ;;
+  esac
+  eu-strip --remove-comment $r $g ${keep_remove_args} -f "$1" "$2" || exit
+  chmod 444 "$1" || exit
+}
+
+add_minidebug()
+{
+  local debuginfo="$1"
+  local binary="$2"
+
+  local dynsyms=`mktemp`
+  local funcsyms=`mktemp`
+  local keep_symbols=`mktemp`
+  local mini_debuginfo=`mktemp`
+
+  # In the minisymtab we don't need the .debug_ sections (already removed
+  # by -S) but also not other non-allocated PROGBITS, NOTE or NOBITS sections.
+  # List and remove them explicitly. We do want to keep the allocated,
+  # symbol and NOBITS sections so cannot use --keep-only because that is
+  # too aggressive. Field $2 is the section name, $3 is the section type
+  # and $8 are the section flags.
+  local remove_sections=`readelf -W -S "$debuginfo" \
+	| awk '{ if (index($2,".debug_") != 1 \
+		     && ($3 == "PROGBITS" || $3 == "NOTE" || $3 == "NOBITS") \
+		     && index($8,"A") == 0) \
+		   printf "--remove-section "$2" " }'`
+
+  # Extract the dynamic symbols from the main binary, there is no need to also have these
+  # in the normal symbol table
+  nm -D "$binary" --format=posix --defined-only | awk '{ print $1 }' | sort > "$dynsyms"
+  # Extract all the text (i.e. function) symbols from the debuginfo
+  # Use format sysv to make sure we can match against the actual ELF FUNC
+  # symbol type. The binutils nm posix format symbol type chars are
+  # ambigous for architectures that might use function descriptors.
+  nm "$debuginfo" --format=sysv --defined-only | awk -F \| '{ if ($4 ~ "FUNC") print $1 }' | sort > "$funcsyms"
+  # Keep all the function symbols not already in the dynamic symbol table
+  comm -13 "$dynsyms" "$funcsyms" > "$keep_symbols"
+  # Copy the full debuginfo, keeping only a minumal set of symbols and removing some unnecessary sections
+  objcopy -S $remove_sections --keep-symbols="$keep_symbols" "$debuginfo" "$mini_debuginfo" &> /dev/null
+  #Inject the compressed data into the .gnu_debugdata section of the original binary
+  xz "$mini_debuginfo"
+  mini_debuginfo="${mini_debuginfo}.xz"
+  objcopy --add-section .gnu_debugdata="$mini_debuginfo" "$binary"
+  rm -f "$dynsyms" "$funcsyms" "$keep_symbols" "$mini_debuginfo"
+}
+
+# Make a relative symlink to $1 called $3$2
+shopt -s extglob
+link_relative()
+{
+  local t="$1" f="$2" pfx="$3"
+  local fn="${f#/}" tn="${t#/}"
+  local fd td d
+
+  while fd="${fn%%/*}"; td="${tn%%/*}"; [ "$fd" = "$td" ]; do
+    fn="${fn#*/}"
+    tn="${tn#*/}"
+  done
+
+  d="${fn%/*}"
+  if [ "$d" != "$fn" ]; then
+    d="${d//+([!\/])/..}"
+    tn="${d}/${tn}"
+  fi
+
+  mkdir -p "$(dirname "$pfx$f")" && ln -snf "$tn" "$pfx$f"
+}
+
+# Make a symlink in /usr/lib/debug/$2 to $1
+debug_link()
+{
+  local l="/usr/lib/debug$2"
+  local t="$1"
+  echo >> "$LINKSFILE" "$l $t"
+  link_relative "$t" "$l" "$RPM_BUILD_ROOT"
+}
+
+get_debugfn()
+{
+  dn=$(dirname "${1#$RPM_BUILD_ROOT}")
+  bn=$(basename "$1" .debug)${unique_debug_suffix}.debug
+  debugdn=${debugdir}${dn}
+  debugfn=${debugdn}/${bn}
+}
+
+set -o pipefail
+
+strict_error=ERROR
+$strict || strict_error=WARNING
+
+temp=$(mktemp -d ${TMPDIR:-/tmp}/find-debuginfo.XXXXXX)
+trap 'rm -rf "$temp"' EXIT
+
+# Build a list of unstripped ELF files and their hardlinks
+touch "$temp/primary"
+find "$RPM_BUILD_ROOT" ! -path "${debugdir}/*.debug" -type f \
+     		     \( -perm -0100 -or -perm -0010 -or -perm -0001 \) \
+		     -print | LC_ALL=C sort |
+file -N -f - | sed -n -e 's/^\(.*\):[ 	]*.*ELF.*, not stripped.*/\1/p' |
+xargs --no-run-if-empty stat -c '%h %D_%i %n' |
+while read nlinks inum f; do
+  if [ $nlinks -gt 1 ]; then
+    var=seen_$inum
+    if test -n "${!var}"; then
+      echo "$inum $f" >>"$temp/linked"
+      continue
+    else
+      read "$var" < <(echo 1)
+    fi
+  fi
+  echo "$nlinks $inum $f" >>"$temp/primary"
+done
+
+# Strip ELF binaries
+do_file()
+{
+  local nlinks=$1 inum=$2 f=$3 id link linked
+
+  get_debugfn "$f"
+  [ -f "${debugfn}" ] && return
+
+  echo "extracting debug info from $f"
+  # See also cpio SOURCEFILE copy. Directories must match up.
+  debug_base_name="$RPM_BUILD_DIR"
+  debug_dest_name="/usr/src/debug"
+  if [ ! -z "$unique_debug_src_base" ]; then
+    debug_base_name="$BUILDDIR"
+    debug_dest_name="/usr/src/debug/${unique_debug_src_base}"
+  fi
+  no_recompute=
+  if [ "$no_recompute_build_id" = "true" ]; then
+    no_recompute="-n"
+  fi
+  id=$(${install_dir}/debugedit -b "$debug_base_name" -d "$debug_dest_name" \
+			      $no_recompute -i \
+			      ${build_id_seed:+--build-id-seed="$build_id_seed"} \
+			      -l "$SOURCEFILE" "$f") || exit
+  if [ -z "$id" ]; then
+    echo >&2 "*** ${strict_error}: No build ID note found in $f"
+    $strict && exit 2
+  fi
+
+  # Add .gdb_index if requested.
+  if $include_gdb_index; then
+    if type gdb-add-index >/dev/null 2>&1; then
+      gdb-add-index "$f"
+    else
+      echo >&2 "*** ERROR: GDB index requested, but no gdb-add-index installed"
+      exit 2
+    fi
+  fi
+
+  # Compress any annobin notes in the original binary.
+  # Ignore any errors, since older objcopy don't support --merge-notes.
+  objcopy --merge-notes "$f" 2>/dev/null || true
+
+  # A binary already copied into /usr/lib/debug doesn't get stripped,
+  # just has its file names collected and adjusted.
+  case "$dn" in
+  /usr/lib/debug/*)
+    return ;;
+  esac
+
+  mkdir -p "${debugdn}"
+  if test -w "$f"; then
+    strip_to_debug "${debugfn}" "$f"
+  else
+    chmod u+w "$f"
+    strip_to_debug "${debugfn}" "$f"
+    chmod u-w "$f"
+  fi
+
+  # strip -g implies we have full symtab, don't add mini symtab in that case.
+  # It only makes sense to add a minisymtab for executables and shared
+  # libraries. Other executable ELF files (like kernel modules) don't need it.
+  if [ "$include_minidebug" = "true" ] && [ "$strip_g" = "false" ]; then
+    skip_mini=true
+    if [ "$strip_glibs" = "false" ]; then
+      case "$(file -bi "$f")" in
+        application/x-sharedlib*) skip_mini=false ;;
+      esac
+    fi
+    case "$(file -bi "$f")" in
+      application/x-executable*) skip_mini=false ;;
+      application/x-pie-executable*) skip_mini=false ;;
+    esac
+    $skip_mini || add_minidebug "${debugfn}" "$f"
+  fi
+
+  echo "./${f#$RPM_BUILD_ROOT}" >> "$ELFBINSFILE"
+
+  # If this file has multiple links, make the corresponding .debug files
+  # all links to one file too.
+  if [ $nlinks -gt 1 ]; then
+    grep "^$inum " "$temp/linked" | while read inum linked; do
+      link=$debugfn
+      get_debugfn "$linked"
+      echo "hard linked $link to $debugfn"
+      mkdir -p "$(dirname "$debugfn")" && ln -nf "$link" "$debugfn"
+    done
+  fi
+}
+
+# 16^6 - 1 or about 16 million files
+FILENUM_DIGITS=6
+run_job()
+{
+  local jobid=$1 filenum
+  local SOURCEFILE=$temp/debugsources.$jobid ELFBINSFILE=$temp/elfbins.$jobid
+
+  >"$SOURCEFILE"
+  >"$ELFBINSFILE"
+  # can't use read -n <n>, because it reads bytes one by one, allowing for
+  # races
+  while :; do
+    filenum=$(dd bs=$(( FILENUM_DIGITS + 1 )) count=1 status=none)
+    if test -z "$filenum"; then
+      break
+    fi
+    do_file $(sed -n "$(( 0x$filenum )) p" "$temp/primary")
+  done
+  echo 0 >"$temp/res.$jobid"
+}
+
+n_files=$(wc -l <"$temp/primary")
+if [ $n_jobs -gt $n_files ]; then
+  n_jobs=$n_files
+fi
+if [ $n_jobs -le 1 ]; then
+  while read nlinks inum f; do
+    do_file "$nlinks" "$inum" "$f"
+  done <"$temp/primary"
+else
+  for ((i = 1; i <= n_files; i++)); do
+    printf "%0${FILENUM_DIGITS}x\\n" $i
+  done | (
+    exec 3<&0
+    for ((i = 0; i < n_jobs; i++)); do
+      # The shell redirects stdin to /dev/null for background jobs. Work
+      # around this by duplicating fd 0
+      run_job $i <&3 &
+    done
+    wait
+  )
+  for f in "$temp"/res.*; do
+    test -f "$f" || continue
+    res=$(< "$f")
+    if [ "$res" !=  "0" ]; then
+      exit 1
+    fi
+  done
+  cat "$temp"/debugsources.* >"$SOURCEFILE"
+  cat "$temp"/elfbins.* >"$ELFBINSFILE"
+fi
+
+# Invoke the DWARF Compressor utility.
+if $run_dwz \
+   && [ -d "${RPM_BUILD_ROOT}/usr/lib/debug" ]; then
+  readarray dwz_files < <(cd "${RPM_BUILD_ROOT}/usr/lib/debug"; find -type f -name \*.debug | LC_ALL=C sort)
+  if [ ${#dwz_files[@]} -gt 0 ]; then
+    size_before=$(du -sk ${RPM_BUILD_ROOT}/usr/lib/debug | cut -f1)
+    dwz_multifile_name="${RPM_PACKAGE_NAME}-${RPM_PACKAGE_VERSION}-${RPM_PACKAGE_RELEASE}.${RPM_ARCH}"
+    dwz_multifile_suffix=
+    dwz_multifile_idx=0
+    while [ -f "${RPM_BUILD_ROOT}/usr/lib/debug/.dwz/${dwz_multifile_name}${dwz_multifile_suffix}" ]; do
+      let ++dwz_multifile_idx
+      dwz_multifile_suffix=".${dwz_multifile_idx}"
+    done
+    dwz_multifile_name="${dwz_multifile_name}${dwz_multifile_suffix}"
+    dwz_opts="-h -q -r"
+    [ ${#dwz_files[@]} -gt 1 ] && [ "$dwz_single_file_mode" = "false" ] \
+      && dwz_opts="${dwz_opts} -m .dwz/${dwz_multifile_name}"
+    mkdir -p "${RPM_BUILD_ROOT}/usr/lib/debug/.dwz"
+    [ -n "${dwz_low_mem_die_limit}" ] \
+      && dwz_opts="${dwz_opts} -l ${dwz_low_mem_die_limit}"
+    [ -n "${dwz_max_die_limit}" ] \
+      && dwz_opts="${dwz_opts} -L ${dwz_max_die_limit}"
+    if type dwz >/dev/null 2>&1; then
+      ( cd "${RPM_BUILD_ROOT}/usr/lib/debug" && dwz $dwz_opts ${dwz_files[@]} )
+    else
+      echo >&2 "*** ERROR: DWARF compression requested, but no dwz installed"
+      exit 2
+    fi
+    size_after=$(du -sk ${RPM_BUILD_ROOT}/usr/lib/debug | cut -f1)
+    echo "original debug info size: ${size_before}kB, size after compression: ${size_after}kB"
+    # Remove .dwz directory if empty
+    rmdir "${RPM_BUILD_ROOT}/usr/lib/debug/.dwz" 2>/dev/null
+
+    # dwz invalidates .gnu_debuglink CRC32 in the main files.
+    cat "$ELFBINSFILE" |
+    (cd "$RPM_BUILD_ROOT"; \
+     tr '\n' '\0' | xargs -0 ${install_dir}/sepdebugcrcfix usr/lib/debug)
+  fi
+fi
+
+# For each symlink whose target has a .debug file,
+# make a .debug symlink to that file.
+find "$RPM_BUILD_ROOT" ! -path "${debugdir}/*" -type l -print |
+while read f
+do
+  t=$(readlink -m "$f").debug
+  f=${f#$RPM_BUILD_ROOT}
+  t=${t#$RPM_BUILD_ROOT}
+  if [ -f "$debugdir$t" ]; then
+    echo "symlinked /usr/lib/debug$t to /usr/lib/debug${f}.debug"
+    debug_link "/usr/lib/debug$t" "${f}.debug"
+  fi
+done
+
+if [ -s "$SOURCEFILE" ]; then
+  # See also debugedit invocation. Directories must match up.
+  debug_base_name="$RPM_BUILD_DIR"
+  debug_dest_name="/usr/src/debug"
+  if [ ! -z "$unique_debug_src_base" ]; then
+    debug_base_name="$BUILDDIR"
+    debug_dest_name="/usr/src/debug/${unique_debug_src_base}"
+  fi
+
+  mkdir -p "${RPM_BUILD_ROOT}${debug_dest_name}"
+  # Filter out anything compiler generated which isn't a source file.
+  # e.g. <internal>, <built-in>, <__thread_local_inner macros>.
+  # Some compilers generate them as if they are part of the working
+  # directory (which is why we match against ^ or /).
+  LC_ALL=C sort -z -u "$SOURCEFILE" | grep -E -v -z '(^|/)<[a-z _-]+>$' |
+  (cd "${debug_base_name}"; cpio -pd0mL "${RPM_BUILD_ROOT}${debug_dest_name}")
+  # stupid cpio creates new directories in mode 0700,
+  # and non-standard modes may be inherented from original directories, fixup
+  find "${RPM_BUILD_ROOT}${debug_dest_name}" -type d -print0 |
+  xargs --no-run-if-empty -0 chmod 0755
+fi
+
+if [ -d "${RPM_BUILD_ROOT}/usr/lib" ] || [ -d "${RPM_BUILD_ROOT}/usr/src" ]; then
+  ((nout > 0)) ||
+  test ! -d "${RPM_BUILD_ROOT}/usr/lib" ||
+  (cd "${RPM_BUILD_ROOT}/usr/lib"; find debug -type d) |
+  sed 's,^,%dir /usr/lib/,' >> "$LISTFILE"
+
+  (cd "${RPM_BUILD_ROOT}/usr"
+   test ! -d lib/debug || find lib/debug ! -type d
+   test ! -d src/debug -o -n "$srcout" || find src/debug -mindepth 1 -maxdepth 1
+  ) | sed 's,^,/usr/,' >> "$LISTFILE"
+fi
+
+if [ -n "$srcout" ]; then
+  srcout="$BUILDDIR/$srcout"
+  > "$srcout"
+  if [ -d "${RPM_BUILD_ROOT}/usr/src/debug" ]; then
+    (cd "${RPM_BUILD_ROOT}/usr"
+     find src/debug -mindepth 1 -maxdepth 1
+    ) | sed 's,^,/usr/,' >> "$srcout"
+  fi
+fi
+
+# Append to $1 only the lines from stdin not already in the file.
+append_uniq()
+{
+  grep -F -f "$1" -x -v >> "$1"
+}
+
+# Helper to generate list of corresponding .debug files from a file list.
+filelist_debugfiles()
+{
+  local extra="$1"
+  shift
+  sed 's/^%[a-z0-9_][a-z0-9_]*([^)]*) *//
+s/^%[a-z0-9_][a-z0-9_]* *//
+/^$/d
+'"$extra" "$@"
+}
+
+# Write an output debuginfo file list based on given input file lists.
+filtered_list()
+{
+  local out="$1"
+  shift
+  test $# -gt 0 || return
+  grep -F -f <(filelist_debugfiles 's,^.*$,/usr/lib/debug&.debug,' "$@") \
+  	-x $LISTFILE >> $out
+  sed -n -f <(filelist_debugfiles 's/[\\.*+#]/\\&/g
+h
+s,^.*$,s# &$##p,p
+g
+s,^.*$,s# /usr/lib/debug&.debug$##p,p
+' "$@") "$LINKSFILE" | append_uniq "$out"
+}
+
+# Write an output debuginfo file list based on an grep -E -style regexp.
+pattern_list()
+{
+  local out="$1" ptn="$2"
+  test -n "$ptn" || return
+  grep -E -x -e "$ptn" "$LISTFILE" >> "$out"
+  sed -n -r "\#^$ptn #s/ .*\$//p" "$LINKSFILE" | append_uniq "$out"
+}
+
+#
+# When given multiple -o switches, split up the output as directed.
+#
+i=0
+while ((i < nout)); do
+  > ${outs[$i]}
+  filtered_list ${outs[$i]} ${lists[$i]}
+  pattern_list ${outs[$i]} "${ptns[$i]}"
+  grep -Fvx -f ${outs[$i]} "$LISTFILE" > "${LISTFILE}.new"
+  mv "${LISTFILE}.new" "$LISTFILE"
+  ((++i))
+done
+if ((nout > 0)); then
+  # Generate %dir lines for each output list.
+  generate_percent_dir()
+  {
+    while read -r line; do
+      while test "${line:0:15}" = "/usr/lib/debug/"; do
+        line="${line%/*}"
+        printf '%s\n' "$line"
+      done
+    done | \
+    sort -u | \
+    while read -r line; do
+      test -d "${RPM_BUILD_ROOT}$line" && printf '%%dir %s\n' "$line"
+    done
+  }
+  i=0
+  while ((i < nout)); do
+    generate_percent_dir < "${outs[$i]}" > "${outs[$i]}.new"
+    cat "${outs[$i]}" >> "${outs[$i]}.new"
+    mv -f "${outs[$i]}.new" "${outs[$i]}"
+    ((++i))
+  done
+  generate_percent_dir < "${LISTFILE}" > "${LISTFILE}.new"
+  cat "$LISTFILE" >> "${LISTFILE}.new"
+  mv "${LISTFILE}.new" "$LISTFILE"
+fi
+                                                                                                                                                                                                                                           usr/bin/gendiff                                                                                     0000755 0000000 0000000 00000000767 14554450620 012174  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        #!/bin/sh
+
+[ -z "$1" ] || [ -z "$2" ] && {
+# usage
+  echo "usage: $0 <directory> <diff-extension>" 1>&2
+  exit 1
+}
+
+: ${DIFF:=diff}
+: ${GENDIFF_DIFF_ARGS:=-up}
+: ${GENDIFF_DIFF_CHANGELOG_ARGS:=-U0}
+
+find $1 \( -name "*$2" -o -name ".*$2" \) -print | sort |
+while read f; do
+    U="${GENDIFF_DIFF_ARGS}"
+    [ "`basename $f`" = "ChangeLog$2" ] && U="${GENDIFF_DIFF_CHANGELOG_ARGS}"
+    F=/dev/null
+    [ -r "${f}" ] && F="${f}"
+    echo "${DIFF} ${U} ${F} ${f%$2}"
+    ${DIFF} ${U} "${F}" "${f%$2}"
+done
+         usr/bin/geqn                                                                                        0000777 0000000 0000000 00000000000 14401602773 012211  2eqn                                                                                                 ustar 00                                                                0000000 0000000                                                                                                                                                                        usr/bin/gettext                                                                                     0000755 0000000 0000000 00000104500 14376674240 012254  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        ELF          >    0*      @       À          @ 8  @         @       @       @       Ø      Ø                                                                                        h      h                                           é9      é9                    `       `       `                               P{      P‹      P‹      Ä      (                    |       Œ       Œ      ğ      ğ                   8      8      8                                   X      X      X      D       D              Såtd   8      8      8                             Påtd   Ôj      Ôj      Ôj      Ì      Ì             Qåtd                                                  Råtd   P{      P‹      P‹      °      °             /lib64/ld-linux-x86-64.so.2              GNU € À                   GNU >ÈlM±aıuA¬”Ödİ˜         GNU                      8         MÁ  8   :   ?   (ŒÑeÎm¼Pv– ‰—Î,cräbAõ9ò‹2Ä÷³¢÷                                             e                      °                      U                                                               %                     ¡                      j                      ¸                      u                     5                     ³                     1                     =                      ‘                      Î                      G                                           õ                      —                     ¨                      p                      Ç                     º                     ı                      Á                     n                     ¬                     ¥                     û                     ½                      í                     å                     Õ                      N                     ¿                                                                                      X                      ~                      Ş                      Æ                      ¹                      H                     P                     ô                     @                     Ì                      Š                                           ç                                            #                         (             ~  "                   =                  Í  !  H             -    H                !                g    `                  0                 @              optind nl_langinfo iconv_open program_invocation_short_name dcgettext __stack_chk_fail __printf_chk free iconv __assert_fail iconv_close strdup __ctype_get_mb_cur_max strrchr putchar ferror fflush memmove strlen iswalnum iswspace __ctype_b_loc mbrtowc strnlen mbsinit stdout optarg realloc __sprintf_chk bindtextdomain __fprintf_chk malloc __libc_start_main stderr memchr iswcntrl __cxa_finalize setlocale strchr getenv calloc memcmp fclose memset fputc fputs program_invocation_name wcwidth memcpy fwrite strcmp __errno_location abort getopt_long strncmp __progname_full __progname __cxa_atexit libc.so.6 GLIBC_2.3 GLIBC_2.3.4 GLIBC_2.14 GLIBC_2.4 GLIBC_2.34 GLIBC_2.2.5 _ITM_deregisterTMCloneTable __gmon_start__ _ITM_registerTMCloneTable                                                                     U         ii   _     ti	   i     ”‘–   u     ii   €     ´‘–   Š     ui	   •      P‹             +      X‹             Ğ*      `‹             a      €‹             	a       ‹             a      À‹             a      à‹             "a                         À                    È                    Ğ                     Ø         2           à         9                     :           (         8           0         ?           @         @           H         <           `         >           (                    0                    8                    @                    H                    P                    X         	           `         
+           h                    p                    x                    €                    ˆ                                        ˜                                         ¨                    °                    ¸                    À                    È                    Ğ                    Ø                    à                    è                    ğ                    ø                                                                      !                    "                     #           (         $           0         %           8         &           @         '           H         (           P         )           X         *           `         +           h         ,           p         -           x         .           €         /           ˆ         0                    1           ˜         3                     4           ¨         5           °         6           ¸         7                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   HƒìH‹Åo  H…ÀtÿĞHƒÄÃ         ÿ5òm  ÿ%ôm  @ ÿ%òm  h    éàÿÿÿÿ%êm  h   éĞÿÿÿÿ%âm  h   éÀÿÿÿÿ%Úm  h   é°ÿÿÿÿ%Òm  h   é ÿÿÿÿ%Êm  h   éÿÿÿÿ%Âm  h   é€ÿÿÿÿ%ºm  h   épÿÿÿÿ%²m  h   é`ÿÿÿÿ%ªm  h	   éPÿÿÿÿ%¢m  h
+   é@ÿÿÿÿ%šm  h   é0ÿÿÿÿ%’m  h   é ÿÿÿÿ%Šm  h   éÿÿÿÿ%‚m  h   é ÿÿÿÿ%zm  h   éğşÿÿÿ%rm  h   éàşÿÿÿ%jm  h   éĞşÿÿÿ%bm  h   éÀşÿÿÿ%Zm  h   é°şÿÿÿ%Rm  h   é şÿÿÿ%Jm  h   éşÿÿÿ%Bm  h   é€şÿÿÿ%:m  h   épşÿÿÿ%2m  h   é`şÿÿÿ%*m  h   éPşÿÿÿ%"m  h   é@şÿÿÿ%m  h   é0şÿÿÿ%m  h   é şÿÿÿ%
+m  h   éşÿÿÿ%m  h   é şÿÿÿ%úl  h   éğıÿÿÿ%òl  h    éàıÿÿÿ%êl  h!   éĞıÿÿÿ%âl  h"   éÀıÿÿÿ%Úl  h#   é°ıÿÿÿ%Òl  h$   é ıÿÿÿ%Êl  h%   éıÿÿÿ%Âl  h&   é€ıÿÿÿ%ºl  h'   épıÿÿÿ%²l  h(   é`ıÿÿÿ%ªl  h)   éPıÿÿÿ%¢l  h*   é@ıÿÿÿ%šl  h+   é0ıÿÿÿ%’l  h,   é ıÿÿÿ%Šl  h-   éıÿÿÿ%‚l  h.   é ıÿÿÿ%zl  h/   éğüÿÿÿ%rl  h0   éàüÿÿÿ%jl  h1   éĞüÿÿÿ%bl  h2   éÀüÿÿÿ%zl  f        èëüÿÿèæüÿÿèáüÿÿèÜüÿÿPèÖüÿÿfD  AWL=¯>  AVAUL-¼g  ATL%°<  U‰ıH=}<  SH‰óHƒì(èlüÿÿH=t<  I‰Æè]üÿÿH‹;Æl   H‰D$Æ€l   èr  H5±<  ¿   èqşÿÿH5<  H=@<  èÎüÿÿH=4<  è¢üÿÿH=
+  è¦5  ÆD$ HÇD$    ÆD$ ÆD$ fD  E1ÀL‰éL‰âH‰Ş‰ïèÕüÿÿƒøÿ„•   …ÀtàƒèEƒø.w	Ic‡LøÿàH‹ğk  º   H5|>  1ÿè]üÿÿH‹=Æk  ¾   H‰ÂH‰Ù1ÀèTşÿÿ¿   è*şÿÿÆ­k  ë‰Æ£k  ë€L‹5qk  étÿÿÿH‹ek  H‰D$écÿÿÿÆD$éYÿÿÿÆD$éOÿÿÿ€|$ …  €|$ …Û   €|$ Hck  …–  )ÅƒıtHƒıt3º   …í„y  H5›;  1ÿè¨ûÿÿ1ö¿   H‰Â1ÀègıÿÿHcĞj  PL‹4Ã‰Ãj  HcÂP€=ïj   H‹Ã‰¬j  …  M…ö„Í  A€> „Ã  H‹D$H…Àt	€8 …S  H‹t$H‹-lj  H…ö„&  L‰÷H‰ÚèP  H‰ÇH‰îè¥ûÿÿéy  ÆD$é^şÿÿH‹j  1ÿº   H59>  èìúÿÿ¿   H‰ÙH‰ÆH‰Ú1Àègüÿÿ¿
+   H:  è&úÿÿº   1ÿH5P>  è³úÿÿ¿   H‰Æ1Àè4üÿÿ¿
+   èúùÿÿº   1ÿH5d>  è‡úÿÿ¿   H‰Æ1Àèüÿÿº   1ÿH5’>  èeúÿÿ¿   H‰Æ1Àèæûÿÿº   1ÿH5¨>  èCúÿÿ¿   H‰Æ1ÀèÄûÿÿº   1ÿH5Î>  è!úÿÿ¿   H‰Æ1Àè¢ûÿÿº   1ÿH5ä>  èÿùÿÿ¿   H‰Æ1Àè€ûÿÿº   1ÿH5?  èİùÿÿ¿   H‰Æ1Àè^ûÿÿ¿
+   è$ùÿÿº   1ÿH5m9  è±ùÿÿ¿   H‰Æ1Àè2ûÿÿº   1ÿH54?  èùÿÿ¿   H‰Æ1Àèûÿÿº   1ÿH5J?  èmùÿÿ¿   H‰Æ1Àèîúÿÿ¿
+   è´øÿÿH=9  èˆøÿÿº   H5\?  H…ÀHX8  HDØ1ÿè'ùÿÿ¿   H‰ÆH‰Ú1Àè¥úÿÿ¿
+   èkøÿÿº   H5ÿ@  1ÿèøøÿÿ¿   HÄ8  H%A  H‰Æ1Àèkúÿÿ1ÿèÄúÿÿH‹=Mh  èx  L:8  ¿   H8  H‰ÂH5)8  1Àè4úÿÿº   H5Ø:  1ÿè‘øÿÿHª;  ¿   H8  H‰Æ1ÀèúÿÿH=8  è¨  º   H58  1ÿH‰ÃèRøÿÿ¿   H‰ÚH‰Æ1ÀèĞùÿÿ1ÿè)úÿÿ9Å‘   M…ötA€> „  H‹L$H…Ét	€9 …2  L‹d$ë H‹59g  ¿    è·øÿÿ9-1g  }OHc(g  P€=Wg   H‹<Ã‰g  uSL‹-g  M…ötM…ätLH‰úL‰æL‰÷èã  H‰ÇL‰îè8øÿÿ9-âf  |˜€=g   t71ÿè€ùÿÿH‹5Áf  H‰ßèøÿÿëèèZ  H‰Çë£H‰şº   L‰÷èe÷ÿÿH‰Çë°H‹5‘f  ¿
+   èøÿÿë¶H‰ßè%  H‰Ãé×ûÿÿH557  1ÿè/÷ÿÿ1ö¿   H‰Â1ÀèîøÿÿHcWf  é’ûÿÿL‹d$E1öéÿÿÿL‰÷º   H‰ŞèõöÿÿH‰ÇéĞûÿÿH‰ÆL‰÷èÒöÿÿéûÿÿH‰ÎL‰÷èÂöÿÿHcf  L‹d$éÙşÿÿ1íI‰Ñ^H‰âHƒäğPTE1À1ÉH=Eùÿÿÿoe  ôf.„     @ H=±e  Hªe  H9øtH‹Ne  H…Àt	ÿà€    Ã€    H=e  H5ze  H)şH‰ğHÁî?HÁøHÆHÑştH‹e  H…ÀtÿàfD  Ã€    óú€=e   u+UHƒ=úd   H‰åtH‹=e  èiøÿÿèdÿÿÿÆee  ]Ã Ã€    óúéwÿÿÿ€    UH‰åAWAVI‰şH‰÷AUATSH‰ÓHƒì(dH‹%(   H‰EÈ1ÀH‰u¸è¾õÿÿH‰ßI‰ÄLhè¯õÿÿH‹u¸L‰âLxIDHƒàğH)ÄH‰çè€öÿÿBÆ$L‰úH‰ŞJ<,èlöÿÿº   H‰æL‰÷èLõÿÿH9ÄHDÃH‹UÈdH+%(   uHeØ[A\A]A^A_]ÃèRõÿÿfATL%+4  UH‰ıSH_ë@ HƒÃ¶Cÿ„À„¾   <\uì„À„²   ¾3@„ö„¦   L‰çè8õÿÿH…ÀtËH‰ïHƒëèçôÿÿI‰ÜH‰ÇI)ìèi  L‰âH‰îH‰Çè»õÿÿH5à4  H‰ÇJ D  ¶KAĞ<Fw¶ÀHc†HğÿàÆ\HƒÃHƒÂD  ¶<\t„Àt%D  HƒÃˆHƒÂ¶„Àt<\uë„Àu¯€    Æ H‰ıH‰è[]A\Ãf¾Á¶Kƒè0ƒé0€ù‡Ÿ   ¾ÉÁ¶Kƒé0€ù†¨   HƒÃé„   Æ\HƒÃHƒÂé{ÿÿÿÆHƒÃHƒÂékÿÿÿÆHƒÃHƒÂé[ÿÿÿÆHƒÃHƒÂéKÿÿÿÆ	HƒÃHƒÂé;ÿÿÿÆHƒÃHƒÂé+ÿÿÿÆ
+HƒÃHƒÂéÿÿÿÆHƒÃHƒÂéÿÿÿHƒÃˆHƒÂéüşÿÿÆßb  HƒÃéìşÿÿ¾ÉHƒÃÁëÙ¶H‰ø€ú/uD  ¶PHƒÀ€ú/tó„Òt;H‰Á1öë„     @„ötH‰È1ö¶QHƒÁ„Òt€ú/uå¶QHƒÁ¾   „ÒuêÃ SH‰ûèóÿÿHƒøv€|ÿ/HPÿt[Ã@ H‰Ğëäf.„     USHƒìH‹=ëa  è  …ÀuJè%òÿÿH‰ÃÇ    H‹=b  è@òÿÿ…ÀunH‹=õa  èĞóÿÿ…Àu^H‹=åa  èPòÿÿ…Àtƒ;	u?HƒÄ[]Ã1ÿº   H5¼:  èMòÿÿH‰ÅèÅñÿÿH‰é¿   H¬:  ‹0H‰Ã1Àèúóÿÿë†¿   èôÿÿH‹=‡a  èòñÿÿ¿   èøóÿÿ„     AUATA‰ôUSH‰ûHƒìH9=!a  „ƒ   è^ñÿÿH‰ßÇ     H‰Åè}ñÿÿH‰ß…Àu~E„ätAèóÿÿ…À„´   D‹m E1äAƒı A•ÄA÷ÜH‰ßèzñÿÿD‰m HƒÄD‰à[]A\A]Ã„     è[ñÿÿ…À…£   E1äHƒÄD‰à[]A\A]Ãf€=Ô`   uäÆË`  éhÿÿÿ è“òÿÿ…Àu‹1ÿH‰Şèõñÿÿƒøÿ„xÿÿÿH‰ßètòÿÿA‰Å…À…eÿÿÿÇE     A¼ÿÿÿÿéeÿÿÿ€    H‰ßèØğÿÿ…À„}ÿÿÿ‹E ƒø	„qÿÿÿE1äƒø A•ÄA÷ÜébÿÿÿfE1äƒ}  A•ÄA÷ÜéMÿÿÿff.„     f1öé©şÿÿf„     ¾   é–şÿÿfD  ATUSH…ÿt|¾/   H‰ûèêğÿÿH‰ÅH…ÀtJL`L‰àH)ØHƒø~:H}úº   H5
+9  èİïÿÿ…Àu!€}lu3A€|$tu+A€|$-u#H]H‰X_  H‰¡_  H‰r_  []A\ÃD  L‰ãëãH‹t_  º7   ¾   H=s8  èîñÿÿèYïÿÿf„     ATUHoS€? H‰ûuWH‹WH5U9  ¶
+‰ÈÀèƒà‹†Óè¨t!HÇG   ¾ÆG ‰G$ÆC[]A\ÃfD  HoH‰ïè´ñÿÿ…À„ì   Æè„ïÿÿL‹cH‰ÆL‰çèÅ  H{$H‰éL‰æH‰ÂèÓ  H‰CHƒøÿtIHƒøşt[H…ÀuH‹CHÇC   €8 u~‹C$…ÀuXÆC H‰ïèJñÿÿ…À„sÿÿÿÆ ÆC[]A\ÃfD  HÇC   ÆC  ÆC[]A\Ã H‹{èÿîÿÿÆC  H‰CÆC[]A\ÃHç7  º³   H5{7  H=¬7  è/ïÿÿHÈ7  º²   H5\7  H=v7  èïÿÿH©7  º–   H5=7  H=@7  èñîÿÿAVAUATI‰üH‰÷¾   USHì   dH‹%(   H‰„$ˆ   1Àè  A€<$ I‰Å„ç  H‰åëL L‰ïè@îÿÿD¶4I9Ü‚Ò  E„ö„ù  èDğÿÿH‹ Böp„æ  €; „¤  €{ Lc„–  L‰îL‰çèô  H‰ÃH…À„  èÓíÿÿHƒøv•L‰d$Æ$ HÇD$    ÆD$ I9ÜƒÅ  D  H‰ïè°ıÿÿ€|$  ‹|$$t…ÿ„ıïÿÿH‹D$HD$ÆD$ H‰D$¶T$ H9ØrÇ„Ò„  è‚îÿÿ…ÀA”ÆH‰\$Ld$@Æ$ HÇD$    ÆD$ L‰l$PÆD$@ HÇD$D    ë> €|$ uH‰ïè)ıÿÿ€|$  t‹L$$…É„vïÿÿH‹D$HD$H‹D$XHD$PÆD$ L‰çÆD$L èğüÿÿ€|$` t±‹T$d…Òu©€|$ uH‰ïèÒüÿÿ€|$  ‹|$$t…ÿt€|$  t	èÇíÿÿ…Àu	E„ö…€   H‰ïH‰\$Æ$ HÇD$    ÆD$ è‹üÿÿ€|$  t‹D$$…ÀtH\$I‰ÜA€<$ …jşÿÿE1öë:@ è{îÿÿH‹¶Cÿ·BƒàE„ötBör…'şÿÿf…À…şÿÿ@ A¾   L‰ïèRëÿÿH‹„$ˆ   dH+%(   u"HÄ   D‰ğ[]A\A]A^Ã@ A¾   éşÿÿèøëÿÿ„     ATH‰şº   UH‰ı1ÿSèªëÿÿH‰ÃH9ÅtH‰îH‰Çè'ıÿÿ„ÀtH‰Ø[]A\Ã H‰ßè ëÿÿH‰ïI‰Äè•ëÿÿI|è	  I‰éI‰Ø¾   I‰ÄH‰Ç1ÀHÇÂÿÿÿÿL‰ãHQ4  è¢íÿÿH‰Ø[]A\Ãf.„     AWº   L=44  AVAUATI‰üUH‰õH‰ş1ÿSHƒìèëÿÿH‰Ãèî  L‰şH‰ÇI‰Åè   …À…  H…í„  H‰l$I‰íE1ÿE1öL‰æH‰ßèÆëÿÿ…À„–  L‰æH‰ßèCüÿÿ„À…«   Hƒ|$ tH‹t$H‰ßè&üÿÿ„À…   M…ítL‰îH‰ßèüÿÿ„ÀuzH‰ßè’êÿÿH‰ïI‰Äè‡êÿÿI|è  I‰éI‰Ø¾   I‰ÄH‰Ç1ÀHÇÂÿÿÿÿHF3  è—ìÿÿM…ötL‰÷èzéÿÿM…ÿtL‰ÿèméÿÿL‰ãHƒÄH‰Ø[]A\A]A^A_Ã„     M…ötL‰÷èCéÿÿM…ÿtÔL‰ÿè6éÿÿëÊ@ L‰êL‰şH‰ïè"	  L‰ïI‰ÆèçéÿÿHxH‰D$èi  H‹T$L‰îH‰Çè¹êÿÿH‰ïL‰şHº//TRANSLH‰ÁH‹D$H‰L$HÈH‰H‰ÊÇ@LIT èÇ  H‹|$I‰ÅèºèÿÿM…í„   ¾?   L‰ïè´éÿÿH…Àt/L‰ïè—èÿÿM…ötjL‰t$L‰õE1íE1ÿé^şÿÿ€    H‰ëéÿÿÿM…ötcL‰æH‰ßèêÿÿ…ÀtL‰t$M‰ïL‰õé>şÿÿ@ M9îtL‰ïè;èÿÿL‰óéÉşÿÿ M…öu™ L‰åE1íE1ÿE1öHÇD$    éíıÿÿfD  HÇD$    M‰ïL‰íéÓıÿÿ@ UH‰òH‰ıSH‰ó1öHƒìèZéÿÿH‰ÂH)êHƒÂH…ÀH‰ØHEÂHƒÄ[]Ãf.„     D  HƒìH•1  ºª   H5|1  H=:1  è½èÿÿff.„     fAWAVAUATU‰õSHƒìhdH‹%(   H‰D$X1Àè+êÿÿH…À„/  I‰Äè
+èÿÿHƒø†   …í…  L‰çL‰d$(L‰ãE1öèõçÿÿL=^1  ÆD$ I,ÆD$$ H‰l$HÇD$    I9ìrBé²  „     €|$8 A¾   t‹|$<E1öè7éÿÿ…ÀA”ÆLëÆD$$ H‰\$(H9ëƒk  €|$ Ll$…Õ  ¶‰ÈÀèƒàA‹‡Óèƒà„¡  HÇD$0   ¾A½   H‹\$(H‹l$ÆD$8‰T$<ÆD$$E…ö„nÿÿÿAƒş„4  A¾   „À„uÿÿÿ‹|$<èèÿÿA¸   ƒøAƒØÿE‰ÆéWÿÿÿ„     L‰çL‰d$(L‰ãL=N0  èÙæÿÿÆD$ M4ÆD$$ L‰t$HÇD$    M9ôrnéû   ¶‰ÈÀèƒàA‹‡Óè¨„ÿ  HÇD$0   ¾ÆD$8H‹\$(‰D$<‹|$<ÆD$$èÿçÿÿ…À„¯  L‹t$H\$0ÆD$$ H‰\$(L9óƒ’  €|$ Ll$tL‰òH|$<L‰éH‰ŞH)Úèˆ  H‰D$0Hƒøÿ„I  H‹\$(Hƒøş„š  H…ÀuHÇD$0   €; …¸  ‹T$<…Ò…Ë  L‰ïÆD$8èêçÿÿ…À„UÿÿÿÆD$ éKÿÿÿ„     Ll$L‰ïèÃçÿÿ…À„™  ÆD$H‰êH|$<L‰éH‰ŞH)Úèğ  H‰D$0Hƒøÿ„Á   H‹\$(Hƒøş„â  H…ÀuHÇD$0   €; …   ‹D$<…À…3  L‰ïÆD$8èRçÿÿH‹l$…ÀtÆD$ L‹l$0¸   ééıÿÿD  Aƒş„Æ  H‹D$XdH+%(   …ë  HƒÄhL‰à[]A\A]A^A_Ã„À„Gıÿÿ‹|$<èoæÿÿ…ÀH‹D$HEÃH‰D$¸   DEğé ıÿÿHÇD$0   H‹\$(A½   1ÀÆD$8 H‹l$é_ıÿÿ Ll$L‰ïè›æÿÿ…À„q  ÆD$é;şÿÿf„     …ítPA¶$„Û„  èzæÿÿM‰åH‹ ëfA¶]IƒÅ„ÛtöDX uìL‰ïè4äÿÿL‰îL‰çHPèÅåÿÿƒı„ÿÿÿL‰çèäÿÿI\ÿL9ã‚ğşÿÿè!æÿÿH‹ë@ Æ HƒëL9ã‚Òşÿÿ¶öDB uæéÃşÿÿf„     HÇD$0   H‹\$(ÆD$8 ÆD$$H‰ßè°ãÿÿH‰ŞL‰çHPèAåÿÿƒı…ûÿÿé}şÿÿ H‹l$ÆD$8 1ÀI‰íI)İL‰l$0é8üÿÿ@ H‹D$ÆD$8 ÆD$$H)ØH‰D$0ëŸ€    H‹D$Æ  é-şÿÿM‰åéÿşÿÿHT,  º©   H5;,  H=â+  è|ãÿÿè—úÿÿè"ãÿÿH+,  º   H5,  H=¢+  èSãÿÿè   f.„     @ Hƒìº   H5,  1ÿè©âÿÿ‹=ÃQ  1öH‰Â1Àègäÿÿ¿   è}äÿÿff.„     fHƒìH…ÿu¿   è­ãÿÿH…ÀtHƒÄÃèÿÿÿff.„      SH‰ûè‡ãÿÿH…Àt[ÃH‰ß[ëºf.„     H‰øSH÷æH‰ÃÀH…Ûx¶ÀH…ÀuH‰ßèNãÿÿH…Àt[ÃèBÿÿÿH‰ß[éyÿÿÿf„     SH‰ûè'ãÿÿH…ÀtH‰ÁH‰Ú1öH‰Ïèrâÿÿ[ÃH‰ßèHÿÿÿH‰Áëä SH‰ûè§âÿÿH…Àt[ÃH‰ß[é'ÿÿÿ€    SH‰óH…ÿtèãÿÿH…Àt[Ã H‰÷èÀâÿÿH…ÀuîH‰ß[éòşÿÿfSH‹H…ÿt/H¸SUUUUUUUH9ØrOH‰ØHÑèH\H‰H‰Şè²âÿÿH…Àt[Ã H…Ût#x(H‰H‰ßèfâÿÿH…ÀuäH‰ß[é˜şÿÿ„     »€   ëØèDşÿÿ@ SèZ  ‰Ã…Àx‰Ø[Ãèkàÿÿƒ8uòè!şÿÿSèÚ  H‰ÃH…Àt
+H‰Ø[ÃD  èCàÿÿƒ8uìèùıÿÿf„     Sè
+  H‰ÃH…Àt
+H‰Ø[ÃD  èàÿÿƒ8uìèÉıÿÿf„     AUI‰õATI‰ÔUSH‰ûHƒìdH‹%(   H‰D$1ÀH…ÿHD$HDØH‰ßè™àÿÿH‰ÅHƒøıvM…äu#H‹D$dH+%(   u,HƒÄH‰è[]A\A]ÃD  1ÿè   „ÀuÒA¶E ½   ‰ëÄè*àÿÿf.„     1ÀH9÷tW1Òë"D  ƒÀ AƒÀ AƒúwAƒÁ ƒÁ HƒÂA8Èu.¶D¶DX¿A‰ÀEQ¿D‰ÉAƒûvÆAƒúwAƒÁ ƒÁ …ÀuÉD)ÈÃHì  º  dH‹%(   H‰„$  1ÀH‰æè9  ‰Â1À…Òufƒ<$Ct<$POSIt!¸   H‹”$  dH+%(   uHÄ  Ã1Àfƒ|$XuÕëØèOßÿÿf.„     D  Hƒì¿   èbàÿÿH…Àt€8 H^(  HDÂHƒÄÃf.„     HD(  HƒÄÃ@ S‰ûèèßÿÿ…Àx[Ãf‰ßèyŞÿÿ[…À”À¶ÀÃff.„     @ UH‰ıSH‰óHƒÆHƒìH‹NèH9ñt'H‹CH‰M H‰E¶CˆE„Àt‹C‰EHƒÄ[]Ã HOH‹SH‰Ïè`ßÿÿH‰ÁëÄff.„     ‰øHÇ'  ‰ùÀèƒà‹‚ÓèƒàÃfD  UH‰åAVAUATSHƒìdH‹%(   H‰EØ1ÀHkÂ€/  I‰üH‰óI‰ÕI‰ÎH<Õ    Hÿ   ‡  HƒÇ6HƒçğH)üH|$HƒçğHƒÇHƒçàH…ÿ„é   HÇG   IƒıvF1Ò¹   D  ¶Dÿ:ué±   f„     H+×8„›   H…ÒuîH‰ÈH‰ÏHƒÁI9ÍuÆIÇ    A¶$„Òt9L‰á1Àë€    H…ÀtSH‹ÇIÔH)Ğ¶„Òt8uåHƒÀHƒÁI9ÅuçM‰&èp  ¸   H‹UØdH+%(   uDHeà[A\A]A^]Ã€    IƒÄHƒÁë­fD  HƒÂH‰ÈH)Ğé^ÿÿÿ1Àëºèà  H‰ÇéışÿÿèãÜÿÿ ATUHoS€? H‰ûuWH‹WH5%&  ¶
+‰ÈÀèƒà‹†Óè¨t!HÇG   ¾ÆG ‰G$ÆC[]A\ÃfD  HoH‰ïè„Şÿÿ…À„ì   ÆèTÜÿÿL‹cH‰ÆL‰çè•óÿÿH{$H‰éL‰æH‰Âè£ûÿÿH‰CHƒøÿtIHƒøşt[H…ÀuH‹CHÇC   €8 u~‹C$…ÀuXÆC H‰ïèŞÿÿ…À„sÿÿÿÆ ÆC[]A\ÃfD  HÇC   ÆC  ÆC[]A\Ã H‹{èÏÛÿÿÆC  H‰CÆC[]A\ÃHG%  º³   H5K$  H=|$  èÿÛÿÿH(%  º²   H5,$  H=F$  èàÛÿÿH	%  º–   H5$  H=$  èÁÛÿÿUH‰åAWAVAUI‰õATSHìÈ   H‰•ÿÿÿH‰½ÿÿÿH‰÷dH‹%(   H‰EÈ1Àè”  H‰ÁH‰… ÿÿÿ¸8   H÷áÂH…Àˆ  ¶ÒH…Ò…ù   H‹… ÿÿÿH<Å    H)ÇHÁçHÿ   ‡  HƒÇ6HƒçğH)üH\$HƒãğHƒÃHƒãàH…Û„±   H‹… ÿÿÿL‰mL{Lu¨ÆE€ L$@HE€HÇE„    IÁäH‰…0ÿÿÿIÜë) I‰Gè¶…?ÿÿÿI‰WğAˆGø„Àt‹E¤A‰GüHUIƒÇ0ÆEŒ H‹½0ÿÿÿèrıÿÿ¶E ˆ…?ÿÿÿ„Àt‹M¤…ÉtiH‹EH‹U˜L9ğu¨L‰öL‰ÿèÛÿÿ¶E M‰èH‹U˜ˆ…?ÿÿÿëÆ…?ÿÿÿ H‹EÈdH+%(   …Õ  ¶…?ÿÿÿHeØ[A\A]A^A_]ÃèÌ  H‰Ãé	ÿÿÿIÇD$   E1ÿHƒ½ ÿÿÿLs0HÇ…(ÿÿÿ   †    E¶në€x t&‹@A9Ft6M…ÿ„¸  O+<üKHÁàHØE„íuÔI‹VH;PuÙH‹0I‹>èÚÿÿ…ÀuÊH‹…(ÿÿÿIƒÇL)øH‹(ÿÿÿIƒÆ0I‰ÌHƒÁH‰(ÿÿÿH9 ÿÿÿu‚H‹…ÿÿÿÆE€ E1ÿL­@ÿÿÿÆ…@ÿÿÿ HÇ     H‹…ÿÿÿHÇ…Dÿÿÿ    Æ…Lÿÿÿ HÇE„    ÆEŒ H‰…PÿÿÿH‰E1ÀD  „ÀtK€}  tW‹U¤…Ò„Œ  KHÁàHØ€x tF9PuKL‹u˜H‹uLöÆEŒ IƒÇH‰uL9½ ÿÿÿ„A  H‹½0ÿÿÿè•ûÿÿ€}  u©KHÁàHØL‹u˜L9ptZM…ÿ…‘   €½Lÿÿÿ uL‰ïè`ûÿÿ€½`ÿÿÿ t‹…dÿÿÿ…À„~ÚÿÿH‹…XÿÿÿÆ…Lÿÿÿ H…PÿÿÿH‹E˜ÆEŒ HEë…fD  H‹uH‹8L‰òH‰µ(ÿÿÿèšØÿÿH‹µ(ÿÿÿ…Àu…é=ÿÿÿf.„     H‹…(ÿÿÿéwşÿÿ@ O‹4üL‰øL)ğH‰…(ÿÿÿ¶EŒM…ö„Òşÿÿ€½Lÿÿÿ t2€½`ÿÿÿ t‹•dÿÿÿ…Ò„×ÙÿÿH‹•XÿÿÿÆ…Lÿÿÿ H•PÿÿÿIƒîtL‰ïèúÿÿ€½`ÿÿÿ tÔëÄ@ ¶EŒL‹½(ÿÿÿépşÿÿH‹…PÿÿÿH‹ÿÿÿH‰H‰ßèW  éıÿÿè×ÿÿff.„     fAWAVAUATUSH‰óHì¨  H‰<$H‰t$dH‹%(   H‰„$˜  1Àè»ÖÿÿL‹$Hƒø‡]  H‹D$D¶ L‰ÀE„ä„  A€8 „  L|$HE1öE‰åH‹\$L‰|$1í¾   M‰÷M‰Äé~   €    ˆ$H…ÛtL‰şH‰ßL)öM‰şèçÖÿÿ¶$HÃ€; unH‹\$H‰ßè>ÖÿÿH‹L$H‰ŞL‰çH‰Âèë÷ÿÿ‰Æ„À…»  1Û€    HƒÅIGML$E:,$t5A€9 I‰ÇtjM‰ÌHƒı	—À@ ğ‰ÂtÓHD­ I9Çƒmÿÿÿ‰ÖëÁf„     H‹L$¶Q„Ò„  M‰âL)ùM)úI‰ËëHƒÀ8Ñu£A¶„Ò„ó  A¶„Éuâ1ÀH‹”$˜  dH+%(   …  HÄ¨  []A\A]A^A_Ã€    H|$PH‰\$`ÆD$P HÇD$T    ÆD$\ ènøÿÿ€|$p L‹$tD‹L$tE…É„€  H‹D$Æ„$    E1ä1ÛÆ„$œ    A¾   H¬$P  L¼$   H‰„$    H„$Ğ   H‰D$H„$  HÇ„$”       L‰„$à   Æ„$Ğ    HÇ„$Ô       HÇD$0    H‰$L‰D$8ëw@ ‹¼$ô   …ÿ„÷şÿÿIƒü	—ÀD ğ„ñ  K¤H9Óƒô  IƒÄHƒÃA‰Æ€|$p t}‹D$t9„$ô   „¬   H‹Œ$à   H‹”$è   f„     HÑH‰Œ$à   H‹|$Æ„$Ü    èC÷ÿÿ€¼$ğ    …mÿÿÿIƒü	—ÀD ğ„]  K¤H9Óƒp  IƒÄHƒÃA‰ÆH‹”$è   H‹Œ$à   H;T$hu–H‹t$`H‰ÏH‰T$ H‰L$èoÔÿÿH‹L$H‹T$ …À…mÿÿÿfoŒ$à   H‰ïfo„$Ğ   Æ„$P   fo”$ğ   Æ„$\   )Œ$   foœ$   H‹„$(  H„$   H‹D$)„$  H‰„$`  Æ„$   HÇ„$T      )”$0  )œ$@  è@öÿÿ€¼$p   t‹”$t  …Ò„aÕÿÿH‹„$h  Dˆt$HƒÃH„$`  L‰d$ L‰|$(H‰Áën€    ‹„$4  …À„'ıÿÿ€¼$p   „œ   ;„$t  …Ê   L‹¼$(  L‹¤$h  L‹´$`  L‹¬$   K|= Æ„$   K&HƒÃH‰¼$   H‰ïH‰Œ$`  Æ„$\   èyõÿÿ€¼$p   t‹„$t  …À„°  €¼$   u	H‹<$èMõÿÿ€¼$0   …GÿÿÿL‹¼$(  L‹¤$h  M9çu&L‹´$`  L‹¬$   L‰úL‰öL‰ïèœÒÿÿ…À„VÿÿÿD¶t$L‹d$ L‹|$(H‹Œ$à   H‹”$è   éıÿÿ€    M‰àL‰ÀéüÿÿD  IƒÄHƒÃé®ıÿÿ IƒÄHƒÃéıÿÿ H‹t$0I‰Ş¶„$œ   I)ö„ì   „Àt3€¼$°    t‹´$´   …öt6H‹„$¨   Æ„$œ    H„$    Iƒît(L‰ÿèPôÿÿ€¼$°    tĞëÃ@ €¼$œ    uNfD  H¼$   è#ôÿÿ€¼$°    u1¶”$ğ   A¾   HCH‰\$0IƒÄH‰Ã„Ò…büÿÿéáüÿÿfD  ‹Œ$´   …ÉuÄH‹t$H‹|$8HT$Hè9õÿÿA‰Æ„Àu,¶”$ğ   ë­„     H‹„$à   éãúÿÿ„À…xÿÿÿéfÿÿÿH‹D$HéÌúÿÿègĞÿÿ€    ATI‰ÔUH‰õ1öSèŸÑÿÿH…ÀtZH‰ÇH‰Ãè/ĞÿÿL9àrM…äu%[¸"   ]A\Ã HPH‰ŞH‰ïèùĞÿÿ1À[]A\ÃfIT$ÿH‰ŞH‰ïèàĞÿÿBÆD%ÿ ëÃ„     M…ätÆE  ¸   ëÉ1öé)Ñÿÿf„     AWAVAUATI‰Ô1ÒU1íSH‰ûHìh  H‰|$(L‰çLt$HLl$@H‰t$1öH‰L$1ÉL‰D$E1ÀdH‹%(   H‰„$X  1ÀèåÎÿÿL‹L$H‰\$0H\$PL‰L$8M…ÉtwHD$0L‰L$ L|$8H‰D$ëfD  H‹D$@H)ØHÅHƒ|$8 „y  H‹t$M‰ğL‰éL‰úL‰çH‰\$@HÇD$H   èuÎÿÿHƒøÿu¿èJÎÿÿ‹ ƒøt³L‹L$ ƒø…£  1Ò1öM‰ğL‰éL‰çL‰L$H‰\$@HÇD$H   è0ÎÿÿHƒøÿ„t  H‹D$@H)ØHèH‰Ã„¼   H‹D$L‹L$H‹(H…í„ì   H‹D$H9‚Ş   E1À1É1Ò1öL‰çL‰L$L|$8èÓÍÿÿH‹D$(L‹L$H‰l$@H‰\$HH‰D$0L‰L$8ë( Ht$0M‰ğL‰éL‰úL‰çèšÍÿÿHƒøÿ„°   L‹L$8M…ÉuÖ1Ò1öM‰ğL‰éL‰çètÍÿÿHƒøÿ„˜   Hƒ|$H …MĞÿÿH‹D$H‰(H‹D$H‰1ÀH‹”$X  dH+%(   …‹   HÄh  []A\A]A^A_Ã L‹L$ éÁşÿÿfD  H‰ßL‰L$è£ÎÿÿL‹L$H…ÀH‰Å…ÿÿÿèÍÌÿÿÇ    ë3D  è»Ìÿÿƒ8„LÿÿÿH‹D$H9(tè£ÌÿÿH‰ïD‹ H‰ÃèeÌÿÿD‰#ƒÈÿé^ÿÿÿè5ÍÿÿD  AWAVAUATI‰ôUSHƒìhdH‹%(   H‰D$X1ÀH‰|$8èõÌÿÿI‰ÁH‰D$@IÁáH=   LCÈIiL‰L$H‰ïèîÍÿÿL‹L$H…À„í  E1À1É1Ò1öL‰çL‰L$(I‰Çè'ÌÿÿHD$PL‹L$(L‰ûH‰D$HD$HH‰D$HD$@H‰D$ HD$8H‰D$ë\D  èËËÿÿI‰Ç‹ ƒø„ç   ƒø…;  L‹t$HLl- I)ŞL9íƒ  L‰îH‰ßèƒÍÿÿH…À„
+  MMÿN<0L‰íH‰ÃM)ñL‹D$H‹L$L‰çL‰|$HH‹T$ H‹t$L‰L$PèsËÿÿHƒøÿ„yÿÿÿëq€    è;Ëÿÿƒ8H‰Á…¶   L‹|$HHT- I)ßH9ÕƒÑ   H‰ÖH‰ßH‰T$H‰D$ èôÌÿÿH‹T$H‹L$ H…À„©   J8H‰ÕH‰ÃH‰L$HHJÿL)ùH‰L$PL‹D$H‹L$1Ò1öL‰çèàÊÿÿHƒøÿ„vÿÿÿH‹D$HHPH‰T$HÆ  H‹t$HH)ŞH9îs)H‰ßè€ÌÿÿH…ÀHEØë€    AÇ   H‰ßèAÊÿÿ1ÛH‹D$XdH+%(   u'HƒÄhH‰Ø[]A\A]A^A_ÃD  Ç   H‰ßè
+ÊÿÿëÇèãÊÿÿè.ÊÿÿÇ    ëµfD  ATUS€? H‰ûtI‰ôH‰ÖH‰ÕL‰çè“êÿÿ…ÀuH‰ßè—ÌÿÿH‰ÃH…ÀtyH‰Ø[]A\Ã€    H‰ïL‰æè¥ÌÿÿH‰ÅHƒøÿt6H‰ßH‰ÆèAıÿÿH‰ÃH…Àt)H‰ïèÑËÿÿ…Ày¾è¨ÉÿÿH‰ßD‹ H‰ÅèjÉÿÿD‰e 1Ûë£fè‹ÉÿÿH‰ïD‹ H‰ÃèËÿÿD‰#1Ûë‡èqÉÿÿ1ÛÇ    éuÿÿÿ@ HƒÇ r2HƒìèËÿÿH‰ÁH…ÀtH@HƒààH@H‰ÂH)ÊˆPÿHƒÄÃ1ÀHƒÄÃ1ÀÃD  @öÇ…*Ìÿÿ@öÇuÃ€    ¶GÿH)ÇéÌÈÿÿf.„     fAUATUSH‰ûHƒìXdH‹%(   H‰D$H1Àè^ÉÿÿHƒøw(H‹D$HdH+%(   …Æ  HƒÄXH‰ß[]A\A]éBÉÿÿfH‰\$1íL%¢  Æ$ HÇD$    ëW H‹T$¶
+‰ÈÀèƒàA‹„Óè¨„Ò   HÇD$   D¾*ÆD$ D‰l$$E…í„   H‹\$H‹D$HØHƒÅH‰D$€<$ ÆD$ H\$tœè§ÈÿÿL‹l$H‰ÆL‰ïèçßÿÿH|$$H‰ÙL‰îH‰ÂèôçÿÿH‰D$HƒøÿtyHƒøş„   H…À…¦   HÇD$   H‹D$€8 …Ö   ‹D$$…À…é   H‹D$HdH+%(   …±   HƒÄXH‰è[]A\A]ÃH\$H‰ßè3Êÿÿ…ÀtrÆ$éZÿÿÿfD  ÆD$  H‹\$¸   HÇD$   éÿÿÿ H‹\$H‰ßèãÇÿÿÆD$  H‰D$éüşÿÿ@ H‰ßÆD$ D‹l$$èÎÉÿÿ…À„ËşÿÿÆ$ éÂşÿÿHV  º–   H5:  H==  èîÇÿÿè™ÇÿÿH2  º²   H5  H=0  èÊÇÿÿH  º³   H5÷  H=(  è«Çÿÿf.„     H‹16  1öéòÈÿÿ  HƒìHƒÄÃ                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         abcfnrtv\01234567 /usr/share/locale @localedir@ TEXTDOMAIN TEXTDOMAINDIR gettext-runtime +c:d:eEhnsV 0.21 %s (GNU %s) %s
+ 1995-2020 Ulrich Drepper Written by %s.
+ Informative output:
+ IN_HELP2MAN bug-gettext@gnu.org too many arguments missing arguments context domain help shell-script version   ”Ëÿÿ”Ëÿÿ”Ëÿÿ”Ëÿÿ”Ëÿÿ”Ëÿÿ”Ëÿÿ”ËÿÿDËÿÿDËÿÿDËÿÿDËÿÿDËÿÿDËÿÿDËÿÿDËÿÿDËÿÿDËÿÿDËÿÿDËÿÿDËÿÿDËÿÿDËÿÿDËÿÿDËÿÿDËÿÿDËÿÿDËÿÿDËÿÿDËÿÿDËÿÿDËÿÿDËÿÿDËÿÿDËÿÿDËÿÿDËÿÿDËÿÿDËÿÿDËÿÿDËÿÿDËÿÿDËÿÿDËÿÿÉËÿÿDËÿÿDËÿÿDËÿÿDËÿÿùËÿÿéËÿÿXÌÿÿDËÿÿDËÿÿ9ÌÿÿDËÿÿDËÿÿDËÿÿDËÿÿDËÿÿDËÿÿDËÿÿ)ÌÿÿDËÿÿDËÿÿDËÿÿÌÿÿDËÿÿ	ÌÿÿDËÿÿÙËÿÿ Âÿÿ1Âÿÿ1Âÿÿ1Âÿÿ1Âÿÿ1Âÿÿ1Âÿÿ1Âÿÿ1Âÿÿ1Âÿÿ1Âÿÿ1Âÿÿ1Âÿÿ1Âÿÿ1Âÿÿ1Âÿÿ1ÂÿÿÂÿÿ1Âÿÿ1Âÿÿ1Âÿÿ1Âÿÿ1Âÿÿ1Âÿÿ1Âÿÿ1Âÿÿ1Âÿÿ1Âÿÿ1Âÿÿ1ÂÿÿŒÂÿÿ€ÂÿÿwÂÿÿ1Âÿÿ1Âÿÿ§Âÿÿ1Âÿÿ1Âÿÿ1Âÿÿ1Âÿÿ1ÂÿÿnÂÿÿ1Âÿÿ1Âÿÿ1Âÿÿ1Âÿÿ˜Ãÿÿ    Try '%s --help' for more information.
+  Copyright (C) %s Free Software Foundation, Inc.
+License GPLv3+: GNU GPL version 3 or later <%s>
+This is free software: you are free to change and redistribute it.
+There is NO WARRANTY, to the extent permitted by law.
+       https://gnu.org/licenses/gpl.html       Usage: %s [OPTION] [[TEXTDOMAIN] MSGID]
+or:    %s [OPTION] -s [MSGID]...
+       Display native language translation of a textual message.
+        -d, --domain=TEXTDOMAIN   retrieve translated messages from TEXTDOMAIN
+         -c, --context=CONTEXT     specify context for MSGID
+    -e                        enable expansion of some escape sequences
+    -n                        suppress trailing newline
+    -E                        (ignored for compatibility)
+          [TEXTDOMAIN] MSGID        retrieve translated message corresponding
+                            to MSGID from TEXTDOMAIN
+       -h, --help                display this help and exit
+   -V, --version             display version information and exit
+       If the TEXTDOMAIN parameter is not given, the domain is determined from the
+environment variable TEXTDOMAIN.  If the message catalog is not found in the
+regular directory, another location can be specified with the environment
+variable TEXTDOMAINDIR.
+When used with the -s option the program behaves like the 'echo' command.
+But it does not simply copy its arguments to stdout.  Instead those messages
+found in the selected catalog are translated.
+Standard search directory: %s
+  Report bugs in the bug tracker at <%s>
+or by email to <%s>.
+    https://savannah.gnu.org/projects/gettext write error %s        A NULL argv[0] was passed through an exec system call.
+ /.libs/ mbuiter.h mbsinit (&iter->state) *iter->cur.ptr == '\0' iter->cur.wc == 0 %s (%s) UTF-8         mbuiter_multi_next mbiter.h     mbiter_multi_next memory exhausted C POSIX ASCII                                   ïÿÿÿşÿÿÿşÿÿ                mbuiter_multi_next              mbuiter_multi_next  ;È  8   Lµÿÿ  Œ¸ÿÿ<  œ¸ÿÿ  ¡¸ÿÿ´  ¦¸ÿÿ$	  «¸ÿÿä	  °¸ÿÿ¸
+  ¼¸ÿÿ´  \¿ÿÿä  LÀÿÿT  üÀÿÿ„  ÌÂÿÿì  ,Ãÿÿ   \Ãÿÿ  ÄÿÿL  lÅÿÿœ  |Åÿÿ°  ŒÅÿÿÄ  <Æÿÿô  ¬ÇÿÿH  \Êÿÿ°  ìÊÿÿè  |Íÿÿ4  ¼Íÿÿ\  ìÍÿÿp  \ÓÿÿÄ  œÓÿÿØ  ÌÓÿÿô  ìÓÿÿ  ,Ôÿÿ4  \ÔÿÿP  |Ôÿÿp  ¬Ôÿÿ  Õÿÿ´  <ÕÿÿĞ  lÕÿÿì  œÕÿÿ  ,ÖÿÿL  ŒÖÿÿd  ×ÿÿ„  L×ÿÿ¤  |×ÿÿÄ  Ü×ÿÿğ  ü×ÿÿ  lÙÿÿ0  ÜÚÿÿ„  <ßÿÿÔ  ìåÿÿD	  læÿÿ|	  |æÿÿ”	  éÿÿ
+  |ëÿÿT
+  <ìÿÿ„
+  |ìÿÿ¤
+  ¬ìÿÿÌ
+  üîÿÿ         zR x      p½ÿÿ"                  zR x  $      0³ÿÿ@   FJw€ ?;*3$"       D   H¶ÿÿ           ,   \   ğ½ÿÿ®    A†CDKŒƒ•
+A   ,   Œ   p¾ÿÿĞ   BŒH†D ƒÜ
+ABC   4   ¼    ¶ÿÿŸ   BIB I(ŒH0†J8ƒG`         ô   Ø¿ÿÿ]            $Àÿÿ%    AƒZ
+E,   $  8Àÿÿ¸    A†AƒD W
+AAA     L   T  ÈÀÿÿC   BBŒD †A(ƒG0^
+(D ABBIT
+(D ABBC      ¤  ÈÁÿÿ          ¸  ÄÁÿÿ
+       ,   Ì  ÀÁÿÿ§    BŒA†A ƒs
+ABF   P   ü  @Âÿÿo   BŒA†E ƒ~
+ABG†
+ABGQ
+ABDV
+ABA   D   P  \Ãÿÿ¨   BBB ŒL(†A0ƒGÀn
+0D(A BBBE      ˜  ´ÿÿ    Àƒ†Œ  4   ¸  ¤Åÿÿ†    BŒI†F ƒ`
+ABDJAB  H   ğ  üÅÿÿŒ   BNB B(ŒD0†I8ƒDPõ
+8D0A(B BBBI $   <  @Èÿÿ1    A†GƒI ]AA    d  XÈÿÿ#    DP   x  tÈÿÿb   BBB B(ŒA0†C8ƒD B
+8D0A(B BBBA          Ì  Íÿÿ3    D   à  ¼Íÿÿ"    DX
+A     ü  ĞÍÿÿ    AƒN
+AD      ĞÍÿÿ7    Dƒd
+AI    <  ğÍÿÿ-    Aƒ^
+A   X  Îÿÿ    AƒN
+AD    x  Îÿÿ.    AƒS
+DQ     ˜  Îÿÿl    Aƒs
+D[
+M     ¼  `Îÿÿ    AƒN
+A   Ø  dÎÿÿ'    AƒQ
+F   ô  xÎÿÿ'    AƒQ
+F    <     ˆÎÿÿ†    BEŒD †A(ƒG@F
+(D ABBF        T  ØÎÿÿ_              l   Ïÿÿq    G W
+B       Œ  €Ïÿÿ<    Da
+KK      ¬   Ïÿÿ!    AƒL
+CH (   Ì  °ÏÿÿU    A†DƒK j
+AAD     ø  äÏÿÿ       (     ğÏÿÿm   A†CKŒƒ!
+H P   8  4Ñÿÿo   BŒA†E ƒ~
+ABG†
+ABGQ
+ABDV
+ABA   ,   Œ  PÒÿÿS   A†CFMŒƒw
+A     ¼  å¯ÿÿ    ƒ†ŒL   Ü  `Öÿÿ©   BBB B(ŒA0†A8ƒJàz
+8A0A(B BBBH      ,  z¯ÿÿ    àƒ†Œ4   L   Üÿÿ€    BŒD†F ƒ`
+FBDR
+ABC   „  èÜÿÿ           L   œ  àÜÿÿ›   BBB B(ŒF0†C8ƒJ !÷
+8A0A(B BBBD      ì  ¿®ÿÿ     !ƒ†ŒL     ßÿÿZ   BBB B(ŒD0†A8ƒD 
+8D0A(B BBBF   ,   \   áÿÿ¼    BŒA†A ƒq
+ABH       Œ  °áÿÿ;    Jf
+AF      ¬  Ğáÿÿ$          À  ğ­ÿÿ    AL   Ô  ØáÿÿE   BBŒA †A(ƒG€s
+(D ABBG
+(D ABBB    $	  Øãÿÿ                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   +      Ğ*      a                     c       	a                     d       a                      h       a                      s       "a                      V                                              U                            àY             P‹                           X‹                    õşÿo                   
+             è      
+       æ                                                       È                                         Ø             È      	                            ûÿÿo          şÿÿo    h      ÿÿÿo           ğÿÿo    æ      ùÿÿo                                                                                            Œ                      6       F       V       f       v       †       –       ¦       ¶       Æ       Ö       æ       ö       !      !      &!      6!      F!      V!      f!      v!      †!      –!      ¦!      ¶!      Æ!      Ö!      æ!      ö!      "      "      &"      6"      F"      V"      f"      v"      †"      –"      ¦"      ¶"      Æ"      Ö"      æ"      ö"      #      #      &#      6#      F#      V#                                                                                       /usr/lib/debug/.dwz/x86_64-linux-gnu/gettext-base.debug +9àŠÄ•J§D£hËô$¿–z903ec86c184db18161fd7541ac94d664dd8f98.debug    Úİğ .shstrtab .interp .note.gnu.property .note.gnu.build-id .note.ABI-tag .gnu.hash .dynsym .dynstr .gnu.version .gnu.version_r .rela.dyn .rela.plt .init .plt.got .text .fini .rodata .eh_frame_hdr .eh_frame .init_array .fini_array .data.rel.ro .dynamic .data .bss .gnu_debugaltlink .gnu_debuglink                                                                                                                                           8      8                                     &             X      X      $                              9             |      |                                     G   öÿÿo                     H                             Q             è      è                                Y              
+       
+      æ                             a   ÿÿÿo       æ      æ      ‚                            n   şÿÿo       h      h      p                            }             Ø      Ø      È                           ‡      B                     È                          ‘                                                           Œ                             @                            —             `#      `#                                                 p#      p#      n6                             ¦             àY      àY      	                              ¬              `       `      Ó
+                              ´             Ôj      Ôj      Ì                             Â              l       l      h	                             Ì             P‹      P{                                   Ø             X‹      X{                                   ä             `‹      `{      À                               ñ              Œ       |      ğ                           ›                   ~      Ø                            ú                     €                                                        €      X                                                    €      L                                                   `€      4                                                    ”€      &                                                                                                                                                                                                                             usr/bin/gettext.sh                                                                                  0000755 0000000 0000000 00000012104 14376674240 012663  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        #! /bin/sh
+#
+# Copyright (C) 2003, 2005-2007, 2011, 2018-2020 Free Software Foundation, Inc.
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Lesser General Public License as published by
+# the Free Software Foundation; either version 2.1 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Lesser General Public License for more details.
+#
+# You should have received a copy of the GNU Lesser General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+#
+
+# Find a way to echo strings without interpreting backslash.
+if test "X`(echo '\t') 2>/dev/null`" = 'X\t'; then
+  echo='echo'
+else
+  if test "X`(printf '%s\n' '\t') 2>/dev/null`" = 'X\t'; then
+    echo='printf %s\n'
+  else
+    echo_func () {
+      cat <<EOT
+$*
+EOT
+    }
+    echo='echo_func'
+  fi
+fi
+
+# This script is primarily a shell function library. In order for
+# ". gettext.sh" to find it, we install it in $PREFIX/bin (that is usually
+# contained in $PATH), rather than in some other location such as
+# $PREFIX/share/sh-scripts or $PREFIX/share/gettext. In order to not violate
+# the Filesystem Hierarchy Standard when doing so, this script is executable.
+# Therefore it needs to support the standard --help and --version.
+if test -z "${ZSH_VERSION+set}"; then
+  # zsh is not POSIX compliant: By default, while ". gettext.sh" is executed,
+  # it sets $0 to "gettext.sh", defeating the purpose of this test. But
+  # fortunately we know that when running under zsh, this script is always
+  # being sourced, not executed, because hardly anyone is crazy enough to
+  # install zsh as /bin/sh.
+  case "$0" in
+    gettext.sh | */gettext.sh | *\\gettext.sh)
+      progname=$0
+      package=gettext-runtime
+      version=0.21
+      # func_usage
+      # outputs to stdout the --help usage message.
+      func_usage ()
+      {
+        echo "GNU gettext shell script function library version $version"
+        echo "Usage: . gettext.sh"
+      }
+      # func_version
+      # outputs to stdout the --version message.
+      func_version ()
+      {
+        echo "$progname (GNU $package) $version"
+        echo "Copyright (C) 2003-2020 Free Software Foundation, Inc.
+License GPLv2+: GNU GPL version 2 or later <https://gnu.org/licenses/gpl.html>
+This is free software: you are free to change and redistribute it.
+There is NO WARRANTY, to the extent permitted by law."
+        echo "Written by" "Bruno Haible"
+      }
+      if test $# = 1; then
+        case "$1" in
+          --help | --hel | --he | --h )
+            func_usage; exit 0 ;;
+          --version | --versio | --versi | --vers | --ver | --ve | --v )
+            func_version; exit 0 ;;
+        esac
+      fi
+      func_usage 1>&2
+      exit 1
+      ;;
+  esac
+fi
+
+# eval_gettext MSGID
+# looks up the translation of MSGID and substitutes shell variables in the
+# result.
+eval_gettext () {
+  gettext "$1" | (export PATH `envsubst --variables "$1"`; envsubst "$1")
+}
+
+# eval_ngettext MSGID MSGID-PLURAL COUNT
+# looks up the translation of MSGID / MSGID-PLURAL for COUNT and substitutes
+# shell variables in the result.
+eval_ngettext () {
+  ngettext "$1" "$2" "$3" | (export PATH `envsubst --variables "$1 $2"`; envsubst "$1 $2")
+}
+
+# eval_pgettext MSGCTXT MSGID
+# looks up the translation of MSGID in the context MSGCTXT and substitutes
+# shell variables in the result.
+eval_pgettext () {
+  gettext --context="$1" "$2" | (export PATH `envsubst --variables "$2"`; envsubst "$2")
+}
+
+# eval_npgettext MSGCTXT MSGID MSGID-PLURAL COUNT
+# looks up the translation of MSGID / MSGID-PLURAL for COUNT in the context
+# MSGCTXT and substitutes shell variables in the result.
+eval_npgettext () {
+  ngettext --context="$1" "$2" "$3" "$4" | (export PATH `envsubst --variables "$2 $3"`; envsubst "$2 $3")
+}
+
+# Note: This use of envsubst is much safer than using the shell built-in 'eval'
+# would be.
+# 1) The security problem with Chinese translations that happen to use a
+#    character such as \xe0\x60 is avoided.
+# 2) The security problem with malevolent translators who put in command lists
+#    like "$(...)" or "`...`" is avoided.
+# 3) The translations can only refer to shell variables that are already
+#    mentioned in MSGID or MSGID-PLURAL.
+#
+# Note: "export PATH" above is a dummy; this is for the case when
+# `envsubst --variables ...` returns nothing.
+#
+# Note: In eval_ngettext above, "$1 $2" means a string whose variables set is
+# the union of the variables set of "$1" and "$2".
+#
+# Note: The minimal use of backquote above ensures that trailing newlines are
+# not dropped, not from the gettext invocation and not from the value of any
+# shell variable.
+#
+# Note: Field splitting on the `envsubst --variables ...` result is desired,
+# since envsubst outputs the variables, separated by newlines. Pathname
+# wildcard expansion or tilde expansion has no effect here, since the words
+# output by "envsubst --variables ..." consist solely of alphanumeric
+# characters and underscore.
+                                                                                                                                                                                                                                                                                                                                                                                                                                                            usr/bin/gettextize                                                                                  0000755 0000000 0000000 00000122434 14376674240 012772  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        #! /bin/sh
+#
+# Copyright (C) 1995-1998, 2000-2020 Free Software Foundation, Inc.
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+#
+
+# This file is meant for authors or maintainers which want to
+# internationalize their package with the help of GNU gettext.  For
+# further information how to use it consult the GNU gettext manual.
+
+progname=$0
+package=gettext-tools
+version=0.21
+archive_version=0.21
+
+# Set variables
+# - gettext_datadir     directory where the data files are stored.
+prefix="/usr"
+datarootdir="${prefix}/share"
+: ${gettext_datadir="${datarootdir}/gettext"}
+: ${AUTOM4TE=autom4te}
+
+# func_tmpdir
+# creates a temporary directory.
+# Sets variable
+# - tmp             pathname of freshly created temporary directory
+func_tmpdir ()
+{
+  # Use the environment variable TMPDIR, falling back to /tmp. This allows
+  # users to specify a different temporary directory, for example, if their
+  # /tmp is filled up or too small.
+  : ${TMPDIR=/tmp}
+  {
+    # Use the mktemp program if available. If not available, hide the error
+    # message.
+    tmp=`(umask 077 && mktemp -d "$TMPDIR/gtXXXXXX") 2>/dev/null` &&
+    test -n "$tmp" && test -d "$tmp"
+  } ||
+  {
+    # Use a simple mkdir command. It is guaranteed to fail if the directory
+    # already exists.  $RANDOM is bash specific and expands to empty in shells
+    # other than bash, ksh and zsh.  Its use does not increase security;
+    # rather, it minimizes the probability of failure in a very cluttered /tmp
+    # directory.
+    tmp=$TMPDIR/gt$$-$RANDOM
+    (umask 077 && mkdir "$tmp")
+  } ||
+  {
+    echo "$0: cannot create a temporary directory in $TMPDIR" >&2
+    { (exit 1); exit 1; }
+  }
+}
+
+# Support for relocatability.
+func_find_curr_installdir ()
+{
+  # Determine curr_installdir, even taking into account symlinks.
+  curr_executable="$0"
+  case "$curr_executable" in
+    */* | *\\*) ;;
+    *) # Need to look in the PATH.
+      save_IFS="$IFS"; IFS="${PATH_SEPARATOR=':'}"
+      for dir in $PATH; do
+        IFS="$save_IFS"
+        test -z "$dir" && dir=.
+        for exec_ext in ''; do
+          if test -f "$dir/$curr_executable$exec_ext"; then
+            curr_executable="$dir/$curr_executable$exec_ext"
+            break 2
+          fi
+        done
+      done
+      IFS="$save_IFS"
+      ;;
+  esac
+  # Make absolute.
+  case "$curr_executable" in
+    /* | ?:/* | ?:\\*) ;;
+    *) curr_executable=`pwd`/"$curr_executable" ;;
+  esac
+  # Resolve symlinks.
+  sed_dirname='s,/[^/]*$,,'
+  sed_linkdest='s,^.* -> \(.*\),\1,p'
+  while : ; do
+    lsline=`LC_ALL=C ls -l "$curr_executable"`
+    case "$lsline" in
+      *" -> "*)
+        linkdest=`echo "$lsline" | sed -n -e "$sed_linkdest"`
+        case "$linkdest" in
+          /* | ?:/* | ?:\\*) curr_executable="$linkdest" ;;
+          *) curr_executable=`echo "$curr_executable" | sed -e "$sed_dirname"`/"$linkdest" ;;
+        esac ;;
+      *) break ;;
+    esac
+  done
+  curr_installdir=`echo "$curr_executable" | sed -e 's,/[^/]*$,,'`
+  # Canonicalize.
+  curr_installdir=`cd "$curr_installdir" && pwd`
+}
+func_find_prefixes ()
+{
+  # Compute the original/current installation prefixes by stripping the
+  # trailing directories off the original/current installation directories.
+  orig_installprefix="$orig_installdir"
+  curr_installprefix="$curr_installdir"
+  while true; do
+    orig_last=`echo "$orig_installprefix" | sed -n -e 's,^.*/\([^/]*\)$,\1,p'`
+    curr_last=`echo "$curr_installprefix" | sed -n -e 's,^.*/\([^/]*\)$,\1,p'`
+    if test -z "$orig_last" || test -z "$curr_last"; then
+      break
+    fi
+    if test "$orig_last" != "$curr_last"; then
+      break
+    fi
+    orig_installprefix=`echo "$orig_installprefix" | sed -e 's,/[^/]*$,,'`
+    curr_installprefix=`echo "$curr_installprefix" | sed -e 's,/[^/]*$,,'`
+  done
+}
+if test "no" = yes; then
+  exec_prefix="${prefix}"
+  bindir="${exec_prefix}/bin"
+  orig_installdir="$bindir" # see Makefile.am's *_SCRIPTS variables
+  func_find_curr_installdir # determine curr_installdir
+  func_find_prefixes
+  # Relocate the directory variables that we use.
+  gettext_datadir=`echo "$gettext_datadir/" | sed -e "s%^${orig_installprefix}/%${curr_installprefix}/%" | sed -e 's,/$,,'`
+fi
+
+# func_trace_autoconf macro configure.ac
+# traces an Autoconf macro call and outputs the arguments to stdout,
+# using autom4te.
+func_trace_autoconf ()
+{
+  echo '\
+dnl replace macros which may abort autom4te with a no-op variant
+m4_pushdef([m4_assert])
+m4_pushdef([m4_fatal])
+m4_pushdef([m4_warn])
+m4_pushdef([m4_errprintn])
+m4_pushdef([m4_exit])
+m4_pushdef([m4_include])
+m4_pushdef([m4_esyscmd])
+' \
+  | "$AUTOM4TE" --no-cache --language=Autoconf-without-aclocal-m4 \
+    --trace="$1":\$% - "$2" 2>/dev/null
+}
+
+# func_trace_sed macro configure.ac
+# traces an Autoconf macro call and outputs the arguments to stdout,
+# using sed.
+func_trace_sed ()
+{
+  sed_extract_arguments='
+s,#.*$,,; s,^dnl .*$,,; s, dnl .*$,,;
+/'"$1"'(/ {
+  ta
+  :a
+    s/)/)/
+    tb
+    s/\\$//
+    N
+    ba
+  :b
+  s,^.*'"$1"'([[ ]*\([^]"$`\\)]*\).*$,\1,p
+}
+d'
+  sed -e "$sed_extract_arguments" "$2"
+}
+
+# func_usage
+# outputs to stdout the --help usage message.
+func_usage ()
+{
+  echo "\
+Usage: gettextize [OPTION]... [package-dir]
+
+Prepares a source package to use gettext.
+
+Options:
+      --help           print this help and exit
+      --version        print version information and exit
+  -f, --force          force writing of new files even if old exist
+      --po-dir=DIR     specify directory with PO files
+      --no-changelog   don't update or create ChangeLog files
+      --symlink        make symbolic links instead of copying files
+  -n, --dry-run        print modifications but don't perform them
+
+Report bugs in the bug tracker at <https://savannah.gnu.org/projects/gettext>
+or by email to <bug-gettext@gnu.org>."
+}
+
+# func_version
+# outputs to stdout the --version message.
+func_version ()
+{
+  echo "$progname (GNU $package) $version"
+  echo "Copyright (C) 1995-2020 Free Software Foundation, Inc.
+License GPLv3+: GNU GPL version 3 or later <https://gnu.org/licenses/gpl.html>
+This is free software: you are free to change and redistribute it.
+There is NO WARRANTY, to the extent permitted by law."
+  echo "Written by" "Ulrich Drepper"
+}
+
+# func_fatal_error message
+# outputs to stderr a fatal error message, and terminates the program.
+func_fatal_error ()
+{
+  echo "gettextize: *** $1" 1>&2
+  echo "gettextize: *** Stop." 1>&2
+  exit 1
+}
+
+# Nuisances.
+(unset CDPATH) >/dev/null 2>&1 && unset CDPATH
+
+# Unset more variables known to interfere with behavior of common tools.
+CLICOLOR_FORCE= GREP_OPTIONS=
+unset CLICOLOR_FORCE GREP_OPTIONS
+
+# Command-line option processing.
+# Removes the OPTIONS from the arguments. Sets the variables:
+# - force           1 if --force was given, 0 otherwise
+# - intldir         yes if --intl was given, empty otherwise
+# - podirs          list of directories specified with --po-dir
+# - try_ln_s        : if --symlink was given, false otherwise
+# - do_changelog    false if --no-changelog was given, : otherwise
+# - doit            false if --dry-run was given, : otherwise
+{
+  force=0
+  intldir=
+  podirs=
+  try_ln_s=false
+  do_changelog=:
+  doit=:
+
+  while test $# -gt 0; do
+    case "$1" in
+      -c | --copy | --cop | --co | --c ) # accepted for backward compatibility
+        shift ;;
+      -n | --dry-run | --dry-ru | --dry-r | --dry- | --dry | --dr | --d )
+        shift
+        doit=false ;;
+      -f | --force | --forc | --for | --fo | --f )
+        shift
+        force=1 ;;
+      --help | --hel | --he | --h )
+        func_usage; exit 0 ;;
+      --intl | --int | --in | --i )
+        shift
+        intldir=yes ;;
+      --po-dir | --po-di | --po-d | --po- | --po | --p )
+        shift 
+        if test $# = 0; then
+          func_fatal_error "missing argument for --po-dir"
+        fi
+        case "$1" in
+          -*) func_fatal_error "missing argument for --po-dir" ;;
+        esac
+        podirs="$podirs $1"
+        shift ;;
+      --po-dir=* )
+        arg=`echo "X$1" | sed -e 's/^X--po-dir=//'`
+        podirs="$podirs $arg"
+        shift ;;
+      --no-changelog | --no-changelo | --no-changel | --no-change | --no-chang | --no-chan | --no-cha | --no-ch | --no-c )
+        shift
+        do_changelog=false ;;
+      --symlink | --symlin | --symli | --syml | --sym | --sy | --s )
+        shift
+        try_ln_s=: ;;
+      --version | --versio | --versi | --vers | --ver | --ve | --v )
+        func_version
+        exit 0 ;;
+      -- ) # Stop option prcessing
+        shift; break ;;

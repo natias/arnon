@@ -1,0 +1,1000 @@
+        push @searchdirs, ($self->{'bindir'}, @{$self->{search_path}}, @INC);
+        unless ($self->opt_m) {
+            if ($self->is_vms) {
+                my($i,$trn);
+                for ($i = 0; $trn = $ENV{'DCL$PATH;'.$i}; $i++) {
+                    push(@searchdirs,$trn);
+                }
+                push(@searchdirs,'perl_root:[lib.pods]')  # installed pods
+            }
+            else {
+                push(@searchdirs, grep(-d, split($Config{path_sep},
+                                                 $ENV{'PATH'})));
+            }
+        }
+        my @files = $self->searchfor(0,$_,@searchdirs);
+        if (@files) {
+            $self->aside( "Found as @files\n" );
+        }
+        # add "perl" prefix, so "perldoc foo" may find perlfoo.pod
+    elsif (BE_LENIENT and !/\W/ and  @files = $self->searchfor(0, "perl$_", @searchdirs)) {
+            $self->aside( "Loosely found as @files\n" );
+        }
+        else {
+            # no match, try recursive search
+            @searchdirs = grep(!/^\.\z/s,@INC);
+            @files= $self->searchfor(1,$_,@searchdirs) if $self->opt_r;
+            if (@files) {
+                $self->aside( "Loosely found as @files\n" );
+            }
+            else {
+                print STDERR "No " .
+                    ($self->opt_m ? "module" : "documentation") . " found for \"$_\".\n";
+                if ( @{ $self->{'found'} } ) {
+                    print STDERR "However, try\n";
+                    my $me = $self->program_name;
+                    for my $dir (@{ $self->{'found'} }) {
+                        opendir(DIR, $dir) or $self->die( "opendir $dir: $!" );
+                        while (my $file = readdir(DIR)) {
+                            next if ($file =~ /^\./s);
+                            $file =~ s/\.(pm|pod)\z//;  # XXX: badfs
+                            print STDERR "\t$me $_\::$file\n";
+                        }
+                        closedir(DIR)    or $self->die( "closedir $dir: $!" );
+                    }
+                }
+            }
+        }
+        push(@found,@files);
+    }
+    return @found;
+}
+
+#..........................................................................
+
+sub maybe_generate_dynamic_pod {
+    my($self, $found_things) = @_;
+    my @dynamic_pod;
+
+    $self->search_perlapi($found_things, \@dynamic_pod)   if  $self->opt_a;
+
+    $self->search_perlfunc($found_things, \@dynamic_pod)  if  $self->opt_f;
+
+    $self->search_perlvar($found_things, \@dynamic_pod)   if  $self->opt_v;
+
+    $self->search_perlfaqs($found_things, \@dynamic_pod)  if  $self->opt_q;
+
+    if( ! $self->opt_f and ! $self->opt_q and ! $self->opt_v and ! $self->opt_a) {
+        DEBUG > 4 and print "That's a non-dynamic pod search.\n";
+    } elsif ( @dynamic_pod ) {
+        $self->aside("Hm, I found some Pod from that search!\n");
+        my ($buffd, $buffer) = $self->new_tempfile('pod', 'dyn');
+        if ( $] >= 5.008 && $self->opt_L ) {
+            binmode($buffd, ":encoding(UTF-8)");
+            print $buffd "=encoding utf8\n\n";
+        }
+
+        push @{ $self->{'temp_file_list'} }, $buffer;
+         # I.e., it MIGHT be deleted at the end.
+
+        my $in_list = !$self->not_dynamic && $self->opt_f || $self->opt_v || $self->opt_a;
+
+        print $buffd "=over 8\n\n" if $in_list;
+        print $buffd @dynamic_pod  or $self->die( "Can't print $buffer: $!" );
+        print $buffd "=back\n"     if $in_list;
+
+        close $buffd        or $self->die( "Can't close $buffer: $!" );
+
+        @$found_things = $buffer;
+          # Yes, so found_things never has more than one thing in
+          #  it, by time we leave here
+
+        $self->add_formatter_option('__filter_nroff' => 1);
+
+    } else {
+        @$found_things = ();
+        $self->aside("I found no Pod from that search!\n");
+    }
+
+    return;
+}
+
+#..........................................................................
+
+sub not_dynamic {
+  my ($self,$value) = @_;
+  $self->{__not_dynamic} = $value if @_ == 2;
+  return $self->{__not_dynamic};
+}
+
+#..........................................................................
+
+sub add_formatter_option { # $self->add_formatter_option('key' => 'value');
+  my $self = shift;
+  push @{ $self->{'formatter_switches'} }, [ @_ ] if @_;
+
+  DEBUG > 3 and printf "Formatter switches now: [%s]\n",
+   join ' ', map "[@$_]", @{ $self->{'formatter_switches'} };
+
+  return;
+}
+
+#.........................................................................
+
+sub new_translator { # $tr = $self->new_translator($lang);
+    my $self = shift;
+    my $lang = shift;
+
+    local @INC = @INC;
+    pop @INC if $INC[-1] eq '.';
+    my $pack = 'POD2::' . uc($lang);
+    eval "require $pack";
+    if ( !$@ && $pack->can('new') ) {
+    return $pack->new();
+    }
+
+    eval { require POD2::Base };
+    return if $@;
+
+    return POD2::Base->new({ lang => $lang });
+}
+
+#.........................................................................
+
+sub add_translator { # $self->add_translator($lang);
+    my $self = shift;
+    for my $lang (@_) {
+        my $tr = $self->new_translator($lang);
+        if ( defined $tr ) {
+            push @{ $self->{'translators'} }, $tr;
+            push @{ $self->{'extra_search_dirs'} }, $tr->pod_dirs;
+
+            $self->aside( "translator for '$lang' loaded\n" );
+        } else {
+            # non-installed or bad translator package
+            $self->warn( "Perldoc cannot load translator package for '$lang': ignored\n" );
+        }
+
+    }
+    return;
+}
+
+#..........................................................................
+
+sub open_fh {
+    my ($self, $op, $path) = @_;
+
+    open my $fh, $op, $path or $self->die("Couldn't open $path: $!");
+    return $fh;
+}
+
+sub set_encoding {
+    my ($self, $fh, $encoding) = @_;
+
+    if ( $encoding =~ /utf-?8/i ) {
+        $encoding = ":encoding(UTF-8)";
+    }
+    else {
+        $encoding = ":encoding($encoding)";
+    }
+
+    if ( $] < 5.008 ) {
+        $self->aside("Your old perl doesn't have proper unicode support.");
+    }
+    else {
+        binmode($fh, $encoding);
+    }
+
+    return $fh;
+}
+
+sub search_perlvar {
+    my($self, $found_things, $pod) = @_;
+
+    my $opt = $self->opt_v;
+
+    if ( $opt !~ /^ (?: [\@\%\$]\S+ | [A-Z]\w* ) $/x ) {
+        CORE::die( "'$opt' does not look like a Perl variable\n" );
+    }
+
+    DEBUG > 2 and print "Search: @$found_things\n";
+
+    my $perlvar = shift @$found_things;
+    my $fh = $self->open_fh("<", $perlvar);
+
+    if ( $opt ne '$0' && $opt =~ /^\$\d+$/ ) { # handle $1, $2, ...
+      $opt = '$<I<digits>>';
+    }
+    my $search_re = quotemeta($opt);
+
+    DEBUG > 2 and
+     print "Going to perlvar-scan for $search_re in $perlvar\n";
+
+    # Skip introduction
+    local $_;
+    my $enc;
+    while (<$fh>) {
+        $enc = $1 if /^=encoding\s+(\S+)/;
+        last if /^=over 8/;
+    }
+
+    $fh = $self->set_encoding($fh, $enc) if $enc;
+
+    # Look for our variable
+    my $found = 0;
+    my $inheader = 1;
+    my $inlist = 0;
+    while (<$fh>) {  
+        last if /^=head2 Error Indicators/;
+        # \b at the end of $` and friends borks things!
+        if ( m/^=item\s+$search_re\s/ )  {
+            $found = 1;
+        }
+        elsif (/^=item/) {
+            last if $found && !$inheader && !$inlist;
+        }
+        elsif (!/^\s+$/) { # not a blank line
+            if ( $found ) {
+                $inheader = 0; # don't accept more =item (unless inlist)
+        }
+            else {
+                @$pod = (); # reset
+                $inheader = 1; # start over
+                next;
+            }
+    }
+
+        if (/^=over/) {
+            ++$inlist;
+        }
+        elsif (/^=back/) {
+            last if $found && !$inheader && !$inlist;
+            --$inlist;
+        }
+        push @$pod, $_;
+#        ++$found if /^\w/;        # found descriptive text
+    }
+    @$pod = () unless $found;
+    if (!@$pod) {
+        CORE::die( "No documentation for perl variable '$opt' found\n" );
+    }
+    close $fh                or $self->die( "Can't close $perlvar: $!" );
+
+    return;
+}
+
+#..........................................................................
+
+sub search_perlop {
+  my ($self,$found_things,$pod) = @_;
+
+  $self->not_dynamic( 1 );
+
+  my $perlop = shift @$found_things;
+  # XXX FIXME: getting filehandles should probably be done in a single place
+  # especially since we need to support UTF8 or other encoding when dealing
+  # with perlop, perlfunc, perlapi, perlfaq[1-9]
+  my $fh = $self->open_fh('<', $perlop);
+
+  my $thing = $self->opt_f;
+
+  my $previous_line;
+  my $push = 0;
+  my $seen_item = 0;
+  my $skip = 1;
+
+  while( my $line = <$fh> ) {
+    $line =~ /^=encoding\s+(\S+)/ && $self->set_encoding($fh, $1);
+    # only start search after we hit the operator section
+    if ($line =~ m!^X<operator, regexp>!) {
+        $skip = 0;
+    }
+
+    next if $skip;
+
+    # strategy is to capture the previous line until we get a match on X<$thingy>
+    # if the current line contains X<$thingy>, then we push "=over", the previous line, 
+    # the current line and keep pushing current line until we see a ^X<some-other-thing>, 
+    # then we chop off final line from @$pod and add =back
+    #
+    # At that point, Bob's your uncle.
+
+    if ( $line =~ m!X<+\s*\Q$thing\E\s*>+!) {
+        if ( $previous_line ) {
+            push @$pod, "=over 8\n\n", $previous_line;
+            $previous_line = "";
+        }
+        push @$pod, $line;
+        $push = 1;
+
+    }
+    elsif ( $push and $line =~ m!^=item\s*.*$! ) {
+        $seen_item = 1;
+    }
+    elsif ( $push and $seen_item and $line =~ m!^X<+\s*[ a-z,?-]+\s*>+!) {
+        $push = 0;
+        $seen_item = 0;
+        last;
+    }
+    elsif ( $push ) {
+        push @$pod, $line;
+    }
+
+    else {
+        $previous_line = $line;
+    }
+
+  } #end while
+
+  # we overfilled by 1 line, so pop off final array element if we have any
+  if ( scalar @$pod ) {
+    pop @$pod;
+
+    # and add the =back
+    push @$pod, "\n\n=back\n";
+    DEBUG > 8 and print "PERLOP POD --->" . (join "", @$pod) . "<---\n";
+  }
+  else {
+    DEBUG > 4 and print "No pod from perlop\n";
+  }
+
+  close $fh;
+
+  return;
+}
+
+#..........................................................................
+
+sub search_perlapi {
+    my($self, $found_things, $pod) = @_;
+
+    DEBUG > 2 and print "Search: @$found_things\n";
+
+    my $perlapi = shift @$found_things;
+    my $fh = $self->open_fh('<', $perlapi);
+
+    my $search_re = quotemeta($self->opt_a);
+
+    DEBUG > 2 and
+     print "Going to perlapi-scan for $search_re in $perlapi\n";
+
+    local $_;
+
+    # Look for our function
+    my $found = 0;
+    my $inlist = 0;
+
+    my @related;
+    my $related_re;
+    while (<$fh>) {
+        /^=encoding\s+(\S+)/ && $self->set_encoding($fh, $1);
+
+        if ( m/^=item\s+$search_re\b/ )  {
+            $found = 1;
+        }
+        elsif (@related > 1 and /^=item/) {
+            $related_re ||= join "|", @related;
+            if (m/^=item\s+(?:$related_re)\b/) {
+                $found = 1;
+            }
+            else {
+                last;
+            }
+        }
+        elsif (/^=item/) {
+            last if $found > 1 and not $inlist;
+        }
+        elsif ($found and /^X<[^>]+>/) {
+            push @related, m/X<([^>]+)>/g;
+        }
+        next unless $found;
+        if (/^=over/) {
+            ++$inlist;
+        }
+        elsif (/^=back/) {
+            last if $found > 1 and not $inlist;
+            --$inlist;
+        }
+        push @$pod, $_;
+        ++$found if /^\w/;        # found descriptive text
+    }
+
+    if (!@$pod) {
+        CORE::die( sprintf
+          "No documentation for perl api function '%s' found\n",
+          $self->opt_a )
+        ;
+    }
+    close $fh                or $self->die( "Can't open $perlapi: $!" );
+
+    return;
+}
+
+#..........................................................................
+
+sub search_perlfunc {
+    my($self, $found_things, $pod) = @_;
+
+    DEBUG > 2 and print "Search: @$found_things\n";
+
+    my $pfunc = shift @$found_things;
+    my $fh = $self->open_fh("<", $pfunc); # "Funk is its own reward"
+
+    # Functions like -r, -e, etc. are listed under `-X'.
+    my $search_re = ($self->opt_f =~ /^-[rwxoRWXOeszfdlpSbctugkTBMAC]$/)
+                        ? '(?:I<)?-X' : quotemeta($self->opt_f) ;
+
+    DEBUG > 2 and
+     print "Going to perlfunc-scan for $search_re in $pfunc\n";
+
+    my $re = 'Alphabetical Listing of Perl Functions';
+
+    # Check available translator or backup to default (english)
+    if ( $self->opt_L && defined $self->{'translators'}->[0] ) {
+        my $tr = $self->{'translators'}->[0];
+        $re =  $tr->search_perlfunc_re if $tr->can('search_perlfunc_re');
+        if ( $] < 5.008 ) {
+            $self->aside("Your old perl doesn't really have proper unicode support.");
+        }
+    }
+
+    # Skip introduction
+    local $_;
+    while (<$fh>) {
+        /^=encoding\s+(\S+)/ && $self->set_encoding($fh, $1);
+        last if /^=head2 (?:$re|Alphabetical Listing of Perl Functions)/;
+    }
+
+    # Look for our function
+    my $found = 0;
+    my $inlist = 0;
+
+    my @perlops = qw(m q qq qr qx qw s tr y);
+
+    my @related;
+    my $related_re;
+    while (<$fh>) {  # "The Mothership Connection is here!"
+        last if( grep{ $self->opt_f eq $_ }@perlops );
+
+        if ( /^=over/ and not $found ) {
+            ++$inlist;
+        }
+        elsif ( /^=back/ and not $found and $inlist ) {
+            --$inlist;
+        }
+
+
+        if ( m/^=item\s+$search_re\b/ and $inlist < 2 )  {
+            $found = 1;
+        }
+        elsif (@related > 1 and /^=item/) {
+            $related_re ||= join "|", @related;
+            if (m/^=item\s+(?:$related_re)\b/) {
+                $found = 1;
+            }
+            else {
+                last if $found > 1 and $inlist < 2;
+            }
+        }
+        elsif (/^=item|^=back/) {
+            last if $found > 1 and $inlist < 2;
+        }
+        elsif ($found and /^X<[^>]+>/) {
+            push @related, m/X<([^>]+)>/g;
+        }
+        next unless $found;
+        if (/^=over/) {
+            ++$inlist;
+        }
+        elsif (/^=back/) {
+            --$inlist;
+        }
+        push @$pod, $_;
+        ++$found if /^\w/;        # found descriptive text
+    }
+
+    if( !@$pod ){
+        $self->search_perlop( $found_things, $pod );
+    }
+
+    if (!@$pod) {
+        CORE::die( sprintf
+          "No documentation for perl function '%s' found\n",
+          $self->opt_f )
+        ;
+    }
+    close $fh                or $self->die( "Can't close $pfunc: $!" );
+
+    return;
+}
+
+#..........................................................................
+
+sub search_perlfaqs {
+    my( $self, $found_things, $pod) = @_;
+
+    my $found = 0;
+    my %found_in;
+    my $search_key = $self->opt_q;
+
+    my $rx = eval { qr/$search_key/ }
+     or $self->die( <<EOD );
+Invalid regular expression '$search_key' given as -q pattern:
+$@
+Did you mean \\Q$search_key ?
+
+EOD
+
+    local $_;
+    foreach my $file (@$found_things) {
+        $self->die( "invalid file spec: $!" ) if $file =~ /[<>|]/;
+        my $fh = $self->open_fh("<", $file);
+        while (<$fh>) {
+            /^=encoding\s+(\S+)/ && $self->set_encoding($fh, $1);
+            if ( m/^=head2\s+.*(?:$search_key)/i ) {
+                $found = 1;
+                push @$pod, "=head1 Found in $file\n\n" unless $found_in{$file}++;
+            }
+            elsif (/^=head[12]/) {
+                $found = 0;
+            }
+            next unless $found;
+            push @$pod, $_;
+        }
+        close($fh);
+    }
+    CORE::die("No documentation for perl FAQ keyword '$search_key' found\n")
+     unless @$pod;
+
+    if ( $self->opt_l ) {
+        CORE::die((join "\n", keys %found_in) . "\n");
+    }
+    return;
+}
+
+
+#..........................................................................
+
+sub render_findings {
+  # Return the filename to open
+
+  my($self, $found_things) = @_;
+
+  my $formatter_class = $self->{'formatter_class'}
+   || $self->die( "No formatter class set!?" );
+  my $formatter = $formatter_class->can('new')
+    ? $formatter_class->new
+    : $formatter_class
+  ;
+
+  if(! @$found_things) {
+    $self->die( "Nothing found?!" );
+    # should have been caught before here
+  } elsif(@$found_things > 1) {
+    $self->warn(
+     "Perldoc is only really meant for reading one document at a time.\n",
+     "So these parameters are being ignored: ",
+     join(' ', @$found_things[1 .. $#$found_things] ),
+     "\n" );
+  }
+
+  my $file = $found_things->[0];
+
+  DEBUG > 3 and printf "Formatter switches now: [%s]\n",
+   join ' ', map "[@$_]", @{ $self->{'formatter_switches'} };
+
+  # Set formatter options:
+  if( ref $formatter ) {
+    foreach my $f (@{ $self->{'formatter_switches'} || [] }) {
+      my($switch, $value, $silent_fail) = @$f;
+      if( $formatter->can($switch) ) {
+        eval { $formatter->$switch( defined($value) ? $value : () ) };
+        $self->warn( "Got an error when setting $formatter_class\->$switch:\n$@\n" )
+         if $@;
+      } else {
+        if( $silent_fail or $switch =~ m/^__/s ) {
+          DEBUG > 2 and print "Formatter $formatter_class doesn't support $switch\n";
+        } else {
+          $self->warn( "$formatter_class doesn't recognize the $switch switch.\n" );
+        }
+      }
+    }
+  }
+
+  $self->{'output_is_binary'} =
+    $formatter->can('write_with_binmode') && $formatter->write_with_binmode;
+
+  if( $self->{podnames} and exists $self->{podnames}{$file} and
+      $formatter->can('name') ) {
+    $formatter->name($self->{podnames}{$file});
+  }
+
+  my ($out_fh, $out) = $self->new_output_file(
+    ( $formatter->can('output_extension') && $formatter->output_extension )
+     || undef,
+    $self->useful_filename_bit,
+  );
+
+  # Now, finally, do the formatting!
+  {
+    local $^W = $^W;
+    if(DEBUG() or $self->opt_D) {
+      # feh, let 'em see it
+    } else {
+      $^W = 0;
+      # The average user just has no reason to be seeing
+      #  $^W-suppressible warnings from the formatting!
+    }
+
+    eval {  $formatter->parse_from_file( $file, $out_fh )  };
+  }
+
+  $self->warn( "Error while formatting with $formatter_class:\n $@\n" ) if $@;
+  DEBUG > 2 and print "Back from formatting with $formatter_class\n";
+
+  close $out_fh
+   or $self->warn( "Can't close $out: $!\n(Did $formatter already close it?)" );
+  sleep 0; sleep 0; sleep 0;
+   # Give the system a few timeslices to meditate on the fact
+   # that the output file does in fact exist and is closed.
+
+  $self->unlink_if_temp_file($file);
+
+  unless( -s $out ) {
+    if( $formatter->can( 'if_zero_length' ) ) {
+      # Basically this is just a hook for Pod::Simple::Checker; since
+      # what other class could /happily/ format an input file with Pod
+      # as a 0-length output file?
+      $formatter->if_zero_length( $file, $out, $out_fh );
+    } else {
+      $self->warn( "Got a 0-length file from $$found_things[0] via $formatter_class!?\n" );
+    }
+  }
+
+  DEBUG and print "Finished writing to $out.\n";
+  return($out, $formatter) if wantarray;
+  return $out;
+}
+
+#..........................................................................
+
+sub unlink_if_temp_file {
+  # Unlink the specified file IFF it's in the list of temp files.
+  # Really only used in the case of -f / -q things when we can
+  #  throw away the dynamically generated source pod file once
+  #  we've formatted it.
+  #
+  my($self, $file) = @_;
+  return unless defined $file and length $file;
+
+  my $temp_file_list = $self->{'temp_file_list'} || return;
+  if(grep $_ eq $file, @$temp_file_list) {
+    $self->aside("Unlinking $file\n");
+    unlink($file) or $self->warn( "Odd, couldn't unlink $file: $!" );
+  } else {
+    DEBUG > 1 and print "$file isn't a temp file, so not unlinking.\n";
+  }
+  return;
+}
+
+#..........................................................................
+
+
+sub after_rendering {
+  my $self = $_[0];
+  $self->after_rendering_VMS     if $self->is_vms;
+  $self->after_rendering_MSWin32 if $self->is_mswin32;
+  $self->after_rendering_Dos     if $self->is_dos;
+  $self->after_rendering_OS2     if $self->is_os2;
+  return;
+}
+
+sub after_rendering_VMS      { return }
+sub after_rendering_Dos      { return }
+sub after_rendering_OS2      { return }
+sub after_rendering_MSWin32  { return }
+
+#..........................................................................
+#   :   :   :   :   :   :   :   :   :
+#..........................................................................
+
+sub minus_f_nocase {   # i.e., do like -f, but without regard to case
+
+     my($self, $dir, $file) = @_;
+     my $path = catfile($dir,$file);
+     return $path if -f $path and -r _;
+
+     if(!$self->opt_i
+        or $self->is_vms or $self->is_mswin32
+        or $self->is_dos or $self->is_os2
+     ) {
+        # On a case-forgiving file system, or if case is important,
+    #  that is it, all we can do.
+    $self->warn( "Ignored $path: unreadable\n" ) if -f _;
+    return '';
+     }
+
+     local *DIR;
+     my @p = ($dir);
+     my($p,$cip);
+     foreach $p (splitdir $file){
+    my $try = catfile @p, $p;
+        $self->aside("Scrutinizing $try...\n");
+    stat $try;
+    if (-d _) {
+        push @p, $p;
+        if ( $p eq $self->{'target'} ) {
+        my $tmp_path = catfile @p;
+        my $path_f = 0;
+        for (@{ $self->{'found'} }) {
+            $path_f = 1 if $_ eq $tmp_path;
+        }
+        push (@{ $self->{'found'} }, $tmp_path) unless $path_f;
+        $self->aside( "Found as $tmp_path but directory\n" );
+        }
+    }
+    elsif (-f _ && -r _ && lc($try) eq lc($path)) {
+        return $try;
+    }
+    elsif (-f _) {
+        $self->warn( "Ignored $try: unreadable or file/dir mismatch\n" );
+    }
+    elsif (-d catdir(@p)) {  # at least we see the containing directory!
+        my $found = 0;
+        my $lcp = lc $p;
+        my $p_dirspec = catdir(@p);
+        opendir DIR, $p_dirspec  or $self->die( "opendir $p_dirspec: $!" );
+        while(defined( $cip = readdir(DIR) )) {
+        if (lc $cip eq $lcp){
+            $found++;
+            last; # XXX stop at the first? what if there's others?
+        }
+        }
+        closedir DIR  or $self->die( "closedir $p_dirspec: $!" );
+        return "" unless $found;
+
+        push @p, $cip;
+        my $p_filespec = catfile(@p);
+        return $p_filespec if -f $p_filespec and -r _;
+        $self->warn( "Ignored $p_filespec: unreadable\n" ) if -f _;
+    }
+     }
+     return "";
+}
+
+#..........................................................................
+
+sub pagers_guessing {
+    # TODO: This whole subroutine needs to be rewritten. It's semi-insane
+    # right now.
+
+    my $self = shift;
+
+    my @pagers;
+    push @pagers, $self->pagers;
+    $self->{'pagers'} = \@pagers;
+
+    if ($self->is_mswin32) {
+        push @pagers, qw( more< less notepad );
+        unshift @pagers, $ENV{PAGER}  if $ENV{PAGER};
+    }
+    elsif ($self->is_vms) {
+        push @pagers, qw( most more less type/page );
+    }
+    elsif ($self->is_dos) {
+        push @pagers, qw( less.exe more.com< );
+        unshift @pagers, $ENV{PAGER}  if $ENV{PAGER};
+    }
+    elsif ( $self->is_amigaos) { 
+      push @pagers, qw( /SYS/Utilities/MultiView /SYS/Utilities/More /C/TYPE );
+      unshift @pagers, "$ENV{PAGER}" if $ENV{PAGER}; 
+    }
+    else {
+        if ($self->is_os2) {
+          unshift @pagers, 'less', 'cmd /c more <';
+        }
+        push @pagers, qw( more less pg view cat );
+        unshift @pagers, "$ENV{PAGER} <"  if $ENV{PAGER};
+    }
+
+    if ($self->is_cygwin) {
+        if (($pagers[0] eq 'less') || ($pagers[0] eq '/usr/bin/less')) {
+            unshift @pagers, '/usr/bin/less -isrR';
+            unshift @pagers, $ENV{PAGER}  if $ENV{PAGER};
+       }
+    }
+
+    if ( $self->opt_m ) {
+        unshift @pagers, "$ENV{PERLDOC_SRC_PAGER}" if $ENV{PERLDOC_SRC_PAGER}
+    }
+    else {
+        unshift @pagers, "$ENV{MANPAGER} <" if $ENV{MANPAGER};
+        unshift @pagers, "$ENV{PERLDOC_PAGER} <" if $ENV{PERLDOC_PAGER};
+    }
+
+    $self->aside("Pagers: ", (join ", ", @pagers));
+
+    return;
+}
+
+#..........................................................................
+
+sub page_module_file {
+    my($self, @found) = @_;
+
+    # Security note:
+    # Don't ever just pass this off to anything like MSWin's "start.exe",
+    # since we might be calling on a .pl file, and we wouldn't want that
+    # to actually /execute/ the file that we just want to page thru!
+    # Also a consideration if one were to use a web browser as a pager;
+    # doing so could trigger the browser's MIME mapping for whatever
+    # it thinks .pm/.pl/whatever is.  Probably just a (useless and
+    # annoying) "Save as..." dialog, but potentially executing the file
+    # in question -- particularly in the case of MSIE and it's, ahem,
+    # occasionally hazy distinction between OS-local extension
+    # associations, and browser-specific MIME mappings.
+
+    if(@found > 1) {
+        $self->warn(
+            "Perldoc is only really meant for reading one document at a time.\n" .
+            "So these files are being ignored: " .
+            join(' ', @found[1 .. $#found] ) .
+            "\n" )
+    }
+
+    return $self->page($found[0], $self->{'output_to_stdout'}, $self->pagers);
+
+}
+
+#..........................................................................
+
+sub check_file {
+    my($self, $dir, $file) = @_;
+
+    unless( ref $self ) {
+      # Should never get called:
+      $Carp::Verbose = 1;
+      require Carp;
+      Carp::croak( join '',
+        "Crazy ", __PACKAGE__, " error:\n",
+        "check_file must be an object_method!\n",
+        "Aborting"
+      );
+    }
+
+    if(length $dir and not -d $dir) {
+      DEBUG > 3 and print "  No dir $dir -- skipping.\n";
+      return "";
+    }
+
+    my $path = $self->minus_f_nocase($dir,$file);
+    if( length $path and ($self->opt_m ? $self->isprintable($path)
+                                      : $self->containspod($path)) ) {
+        DEBUG > 3 and print
+            "  The file $path indeed looks promising!\n";
+        return $path;
+    }
+    DEBUG > 3 and print "  No good: $file in $dir\n";
+
+    return "";
+}
+
+sub isprintable {
+	my($self, $file, $readit) = @_;
+	my $size= 1024;
+	my $maxunprintfrac= 0.2;   # tolerate some unprintables for UTF-8 comments etc.
+
+	return 1 if !$readit && $file =~ /\.(?:pl|pm|pod|cmd|com|bat)\z/i;
+
+	my $data;
+	local($_);
+	my $fh = $self->open_fh("<", $file);
+	read $fh, $data, $size;
+	close $fh;
+	$size= length($data);
+	$data =~ tr/\x09-\x0D\x20-\x7E//d;
+	return length($data) <= $size*$maxunprintfrac;
+}
+
+#..........................................................................
+
+sub containspod {
+    my($self, $file, $readit) = @_;
+    return 1 if !$readit && $file =~ /\.pod\z/i;
+
+
+    #  Under cygwin the /usr/bin/perl is legal executable, but
+    #  you cannot open a file with that name. It must be spelled
+    #  out as "/usr/bin/perl.exe".
+    #
+    #  The following if-case under cygwin prevents error
+    #
+    #     $ perldoc perl
+    #     Cannot open /usr/bin/perl: no such file or directory
+    #
+    #  This would work though
+    #
+    #     $ perldoc perl.pod
+
+    if ( $self->is_cygwin  and  -x $file  and  -f "$file.exe" )
+    {
+        $self->warn( "Cygwin $file.exe search skipped\n" ) if DEBUG or $self->opt_D;
+        return 0;
+    }
+
+    local($_);
+    my $fh = $self->open_fh("<", $file);
+    while (<$fh>) {
+    if (/^=head/) {
+        close($fh)     or $self->die( "Can't close $file: $!" );
+        return 1;
+    }
+    }
+    close($fh)         or $self->die( "Can't close $file: $!" );
+    return 0;
+}
+
+#..........................................................................
+
+sub maybe_extend_searchpath {
+  my $self = shift;
+
+  # Does this look like a module or extension directory?
+
+  if (-f "Makefile.PL" || -f "Build.PL") {
+
+    push @{$self->{search_path} }, '.','lib';
+
+    # don't add if superuser
+    if ($< && $> && -d "blib") {   # don't be looking too hard now!
+      push @{ $self->{search_path} }, 'blib';
+      $self->warn( $@ ) if $@ && $self->opt_D;
+    }
+  }
+
+  return;
+}
+
+#..........................................................................
+
+sub new_output_file {
+  my $self = shift;
+  my $outspec = $self->opt_d;  # Yes, -d overrides all else!
+                               # So don't call this twice per format-job!
+
+  return $self->new_tempfile(@_) unless defined $outspec and length $outspec;
+
+  # Otherwise open a write-handle on opt_d!f
+
+  DEBUG > 3 and print "About to try writing to specified output file $outspec\n";
+  my $fh = $self->open_fh(">", $outspec);
+
+  DEBUG > 3 and print "Successfully opened $outspec\n";
+  binmode($fh) if $self->{'output_is_binary'};
+  return($fh, $outspec);
+}
+
+#..........................................................................
+
+sub useful_filename_bit {
+  # This tries to provide a meaningful bit of text to do with the query,
+  # such as can be used in naming the file -- since if we're going to be
+  # opening windows on temp files (as a "pager" may well do!) then it's
+  # better if the temp file's name (which may well be used as the window
+  # title) isn't ALL just random garbage!
+  # In other words "perldoc_LWPSimple_2371981429" is a better temp file
+  # name than "perldoc_2371981429".  So this routine is what tries to
+  # provide the "LWPSimple" bit.
+  #
+  my $self = shift;
+  my $pages = $self->{'pages'} || return undef;
+  return undef unless @$pages;
+
+  my $chunk = $pages->[0];
+  return undef unless defined $chunk;
+  $chunk =~ s/:://g;
+  $chunk =~ s/\.\w+$//g; # strip any extension
+  if( $chunk =~ m/([^\#\\:\/\$]+)$/s ) { # get basename, if it's a file
+    $chunk = $1;
+  } else {
+    return undef;

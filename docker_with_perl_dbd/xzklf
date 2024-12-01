@@ -1,0 +1,1000 @@
+    }
+
+    sub addEntry
+    {
+        my $self = shift ;
+        my $entry = shift ;
+
+        my $localHeaderOffset = $entry->localHeaderOffset  ;
+        my $CentralDirectoryOffset = $entry->centralHeaderOffset ;
+        my $filename = $entry->filename ;
+
+        Nesting::add($entry);
+
+        # Create a reference from Central to Local header entries
+        my $ldEntry = Nesting::getLdEntryByOffset($localHeaderOffset);
+        if ($ldEntry)
+        {
+            $entry->ldEntry($ldEntry) ;
+
+            # LD -> CD
+            # can have multiple LD entries point to same CD
+            # so need to keep a list
+            $ldEntry->addCdEntry($entry);
+        }
+
+        # only check for duplicate in real CD scan
+        if ($self->{alreadyScanned} && ! $entry->encapsulated )
+        {
+            my $existing = $self->{byName}{$filename} ;
+            if ($existing && $existing->centralHeaderOffset != $entry->centralHeaderOffset)
+            {
+                ::error $CentralDirectoryOffset,
+                        "Duplicate Central Directory entries for filename '$filename'",
+                        "Current Central Directory entry at offset " . ::decimalHex0x($CentralDirectoryOffset),
+                        "Duplicate Central Directory entry at offset " . ::decimalHex0x($self->{byName}{$filename}{centralHeaderOffset});
+
+                # not strictly illegal to have duplicate filename, so save this one
+            }
+            else
+            {
+                my $existingNormalizedEntry = $self->normalize_filename($entry, $filename);
+                if ($existingNormalizedEntry)
+                {
+                    ::warning $CentralDirectoryOffset,
+                            "Portability Issue: Found case-insensitive duplicate for filename '$filename'",
+                            "Current Central Directory entry at offset " . ::decimalHex0x($CentralDirectoryOffset),
+                            "Duplicate Central Directory entry for filename '" . $existingNormalizedEntry->outputFilename . "' at offset " . ::decimalHex0x($existingNormalizedEntry->centralHeaderOffset);
+                }
+            }
+        }
+
+        # CD can get processed twice, so return if already processed
+        return
+            if $self->{byCentralOffset}{$CentralDirectoryOffset} ;
+
+        if (! $entry->encapsulated )
+        {
+            push @{ $self->{entries} }, $entry;
+
+            $self->{byLocalOffset}{$localHeaderOffset} = $entry;
+            $self->{byCentralOffset}{$CentralDirectoryOffset} = $entry;
+            $self->{byName}{ $filename } = $entry;
+            $self->{offset2Index} = $self->{count} ++;
+        }
+
+    }
+
+    sub exists
+    {
+        my $self = shift ;
+
+        return scalar @{ $self->{entries} };
+    }
+
+    sub sortByLocalOffset
+    {
+        my $self = shift ;
+
+        @{ $self->{entries} } = sort { $a->localHeaderOffset() <=> $b->localHeaderOffset() }
+                                @{ $self->{entries} };
+    }
+
+    sub getByLocalOffset
+    {
+        my $self = shift ;
+        my $offset = shift ;
+
+        # TODO - what happens if none exists?
+        my $entry = $self->{byLocalOffset}{$offset - $PREFIX_DELTA} ;
+        return $entry ;
+    }
+
+    sub localOffset
+    {
+        my $self = shift ;
+        my $offset = shift ;
+
+        # TODO - what happens if none exists?
+        return $self->{byLocalOffset}{$offset - $PREFIX_DELTA} ;
+    }
+
+    sub getNextLocalOffset
+    {
+        my $self = shift ;
+        my $offset = shift ;
+
+        my $index = $self->{offset2Index} ;
+
+        if ($index + 1 >= $self->{count})
+        {
+            return 0;
+        }
+
+        return ${ $self->{entries} }[$index+1]->localHeaderOffset() ;
+    }
+
+    sub inCD
+    {
+        my $self = shift ;
+        $FH->tell() >= $self->{CentralDirectoryOffset};
+    }
+
+    sub setPkEncryptedCD
+    {
+        my $self = shift ;
+
+        $self->{encryptedCD} = 1 ;
+
+    }
+
+    sub setMiniZipEncrypted
+    {
+        my $self = shift ;
+
+        $self->{minizip_secure} = 1 ;
+    }
+
+    sub isMiniZipEncrypted
+    {
+        my $self = shift ;
+        return $self->{minizip_secure};
+    }
+
+    sub isEncryptedCD
+    {
+        my $self = shift ;
+        return $self->{encryptedCD} && ! $self->{minizip_secure};
+    }
+
+    sub normalize_filename
+    {
+        # check if there is a filename that already exists
+        # with the same name when normalized to lower case
+
+        my $self = shift ;
+        my $entry = shift;
+        my $filename = shift;
+
+        my $nFilename = lc $filename;
+
+        my $lookup = $self->{normalized_filenames}{$nFilename};
+        # if ($lookup && $lookup ne $filename)
+        if ($lookup)
+        {
+            return $lookup,
+        }
+
+        $self->{normalized_filenames}{$nFilename} = $entry;
+
+        return undef;
+    }
+}
+
+{
+    package LocalDirectoryEntry;
+
+    use parent -norequire , 'LocalCentralEntryBase' ;
+
+    use constant Offset_VersionNeededToExtract  => 4;
+    use constant Offset_GeneralPurposeFlags     => 6;
+    use constant Offset_CompressionMethod       => 8;
+    use constant Offset_ModificationTime        => 10;
+    use constant Offset_ModificationDate        => 12;
+    use constant Offset_CRC32                   => 14;
+    use constant Offset_CompressedSize          => 18;
+    use constant Offset_UncompressedSize        => 22;
+    use constant Offset_FilenameLength          => 26;
+    use constant Offset_ExtraFieldLength        => 27;
+    use constant Offset_Filename                => 30;
+
+    sub new
+    {
+        my $class = shift ;
+
+        my $self = $class->SUPER::new();
+
+        my %fields = (
+                        'streamedMatch'         => 0,
+                        'readDataDescriptor'    => 0,
+                        'cdEntryIndex'          => {},
+                        'cdEntryList'           => [],
+                     ) ;
+
+        FieldsAndAccessors::Add($class, $self, \%fields) ;
+
+        $self->inCentralDir(0) ;
+        $self->entryType(::ZIP_LOCAL_HDR_SIG) ;
+
+        return $self;
+    }
+
+    sub addCdEntry
+    {
+        my $self = shift ;
+        my $entry = shift;
+
+        # don't want encapsulated entries
+        # and protect against duplicates
+        return
+            if $entry->encapsulated ||
+               $self->{cdEntryIndex}{$entry->index} ++ >= 1;
+
+        push @{ $self->{cdEntryList} }, $entry ;
+    }
+
+    sub getCdEntry
+    {
+        my $self = shift ;
+
+        return []
+            if ! $self->{cdEntryList} ;
+
+        return $self->{cdEntryList}[0] ;
+    }
+
+    sub getCdEntries
+    {
+        my $self = shift ;
+        return $self->{cdEntryList} ;
+    }
+}
+
+{
+    package LocalDirectory;
+
+    sub new
+    {
+        my $class = shift ;
+
+        my %object = (
+                        'entries'       => [],
+                        'count'         => 0,
+                        'byLocalOffset' => {},
+                        'byName'        => {},
+                        'offset2Index' => {},
+                        'normalized_filenames' => {},
+                        'CentralDirectoryOffset'      => 0,
+                        'CentralDirectorySize'      => 0,
+                        'zip64'         => 0,
+                        'encryptedCD'   => 0,
+                        'streamedPresent' => 0,
+                     ) ;
+
+        bless \%object, $class;
+    }
+
+    sub isLocalEntryNested
+    {
+        my $self = shift ;
+        my $localEntry = shift;
+
+        return Nesting::getFirstEncapsulation($localEntry);
+
+    }
+
+    sub addEntry
+    {
+        my $self = shift ;
+        my $localEntry = shift ;
+
+        my $filename = $localEntry->filename ;
+        my $localHeaderOffset = $localEntry->localHeaderOffset;
+        my $payloadOffset = $localEntry->payloadOffset ;
+
+        my $existingEntry = $self->{byName}{$filename} ;
+
+        my $endSurfaceArea = $payloadOffset + ($localEntry->compressedSize // 0)  ;
+
+        if ($existingEntry)
+        {
+            ::error $localHeaderOffset,
+                    "Duplicate Local Directory entry for filename '$filename'",
+                    "Current Local Directory entry at offset " . ::decimalHex0x($localHeaderOffset),
+                    "Duplicate Local Directory entry at offset " . ::decimalHex0x($existingEntry->localHeaderOffset),
+        }
+        else
+        {
+
+            my ($existing_filename, $offset) = $self->normalize_filename($filename);
+            if ($existing_filename)
+            {
+                ::warning $localHeaderOffset,
+                        "Portability Issue: Found case-insensitive duplicate for filename '$filename'",
+                        "Current Local Directory entry at offset " . ::decimalHex0x($localHeaderOffset),
+                        "Duplicate Local Directory entry for filename '$existing_filename' at offset " . ::decimalHex0x($offset);
+            }
+        }
+
+        # keep nested local entries for zipbomb deteection
+        push @{ $self->{entries} }, $localEntry;
+
+        $self->{byLocalOffset}{$localHeaderOffset} = $localEntry;
+        $self->{byName}{ $filename } = $localEntry;
+
+        $self->{streamedPresent} ++
+            if $localEntry->streamed;
+
+        Nesting::add($localEntry);
+    }
+
+    sub exists
+    {
+        my $self = shift ;
+
+        return scalar @{ $self->{entries} };
+    }
+
+    sub sortByLocalOffset
+    {
+        my $self = shift ;
+
+        @{ $self->{entries} } = sort { $a->localHeaderOffset() <=> $b->localHeaderOffset() }
+                                @{ $self->{entries} };
+    }
+
+    sub localOffset
+    {
+        my $self = shift ;
+        my $offset = shift ;
+
+        return $self->{byLocalOffset}{$offset} ;
+    }
+
+    sub getByLocalOffset
+    {
+        my $self = shift ;
+        my $offset = shift ;
+
+        # TODO - what happens if none exists?
+        my $entry = $self->{byLocalOffset}{$offset} ;
+        return $entry ;
+    }
+
+    sub getNextLocalOffset
+    {
+        my $self = shift ;
+        my $offset = shift ;
+
+        my $index = $self->{offset2Index} ;
+
+        if ($index + 1 >= $self->{count})
+        {
+            return 0;
+        }
+
+        return ${ $self->{entries} }[$index+1]->localHeaderOffset ;
+    }
+
+    sub lastStreamedEntryAdded
+    {
+        my $self = shift ;
+        my $offset = shift ;
+
+        for my $entry ( reverse @{ $self->{entries} } )
+        {
+            if ($entry->streamed)# && ! $entry->streamedMatch)
+            {
+                $entry->streamedMatch($entry->streamedMatch + 1) ;
+                return $entry;
+            }
+        }
+
+        return undef;
+    }
+
+    sub inCD
+    {
+        my $self = shift ;
+        $FH->tell() >= $self->{CentralDirectoryOffset};
+    }
+
+    sub setPkEncryptedCD
+    {
+        my $self = shift ;
+
+        $self->{encryptedCD} = 1 ;
+
+    }
+
+    sub isEncryptedCD
+    {
+        my $self = shift ;
+        return $self->{encryptedCD} ;
+    }
+
+    sub anyStreamedEntries
+    {
+        my $self = shift ;
+        return $self->{streamedPresent} ;
+    }
+
+    sub normalize_filename
+    {
+        # check if there is a filename that already exists
+        # with the same name when normalized to lower case
+
+        my $self = shift ;
+        my $filename = shift;
+
+        my $nFilename = lc $filename;
+
+        my $lookup = $self->{normalized_filenames}{$nFilename};
+        if ($lookup && $lookup ne $filename)
+        {
+            return $self->{byName}{$lookup}{outputFilename},
+                   $self->{byName}{$lookup}{localHeaderOffset}
+        }
+
+        $self->{normalized_filenames}{$nFilename} = $filename;
+
+        return undef, undef;
+    }
+}
+
+{
+    package Eocd ;
+
+    sub new
+    {
+        my $class = shift ;
+
+        my %object = (
+                        'zip64'       => 0,
+                     ) ;
+
+        bless \%object, $class;
+    }
+}
+
+sub displayFileInfo
+{
+    return;
+
+    my $filename = shift;
+
+    info undef,
+        "Filename       : '$filename'",
+        "Size           : " . (-s $filename) . " (" . decimalHex0x(-s $filename) . ")",
+        # "Native Encoding: '" . TextEncoding::getNativeLocaleName() . "'",
+}
+
+{
+    package TextEncoding;
+
+    my $nativeLocaleEncoding = getNativeLocale();
+    my $opt_EncodingFrom = $nativeLocaleEncoding;
+    my $opt_EncodingTo = $nativeLocaleEncoding ;
+    my $opt_Encoding_Enabled;
+    my $opt_Debug_Encoding;
+    my $opt_use_LanguageEncodingFlag;
+
+    sub setDefaults
+    {
+        $nativeLocaleEncoding = getNativeLocale();
+        $opt_EncodingFrom = $nativeLocaleEncoding;
+        $opt_EncodingTo = $nativeLocaleEncoding ;
+        $opt_Encoding_Enabled = 1;
+        $opt_Debug_Encoding = 0;
+        $opt_use_LanguageEncodingFlag = 1;
+    }
+
+    sub getNativeLocale
+    {
+        state $enc;
+
+        if (! defined $enc)
+        {
+            eval
+            {
+                require encoding ;
+                my $encoding = encoding::_get_locale_encoding() ;
+                if (! $encoding)
+                {
+                    # CP437 is the legacy default for zip files
+                    $encoding = 'cp437';
+                    # ::warning undef, "Cannot determine system charset: defaulting to '$encoding'"
+                }
+                $enc = Encode::find_encoding($encoding) ;
+            } ;
+        }
+
+        return $enc;
+    }
+
+    sub getNativeLocaleName
+    {
+        state $name;
+
+        return $name
+            if defined $name ;
+
+        if (! defined $name)
+        {
+            my $enc = getNativeLocale();
+            if ($enc)
+            {
+                $name = $enc->name()
+            }
+            else
+            {
+                $name = 'unknown'
+            }
+        }
+
+        return $name ;
+    }
+
+    sub parseEncodingOption
+    {
+        my $opt_name = shift;
+        my $opt_value = shift;
+
+        my $enc = Encode::find_encoding($opt_value) ;
+        die "Encoding '$opt_value' not found for option '$opt_name'\n"
+            unless ref $enc;
+
+        if ($opt_name eq 'encoding')
+        {
+            $opt_EncodingFrom = $enc;
+        }
+        elsif ($opt_name eq 'output-encoding')
+        {
+            $opt_EncodingTo = $enc;
+        }
+        else
+        {
+            die "Unknown option $opt_name\n"
+        }
+    }
+
+    sub NoEncoding
+    {
+        my $opt_name = shift;
+        my $opt_value = shift;
+
+        $opt_Encoding_Enabled = 0 ;
+    }
+
+    sub LanguageEncodingFlag
+    {
+        my $opt_name = shift;
+        my $opt_value = shift;
+
+        $opt_use_LanguageEncodingFlag = $opt_value ;
+    }
+
+    sub debugEncoding
+    {
+        if (@_)
+        {
+            $opt_Debug_Encoding = 1 ;
+        }
+
+        return $opt_Debug_Encoding ;
+    }
+
+    sub encodingInfo
+    {
+        return
+            unless $opt_Encoding_Enabled && $opt_Debug_Encoding ;
+
+        my $enc  = TextEncoding::getNativeLocaleName();
+        my $from = $opt_EncodingFrom->name();
+        my $to   = $opt_EncodingTo->name();
+
+        ::debug undef, "Debug Encoding Enabled",
+                      "System Default Encoding:                  '$enc'",
+                      "Encoding used when reading from zip file: '$from'",
+                      "Encoding used for display output:         '$to'";
+    }
+
+    sub cleanEval
+    {
+        chomp $_[0] ;
+        $_[0] =~ s/ at .+ line \d+\.$// ;
+        return $_[0];
+    }
+
+    sub decode
+    {
+        my $name = shift ;
+        my $type = shift ;
+        my $LanguageEncodingFlag = shift ;
+
+        return $name
+            if ! $opt_Encoding_Enabled ;
+
+        # TODO - check for badly formed content
+        if ($LanguageEncodingFlag && $opt_use_LanguageEncodingFlag)
+        {
+            # use "utf-8-strict" to catch invalid codepoints
+            eval { $name = Encode::decode('utf-8-strict', $name, Encode::FB_CROAK ) } ;
+            ::warning $FH->tell() - length $name, "Could not decode 'UTF-8' $type: " . cleanEval $@
+                if $@ ;
+        }
+        else
+        {
+            eval { $name = $opt_EncodingFrom->decode($name, Encode::FB_CROAK ) } ;
+            ::warning $FH->tell() - length $name, "Could not decode '" . $opt_EncodingFrom->name() . "' $type: " . cleanEval $@
+                if $@;
+        }
+
+        # remove any BOM
+        $name =~ s/^\x{FEFF}//;
+
+        return $name ;
+    }
+
+    sub encode
+    {
+        my $name = shift ;
+        my $type = shift ;
+        my $LanguageEncodingFlag = shift ;
+
+        return $name
+            if ! $opt_Encoding_Enabled;
+
+        if ($LanguageEncodingFlag && $opt_use_LanguageEncodingFlag)
+        {
+            eval { $name = Encode::encode('utf8', $name, Encode::FB_CROAK ) } ;
+            ::warning $FH->tell() - length $name, "Could not encode 'utf8' $type: " . cleanEval $@
+                if $@ ;
+        }
+        else
+        {
+            eval { $name = $opt_EncodingTo->encode($name, Encode::FB_CROAK ) } ;
+            ::warning $FH->tell() - length $name, "Could not encode '" . $opt_EncodingTo->name() . "' $type: " . cleanEval $@
+                if $@;
+        }
+
+        return $name;
+    }
+}
+
+{
+    package Nesting;
+
+    use Data::Dumper;
+
+    my @nestingStack = ();
+    my %encapsulations;
+    my %inner2outer;
+    my $encapsulationCount  = 0;
+    my %index2entry ;
+    my %offset2entry ;
+
+    # my %localOffset2cdEntry;
+
+    sub clearStack
+    {
+        @nestingStack = ();
+        %encapsulations = ();
+        %inner2outer = ();
+        %index2entry = ();
+        %offset2entry = ();
+        $encapsulationCount = 0;
+    }
+
+    sub dump
+    {
+        my $indent = shift // 0;
+
+        for my $offset (sort {$a <=> $b} keys %offset2entry)
+        {
+            my $leading = " " x $indent ;
+            say $leading . "\nOffset $offset" ;
+            say Dumper($offset2entry{$offset})
+        }
+    }
+
+    sub add
+    {
+        my $entry = shift;
+
+        getEnclosingEntry($entry);
+        push @nestingStack, $entry;
+        $index2entry{ $entry->index } = $entry;
+        $offset2entry{ $entry->offsetStart } = $entry;
+    }
+
+    sub getEnclosingEntry
+    {
+        my $entry = shift;
+
+        my $filename = $entry->filename;
+
+        pop @nestingStack
+            while @nestingStack && $entry->offsetStart > $nestingStack[-1]->offsetEnd ;
+
+        my $match = undef;
+
+        if (@nestingStack &&
+            $entry->offsetStart >= $nestingStack[-1]->offsetStart &&
+            $entry->offsetEnd   <= $nestingStack[-1]->offsetEnd &&
+            $entry->index       != $nestingStack[-1]->index)
+        {
+            # Nested entry found
+            $match = $nestingStack[-1];
+            push @{ $encapsulations{ $match->index } }, $entry;
+            $inner2outer{ $entry->index} = $match->index;
+            ++ $encapsulationCount;
+
+            $entry->encapsulated(1) ;
+            $match->increment_childrenCount();
+
+            if ($NESTING_DEBUG)
+            {
+                say "#### nesting " . (caller(1))[3] . " index #" . $entry->index . ' "' .
+                    $entry->outputFilename . '" [' . $entry->offsetStart . "->" . $entry->offsetEnd . "]" .
+                    " in #" . $match->index . ' "' .
+                    $match->outputFilename . '" [' . $match->offsetStart . "->" . $match->offsetEnd . "]" ;
+            }
+        }
+
+        return $match;
+    }
+
+    sub isNested
+    {
+        my $offsetStart = shift;
+        my $offsetEnd = shift;
+
+        if ($NESTING_DEBUG)
+        {
+            say "### Want: offsetStart " . ::decimalHex0x($offsetStart) . " offsetEnd " . ::decimalHex0x($offsetEnd);
+            for my $entry (@nestingStack)
+            {
+                say "### Have: offsetStart " . ::decimalHex0x($entry->offsetStart) . " offsetEnd " . ::decimalHex0x($entry->offsetEnd);
+            }
+        }
+
+        return 0
+            unless @nestingStack ;
+
+        my @copy = @nestingStack ;
+
+        pop @copy
+            while @copy && $offsetStart > $copy[-1]->offsetEnd ;
+
+        return @copy &&
+               $offsetStart >= $copy[-1]->offsetStart &&
+               $offsetEnd   <= $copy[-1]->offsetEnd ;
+    }
+
+    sub getOuterEncapsulation
+    {
+        my $entry = shift;
+
+        my $outerIndex =  $inner2outer{ $entry->index } ;
+
+        return undef
+            if ! defined $outerIndex ;
+
+        return $index2entry{$outerIndex} // undef;
+    }
+
+    sub getEncapsulations
+    {
+        my $entry = shift;
+
+        return $encapsulations{ $entry->index } ;
+    }
+
+    sub getFirstEncapsulation
+    {
+        my $entry = shift;
+
+        my $got = $encapsulations{ $entry->index } ;
+
+        return defined $got ? $$got[0] : undef;
+    }
+
+    sub encapsulations
+    {
+        return \%encapsulations;
+    }
+
+    sub encapsulationCount
+    {
+        return $encapsulationCount;
+    }
+
+    sub childrenInCentralDir
+    {
+        # find local header entries that have children that are not referenced in the CD
+        # tis means it is likely a benign nextd zip file
+        my $entry = shift;
+
+        for my $child (@{ $encapsulations{$entry->index} } )
+        {
+            next
+                unless $child->entryType == ::ZIP_LOCAL_HDR_SIG ;
+
+            return 1
+                if @{ $child->cdEntryList };
+        }
+
+        return 0;
+    }
+
+    sub entryByIndex
+    {
+        my $index = shift;
+        return $index2entry{$index};
+    }
+
+    sub getEntryByOffset
+    {
+        my $offset  = shift;
+        return $offset2entry{$offset};
+    }
+
+    sub getLdEntryByOffset
+    {
+        my $offset  = shift;
+        my $entry = $offset2entry{$offset};
+
+        return $entry
+            if $entry && $entry->entryType == ::ZIP_LOCAL_HDR_SIG;
+
+        return undef;
+    }
+
+    sub getEntriesByOffset
+    {
+        return \%offset2entry ;
+    }
+}
+
+{
+    package SimpleTable ;
+
+    use List::Util qw(max sum);
+
+    sub new
+    {
+        my $class = shift;
+
+        my %object = (
+            header => [],
+            data   => [],
+            columns   => 0,
+            prefix => '#  ',
+        );
+        bless \%object, $class;
+    }
+
+    sub addHeaderRow
+    {
+        my $self = shift;
+        push @{ $self->{header} }, [ @_ ] ;
+        $self->{columns} = max($self->{columns}, scalar @_ ) ;
+    }
+
+    sub addDataRow
+    {
+        my $self = shift;
+
+        push @{ $self->{data} }, [ @_ ] ;
+        $self->{columns} = max($self->{columns}, scalar @_ ) ;
+    }
+
+    sub hasData
+    {
+        my $self = shift;
+
+        return scalar @{ $self->{data} } ;
+    }
+
+    sub display
+    {
+        my $self = shift;
+
+        # work out the column widths
+        my @colW = (0) x $self->{columns} ;
+        for my $row (@{ $self->{data} }, @{ $self->{header} })
+        {
+            my @r = @$row;
+            for my $ix (0 .. $self->{columns} -1)
+            {
+                $colW[$ix] = max($colW[$ix],
+                                3 + length( $r[$ix] )
+                                );
+            }
+        }
+
+        my $width = sum(@colW) ; #+ @colW ;
+        my @template ;
+        for my $w (@colW)
+        {
+            push @template, ' ' x ($w - 3);
+        }
+
+        print $self->{prefix} . '-' x ($width + 1) . "\n";
+
+        for my $row (@{ $self->{header} })
+        {
+            my @outputRow = @template;
+
+            print $self->{prefix} . '| ';
+            for my $ix (0 .. $self->{columns} -1)
+            {
+                my $field = $template[$ix] ;
+                substr($field, 0, length($row->[$ix]), $row->[$ix]);
+                print $field . ' | ';
+            }
+            print "\n";
+
+        }
+
+        print $self->{prefix} . '-' x ($width + 1) . "\n";
+
+        for my $row (@{ $self->{data} })
+        {
+            my @outputRow = @template;
+
+            print $self->{prefix} . '| ';
+            for my $ix (0 .. $self->{columns} -1)
+            {
+                my $field = $template[$ix] ;
+                substr($field, 0, length($row->[$ix]), $row->[$ix]);
+                print $field . ' | ';
+            }
+            print "\n";
+        }
+
+        print $self->{prefix} . '-' x ($width + 1) . "\n";
+        print "#\n";
+    }
+}
+
+sub Usage
+{
+    my $enc = TextEncoding::getNativeLocaleName();
+
+    my $message = <<EOM;
+zipdetails [OPTIONS] file
+
+Display details about the internal structure of a Zip file.
+
+OPTIONS
+
+  General Options
+     -h, --help
+            Display help
+     --redact
+            Hide filename and payload data in the output
+     --scan
+            Enable pessimistic scanning mode.
+            Blindly scan the file looking for zip headers
+            Expect false-positives.
+     --utc
+            Display date/time fields in UTC. Default is local time
+     -v
+            Enable verbose mode -- output more stuff
+     --version
+            Print zipdetails version number
+            This is version $VERSION
+     --walk
+            Enable optimistic scanning mode.
+            Blindly scan the file looking for zip headers
+            Expect false-positives.
+
+  Filename/Comment Encoding
+    --encoding e
+            Use encoding "e" when reading filename/comments from the zip file
+            Uses system encoding ('$enc') by default
+    --no-encoding
+            Disable filename & comment encoding. Default disabled.
+    --output-encoding e
+            Use encoding "e" when writing filename/comments to the display
+            Uses system encoding ('$enc') by default
+    --debug-encoding
+            Display eatra info when a filename/comment encoding has changed
+    --language-encoding, --no-language-encoding
+            Enable/disable support for the zip file "Language Encoding" flag.
+            When this flag is set in a zip file the filename/comment is assumed
+            to be encoded in UTF8.
+            Default is enabled
+

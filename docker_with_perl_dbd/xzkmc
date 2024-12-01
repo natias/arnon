@@ -1,0 +1,1000 @@
+
+sub prepare {
+    my ($self) = @_;
+
+    $self->get
+        or return;
+
+    if ( defined( my $sc = $self->shortcut_prepare) ) {
+        return $sc;
+    }
+
+    local $ENV{PERL5LIB} = defined($ENV{PERL5LIB})
+                           ? $ENV{PERL5LIB}
+                           : ($ENV{PERLLIB} || "");
+    local $ENV{PERL5OPT} = defined $ENV{PERL5OPT} ? $ENV{PERL5OPT} : "";
+    local $ENV{PERL_USE_UNSAFE_INC} =
+        exists $ENV{PERL_USE_UNSAFE_INC} && defined $ENV{PERL_USE_UNSAFE_INC}
+        ? $ENV{PERL_USE_UNSAFE_INC} : 1; # prepare
+    $CPAN::META->set_perl5lib;
+    local $ENV{MAKEFLAGS}; # protect us from outer make calls
+
+    if ($CPAN::Signal) {
+        delete $self->{force_update};
+        return;
+    }
+
+    my $builddir = $self->dir or
+        $CPAN::Frontend->mydie("PANIC: Cannot determine build directory\n");
+
+    unless (chdir $builddir) {
+        $CPAN::Frontend->mywarn("Couldn't chdir to '$builddir': $!");
+        return;
+    }
+
+    if ($CPAN::Signal) {
+        delete $self->{force_update};
+        return;
+    }
+
+    $self->debug("Changed directory to $builddir") if $CPAN::DEBUG;
+
+    local $ENV{PERL_AUTOINSTALL} = $ENV{PERL_AUTOINSTALL} || '';
+    local $ENV{PERL_EXTUTILS_AUTOINSTALL} = $ENV{PERL_EXTUTILS_AUTOINSTALL} || '';
+    $self->choose_MM_or_MB
+        or return;
+
+    my $configurator = $self->{configure} ? "Configure"
+                     : $self->{modulebuild} ? "Build.PL"
+                     : "Makefile.PL";
+
+    $CPAN::Frontend->myprint("Configuring ".$self->id." with $configurator\n");
+
+    if ($CPAN::Config->{prerequisites_policy} eq "follow") {
+        $ENV{PERL_AUTOINSTALL}          ||= "--defaultdeps";
+        $ENV{PERL_EXTUTILS_AUTOINSTALL} ||= "--defaultdeps";
+    }
+
+    my $system;
+    my $pl_commandline;
+    if ($self->prefs->{pl}) {
+        $pl_commandline = $self->prefs->{pl}{commandline};
+    }
+    local $ENV{PERL} = defined $ENV{PERL}? $ENV{PERL} : $^X;
+    local $ENV{PERL5_CPAN_IS_EXECUTING} = $ENV{PERL5_CPAN_IS_EXECUTING} || '';
+    local $ENV{PERL_MM_USE_DEFAULT} = 1 if $CPAN::Config->{use_prompt_default};
+    local $ENV{NONINTERACTIVE_TESTING} = 1 if $CPAN::Config->{use_prompt_default};
+    if ($pl_commandline) {
+        $system = $pl_commandline;
+        $ENV{PERL} = $^X;
+    } elsif ($self->{'configure'}) {
+        $system = $self->{'configure'};
+    } elsif ($self->{modulebuild}) {
+        my($perl) = $self->perl or die "Couldn\'t find executable perl\n";
+        my $mbuildpl_arg = $self->_make_phase_arg("pl");
+        $system = sprintf("%s Build.PL%s",
+                          $perl,
+                          $mbuildpl_arg ? " $mbuildpl_arg" : "",
+                         );
+    } else {
+        my($perl) = $self->perl or die "Couldn\'t find executable perl\n";
+        my $switch = "";
+# This needs a handler that can be turned on or off:
+#        $switch = "-MExtUtils::MakeMaker ".
+#            "-Mops=:default,:filesys_read,:filesys_open,require,chdir"
+#            if $] > 5.00310;
+        my $makepl_arg = $self->_make_phase_arg("pl");
+        $ENV{PERL5_CPAN_IS_EXECUTING} = File::Spec->catfile($self->{build_dir},
+                                                            "Makefile.PL");
+        $system = sprintf("%s%s Makefile.PL%s",
+                          $perl,
+                          $switch ? " $switch" : "",
+                          $makepl_arg ? " $makepl_arg" : "",
+                         );
+    }
+    my $pl_env;
+    if ($self->prefs->{pl}) {
+        $pl_env = $self->prefs->{pl}{env};
+    }
+    local @ENV{keys %$pl_env} = values %$pl_env if $pl_env;
+    if (exists $self->{writemakefile}) {
+    } else {
+        local($SIG{ALRM}) = sub { die "inactivity_timeout reached\n" };
+        my($ret,$pid,$output);
+        $@ = "";
+        my $go_via_alarm;
+        if ($CPAN::Config->{inactivity_timeout}) {
+            require Config;
+            if ($Config::Config{d_alarm}
+                &&
+                $Config::Config{d_alarm} eq "define"
+               ) {
+                $go_via_alarm++
+            } else {
+                $CPAN::Frontend->mywarn("Warning: you have configured the config ".
+                                        "variable 'inactivity_timeout' to ".
+                                        "'$CPAN::Config->{inactivity_timeout}'. But ".
+                                        "on this machine the system call 'alarm' ".
+                                        "isn't available. This means that we cannot ".
+                                        "provide the feature of intercepting long ".
+                                        "waiting code and will turn this feature off.\n"
+                                       );
+                $CPAN::Config->{inactivity_timeout} = 0;
+            }
+        }
+        if ($go_via_alarm) {
+            if ( $self->_should_report('pl') ) {
+                ($output, $ret) = CPAN::Reporter::record_command(
+                    $system,
+                    $CPAN::Config->{inactivity_timeout},
+                );
+                CPAN::Reporter::grade_PL( $self, $system, $output, $ret );
+            }
+            else {
+                eval {
+                    alarm $CPAN::Config->{inactivity_timeout};
+                    local $SIG{CHLD}; # = sub { wait };
+                    if (defined($pid = fork)) {
+                        if ($pid) { #parent
+                            # wait;
+                            waitpid $pid, 0;
+                        } else {    #child
+                            # note, this exec isn't necessary if
+                            # inactivity_timeout is 0. On the Mac I'd
+                            # suggest, we set it always to 0.
+                            exec $system;
+                        }
+                    } else {
+                        $CPAN::Frontend->myprint("Cannot fork: $!");
+                        return;
+                    }
+                };
+                alarm 0;
+                if ($@) {
+                    kill 9, $pid;
+                    waitpid $pid, 0;
+                    my $err = "$@";
+                    $CPAN::Frontend->myprint($err);
+                    $self->{writemakefile} = CPAN::Distrostatus->new("NO $err");
+                    $@ = "";
+                    $self->store_persistent_state;
+                    return $self->goodbye("$system -- TIMED OUT");
+                }
+            }
+        } else {
+            if (my $expect_model = $self->_prefs_with_expect("pl")) {
+                # XXX probably want to check _should_report here and warn
+                # about not being able to use CPAN::Reporter with expect
+                $ret = $self->_run_via_expect($system,'writemakefile',$expect_model);
+                if (! defined $ret
+                    && $self->{writemakefile}
+                    && $self->{writemakefile}->failed) {
+                    # timeout
+                    return;
+                }
+            }
+            elsif ( $self->_should_report('pl') ) {
+                ($output, $ret) = eval { CPAN::Reporter::record_command($system) };
+                if (! defined $output or $@) {
+                    my $err = $@ || "Unknown error";
+                    $CPAN::Frontend->mywarn("Error while running PL phase: $err\n");
+                    $self->{writemakefile} = CPAN::Distrostatus
+                        ->new("NO '$system' returned status $ret and no output");
+                    return $self->goodbye("$system -- NOT OK");
+                }
+                CPAN::Reporter::grade_PL( $self, $system, $output, $ret );
+            }
+            else {
+                $ret = system($system);
+            }
+            if ($ret != 0) {
+                $self->{writemakefile} = CPAN::Distrostatus
+                    ->new("NO '$system' returned status $ret");
+                $CPAN::Frontend->mywarn("Warning: No success on command[$system]\n");
+                $self->store_persistent_state;
+                return $self->goodbye("$system -- NOT OK");
+            }
+        }
+        if (-f "Makefile" || -f "Build" || ($^O eq 'VMS' && (-f 'descrip.mms' || -f 'Build.com'))) {
+            $self->{writemakefile} = CPAN::Distrostatus->new("YES");
+            delete $self->{make_clean}; # if cleaned before, enable next
+            $self->store_persistent_state;
+            return $self->success("$system -- OK");
+        } else {
+            my $makefile = $self->{modulebuild} ? "Build" : "Makefile";
+            my $why = "No '$makefile' created";
+            $CPAN::Frontend->mywarn($why);
+            $self->{writemakefile} = CPAN::Distrostatus
+                ->new(qq{NO -- $why\n});
+            $self->store_persistent_state;
+            return $self->goodbye("$system -- NOT OK");
+        }
+    }
+    $self->store_persistent_state;
+    return 1; # success
+}
+
+#-> sub CPAN::Distribution::shortcut_make ;
+# return values: undef means don't shortcut; 0 means shortcut as fail;
+# and 1 means shortcut as success
+sub shortcut_make {
+    my ($self) = @_;
+
+    $self->debug("checking make/build results[$self->{ID}]") if $CPAN::DEBUG;
+    if (defined $self->{make}) {
+        if (UNIVERSAL::can($self->{make},"failed") ?
+            $self->{make}->failed :
+            $self->{make} =~ /^NO/
+        ) {
+            if ($self->{force_update}) {
+                # Trying an already failed 'make' (unless somebody else blocks)
+                return undef; # no shortcut
+            } else {
+                # introduced for turning recursion detection into a distrostatus
+                my $error = length $self->{make}>3
+                    ? substr($self->{make},3) : "Unknown error";
+                $self->store_persistent_state;
+                return $self->goodbye("Could not make: $error\n");
+            }
+        } else {
+            return $self->success("Has already been made")
+        }
+    }
+    return undef; # no shortcut
+}
+
+#-> sub CPAN::Distribution::make ;
+sub make {
+    my($self) = @_;
+
+    $self->pre_make();
+
+    if (exists $self->{cleanup_after_install_done}) {
+        $self->post_make();
+        return $self->get;
+    }
+
+    $self->debug("checking goto id[$self->{ID}]") if $CPAN::DEBUG;
+    if (my $goto = $self->prefs->{goto}) {
+        $self->post_make();
+        return $self->goto($goto);
+    }
+    # Emergency brake if they said install Pippi and get newest perl
+
+    # XXX Would this make more sense in shortcut_prepare, since
+    # that doesn't make sense on a perl dist either?  Broader
+    # question: what is the purpose of suggesting force install
+    # on a perl distribution?  That seems unlikely to result in
+    # such a dependency being satisfied, even if the perl is
+    # successfully installed.  This situation is tantamount to
+    # a prereq on a version of perl greater than the current one
+    # so I think we should just abort. -- xdg, 2012-04-06
+    if ($self->isa_perl) {
+        if (
+            $self->called_for ne $self->id &&
+            ! $self->{force_update}
+        ) {
+            # if we die here, we break bundles
+            $CPAN::Frontend
+                ->mywarn(sprintf(
+                            qq{The most recent version "%s" of the module "%s"
+is part of the perl-%s distribution. To install that, you need to run
+  force install %s   --or--
+  install %s
+},
+                             $CPAN::META->instance(
+                                                   'CPAN::Module',
+                                                   $self->called_for
+                                                  )->cpan_version,
+                             $self->called_for,
+                             $self->isa_perl,
+                             $self->called_for,
+                             $self->pretty_id,
+                            ));
+            $self->{make} = CPAN::Distrostatus->new("NO isa perl");
+            $CPAN::Frontend->mysleep(1);
+            $self->post_make();
+            return;
+        }
+    }
+
+    unless ($self->prepare){
+        $self->post_make();
+        return;
+    }
+
+    if ( defined( my $sc = $self->shortcut_make) ) {
+        $self->post_make();
+        return $sc;
+    }
+
+    if ($CPAN::Signal) {
+        delete $self->{force_update};
+        $self->post_make();
+        return;
+    }
+
+    my $builddir = $self->dir or
+        $CPAN::Frontend->mydie("PANIC: Cannot determine build directory\n");
+
+    unless (chdir $builddir) {
+        $CPAN::Frontend->mywarn("Couldn't chdir to '$builddir': $!");
+        $self->post_make();
+        return;
+    }
+
+    my $make = $self->{modulebuild} ? "Build" : "make";
+    $CPAN::Frontend->myprint(sprintf "Running %s for %s\n", $make, $self->id);
+    local $ENV{PERL5LIB} = defined($ENV{PERL5LIB})
+                           ? $ENV{PERL5LIB}
+                           : ($ENV{PERLLIB} || "");
+    local $ENV{PERL5OPT} = defined $ENV{PERL5OPT} ? $ENV{PERL5OPT} : "";
+    local $ENV{PERL_USE_UNSAFE_INC} =
+        exists $ENV{PERL_USE_UNSAFE_INC} && defined $ENV{PERL_USE_UNSAFE_INC}
+        ? $ENV{PERL_USE_UNSAFE_INC} : 1; # make
+    $CPAN::META->set_perl5lib;
+    local $ENV{MAKEFLAGS}; # protect us from outer make calls
+
+    if ($CPAN::Signal) {
+        delete $self->{force_update};
+        $self->post_make();
+        return;
+    }
+
+    if ($^O eq 'MacOS') {
+        Mac::BuildTools::make($self);
+        $self->post_make();
+        return;
+    }
+
+    my %env;
+    while (my($k,$v) = each %ENV) {
+        next if defined $v;
+        $env{$k} = '';
+    }
+    local @ENV{keys %env} = values %env;
+    my $satisfied = eval { $self->satisfy_requires };
+    if ($@) {
+        return $self->goodbye($@);
+    }
+    unless ($satisfied){
+        $self->post_make();
+        return;
+    }
+    if ($CPAN::Signal) {
+        delete $self->{force_update};
+        $self->post_make();
+        return;
+    }
+
+    # need to chdir again, because $self->satisfy_requires might change the directory
+    unless (chdir $builddir) {
+        $CPAN::Frontend->mywarn("Couldn't chdir to '$builddir': $!");
+        $self->post_make();
+        return;
+    }
+
+    my $system;
+    my $make_commandline;
+    if ($self->prefs->{make}) {
+        $make_commandline = $self->prefs->{make}{commandline};
+    }
+    local $ENV{PERL} = defined $ENV{PERL}? $ENV{PERL} : $^X;
+    local $ENV{PERL_MM_USE_DEFAULT} = 1 if $CPAN::Config->{use_prompt_default};
+    local $ENV{NONINTERACTIVE_TESTING} = 1 if $CPAN::Config->{use_prompt_default};
+    if ($make_commandline) {
+        $system = $make_commandline;
+        $ENV{PERL} = CPAN::find_perl();
+    } else {
+        if ($self->{modulebuild}) {
+            unless (-f "Build" || ($^O eq 'VMS' && -f 'Build.com')) {
+                my $cwd = CPAN::anycwd();
+                $CPAN::Frontend->mywarn("Alert: no Build file available for 'make $self->{id}'".
+                                        " in cwd[$cwd]. Danger, Will Robinson!\n");
+                $CPAN::Frontend->mysleep(5);
+            }
+            $system = join " ", $self->_build_command(), $CPAN::Config->{mbuild_arg};
+        } else {
+            $system = join " ", $self->_make_command(),  $CPAN::Config->{make_arg};
+        }
+        $system =~ s/\s+$//;
+        my $make_arg = $self->_make_phase_arg("make");
+        $system = sprintf("%s%s",
+                          $system,
+                          $make_arg ? " $make_arg" : "",
+                         );
+    }
+    my $make_env;
+    if ($self->prefs->{make}) {
+        $make_env = $self->prefs->{make}{env};
+    }
+    local @ENV{keys %$make_env} = values %$make_env if $make_env;
+    my $expect_model = $self->_prefs_with_expect("make");
+    my $want_expect = 0;
+    if ( $expect_model && @{$expect_model->{talk}} ) {
+        my $can_expect = $CPAN::META->has_inst("Expect");
+        if ($can_expect) {
+            $want_expect = 1;
+        } else {
+            $CPAN::Frontend->mywarn("Expect not installed, falling back to ".
+                                    "system()\n");
+        }
+    }
+    my ($system_ok, $system_err);
+    if ($want_expect) {
+        # XXX probably want to check _should_report here and
+        # warn about not being able to use CPAN::Reporter with expect
+        $system_ok = $self->_run_via_expect($system,'make',$expect_model) == 0;
+    }
+    elsif ( $self->_should_report('make') ) {
+        my ($output, $ret) = CPAN::Reporter::record_command($system);
+        CPAN::Reporter::grade_make( $self, $system, $output, $ret );
+        $system_ok = ! $ret;
+    }
+    else {
+        my $rc = system($system);
+        $system_ok = $rc == 0;
+        $system_err = $! if $rc == -1;
+    }
+    $self->introduce_myself;
+    if ( $system_ok ) {
+        $CPAN::Frontend->myprint("  $system -- OK\n");
+        $self->{make} = CPAN::Distrostatus->new("YES");
+    } else {
+        $self->{writemakefile} ||= CPAN::Distrostatus->new("YES");
+        $self->{make} = CPAN::Distrostatus->new("NO");
+        $CPAN::Frontend->mywarn("  $system -- NOT OK\n");
+        $CPAN::Frontend->mywarn("  $system_err\n") if defined $system_err;
+    }
+    $self->store_persistent_state;
+
+    $self->post_make();
+
+    return !! $system_ok;
+}
+
+# CPAN::Distribution::goodbye ;
+sub goodbye {
+    my($self,$goodbye) = @_;
+    my $id = $self->pretty_id;
+    $CPAN::Frontend->mywarn("  $id\n  $goodbye\n");
+    return 0; # must be explicit false, not undef
+}
+
+sub success {
+    my($self,$why) = @_;
+    my $id = $self->pretty_id;
+    $CPAN::Frontend->myprint("  $id\n  $why\n");
+    return 1;
+}
+
+# CPAN::Distribution::_run_via_expect ;
+sub _run_via_expect {
+    my($self,$system,$phase,$expect_model) = @_;
+    CPAN->debug("system[$system]expect_model[$expect_model]") if $CPAN::DEBUG;
+    if ($CPAN::META->has_inst("Expect")) {
+        my $expo = Expect->new;  # expo Expect object;
+        $expo->spawn($system);
+        $expect_model->{mode} ||= "deterministic";
+        if ($expect_model->{mode} eq "deterministic") {
+            return $self->_run_via_expect_deterministic($expo,$phase,$expect_model);
+        } elsif ($expect_model->{mode} eq "anyorder") {
+            return $self->_run_via_expect_anyorder($expo,$phase,$expect_model);
+        } else {
+            die "Panic: Illegal expect mode: $expect_model->{mode}";
+        }
+    } else {
+        $CPAN::Frontend->mywarn("Expect not installed, falling back to system()\n");
+        return system($system);
+    }
+}
+
+sub _run_via_expect_anyorder {
+    my($self,$expo,$phase,$expect_model) = @_;
+    my $timeout = $expect_model->{timeout} || 5;
+    my $reuse = $expect_model->{reuse};
+    my @expectacopy = @{$expect_model->{talk}}; # we trash it!
+    my $but = "";
+    my $timeout_start = time;
+  EXPECT: while () {
+        my($eof,$ran_into_timeout);
+        # XXX not up to the full power of expect. one could certainly
+        # wrap all of the talk pairs into a single expect call and on
+        # success tweak it and step ahead to the next question. The
+        # current implementation unnecessarily limits itself to a
+        # single match.
+        my @match = $expo->expect(1,
+                                  [ eof => sub {
+                                        $eof++;
+                                    } ],
+                                  [ timeout => sub {
+                                        $ran_into_timeout++;
+                                    } ],
+                                  -re => eval"qr{.}",
+                                 );
+        if ($match[2]) {
+            $but .= $match[2];
+        }
+        $but .= $expo->clear_accum;
+        if ($eof) {
+            $expo->soft_close;
+            return $expo->exitstatus();
+        } elsif ($ran_into_timeout) {
+            # warn "DEBUG: they are asking a question, but[$but]";
+            for (my $i = 0; $i <= $#expectacopy; $i+=2) {
+                my($next,$send) = @expectacopy[$i,$i+1];
+                my $regex = eval "qr{$next}";
+                # warn "DEBUG: will compare with regex[$regex].";
+                if ($but =~ /$regex/) {
+                    # warn "DEBUG: will send send[$send]";
+                    $expo->send($send);
+                    # never allow reusing an QA pair unless they told us
+                    splice @expectacopy, $i, 2 unless $reuse;
+                    $but =~ s/(?s:^.*?)$regex//;
+                    $timeout_start = time;
+                    next EXPECT;
+                }
+            }
+            my $have_waited = time - $timeout_start;
+            if ($have_waited < $timeout) {
+                # warn "DEBUG: have_waited[$have_waited]timeout[$timeout]";
+                next EXPECT;
+            }
+            my $why = "could not answer a question during the dialog";
+            $CPAN::Frontend->mywarn("Failing: $why\n");
+            $self->{$phase} =
+                CPAN::Distrostatus->new("NO $why");
+            return 0;
+        }
+    }
+}
+
+sub _run_via_expect_deterministic {
+    my($self,$expo,$phase,$expect_model) = @_;
+    my $ran_into_timeout;
+    my $ran_into_eof;
+    my $timeout = $expect_model->{timeout} || 15; # currently unsettable
+    my $expecta = $expect_model->{talk};
+  EXPECT: for (my $i = 0; $i <= $#$expecta; $i+=2) {
+        my($re,$send) = @$expecta[$i,$i+1];
+        CPAN->debug("timeout[$timeout]re[$re]") if $CPAN::DEBUG;
+        my $regex = eval "qr{$re}";
+        $expo->expect($timeout,
+                      [ eof => sub {
+                            my $but = $expo->clear_accum;
+                            $CPAN::Frontend->mywarn("EOF (maybe harmless)
+expected[$regex]\nbut[$but]\n\n");
+                            $ran_into_eof++;
+                        } ],
+                      [ timeout => sub {
+                            my $but = $expo->clear_accum;
+                            $CPAN::Frontend->mywarn("TIMEOUT
+expected[$regex]\nbut[$but]\n\n");
+                            $ran_into_timeout++;
+                        } ],
+                      -re => $regex);
+        if ($ran_into_timeout) {
+            # note that the caller expects 0 for success
+            $self->{$phase} =
+                CPAN::Distrostatus->new("NO timeout during expect dialog");
+            return 0;
+        } elsif ($ran_into_eof) {
+            last EXPECT;
+        }
+        $expo->send($send);
+    }
+    $expo->soft_close;
+    return $expo->exitstatus();
+}
+
+#-> CPAN::Distribution::_validate_distropref
+sub _validate_distropref {
+    my($self,@args) = @_;
+    if (
+        $CPAN::META->has_inst("CPAN::Kwalify")
+        &&
+        $CPAN::META->has_inst("Kwalify")
+       ) {
+        eval {CPAN::Kwalify::_validate("distroprefs",@args);};
+        if ($@) {
+            $CPAN::Frontend->mywarn($@);
+        }
+    } else {
+        CPAN->debug("not validating '@args'") if $CPAN::DEBUG;
+    }
+}
+
+#-> CPAN::Distribution::_find_prefs
+sub _find_prefs {
+    my($self) = @_;
+    my $distroid = $self->pretty_id;
+    #CPAN->debug("distroid[$distroid]") if $CPAN::DEBUG;
+    my $prefs_dir = $CPAN::Config->{prefs_dir};
+    return if $prefs_dir =~ /^\s*$/;
+    eval { File::Path::mkpath($prefs_dir); };
+    if ($@) {
+        $CPAN::Frontend->mydie("Cannot create directory $prefs_dir");
+    }
+    # shortcut if there are no distroprefs files
+    {
+      my $dh = DirHandle->new($prefs_dir) or $CPAN::Frontend->mydie("Couldn't open '$prefs_dir': $!");
+      my @files = map { /\.(yml|dd|st)\z/i } $dh->read;
+      return unless @files;
+    }
+    my $yaml_module = CPAN::_yaml_module();
+    my $ext_map = {};
+    my @extensions;
+    if ($CPAN::META->has_inst($yaml_module)) {
+        $ext_map->{yml} = 'CPAN';
+    } else {
+        my @fallbacks;
+        if ($CPAN::META->has_inst("Data::Dumper")) {
+            push @fallbacks, $ext_map->{dd} = 'Data::Dumper';
+        }
+        if ($CPAN::META->has_inst("Storable")) {
+            push @fallbacks, $ext_map->{st} = 'Storable';
+        }
+        if (@fallbacks) {
+            local $" = " and ";
+            unless ($self->{have_complained_about_missing_yaml}++) {
+                $CPAN::Frontend->mywarnonce("'$yaml_module' not installed, falling back ".
+                                            "to @fallbacks to read prefs '$prefs_dir'\n");
+            }
+        } else {
+            unless ($self->{have_complained_about_missing_yaml}++) {
+                $CPAN::Frontend->mywarnonce("'$yaml_module' not installed, cannot ".
+                                            "read prefs '$prefs_dir'\n");
+            }
+        }
+    }
+    my $finder = CPAN::Distroprefs->find($prefs_dir, $ext_map);
+    DIRENT: while (my $result = $finder->next) {
+        if ($result->is_warning) {
+            $CPAN::Frontend->mywarn($result->as_string);
+            $CPAN::Frontend->mysleep(1);
+            next DIRENT;
+        } elsif ($result->is_fatal) {
+            $CPAN::Frontend->mydie($result->as_string);
+        }
+
+        my @prefs = @{ $result->prefs };
+
+      ELEMENT: for my $y (0..$#prefs) {
+            my $pref = $prefs[$y];
+            $self->_validate_distropref($pref->data, $result->abs, $y);
+
+            # I don't know why we silently skip when there's no match, but
+            # complain if there's an empty match hashref, and there's no
+            # comment explaining why -- hdp, 2008-03-18
+            unless ($pref->has_any_match) {
+                next ELEMENT;
+            }
+
+            unless ($pref->has_valid_subkeys) {
+                $CPAN::Frontend->mydie(sprintf
+                    "Nonconforming .%s file '%s': " .
+                    "missing match/* subattribute. " .
+                    "Please remove, cannot continue.",
+                    $result->ext, $result->abs,
+                );
+            }
+
+            my $arg = {
+                env          => \%ENV,
+                distribution => $distroid,
+                perl         => \&CPAN::find_perl,
+                perlconfig   => \%Config::Config,
+                module       => sub { [ $self->containsmods ] },
+            };
+
+            if ($pref->matches($arg)) {
+                return {
+                    prefs => $pref->data,
+                    prefs_file => $result->abs,
+                    prefs_file_doc => $y,
+                };
+            }
+
+        }
+    }
+    return;
+}
+
+# CPAN::Distribution::prefs
+sub prefs {
+    my($self) = @_;
+    if (exists $self->{negative_prefs_cache}
+        &&
+        $self->{negative_prefs_cache} != $CPAN::CurrentCommandId
+       ) {
+        delete $self->{negative_prefs_cache};
+        delete $self->{prefs};
+    }
+    if (exists $self->{prefs}) {
+        return $self->{prefs}; # XXX comment out during debugging
+    }
+    if ($CPAN::Config->{prefs_dir}) {
+        CPAN->debug("prefs_dir[$CPAN::Config->{prefs_dir}]") if $CPAN::DEBUG;
+        my $prefs = $self->_find_prefs();
+        $prefs ||= ""; # avoid warning next line
+        CPAN->debug("prefs[$prefs]") if $CPAN::DEBUG;
+        if ($prefs) {
+            for my $x (qw(prefs prefs_file prefs_file_doc)) {
+                $self->{$x} = $prefs->{$x};
+            }
+            my $bs = sprintf(
+                             "%s[%s]",
+                             File::Basename::basename($self->{prefs_file}),
+                             $self->{prefs_file_doc},
+                            );
+            my $filler1 = "_" x 22;
+            my $filler2 = int(66 - length($bs))/2;
+            $filler2 = 0 if $filler2 < 0;
+            $filler2 = " " x $filler2;
+            $CPAN::Frontend->myprint("
+$filler1 D i s t r o P r e f s $filler1
+$filler2 $bs $filler2
+");
+            $CPAN::Frontend->mysleep(1);
+            return $self->{prefs};
+        }
+    }
+    $self->{negative_prefs_cache} = $CPAN::CurrentCommandId;
+    return $self->{prefs} = +{};
+}
+
+# CPAN::Distribution::_make_phase_arg
+sub _make_phase_arg {
+    my($self, $phase) = @_;
+    my $_make_phase_arg;
+    my $prefs = $self->prefs;
+    if (
+        $prefs
+        && exists $prefs->{$phase}
+        && exists $prefs->{$phase}{args}
+        && $prefs->{$phase}{args}
+       ) {
+        $_make_phase_arg = join(" ",
+                           map {CPAN::HandleConfig
+                                 ->safe_quote($_)} @{$prefs->{$phase}{args}},
+                          );
+    }
+
+# cpan[2]> o conf make[TAB]
+# make                       make_install_make_command
+# make_arg                   makepl_arg
+# make_install_arg
+# cpan[2]> o conf mbuild[TAB]
+# mbuild_arg                    mbuild_install_build_command
+# mbuild_install_arg            mbuildpl_arg
+
+    my $mantra; # must switch make/mbuild here
+    if ($self->{modulebuild}) {
+        $mantra = "mbuild";
+    } else {
+        $mantra = "make";
+    }
+    my %map = (
+               pl => "pl_arg",
+               make => "_arg",
+               test => "_test_arg", # does not really exist but maybe
+                                    # will some day and now protects
+                                    # us from unini warnings
+               install => "_install_arg",
+              );
+    my $phase_underscore_meshup = $map{$phase};
+    my $what = sprintf "%s%s", $mantra, $phase_underscore_meshup;
+
+    $_make_phase_arg ||= $CPAN::Config->{$what};
+    return $_make_phase_arg;
+}
+
+# CPAN::Distribution::_make_command
+sub _make_command {
+    my ($self) = @_;
+    if ($self) {
+        return
+            CPAN::HandleConfig
+                ->safe_quote(
+                             CPAN::HandleConfig->prefs_lookup($self,
+                                                              q{make})
+                             || $Config::Config{make}
+                             || 'make'
+                            );
+    } else {
+        # Old style call, without object. Deprecated
+        Carp::confess("CPAN::_make_command() used as function. Don't Do That.");
+        return
+          safe_quote(undef,
+                     CPAN::HandleConfig->prefs_lookup($self,q{make})
+                     || $CPAN::Config->{make}
+                     || $Config::Config{make}
+                     || 'make');
+    }
+}
+
+sub _make_install_make_command {
+    my ($self) = @_;
+    my $mimc =
+        CPAN::HandleConfig->prefs_lookup($self, q{make_install_make_command});
+    return $self->_make_command() unless $mimc;
+
+    # Quote the "make install" make command on Windows, where it is commonly
+    # found in, e.g., C:\Program Files\... and therefore needs quoting. We can't
+    # do this in general because the command maybe "sudo make..." (i.e. a
+    # program with arguments), but that is unlikely to be the case on Windows.
+    $mimc = CPAN::HandleConfig->safe_quote($mimc) if $^O eq 'MSWin32';
+
+    return $mimc;
+}
+
+#-> sub CPAN::Distribution::is_locally_optional
+sub is_locally_optional {
+    my($self, $prereq_pm, $prereq) = @_;
+    $prereq_pm ||= $self->{prereq_pm};
+    my($nmo,$opt);
+    for my $rt (qw(requires build_requires)) {
+        if (exists $prereq_pm->{$rt}{$prereq}) {
+            # rt 121914
+            $nmo ||= $CPAN::META->instance("CPAN::Module",$prereq);
+            my $av = $nmo->available_version;
+            return 0 if !$av || CPAN::Version->vlt($av,$prereq_pm->{$rt}{$prereq});
+        }
+        if (exists $prereq_pm->{"opt_$rt"}{$prereq}) {
+            $opt = 1;
+        }
+    }
+    return $opt||0;
+}
+
+#-> sub CPAN::Distribution::follow_prereqs ;
+sub follow_prereqs {
+    my($self) = shift;
+    my($slot) = shift;
+    my(@prereq_tuples) = grep {$_->[0] ne "perl"} @_;
+    return unless @prereq_tuples;
+    my(@good_prereq_tuples);
+    for my $p (@prereq_tuples) {
+        # e.g. $p = ['Devel::PartialDump', 'r', 1]
+        # promote if possible
+        if ($p->[1] =~ /^(r|c)$/) {
+            push @good_prereq_tuples, $p;
+        } elsif ($p->[1] =~ /^(b)$/) {
+            my $reqtype = CPAN::Queue->reqtype_of($p->[0]);
+            if ($reqtype =~ /^(r|c)$/) {
+                push @good_prereq_tuples, [$p->[0], $reqtype, $p->[2]];
+            } else {
+                push @good_prereq_tuples, $p;
+            }
+        } else {
+            die "Panic: in follow_prereqs: reqtype[$p->[1]] seen, should never happen";
+        }
+    }
+    my $pretty_id = $self->pretty_id;
+    my %map = (
+               b => "build_requires",
+               r => "requires",
+               c => "commandline",
+              );
+    my($filler1,$filler2,$filler3,$filler4);
+    my $unsat = "Unsatisfied dependencies detected during";
+    my $w = length($unsat) > length($pretty_id) ? length($unsat) : length($pretty_id);
+    {
+        my $r = int(($w - length($unsat))/2);
+        my $l = $w - length($unsat) - $r;
+        $filler1 = "-"x4 . " "x$l;
+        $filler2 = " "x$r . "-"x4 . "\n";
+    }
+    {
+        my $r = int(($w - length($pretty_id))/2);
+        my $l = $w - length($pretty_id) - $r;
+        $filler3 = "-"x4 . " "x$l;
+        $filler4 = " "x$r . "-"x4 . "\n";
+    }
+    $CPAN::Frontend->
+        myprint("$filler1 $unsat $filler2".
+                "$filler3 $pretty_id $filler4".
+                join("", map {sprintf "    %s \[%s%s]\n", $_->[0], $map{$_->[1]}, $self->is_locally_optional(undef,$_->[0]) ? ",optional" : ""} @good_prereq_tuples),
+               );
+    my $follow = 0;
+    if ($CPAN::Config->{prerequisites_policy} eq "follow") {
+        $follow = 1;
+    } elsif ($CPAN::Config->{prerequisites_policy} eq "ask") {
+        my $answer = CPAN::Shell::colorable_makemaker_prompt(
+"Shall I follow them and prepend them to the queue
+of modules we are processing right now?", "yes");
+        $follow = $answer =~ /^\s*y/i;
+    } else {
+        my @prereq = map { $_->[0] } @good_prereq_tuples;
+        local($") = ", ";
+        $CPAN::Frontend->
+            myprint("  Ignoring dependencies on modules @prereq\n");
+    }
+    if ($follow) {
+        my $id = $self->id;
+        my(@to_queue_mand,@to_queue_opt);
+        for my $gp (@good_prereq_tuples) {
+            my($prereq,$reqtype,$optional) = @$gp;
+            my $qthing = +{qmod=>$prereq,reqtype=>$reqtype,optional=>$optional};
+            if ($optional &&
+                $self->is_locally_optional(undef,$prereq)
+               ){
+                # Since we do not depend on this one, we do not need
+                # this in a mandatory arrangement:
+                push @to_queue_opt, $qthing;
+            } else {
+                my $any = CPAN::Shell->expandany($prereq);
+                $self->{$slot . "_for"}{$any->id}++;
+                if ($any) {
+                    unless ($optional) {
+                        # No recursion check in an optional area of the tree
+                        $any->color_cmd_tmps(0,2);
+                    }
+                } else {
+                    $CPAN::Frontend->mywarn("Warning (maybe a bug): Cannot expand prereq '$prereq'\n");
+                    $CPAN::Frontend->mysleep(2);
+                }
+                # order everything that is not locally_optional just
+                # like mandatory items: this keeps leaves before
+                # branches
+                unshift @to_queue_mand, $qthing;
+            }
+        }
+        if (@to_queue_mand) {
+            unshift @to_queue_mand, {qmod => $id, reqtype => $self->{reqtype}, optional=> !$self->{mandatory}};
+            CPAN::Queue->jumpqueue(@to_queue_opt,@to_queue_mand);
+            $self->{$slot} = "Delayed until after prerequisites";
+            return 1; # signal we need dependencies
+        } elsif (@to_queue_opt) {
+            CPAN::Queue->jumpqueue(@to_queue_opt);
+        }
+    }
+    return;
+}
+
+sub _feature_depends {
+    my($self) = @_;
+    my $meta_yml = $self->parse_meta_yml();
+    my $optf = $meta_yml->{optional_features} or return;
+    if (!ref $optf or ref $optf ne "HASH"){
+        $CPAN::Frontend->mywarn("The content of optional_features is not a HASH reference. Cannot use it.\n");
+        $optf = {};
+    }
+    my $wantf = $self->prefs->{features} or return;
+    if (!ref $wantf or ref $wantf ne "ARRAY"){
+        $CPAN::Frontend->mywarn("The content of 'features' is not an ARRAY reference. Cannot use it.\n");
+        $wantf = [];
+    }
+    my $dep = +{};
+    for my $wf (@$wantf) {
+        if (my $f = $optf->{$wf}) {
+            $CPAN::Frontend->myprint("Found the demanded feature '$wf' that ".
+                                     "is accompanied by this description:\n".
+                                     $f->{description}.
+                                     "\n\n"
+                                    );
+            # configure_requires currently not in the spec, unlikely to be useful anyway
+            for my $reqtype (qw(configure_requires build_requires requires)) {
+                my $reqhash = $f->{$reqtype} or next;
+                while (my($k,$v) = each %$reqhash) {
+                    $dep->{$reqtype}{$k} = $v;
+                }
+            }
+        } else {
+            $CPAN::Frontend->mywarn("The demanded feature '$wf' was not ".
+                                    "found in the META.yml file".
+                                    "\n\n"
+                                   );
+        }
+    }
+    $dep;
+}
+
+sub prereqs_for_slot {
+    my($self,$slot) = @_;
+    my($prereq_pm);
+    unless ($CPAN::META->has_usable("CPAN::Meta::Requirements")) {
+        my $whynot = "not available";
+        if (defined $CPAN::Meta::Requirements::VERSION) {
+            $whynot = "version $CPAN::Meta::Requirements::VERSION not sufficient";
+        }

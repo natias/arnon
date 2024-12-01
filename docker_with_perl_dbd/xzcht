@@ -1,0 +1,1000 @@
+
+=cut
+
+sub dbdie {
+    local $frame         = 0;
+    local $doret         = -2;
+    local $SIG{__DIE__}  = '';
+    local $SIG{__WARN__} = '';
+    if ( $dieLevel > 2 ) {
+        local $SIG{__WARN__} = \&dbwarn;
+        _db_warn(@_);    # Yell no matter what
+        return;
+    }
+    if ( $dieLevel < 2 ) {
+        die @_ if $^S;    # in eval propagate
+    }
+
+    # The code used to check $^S to see if compilation of the current thing
+    # hadn't finished. We don't do it anymore, figuring eval is pretty stable.
+    eval { require Carp };
+
+    die( @_,
+        "\nCannot print stack trace, load with -MCarp option to see stack" )
+      unless defined &Carp::longmess;
+
+    # We do not want to debug this chunk (automatic disabling works
+    # inside DB::DB, but not in Carp). Save $single and $trace, turn them off,
+    # get the stack trace from Carp::longmess (if possible), restore $signal
+    # and $trace, and then die with the stack trace.
+    my ( $mysingle, $mytrace ) = ( $single, $trace );
+    $single = 0;
+    $trace  = 0;
+    my $mess = "@_";
+    {
+
+        package Carp;    # Do not include us in the list
+        eval { $mess = Carp::longmess(@_); };
+    }
+    ( $single, $trace ) = ( $mysingle, $mytrace );
+    die $mess;
+} ## end sub dbdie
+
+=head2 C<warnlevel()>
+
+Set the C<$DB::warnLevel> variable that stores the value of the
+C<warnLevel> option. Calling C<warnLevel()> with a positive value
+results in the debugger taking over all warning handlers. Setting
+C<warnLevel> to zero leaves any warning handlers set up by the program
+being debugged in place.
+
+=cut
+
+sub warnLevel {
+    if (@_) {
+        my $prevwarn = $SIG{__WARN__} unless $warnLevel;
+        $warnLevel = shift;
+        if ($warnLevel) {
+            $SIG{__WARN__} = \&DB::dbwarn;
+        }
+        elsif ($prevwarn) {
+            $SIG{__WARN__} = $prevwarn;
+        } else {
+            undef $SIG{__WARN__};
+        }
+    } ## end if (@_)
+    $warnLevel;
+} ## end sub warnLevel
+
+=head2 C<dielevel>
+
+Similar to C<warnLevel>. Non-zero values for C<dieLevel> result in the
+C<DB::dbdie()> function overriding any other C<die()> handler. Setting it to
+zero lets you use your own C<die()> handler.
+
+=cut
+
+sub dieLevel {
+    local $\ = '';
+    if (@_) {
+        my $prevdie = $SIG{__DIE__} unless $dieLevel;
+        $dieLevel = shift;
+        if ($dieLevel) {
+
+            # Always set it to dbdie() for non-zero values.
+            $SIG{__DIE__} = \&DB::dbdie;    # if $dieLevel < 2;
+
+            # No longer exists, so don't try  to use it.
+            #$SIG{__DIE__} = \&DB::diehard if $dieLevel >= 2;
+
+            # If we've finished initialization, mention that stack dumps
+            # are enabled, If dieLevel is 1, we won't stack dump if we die
+            # in an eval().
+            print $OUT "Stack dump during die enabled",
+              ( $dieLevel == 1 ? " outside of evals" : "" ), ".\n"
+              if $I_m_init;
+
+            # XXX This is probably obsolete, given that diehard() is gone.
+            print $OUT "Dump printed too.\n" if $dieLevel > 2;
+        } ## end if ($dieLevel)
+
+        # Put the old one back if there was one.
+        elsif ($prevdie) {
+            $SIG{__DIE__} = $prevdie;
+            print $OUT "Default die handler restored.\n";
+        } else {
+            undef $SIG{__DIE__};
+            print $OUT "Die handler removed.\n";
+        }
+    } ## end if (@_)
+    $dieLevel;
+} ## end sub dieLevel
+
+=head2 C<signalLevel>
+
+Number three in a series: set C<signalLevel> to zero to keep your own
+signal handler for C<SIGSEGV> and/or C<SIGBUS>. Otherwise, the debugger
+takes over and handles them with C<DB::diesignal()>.
+
+=cut
+
+sub signalLevel {
+    if (@_) {
+        my $prevsegv = $SIG{SEGV} unless $signalLevel;
+        my $prevbus  = $SIG{BUS}  unless $signalLevel;
+        $signalLevel = shift;
+        if ($signalLevel) {
+            $SIG{SEGV} = \&DB::diesignal;
+            $SIG{BUS}  = \&DB::diesignal;
+        }
+        else {
+            $SIG{SEGV} = $prevsegv;
+            $SIG{BUS}  = $prevbus;
+        }
+    } ## end if (@_)
+    $signalLevel;
+} ## end sub signalLevel
+
+=head1 SUBROUTINE DECODING SUPPORT
+
+These subroutines are used during the C<x> and C<X> commands to try to
+produce as much information as possible about a code reference. They use
+L<Devel::Peek> to try to find the glob in which this code reference lives
+(if it does) - this allows us to actually code references which correspond
+to named subroutines (including those aliased via glob assignment).
+
+=head2 C<CvGV_name()>
+
+Wrapper for C<CvGV_name_or_bust>; tries to get the name of a reference
+via that routine. If this fails, return the reference again (when the
+reference is stringified, it'll come out as C<SOMETHING(0x...)>).
+
+=cut
+
+sub CvGV_name {
+    my $in   = shift;
+    my $name = CvGV_name_or_bust($in);
+    defined $name ? $name : $in;
+}
+
+=head2 C<CvGV_name_or_bust> I<coderef>
+
+Calls L<Devel::Peek> to try to find the glob the ref lives in; returns
+C<undef> if L<Devel::Peek> can't be loaded, or if C<Devel::Peek::CvGV> can't
+find a glob for this ref.
+
+Returns C<< I<package>::I<glob name> >> if the code ref is found in a glob.
+
+=cut
+
+use vars qw($skipCvGV);
+
+sub CvGV_name_or_bust {
+    my $in = shift;
+    return if $skipCvGV;    # Backdoor to avoid problems if XS broken...
+    return unless ref $in;
+    $in = \&$in;            # Hard reference...
+    eval { require Devel::Peek; 1 } or return;
+    my $gv = Devel::Peek::CvGV($in) or return;
+    *$gv{PACKAGE} . '::' . *$gv{NAME};
+} ## end sub CvGV_name_or_bust
+
+=head2 C<find_sub>
+
+A utility routine used in various places; finds the file where a subroutine
+was defined, and returns that filename and a line-number range.
+
+Tries to use C<@sub> first; if it can't find it there, it tries building a
+reference to the subroutine and uses C<CvGV_name_or_bust> to locate it,
+loading it into C<@sub> as a side effect (XXX I think). If it can't find it
+this way, it brute-force searches C<%sub>, checking for identical references.
+
+=cut
+
+sub _find_sub_helper {
+    my $subr = shift;
+
+    return unless defined &$subr;
+    my $name = CvGV_name_or_bust($subr);
+    my $data;
+    $data = $sub{$name} if defined $name;
+    return $data if defined $data;
+
+    # Old stupid way...
+    $subr = \&$subr;    # Hard reference
+    my $s;
+    for ( keys %sub ) {
+        $s = $_, last if $subr eq \&$_;
+    }
+    if ($s)
+    {
+        return $sub{$s};
+    }
+    else
+    {
+        return;
+    }
+
+}
+
+sub find_sub {
+    my $subr = shift;
+    return ( $sub{$subr} || _find_sub_helper($subr) );
+} ## end sub find_sub
+
+=head2 C<methods>
+
+A subroutine that uses the utility function C<methods_via> to find all the
+methods in the class corresponding to the current reference and in
+C<UNIVERSAL>.
+
+=cut
+
+use vars qw(%seen);
+
+sub methods {
+
+    # Figure out the class - either this is the class or it's a reference
+    # to something blessed into that class.
+    my $class = shift;
+    $class = ref $class if ref $class;
+
+    local %seen;
+
+    # Show the methods that this class has.
+    methods_via( $class, '', 1 );
+
+    # Show the methods that UNIVERSAL has.
+    methods_via( 'UNIVERSAL', 'UNIVERSAL', 0 );
+} ## end sub methods
+
+=head2 C<methods_via($class, $prefix, $crawl_upward)>
+
+C<methods_via> does the work of crawling up the C<@ISA> tree and reporting
+all the parent class methods. C<$class> is the name of the next class to
+try; C<$prefix> is the message prefix, which gets built up as we go up the
+C<@ISA> tree to show parentage; C<$crawl_upward> is 1 if we should try to go
+higher in the C<@ISA> tree, 0 if we should stop.
+
+=cut
+
+sub methods_via {
+
+    # If we've processed this class already, just quit.
+    my $class = shift;
+    return if $seen{$class}++;
+
+    # This is a package that is contributing the methods we're about to print.
+    my $prefix  = shift;
+    my $prepend = $prefix ? "via $prefix: " : '';
+    my @to_print;
+
+    # Extract from all the symbols in this class.
+    my $class_ref = do { no strict "refs"; \%{$class . '::'} };
+    while (my ($name, $glob) = each %$class_ref) {
+        # references directly in the symbol table are Proxy Constant
+        # Subroutines, and are by their very nature defined
+        # Otherwise, check if the thing is a typeglob, and if it is, it decays
+        # to a subroutine reference, which can be tested by defined.
+        # $glob might also be the value -1  (from sub foo;)
+        # or (say) '$$' (from sub foo ($$);)
+        # \$glob will be SCALAR in both cases.
+        if ((ref $glob || ($glob && ref \$glob eq 'GLOB' && defined &$glob))
+            && !$seen{$name}++) {
+            push @to_print, "$prepend$name\n";
+        }
+    }
+
+    {
+        local $\ = '';
+        local $, = '';
+        print $DB::OUT $_ foreach sort @to_print;
+    }
+
+    # If the $crawl_upward argument is false, just quit here.
+    return unless shift;
+
+    # $crawl_upward true: keep going up the tree.
+    # Find all the classes this one is a subclass of.
+    my $class_ISA_ref = do { no strict "refs"; \@{"${class}::ISA"} };
+    for my $name ( @$class_ISA_ref ) {
+
+        # Set up the new prefix.
+        $prepend = $prefix ? $prefix . " -> $name" : $name;
+
+        # Crawl up the tree and keep trying to crawl up.
+        methods_via( $name, $prepend, 1 );
+    }
+} ## end sub methods_via
+
+=head2 C<setman> - figure out which command to use to show documentation
+
+Just checks the contents of C<$^O> and sets the C<$doccmd> global accordingly.
+
+=cut
+
+sub setman {
+    $doccmd = $^O !~ /^(?:MSWin32|VMS|os2|amigaos|riscos)\z/s
+      ? "man"         # O Happy Day!
+      : "perldoc";    # Alas, poor unfortunates
+} ## end sub setman
+
+=head2 C<runman> - run the appropriate command to show documentation
+
+Accepts a man page name; runs the appropriate command to display it (set up
+during debugger initialization). Uses C<_db_system()> to avoid mucking up the
+program's STDIN and STDOUT.
+
+=cut
+
+sub runman {
+    my $page = shift;
+    unless ($page) {
+        _db_system("$doccmd $doccmd");
+        return;
+    }
+
+    # this way user can override, like with $doccmd="man -Mwhatever"
+    # or even just "man " to disable the path check.
+    if ( $doccmd ne 'man' ) {
+        _db_system("$doccmd $page");
+        return;
+    }
+
+    $page = 'perl' if lc($page) eq 'help';
+
+    require Config;
+    my $man1dir = $Config::Config{man1direxp};
+    my $man3dir = $Config::Config{man3direxp};
+    for ( $man1dir, $man3dir ) { s#/[^/]*\z## if /\S/ }
+    my $manpath = '';
+    $manpath .= "$man1dir:" if $man1dir =~ /\S/;
+    $manpath .= "$man3dir:" if $man3dir =~ /\S/ && $man1dir ne $man3dir;
+    chop $manpath if $manpath;
+
+    # harmless if missing, I figure
+    local $ENV{MANPATH} = $manpath if $manpath;
+    my $nopathopt = $^O =~ /dunno what goes here/;
+    if (
+        CORE::system(
+            $doccmd,
+
+            # I just *know* there are men without -M
+            ( ( $manpath && !$nopathopt ) ? ( "-M", $manpath ) : () ),
+            split ' ', $page
+        )
+      )
+    {
+        unless ( $page =~ /^perl\w/ ) {
+            # Previously the debugger contained a list which it slurped in,
+            # listing the known "perl" manpages. However, it was out of date,
+            # with errors both of omission and inclusion. This approach is
+            # considerably less complex. The failure mode on a butchered
+            # install is simply that the user has to run man or perldoc
+            # "manually" with the full manpage name.
+
+            # There is a list of $^O values in installperl to determine whether
+            # the directory is 'pods' or 'pod'. However, we can avoid tight
+            # coupling to that by simply checking the "non-standard" 'pods'
+            # first.
+            my $pods = "$Config::Config{privlibexp}/pods";
+            $pods = "$Config::Config{privlibexp}/pod"
+                unless -d $pods;
+            if (-f "$pods/perl$page.pod") {
+                CORE::system( $doccmd,
+                    ( ( $manpath && !$nopathopt ) ? ( "-M", $manpath ) : () ),
+                    "perl$page" );
+            }
+        }
+    } ## end if (CORE::system($doccmd...
+} ## end sub runman
+
+#use Carp;                          # This did break, left for debugging
+
+=head1 DEBUGGER INITIALIZATION - THE SECOND BEGIN BLOCK
+
+Because of the way the debugger interface to the Perl core is designed, any
+debugger package globals that C<DB::sub()> requires have to be defined before
+any subroutines can be called. These are defined in the second C<BEGIN> block.
+
+This block sets things up so that (basically) the world is sane
+before the debugger starts executing. We set up various variables that the
+debugger has to have set up before the Perl core starts running:
+
+=over 4
+
+=item *
+
+The debugger's own filehandles (copies of STD and STDOUT for now).
+
+=item *
+
+Characters for shell escapes, the recall command, and the history command.
+
+=item *
+
+The maximum recursion depth.
+
+=item *
+
+The size of a C<w> command's window.
+
+=item *
+
+The before-this-line context to be printed in a C<v> (view a window around this line) command.
+
+=item *
+
+The fact that we're not in a sub at all right now.
+
+=item *
+
+The default SIGINT handler for the debugger.
+
+=item *
+
+The appropriate value of the flag in C<$^D> that says the debugger is running
+
+=item *
+
+The current debugger recursion level
+
+=item *
+
+The list of postponed items and the C<$single> stack (XXX define this)
+
+=item *
+
+That we want no return values and no subroutine entry/exit trace.
+
+=back
+
+=cut
+
+# The following BEGIN is very handy if debugger goes havoc, debugging debugger?
+
+use vars qw($db_stop);
+
+BEGIN {    # This does not compile, alas. (XXX eh?)
+    $IN  = \*STDIN;     # For bugs before DB::OUT has been opened
+    $OUT = \*STDERR;    # For errors before DB::OUT has been opened
+
+    # Define characters used by command parsing.
+    $sh       = '!';      # Shell escape (does not work)
+    $rc       = ',';      # Recall command (does not work)
+    @hist     = ('?');    # Show history (does not work)
+    @truehist = ();       # Can be saved for replay (per session)
+
+    # This defines the point at which you get the 'deep recursion'
+    # warning. It MUST be defined or the debugger will not load.
+    $deep = 1000;
+
+    # Number of lines around the current one that are shown in the
+    # 'w' command.
+    $window = 10;
+
+    # How much before-the-current-line context the 'v' command should
+    # use in calculating the start of the window it will display.
+    $preview = 3;
+
+    # We're not in any sub yet, but we need this to be a defined value.
+    $sub = '';
+
+    # Set up the debugger's interrupt handler. It simply sets a flag
+    # ($signal) that DB::DB() will check before each command is executed.
+    $SIG{INT} = \&DB::catch;
+
+    # The following lines supposedly, if uncommented, allow the debugger to
+    # debug itself. Perhaps we can try that someday.
+    # This may be enabled to debug debugger:
+    #$warnLevel = 1 unless defined $warnLevel;
+    #$dieLevel = 1 unless defined $dieLevel;
+    #$signalLevel = 1 unless defined $signalLevel;
+
+    # This is the flag that says "a debugger is running, please call
+    # DB::DB and DB::sub". We will turn it on forcibly before we try to
+    # execute anything in the user's context, because we always want to
+    # get control back.
+    $db_stop = 0;          # Compiler warning ...
+    $db_stop = 1 << 30;    # ... because this is only used in an eval() later.
+
+    # This variable records how many levels we're nested in debugging.
+    # Used in the debugger prompt, and in determining whether it's all over or
+    # not.
+    $level = 0;            # Level of recursive debugging
+
+    # "Triggers bug (?) in perl if we postpone this until runtime."
+    # XXX No details on this yet, or whether we should fix the bug instead
+    # of work around it. Stay tuned.
+    @stack = (0);
+
+    # Used to track the current stack depth using the auto-stacked-variable
+    # trick.
+    $stack_depth = 0;      # Localized repeatedly; simple way to track $#stack
+
+    # Don't print return values on exiting a subroutine.
+    $doret = -2;
+
+    # No extry/exit tracing.
+    $frame = 0;
+
+} ## end BEGIN
+
+BEGIN { $^W = $ini_warn; }    # Switch warnings back
+
+=head1 READLINE SUPPORT - COMPLETION FUNCTION
+
+=head2 db_complete
+
+C<readline> support - adds command completion to basic C<readline>.
+
+Returns a list of possible completions to C<readline> when invoked. C<readline>
+will print the longest common substring following the text already entered.
+
+If there is only a single possible completion, C<readline> will use it in full.
+
+This code uses C<map> and C<grep> heavily to create lists of possible
+completion. Think LISP in this section.
+
+=cut
+
+sub db_complete {
+
+    # Specific code for b c l V m f O, &blah, $blah, @blah, %blah
+    # $text is the text to be completed.
+    # $line is the incoming line typed by the user.
+    # $start is the start of the text to be completed in the incoming line.
+    my ( $text, $line, $start ) = @_;
+
+    # Save the initial text.
+    # The search pattern is current package, ::, extract the next qualifier
+    # Prefix and pack are set to undef.
+    my ( $itext, $search, $prefix, $pack ) =
+      ( $text, "^\Q${package}::\E([^:]+)\$" );
+
+=head3 C<b postpone|compile>
+
+=over 4
+
+=item *
+
+Find all the subroutines that might match in this package
+
+=item *
+
+Add C<postpone>, C<load>, and C<compile> as possibles (we may be completing the keyword itself)
+
+=item *
+
+Include all the rest of the subs that are known
+
+=item *
+
+C<grep> out the ones that match the text we have so far
+
+=item *
+
+Return this as the list of possible completions
+
+=back
+
+=cut
+
+    return sort grep /^\Q$text/, ( keys %sub ),
+      qw(postpone load compile),    # subroutines
+      ( map { /$search/ ? ($1) : () } keys %sub )
+      if ( substr $line, 0, $start ) =~ /^\|*[blc]\s+((postpone|compile)\s+)?$/;
+
+=head3 C<b load>
+
+Get all the possible files from C<@INC> as it currently stands and
+select the ones that match the text so far.
+
+=cut
+
+    return sort grep /^\Q$text/, values %INC    # files
+      if ( substr $line, 0, $start ) =~ /^\|*b\s+load\s+$/;
+
+=head3  C<V> (list variable) and C<m> (list modules)
+
+There are two entry points for these commands:
+
+=head4 Unqualified package names
+
+Get the top-level packages and grab everything that matches the text
+so far. For each match, recursively complete the partial packages to
+get all possible matching packages. Return this sorted list.
+
+=cut
+
+    return sort map { ( $_, db_complete( $_ . "::", "V ", 2 ) ) }
+      grep /^\Q$text/, map { /^(.*)::$/ ? ($1) : () } keys %::    # top-packages
+      if ( substr $line, 0, $start ) =~ /^\|*[Vm]\s+$/ and $text =~ /^\w*$/;
+
+=head4 Qualified package names
+
+Take a partially-qualified package and find all subpackages for it
+by getting all the subpackages for the package so far, matching all
+the subpackages against the text, and discarding all of them which
+start with 'main::'. Return this list.
+
+=cut
+
+    return sort map { ( $_, db_complete( $_ . "::", "V ", 2 ) ) }
+      grep !/^main::/, grep /^\Q$text/,
+      map { /^(.*)::$/ ? ( $prefix . "::$1" ) : () }
+      do { no strict 'refs'; keys %{ $prefix . '::' } }
+      if ( substr $line, 0, $start ) =~ /^\|*[Vm]\s+$/
+      and $text =~ /^(.*[^:])::?(\w*)$/
+      and $prefix = $1;
+
+=head3 C<f> - switch files
+
+Here, we want to get a fully-qualified filename for the C<f> command.
+Possibilities are:
+
+=over 4
+
+=item 1. The original source file itself
+
+=item 2. A file from C<@INC>
+
+=item 3. An C<eval> (the debugger gets a C<(eval N)> fake file for each C<eval>).
+
+=back
+
+=cut
+
+    if ( $line =~ /^\|*f\s+(.*)/ ) {    # Loaded files
+           # We might possibly want to switch to an eval (which has a "filename"
+           # like '(eval 9)'), so we may need to clean up the completion text
+           # before proceeding.
+        $prefix = length($1) - length($text);
+        $text   = $1;
+
+=pod
+
+Under the debugger, source files are represented as C<_E<lt>/fullpath/to/file>
+(C<eval>s are C<_E<lt>(eval NNN)>) keys in C<%main::>. We pull all of these
+out of C<%main::>, add the initial source file, and extract the ones that
+match the completion text so far.
+
+=cut
+
+        return sort
+          map { substr $_, 2 + $prefix } grep /^_<\Q$text/, ( keys %main:: ),
+          $0;
+    } ## end if ($line =~ /^\|*f\s+(.*)/)
+
+=head3 Subroutine name completion
+
+We look through all of the defined subs (the keys of C<%sub>) and
+return both all the possible matches to the subroutine name plus
+all the matches qualified to the current package.
+
+=cut
+
+    if ( ( substr $text, 0, 1 ) eq '&' ) {    # subroutines
+        $text = substr $text, 1;
+        $prefix = "&";
+        return sort map "$prefix$_", grep /^\Q$text/, ( keys %sub ),
+          (
+            map { /$search/ ? ($1) : () }
+              keys %sub
+          );
+    } ## end if ((substr $text, 0, ...
+
+=head3  Scalar, array, and hash completion: partially qualified package
+
+Much like the above, except we have to do a little more cleanup:
+
+=cut
+
+    if ( $text =~ /^[\$@%](.*)::(.*)/ ) {    # symbols in a package
+
+=pod
+
+=over 4
+
+=item *
+
+Determine the package that the symbol is in. Put it in C<::> (effectively C<main::>) if no package is specified.
+
+=cut
+
+        $pack = ( $1 eq 'main' ? '' : $1 ) . '::';
+
+=pod
+
+=item *
+
+Figure out the prefix vs. what needs completing.
+
+=cut
+
+        $prefix = ( substr $text, 0, 1 ) . $1 . '::';
+        $text   = $2;
+
+=pod
+
+=item *
+
+Look through all the symbols in the package. C<grep> out all the possible hashes/arrays/scalars, and then C<grep> the possible matches out of those. C<map> the prefix onto all the possibilities.
+
+=cut
+
+        my @out = do {
+            no strict 'refs';
+            map "$prefix$_", grep /^\Q$text/, grep /^_?[a-zA-Z]/,
+            keys %$pack;
+        };
+
+=pod
+
+=item *
+
+If there's only one hit, and it's a package qualifier, and it's not equal to the initial text, re-complete it using the symbol we actually found.
+
+=cut
+
+        if ( @out == 1 and $out[0] =~ /::$/ and $out[0] ne $itext ) {
+            return db_complete( $out[0], $line, $start );
+        }
+
+        # Return the list of possibles.
+        return sort @out;
+
+    } ## end if ($text =~ /^[\$@%](.*)::(.*)/)
+
+=pod
+
+=back
+
+=head3 Symbol completion: current package or package C<main>.
+
+=cut
+
+    if ( $text =~ /^[\$@%]/ ) {    # symbols (in $package + packages in main)
+=pod
+
+=over 4
+
+=item *
+
+If it's C<main>, delete main to just get C<::> leading.
+
+=cut
+
+        $pack = ( $package eq 'main' ? '' : $package ) . '::';
+
+=pod
+
+=item *
+
+We set the prefix to the item's sigil, and trim off the sigil to get the text to be completed.
+
+=cut
+
+        $prefix = substr $text, 0, 1;
+        $text   = substr $text, 1;
+
+        my @out;
+
+=pod
+
+=item *
+
+We look for the lexical scope above DB::DB and auto-complete lexical variables
+if PadWalker could be loaded.
+
+=cut
+
+        if (not $text =~ /::/ and eval {
+            local @INC = @INC;
+            pop @INC if $INC[-1] eq '.';
+            require PadWalker } ) {
+            my $level = 1;
+            while (1) {
+                my @info = caller($level);
+                $level++;
+                $level = -1, last
+                  if not @info;
+                last if $info[3] eq 'DB::DB';
+            }
+            if ($level > 0) {
+                my $lexicals = PadWalker::peek_my($level);
+                push @out, grep /^\Q$prefix$text/, keys %$lexicals;
+            }
+        }
+
+=pod
+
+=item *
+
+If the package is C<::> (C<main>), create an empty list; if it's something else, create a list of all the packages known.  Append whichever list to a list of all the possible symbols in the current package. C<grep> out the matches to the text entered so far, then C<map> the prefix back onto the symbols.
+
+=cut
+
+        push @out, map "$prefix$_", grep /^\Q$text/,
+          ( grep /^_?[a-zA-Z]/, do { no strict 'refs'; keys %$pack } ),
+          ( $pack eq '::' ? () : ( grep /::$/, keys %:: ) );
+
+=item *
+
+If there's only one hit, it's a package qualifier, and it's not equal to the initial text, recomplete using this symbol.
+
+=back
+
+=cut
+
+        if ( @out == 1 and $out[0] =~ /::$/ and $out[0] ne $itext ) {
+            return db_complete( $out[0], $line, $start );
+        }
+
+        # Return the list of possibles.
+        return sort @out;
+    } ## end if ($text =~ /^[\$@%]/)
+
+=head3 Options
+
+We use C<option_val()> to look up the current value of the option. If there's
+only a single value, we complete the command in such a way that it is a
+complete command for setting the option in question. If there are multiple
+possible values, we generate a command consisting of the option plus a trailing
+question mark, which, if executed, will list the current value of the option.
+
+=cut
+
+    if ( ( substr $line, 0, $start ) =~ /^\|*[oO]\b.*\s$/ )
+    {    # Options after space
+           # We look for the text to be matched in the list of possible options,
+           # and fetch the current value.
+        my @out = grep /^\Q$text/, @options;
+        my $val = option_val( $out[0], undef );
+
+        # Set up a 'query option's value' command.
+        my $out = '? ';
+        if ( not defined $val or $val =~ /[\n\r]/ ) {
+
+            # There's really nothing else we can do.
+        }
+
+        # We have a value. Create a proper option-setting command.
+        elsif ( $val =~ /\s/ ) {
+
+            # XXX This may be an extraneous variable.
+            my $found;
+
+            # We'll want to quote the string (because of the embedded
+            # whtespace), but we want to make sure we don't end up with
+            # mismatched quote characters. We try several possibilities.
+            foreach my $l ( split //, qq/\"\'\#\|/ ) {
+
+                # If we didn't find this quote character in the value,
+                # quote it using this quote character.
+                $out = "$l$val$l ", last if ( index $val, $l ) == -1;
+            }
+        } ## end elsif ($val =~ /\s/)
+
+        # Don't need any quotes.
+        else {
+            $out = "=$val ";
+        }
+
+        # If there were multiple possible values, return '? ', which
+        # makes the command into a query command. If there was just one,
+        # have readline append that.
+        $rl_attribs->{completer_terminator_character} =
+          ( @out == 1 ? $out : '? ' );
+
+        # Return list of possibilities.
+        return sort @out;
+    } ## end if ((substr $line, 0, ...
+
+=head3 Filename completion
+
+For entering filenames. We simply call C<readline>'s C<filename_list()>
+method with the completion text to get the possible completions.
+
+=cut
+
+    return $term->filename_list($text);    # filenames
+
+} ## end sub db_complete
+
+=head1 MISCELLANEOUS SUPPORT FUNCTIONS
+
+Functions that possibly ought to be somewhere else.
+
+=head2 end_report
+
+Say we're done.
+
+=cut
+
+sub end_report {
+    local $\ = '';
+    print $OUT "Use 'q' to quit or 'R' to restart.  'h q' for details.\n";
+}
+
+=head2 clean_ENV
+
+If we have $ini_pids, save it in the environment; else remove it from the
+environment. Used by the C<R> (restart) command.
+
+=cut
+
+sub clean_ENV {
+    if ( defined($ini_pids) ) {
+        $ENV{PERLDB_PIDS} = $ini_pids;
+    }
+    else {
+        delete( $ENV{PERLDB_PIDS} );
+    }
+} ## end sub clean_ENV
+
+# PERLDBf_... flag names from perl.h
+our ( %DollarCaretP_flags, %DollarCaretP_flags_r );
+
+BEGIN {
+    %DollarCaretP_flags = (
+        PERLDBf_SUB       => 0x01,     # Debug sub enter/exit
+        PERLDBf_LINE      => 0x02,     # Keep line #
+        PERLDBf_NOOPT     => 0x04,     # Switch off optimizations
+        PERLDBf_INTER     => 0x08,     # Preserve more data
+        PERLDBf_SUBLINE   => 0x10,     # Keep subr source lines
+        PERLDBf_SINGLE    => 0x20,     # Start with single-step on
+        PERLDBf_NONAME    => 0x40,     # For _SUB: no name of the subr
+        PERLDBf_GOTO      => 0x80,     # Report goto: call DB::goto
+        PERLDBf_NAMEEVAL  => 0x100,    # Informative names for evals
+        PERLDBf_NAMEANON  => 0x200,    # Informative names for anon subs
+        PERLDBf_SAVESRC   => 0x400,    # Save source lines into @{"_<$filename"}
+        PERLDB_ALL        => 0x33f,    # No _NONAME, _GOTO
+    );
+    # PERLDBf_LINE also enables the actions of PERLDBf_SAVESRC, so the debugger
+    # doesn't need to set it. It's provided for the benefit of profilers and
+    # other code analysers.
+
+    %DollarCaretP_flags_r = reverse %DollarCaretP_flags;
+}
+
+sub parse_DollarCaretP_flags {
+    my $flags = shift;
+    $flags =~ s/^\s+//;
+    $flags =~ s/\s+$//;
+    my $acu = 0;
+    foreach my $f ( split /\s*\|\s*/, $flags ) {
+        my $value;
+        if ( $f =~ /^0x([[:xdigit:]]+)$/ ) {
+            $value = hex $1;
+        }
+        elsif ( $f =~ /^(\d+)$/ ) {
+            $value = int $1;
+        }
+        elsif ( $f =~ /^DEFAULT$/i ) {
+            $value = $DollarCaretP_flags{PERLDB_ALL};
+        }
+        else {
+            $f =~ /^(?:PERLDBf_)?(.*)$/i;
+            $value = $DollarCaretP_flags{ 'PERLDBf_' . uc($1) };
+            unless ( defined $value ) {
+                print $OUT (
+                    "Unrecognized \$^P flag '$f'!\n",
+                    "Acceptable flags are: "
+                      . join( ', ', sort keys %DollarCaretP_flags ),
+                    ", and hexadecimal and decimal numbers.\n"
+                );
+                return undef;
+            }
+        }
+        $acu |= $value;
+    }
+    $acu;
+}
+
+sub expand_DollarCaretP_flags {
+    my $DollarCaretP = shift;
+    my @bits         = (
+        map {
+            my $n = ( 1 << $_ );
+            ( $DollarCaretP & $n )

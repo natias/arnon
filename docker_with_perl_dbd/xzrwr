@@ -1,0 +1,1000 @@
+           empty static block is ten bits long */
+        if ((log->first = lseek(log->fd, -1, SEEK_CUR)) < 0 ||
+            read(log->fd, buf, 1) != 1)
+            return -1;
+        log->first++;
+        if (*buf) {
+            log->back = 1;
+            while ((*buf & ((uint)1 << (8 - log->back++))) == 0)
+                ;       /* guaranteed to terminate, since *buf != 0 */
+        }
+        else
+            log->back = 10;
+
+        /* update compressed crc and length */
+        log->ccrc = log->tcrc;
+        log->clen = log->tlen;
+    }
+    else {
+        /* no data to compress -- fix up existing gzip stream */
+        log->tcrc = log->ccrc;
+        log->tlen = log->clen;
+    }
+
+    /* complete and truncate gzip stream */
+    log->last = log->first;
+    log->stored = 0;
+    PUT4(buf, log->tcrc);
+    PUT4(buf + 4, log->tlen);
+    if (log_last(log, 1) || write(log->fd, buf, 8) != 8 ||
+        (end = lseek(log->fd, 0, SEEK_CUR)) < 0 || ftruncate(log->fd, end))
+        return -1;
+    BAIL(6);
+
+    /* mark as being in the replace operation */
+    if (log_mark(log, REPLACE_OP))
+        return -1;
+
+    /* execute the replace operation and mark the file as done */
+    return log_replace(log);
+}
+
+/* log a repair record to the .repairs file */
+local void log_log(struct log *log, int op, char *record)
+{
+    time_t now;
+    FILE *rec;
+
+    now = time(NULL);
+    strcpy(log->end, ".repairs");
+    rec = fopen(log->path, "a");
+    if (rec == NULL)
+        return;
+    fprintf(rec, "%.24s %s recovery: %s\n", ctime(&now), op == APPEND_OP ?
+            "append" : (op == COMPRESS_OP ? "compress" : "replace"), record);
+    fclose(rec);
+    return;
+}
+
+/* Recover the interrupted operation op.  First read foo.add for recovering an
+   append or compress operation.  Return -1 if there was an error reading or
+   writing foo.gz or reading an existing foo.add, or -2 if there was a memory
+   allocation failure. */
+local int log_recover(struct log *log, int op)
+{
+    int fd, ret = 0;
+    unsigned char *data = NULL;
+    size_t len = 0;
+    struct stat st;
+
+    /* log recovery */
+    log_log(log, op, "start");
+
+    /* load foo.add file if expected and present */
+    if (op == APPEND_OP || op == COMPRESS_OP) {
+        strcpy(log->end, ".add");
+        if (stat(log->path, &st) == 0 && st.st_size) {
+            len = (size_t)(st.st_size);
+            if ((off_t)len != st.st_size ||
+                    (data = malloc(st.st_size)) == NULL) {
+                log_log(log, op, "allocation failure");
+                return -2;
+            }
+            if ((fd = open(log->path, O_RDONLY, 0)) < 0) {
+                free(data);
+                log_log(log, op, ".add file read failure");
+                return -1;
+            }
+            ret = (size_t)read(fd, data, len) != len;
+            close(fd);
+            if (ret) {
+                free(data);
+                log_log(log, op, ".add file read failure");
+                return -1;
+            }
+            log_log(log, op, "loaded .add file");
+        }
+        else
+            log_log(log, op, "missing .add file!");
+    }
+
+    /* recover the interrupted operation */
+    switch (op) {
+    case APPEND_OP:
+        ret = log_append(log, data, len);
+        break;
+    case COMPRESS_OP:
+        ret = log_compress(log, data, len);
+        break;
+    case REPLACE_OP:
+        ret = log_replace(log);
+    }
+
+    /* log status */
+    log_log(log, op, ret ? "failure" : "complete");
+
+    /* clean up */
+    if (data != NULL)
+        free(data);
+    return ret;
+}
+
+/* Close the foo.gz file (if open) and release the lock. */
+local void log_close(struct log *log)
+{
+    if (log->fd >= 0)
+        close(log->fd);
+    log->fd = -1;
+    log_unlock(log);
+}
+
+/* Open foo.gz, verify the header, and load the extra field contents, after
+   first creating the foo.lock file to gain exclusive access to the foo.*
+   files.  If foo.gz does not exist or is empty, then write the initial header,
+   extra, and body content of an empty foo.gz log file.  If there is an error
+   creating the lock file due to access restrictions, or an error reading or
+   writing the foo.gz file, or if the foo.gz file is not a proper log file for
+   this object (e.g. not a gzip file or does not contain the expected extra
+   field), then return true.  If there is an error, the lock is released.
+   Otherwise, the lock is left in place. */
+local int log_open(struct log *log)
+{
+    int op;
+
+    /* release open file resource if left over -- can occur if lock lost
+       between gzlog_open() and gzlog_write() */
+    if (log->fd >= 0)
+        close(log->fd);
+    log->fd = -1;
+
+    /* negotiate exclusive access */
+    if (log_lock(log) < 0)
+        return -1;
+
+    /* open the log file, foo.gz */
+    strcpy(log->end, ".gz");
+    log->fd = open(log->path, O_RDWR | O_CREAT, 0644);
+    if (log->fd < 0) {
+        log_close(log);
+        return -1;
+    }
+
+    /* if new, initialize foo.gz with an empty log, delete old dictionary */
+    if (lseek(log->fd, 0, SEEK_END) == 0) {
+        if (write(log->fd, log_gzhead, HEAD) != HEAD ||
+            write(log->fd, log_gzext, EXTRA) != EXTRA ||
+            write(log->fd, log_gzbody, BODY) != BODY) {
+            log_close(log);
+            return -1;
+        }
+        strcpy(log->end, ".dict");
+        unlink(log->path);
+    }
+
+    /* verify log file and load extra field information */
+    if ((op = log_head(log)) < 0) {
+        log_close(log);
+        return -1;
+    }
+
+    /* check for interrupted process and if so, recover */
+    if (op != NO_OP && log_recover(log, op)) {
+        log_close(log);
+        return -1;
+    }
+
+    /* touch the lock file to prevent another process from grabbing it */
+    log_touch(log);
+    return 0;
+}
+
+/* See gzlog.h for the description of the external methods below */
+gzlog *gzlog_open(char *path)
+{
+    size_t n;
+    struct log *log;
+
+    /* check arguments */
+    if (path == NULL || *path == 0)
+        return NULL;
+
+    /* allocate and initialize log structure */
+    log = malloc(sizeof(struct log));
+    if (log == NULL)
+        return NULL;
+    strcpy(log->id, LOGID);
+    log->fd = -1;
+
+    /* save path and end of path for name construction */
+    n = strlen(path);
+    log->path = malloc(n + 9);              /* allow for ".repairs" */
+    if (log->path == NULL) {
+        free(log);
+        return NULL;
+    }
+    strcpy(log->path, path);
+    log->end = log->path + n;
+
+    /* gain exclusive access and verify log file -- may perform a
+       recovery operation if needed */
+    if (log_open(log)) {
+        free(log->path);
+        free(log);
+        return NULL;
+    }
+
+    /* return pointer to log structure */
+    return log;
+}
+
+/* gzlog_compress() return values:
+    0: all good
+   -1: file i/o error (usually access issue)
+   -2: memory allocation failure
+   -3: invalid log pointer argument */
+int gzlog_compress(gzlog *logd)
+{
+    int fd, ret;
+    uint block;
+    size_t len, next;
+    unsigned char *data, buf[5];
+    struct log *log = logd;
+
+    /* check arguments */
+    if (log == NULL || strcmp(log->id, LOGID))
+        return -3;
+
+    /* see if we lost the lock -- if so get it again and reload the extra
+       field information (it probably changed), recover last operation if
+       necessary */
+    if (log_check(log) && log_open(log))
+        return -1;
+
+    /* create space for uncompressed data */
+    len = ((size_t)(log->last - log->first) & ~(((size_t)1 << 10) - 1)) +
+          log->stored;
+    if ((data = malloc(len)) == NULL)
+        return -2;
+
+    /* do statement here is just a cheap trick for error handling */
+    do {
+        /* read in the uncompressed data */
+        if (lseek(log->fd, log->first - 1, SEEK_SET) < 0)
+            break;
+        next = 0;
+        while (next < len) {
+            if (read(log->fd, buf, 5) != 5)
+                break;
+            block = PULL2(buf + 1);
+            if (next + block > len ||
+                read(log->fd, (char *)data + next, block) != block)
+                break;
+            next += block;
+        }
+        if (lseek(log->fd, 0, SEEK_CUR) != log->last + 4 + log->stored)
+            break;
+        log_touch(log);
+
+        /* write the uncompressed data to the .add file */
+        strcpy(log->end, ".add");
+        fd = open(log->path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (fd < 0)
+            break;
+        ret = (size_t)write(fd, data, len) != len;
+        if (ret | close(fd))
+            break;
+        log_touch(log);
+
+        /* write the dictionary for the next compress to the .temp file */
+        strcpy(log->end, ".temp");
+        fd = open(log->path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (fd < 0)
+            break;
+        next = DICT > len ? len : DICT;
+        ret = (size_t)write(fd, (char *)data + len - next, next) != next;
+        if (ret | close(fd))
+            break;
+        log_touch(log);
+
+        /* roll back to compressed data, mark the compress in progress */
+        log->last = log->first;
+        log->stored = 0;
+        if (log_mark(log, COMPRESS_OP))
+            break;
+        BAIL(7);
+
+        /* compress and append the data (clears mark) */
+        ret = log_compress(log, data, len);
+        free(data);
+        return ret;
+    } while (0);
+
+    /* broke out of do above on i/o error */
+    free(data);
+    return -1;
+}
+
+/* gzlog_write() return values:
+    0: all good
+   -1: file i/o error (usually access issue)
+   -2: memory allocation failure
+   -3: invalid log pointer argument */
+int gzlog_write(gzlog *logd, void *data, size_t len)
+{
+    int fd, ret;
+    struct log *log = logd;
+
+    /* check arguments */
+    if (log == NULL || strcmp(log->id, LOGID))
+        return -3;
+    if (data == NULL || len <= 0)
+        return 0;
+
+    /* see if we lost the lock -- if so get it again and reload the extra
+       field information (it probably changed), recover last operation if
+       necessary */
+    if (log_check(log) && log_open(log))
+        return -1;
+
+    /* create and write .add file */
+    strcpy(log->end, ".add");
+    fd = open(log->path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0)
+        return -1;
+    ret = (size_t)write(fd, data, len) != len;
+    if (ret | close(fd))
+        return -1;
+    log_touch(log);
+
+    /* mark log file with append in progress */
+    if (log_mark(log, APPEND_OP))
+        return -1;
+    BAIL(8);
+
+    /* append data (clears mark) */
+    if (log_append(log, data, len))
+        return -1;
+
+    /* check to see if it's time to compress -- if not, then done */
+    if (((log->last - log->first) >> 10) + (log->stored >> 10) < TRIGGER)
+        return 0;
+
+    /* time to compress */
+    return gzlog_compress(log);
+}
+
+/* gzlog_close() return values:
+    0: ok
+   -3: invalid log pointer argument */
+int gzlog_close(gzlog *logd)
+{
+    struct log *log = logd;
+
+    /* check arguments */
+    if (log == NULL || strcmp(log->id, LOGID))
+        return -3;
+
+    /* close the log file and release the lock */
+    log_close(log);
+
+    /* free structure and return */
+    if (log->path != NULL)
+        free(log->path);
+    strcpy(log->id, "bad");
+    free(log);
+    return 0;
+}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                           usr/share/doc/zlib1g-dev/examples/gzlog.h                                                           0000644 0000000 0000000 00000010716 14301253041 016777  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        /* gzlog.h
+  Copyright (C) 2004, 2008, 2012 Mark Adler, all rights reserved
+  version 2.2, 14 Aug 2012
+
+  This software is provided 'as-is', without any express or implied
+  warranty.  In no event will the author be held liable for any damages
+  arising from the use of this software.
+
+  Permission is granted to anyone to use this software for any purpose,
+  including commercial applications, and to alter it and redistribute it
+  freely, subject to the following restrictions:
+
+  1. The origin of this software must not be misrepresented; you must not
+     claim that you wrote the original software. If you use this software
+     in a product, an acknowledgment in the product documentation would be
+     appreciated but is not required.
+  2. Altered source versions must be plainly marked as such, and must not be
+     misrepresented as being the original software.
+  3. This notice may not be removed or altered from any source distribution.
+
+  Mark Adler    madler@alumni.caltech.edu
+ */
+
+/* Version History:
+   1.0  26 Nov 2004  First version
+   2.0  25 Apr 2008  Complete redesign for recovery of interrupted operations
+                     Interface changed slightly in that now path is a prefix
+                     Compression now occurs as needed during gzlog_write()
+                     gzlog_write() now always leaves the log file as valid gzip
+   2.1   8 Jul 2012  Fix argument checks in gzlog_compress() and gzlog_write()
+   2.2  14 Aug 2012  Clean up signed comparisons
+ */
+
+/*
+   The gzlog object allows writing short messages to a gzipped log file,
+   opening the log file locked for small bursts, and then closing it.  The log
+   object works by appending stored (uncompressed) data to the gzip file until
+   1 MB has been accumulated.  At that time, the stored data is compressed, and
+   replaces the uncompressed data in the file.  The log file is truncated to
+   its new size at that time.  After each write operation, the log file is a
+   valid gzip file that can decompressed to recover what was written.
+
+   The gzlog operations can be interrupted at any point due to an application or
+   system crash, and the log file will be recovered the next time the log is
+   opened with gzlog_open().
+ */
+
+#ifndef GZLOG_H
+#define GZLOG_H
+
+/* gzlog object type */
+typedef void gzlog;
+
+/* Open a gzlog object, creating the log file if it does not exist.  Return
+   NULL on error.  Note that gzlog_open() could take a while to complete if it
+   has to wait to verify that a lock is stale (possibly for five minutes), or
+   if there is significant contention with other instantiations of this object
+   when locking the resource.  path is the prefix of the file names created by
+   this object.  If path is "foo", then the log file will be "foo.gz", and
+   other auxiliary files will be created and destroyed during the process:
+   "foo.dict" for a compression dictionary, "foo.temp" for a temporary (next)
+   dictionary, "foo.add" for data being added or compressed, "foo.lock" for the
+   lock file, and "foo.repairs" to log recovery operations performed due to
+   interrupted gzlog operations.  A gzlog_open() followed by a gzlog_close()
+   will recover a previously interrupted operation, if any. */
+gzlog *gzlog_open(char *path);
+
+/* Write to a gzlog object.  Return zero on success, -1 if there is a file i/o
+   error on any of the gzlog files (this should not happen if gzlog_open()
+   succeeded, unless the device has run out of space or leftover auxiliary
+   files have permissions or ownership that prevent their use), -2 if there is
+   a memory allocation failure, or -3 if the log argument is invalid (e.g. if
+   it was not created by gzlog_open()).  This function will write data to the
+   file uncompressed, until 1 MB has been accumulated, at which time that data
+   will be compressed.  The log file will be a valid gzip file upon successful
+   return. */
+int gzlog_write(gzlog *log, void *data, size_t len);
+
+/* Force compression of any uncompressed data in the log.  This should be used
+   sparingly, if at all.  The main application would be when a log file will
+   not be appended to again.  If this is used to compress frequently while
+   appending, it will both significantly increase the execution time and
+   reduce the compression ratio.  The return codes are the same as for
+   gzlog_write(). */
+int gzlog_compress(gzlog *log);
+
+/* Close a gzlog object.  Return zero on success, -3 if the log argument is
+   invalid.  The log object is freed, and so cannot be referenced again. */
+int gzlog_close(gzlog *log);
+
+#endif
+                                                  usr/share/doc/zlib1g-dev/examples/gznorm.c                                                          0000644 0000000 0000000 00000053246 13356471244 017211  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        /* gznorm.c -- normalize a gzip stream
+ * Copyright (C) 2018 Mark Adler
+ * For conditions of distribution and use, see copyright notice in zlib.h
+ * Version 1.0  7 Oct 2018  Mark Adler */
+
+// gznorm takes a gzip stream, potentially containing multiple members, and
+// converts it to a gzip stream with a single member. In addition the gzip
+// header is normalized, removing the file name and time stamp, and setting the
+// other header contents (XFL, OS) to fixed values. gznorm does not recompress
+// the data, so it is fast, but no advantage is gained from the history that
+// could be available across member boundaries.
+
+#include <stdio.h>      // fread, fwrite, putc, fflush, ferror, fprintf,
+                        // vsnprintf, stdout, stderr, NULL, FILE
+#include <stdlib.h>     // malloc, free
+#include <string.h>     // strerror
+#include <errno.h>      // errno
+#include <stdarg.h>     // va_list, va_start, va_end
+#include "zlib.h"       // inflateInit2, inflate, inflateReset, inflateEnd,
+                        // z_stream, z_off_t, crc32_combine, Z_NULL, Z_BLOCK,
+                        // Z_OK, Z_STREAM_END, Z_BUF_ERROR, Z_DATA_ERROR,
+                        // Z_MEM_ERROR
+
+#if defined(MSDOS) || defined(OS2) || defined(WIN32) || defined(__CYGWIN__)
+#  include <fcntl.h>
+#  include <io.h>
+#  define SET_BINARY_MODE(file) setmode(fileno(file), O_BINARY)
+#else
+#  define SET_BINARY_MODE(file)
+#endif
+
+#define local static
+
+// printf to an allocated string. Return the string, or NULL if the printf or
+// allocation fails.
+local char *aprintf(char *fmt, ...) {
+    // Get the length of the result of the printf.
+    va_list args;
+    va_start(args, fmt);
+    int len = vsnprintf(NULL, 0, fmt, args);
+    va_end(args);
+    if (len < 0)
+        return NULL;
+
+    // Allocate the required space and printf to it.
+    char *str = malloc(len + 1);
+    if (str == NULL)
+        return NULL;
+    va_start(args, fmt);
+    vsnprintf(str, len + 1, fmt, args);
+    va_end(args);
+    return str;
+}
+
+// Return with an error, putting an allocated error message in *err. Doing an
+// inflateEnd() on an already ended state, or one with state set to Z_NULL, is
+// permitted.
+#define BYE(...) \
+    do { \
+        inflateEnd(&strm); \
+        *err = aprintf(__VA_ARGS__); \
+        return 1; \
+    } while (0)
+
+// Chunk size for buffered reads and for decompression. Twice this many bytes
+// will be allocated on the stack by gzip_normalize(). Must fit in an unsigned.
+#define CHUNK 16384
+
+// Read a gzip stream from in and write an equivalent normalized gzip stream to
+// out. If given no input, an empty gzip stream will be written. If successful,
+// 0 is returned, and *err is set to NULL. On error, 1 is returned, where the
+// details of the error are returned in *err, a pointer to an allocated string.
+//
+// The input may be a stream with multiple gzip members, which is converted to
+// a single gzip member on the output. Each gzip member is decompressed at the
+// level of deflate blocks. This enables clearing the last-block bit, shifting
+// the compressed data to concatenate to the previous member's compressed data,
+// which can end at an arbitrary bit boundary, and identifying stored blocks in
+// order to resynchronize those to byte boundaries. The deflate compressed data
+// is terminated with a 10-bit empty fixed block. If any members on the input
+// end with a 10-bit empty fixed block, then that block is excised from the
+// stream. This avoids appending empty fixed blocks for every normalization,
+// and assures that gzip_normalize applied a second time will not change the
+// input. The pad bits after stored block headers and after the final deflate
+// block are all forced to zeros.
+local int gzip_normalize(FILE *in, FILE *out, char **err) {
+    // initialize the inflate engine to process a gzip member
+    z_stream strm;
+    strm.zalloc = Z_NULL;
+    strm.zfree = Z_NULL;
+    strm.opaque = Z_NULL;
+    strm.avail_in = 0;
+    strm.next_in = Z_NULL;
+    if (inflateInit2(&strm, 15 + 16) != Z_OK)
+        BYE("out of memory");
+
+    // State while processing the input gzip stream.
+    enum {              // BETWEEN -> HEAD -> BLOCK -> TAIL -> BETWEEN -> ...
+        BETWEEN,        // between gzip members (must end in this state)
+        HEAD,           // reading a gzip header
+        BLOCK,          // reading deflate blocks
+        TAIL            // reading a gzip trailer
+    } state = BETWEEN;              // current component being processed
+    unsigned long crc = 0;          // accumulated CRC of uncompressed data
+    unsigned long len = 0;          // accumulated length of uncompressed data
+    unsigned long buf = 0;          // deflate stream bit buffer of num bits
+    int num = 0;                    // number of bits in buf (at bottom)
+
+    // Write a canonical gzip header (no mod time, file name, comment, extra
+    // block, or extra flags, and OS is marked as unknown).
+    fwrite("\x1f\x8b\x08\0\0\0\0\0\0\xff", 1, 10, out);
+
+    // Process the gzip stream from in until reaching the end of the input,
+    // encountering invalid input, or experiencing an i/o error.
+    int more;                       // true if not at the end of the input
+    do {
+        // State inside this loop.
+        unsigned char *put;         // next input buffer location to process
+        int prev;                   // number of bits from previous block in
+                                    // the bit buffer, or -1 if not at the
+                                    // start of a block
+        unsigned long long memb;    // uncompressed length of member
+        size_t tail;                // number of trailer bytes read (0..8)
+        unsigned long part;         // accumulated trailer component
+
+        // Get the next chunk of input from in.
+        unsigned char dat[CHUNK];
+        strm.avail_in = fread(dat, 1, CHUNK, in);
+        if (strm.avail_in == 0)
+            break;
+        more = strm.avail_in == CHUNK;
+        strm.next_in = put = dat;
+
+        // Run that chunk of input through the inflate engine to exhaustion.
+        do {
+            // At this point it is assured that strm.avail_in > 0.
+
+            // Inflate until the end of a gzip component (header, deflate
+            // block, trailer) is reached, or until all of the chunk is
+            // consumed. The resulting decompressed data is discarded, though
+            // the total size of the decompressed data in each member is
+            // tracked, for the calculation of the total CRC.
+            do {
+                // inflate and handle any errors
+                unsigned char scrap[CHUNK];
+                strm.avail_out = CHUNK;
+                strm.next_out = scrap;
+                int ret = inflate(&strm, Z_BLOCK);
+                if (ret == Z_MEM_ERROR)
+                    BYE("out of memory");
+                if (ret == Z_DATA_ERROR)
+                    BYE("input invalid: %s", strm.msg);
+                if (ret != Z_OK && ret != Z_BUF_ERROR && ret != Z_STREAM_END)
+                    BYE("internal error");
+
+                // Update the number of uncompressed bytes generated in this
+                // member. The actual count (not modulo 2^32) is required to
+                // correctly compute the total CRC.
+                unsigned got = CHUNK - strm.avail_out;
+                memb += got;
+                if (memb < got)
+                    BYE("overflow error");
+
+                // Continue to process this chunk until it is consumed, or
+                // until the end of a component (header, deflate block, or
+                // trailer) is reached.
+            } while (strm.avail_out == 0 && (strm.data_type & 0x80) == 0);
+
+            // Since strm.avail_in was > 0 for the inflate call, some input was
+            // just consumed. It is therefore assured that put < strm.next_in.
+
+            // Disposition the consumed component or part of a component.
+            switch (state) {
+                case BETWEEN:
+                    state = HEAD;
+                    // Fall through to HEAD when some or all of the header is
+                    // processed.
+
+                case HEAD:
+                    // Discard the header.
+                    if (strm.data_type & 0x80) {
+                        // End of header reached -- deflate blocks follow.
+                        put = strm.next_in;
+                        prev = num;
+                        memb = 0;
+                        state = BLOCK;
+                    }
+                    break;
+
+                case BLOCK:
+                    // Copy the deflate stream to the output, but with the
+                    // last-block-bit cleared. Re-synchronize stored block
+                    // headers to the output byte boundaries. The bytes at
+                    // put..strm.next_in-1 is the compressed data that has been
+                    // processed and is ready to be copied to the output.
+
+                    // At this point, it is assured that new compressed data is
+                    // available, i.e., put < strm.next_in. If prev is -1, then
+                    // that compressed data starts in the middle of a deflate
+                    // block. If prev is not -1, then the bits in the bit
+                    // buffer, possibly combined with the bits in *put, contain
+                    // the three-bit header of the new deflate block. In that
+                    // case, prev is the number of bits from the previous block
+                    // that remain in the bit buffer. Since num is the number
+                    // of bits in the bit buffer, we have that num - prev is
+                    // the number of bits from the new block currently in the
+                    // bit buffer.
+
+                    // If strm.data_type & 0xc0 is 0x80, then the last byte of
+                    // the available compressed data includes the last bits of
+                    // the end of a deflate block. In that case, that last byte
+                    // also has strm.data_type & 0x1f bits of the next deflate
+                    // block, in the range 0..7. If strm.data_type & 0xc0 is
+                    // 0xc0, then the last byte of the compressed data is the
+                    // end of the deflate stream, followed by strm.data_type &
+                    // 0x1f pad bits, also in the range 0..7.
+
+                    // Set bits to the number of bits not yet consumed from the
+                    // last byte. If we are at the end of the block, bits is
+                    // either the number of bits in the last byte belonging to
+                    // the next block, or the number of pad bits after the
+                    // final block. In either of those cases, bits is in the
+                    // range 0..7.
+                    ;                   // (required due to C syntax oddity)
+                    int bits = strm.data_type & 0x1f;
+
+                    if (prev != -1) {
+                        // We are at the start of a new block. Clear the last
+                        // block bit, and check for special cases. If it is a
+                        // stored block, then emit the header and pad to the
+                        // next byte boundary. If it is a final, empty fixed
+                        // block, then excise it.
+
+                        // Some or all of the three header bits for this block
+                        // may already be in the bit buffer. Load any remaining
+                        // header bits into the bit buffer.
+                        if (num - prev < 3) {
+                            buf += (unsigned long)*put++ << num;
+                            num += 8;
+                        }
+
+                        // Set last to have a 1 in the position of the last
+                        // block bit in the bit buffer.
+                        unsigned long last = (unsigned long)1 << prev;
+
+                        if (((buf >> prev) & 7) == 3) {
+                            // This is a final fixed block. Load at least ten
+                            // bits from this block, including the header, into
+                            // the bit buffer. We already have at least three,
+                            // so at most one more byte needs to be loaded.
+                            if (num - prev < 10) {
+                                if (put == strm.next_in)
+                                    // Need to go get and process more input.
+                                    // We'll end up back here to finish this.
+                                    break;
+                                buf += (unsigned long)*put++ << num;
+                                num += 8;
+                            }
+                            if (((buf >> prev) & 0x3ff) == 3) {
+                                // That final fixed block is empty. Delete it
+                                // to avoid adding an empty block every time a
+                                // gzip stream is normalized.
+                                num = prev;
+                                buf &= last - 1;    // zero the pad bits
+                            }
+                        }
+                        else if (((buf >> prev) & 6) == 0) {
+                            // This is a stored block. Flush to the next
+                            // byte boundary after the three-bit header.
+                            num = (prev + 10) & ~7;
+                            buf &= last - 1;        // zero the pad bits
+                        }
+
+                        // Clear the last block bit.
+                        buf &= ~last;
+
+                        // Write out complete bytes in the bit buffer.
+                        while (num >= 8) {
+                            putc(buf, out);
+                            buf >>= 8;
+                            num -= 8;
+                        }
+
+                        // If no more bytes left to process, then we have
+                        // consumed the byte that had bits from the next block.
+                        if (put == strm.next_in)
+                            bits = 0;
+                    }
+
+                    // We are done handling the deflate block header. Now copy
+                    // all or almost all of the remaining compressed data that
+                    // has been processed so far. Don't copy one byte at the
+                    // end if it contains bits from the next deflate block or
+                    // pad bits at the end of a deflate block.
+
+                    // mix is 1 if we are at the end of a deflate block, and if
+                    // some of the bits in the last byte follow this block. mix
+                    // is 0 if we are in the middle of a deflate block, if the
+                    // deflate block ended on a byte boundary, or if all of the
+                    // compressed data processed so far has been consumed.
+                    int mix = (strm.data_type & 0x80) && bits;
+
+                    // Copy all of the processed compressed data to the output,
+                    // except for the last byte if it contains bits from the
+                    // next deflate block or pad bits at the end of the deflate
+                    // stream. Copy the data after shifting in num bits from
+                    // buf in front of it, leaving num bits from the end of the
+                    // compressed data in buf when done.
+                    unsigned char *end = strm.next_in - mix;
+                    if (put < end) {
+                        if (num)
+                            // Insert num bits from buf before the data being
+                            // copied.
+                            do {
+                                buf += (unsigned)(*put++) << num;
+                                putc(buf, out);
+                                buf >>= 8;
+                            } while (put < end);
+                        else {
+                            // No shifting needed -- write directly.
+                            fwrite(put, 1, end - put, out);
+                            put = end;
+                        }
+                    }
+
+                    // Process the last processed byte if it wasn't written.
+                    if (mix) {
+                        // Load the last byte into the bit buffer.
+                        buf += (unsigned)(*put++) << num;
+                        num += 8;
+
+                        if (strm.data_type & 0x40) {
+                            // We are at the end of the deflate stream and
+                            // there are bits pad bits. Discard the pad bits
+                            // and write a byte to the output, if available.
+                            // Leave the num bits left over in buf to prepend
+                            // to the next deflate stream.
+                            num -= bits;
+                            if (num >= 8) {
+                                putc(buf, out);
+                                num -= 8;
+                                buf >>= 8;
+                            }
+
+                            // Force the pad bits in the bit buffer to zeros.
+                            buf &= ((unsigned long)1 << num) - 1;
+
+                            // Don't need to set prev here since going to TAIL.
+                        }
+                        else
+                            // At the end of an internal deflate block. Leave
+                            // the last byte in the bit buffer to examine on
+                            // the next entry to BLOCK, when more bits from the
+                            // next block will be available.
+                            prev = num - bits;      // number of bits in buffer
+                                                    // from current block
+                    }
+
+                    // Don't have a byte left over, so we are in the middle of
+                    // a deflate block, or the deflate block ended on a byte
+                    // boundary. Set prev appropriately for the next entry into
+                    // BLOCK.
+                    else if (strm.data_type & 0x80)
+                        // The block ended on a byte boundary, so no header
+                        // bits are in the bit buffer.
+                        prev = num;
+                    else
+                        // In the middle of a deflate block, so no header here.
+                        prev = -1;
+
+                    // Check for the end of the deflate stream.
+                    if ((strm.data_type & 0xc0) == 0xc0) {
+                        // That ends the deflate stream on the input side, the
+                        // pad bits were discarded, and any remaining bits from
+                        // the last block in the stream are saved in the bit
+                        // buffer to prepend to the next stream. Process the
+                        // gzip trailer next.
+                        tail = 0;
+                        part = 0;
+                        state = TAIL;
+                    }
+                    break;
+
+                case TAIL:
+                    // Accumulate available trailer bytes to update the total
+                    // CRC and the total uncompressed length.
+                    do {
+                        part = (part >> 8) + ((unsigned long)(*put++) << 24);
+                        tail++;
+                        if (tail == 4) {
+                            // Update the total CRC.
+                            z_off_t len2 = memb;
+                            if (len2 < 0 || (unsigned long long)len2 != memb)
+                                BYE("overflow error");
+                            crc = crc ? crc32_combine(crc, part, len2) : part;
+                            part = 0;
+                        }
+                        else if (tail == 8) {
+                            // Update the total uncompressed length. (It's ok
+                            // if this sum is done modulo 2^32.)
+                            len += part;
+
+                            // At the end of a member. Set up to inflate an
+                            // immediately following gzip member. (If we made
+                            // it this far, then the trailer was valid.)
+                            if (inflateReset(&strm) != Z_OK)
+                                BYE("internal error");
+                            state = BETWEEN;
+                            break;
+                        }
+                    } while (put < strm.next_in);
+                    break;
+            }
+
+            // Process the input buffer until completely consumed.
+        } while (strm.avail_in > 0);
+
+        // Process input until end of file, invalid input, or i/o error.
+    } while (more);
+
+    // Done with the inflate engine.
+    inflateEnd(&strm);
+
+    // Verify the validity of the input.
+    if (state != BETWEEN)
+        BYE("input invalid: incomplete gzip stream");
+
+    // Write the remaining deflate stream bits, followed by a terminating
+    // deflate fixed block.
+    buf += (unsigned long)3 << num;
+    putc(buf, out);
+    putc(buf >> 8, out);
+    if (num > 6)
+        putc(0, out);
+
+    // Write the gzip trailer, which is the CRC and the uncompressed length
+    // modulo 2^32, both in little-endian order.
+    putc(crc, out);
+    putc(crc >> 8, out);
+    putc(crc >> 16, out);
+    putc(crc >> 24, out);
+    putc(len, out);
+    putc(len >> 8, out);
+    putc(len >> 16, out);
+    putc(len >> 24, out);
+    fflush(out);
+
+    // Check for any i/o errors.
+    if (ferror(in) || ferror(out))
+        BYE("i/o error: %s", strerror(errno));
+
+    // All good!
+    *err = NULL;
+    return 0;
+}
+
+// Normalize the gzip stream on stdin, writing the result to stdout.
+int main(void) {
+    // Avoid end-of-line conversions on evil operating systems.
+    SET_BINARY_MODE(stdin);
+    SET_BINARY_MODE(stdout);
+
+    // Normalize from stdin to stdout, returning 1 on error, 0 if ok.
+    char *err;
+    int ret = gzip_normalize(stdin, stdout, &err);
+    if (ret)
+        fprintf(stderr, "gznorm error: %s\n", err);
+    free(err);
+    return ret;
+}
+                                                                                                                                                                                                                                                                                                                                                          usr/share/doc/zlib1g-dev/examples/infcover.c                                                        0000644 0000000 0000000 00000060223 13032130646 017466  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        /* infcover.c -- test zlib's inflate routines with full code coverage
+ * Copyright (C) 2011, 2016 Mark Adler
+ * For conditions of distribution and use, see copyright notice in zlib.h
+ */
+
+/* to use, do: ./configure --cover && make cover */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <assert.h>
+#include "zlib.h"
+
+/* get definition of internal structure so we can mess with it (see pull()),
+   and so we can call inflate_trees() (see cover5()) */
+#define ZLIB_INTERNAL
+#include "inftrees.h"
+#include "inflate.h"
+
+#define local static
+
+/* -- memory tracking routines -- */
+
+/*
+   These memory tracking routines are provided to zlib and track all of zlib's
+   allocations and deallocations, check for LIFO operations, keep a current
+   and high water mark of total bytes requested, optionally set a limit on the
+   total memory that can be allocated, and when done check for memory leaks.
+
+   They are used as follows:
+
+   z_stream strm;
+   mem_setup(&strm)         initializes the memory tracking and sets the
+                            zalloc, zfree, and opaque members of strm to use
+                            memory tracking for all zlib operations on strm
+   mem_limit(&strm, limit)  sets a limit on the total bytes requested -- a
+                            request that exceeds this limit will result in an
+                            allocation failure (returns NULL) -- setting the
+                            limit to zero means no limit, which is the default
+                            after mem_setup()
+   mem_used(&strm, "msg")   prints to stderr "msg" and the total bytes used
+   mem_high(&strm, "msg")   prints to stderr "msg" and the high water mark
+   mem_done(&strm, "msg")   ends memory tracking, releases all allocations
+                            for the tracking as well as leaked zlib blocks, if
+                            any.  If there was anything unusual, such as leaked
+                            blocks, non-FIFO frees, or frees of addresses not
+                            allocated, then "msg" and information about the
+                            problem is printed to stderr.  If everything is
+                            normal, nothing is printed. mem_done resets the
+                            strm members to Z_NULL to use the default memory
+                            allocation routines on the next zlib initialization
+                            using strm.
+ */

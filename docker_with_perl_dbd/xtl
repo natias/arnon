@@ -1,0 +1,1000 @@
+            return self
+
+        assert self.sname not in obj.__dict__
+
+        entry = obj._filecache.get(self.name)
+
+        if entry:
+            if entry.changed():
+                entry.obj = self.func(obj)
+        else:
+            paths = self.tracked_paths(obj)
+
+            # We stat -before- creating the object so our cache doesn't lie if
+            # a writer modified between the time we read and stat
+            entry = filecacheentry(paths, True)
+            entry.obj = self.func(obj)
+
+            obj._filecache[self.name] = entry
+
+        obj.__dict__[self.sname] = entry.obj
+        return entry.obj
+
+    # don't implement __set__(), which would make __dict__ lookup as slow as
+    # function call.
+
+    def set(self, obj, value):
+        if self.name not in obj._filecache:
+            # we add an entry for the missing value because X in __dict__
+            # implies X in _filecache
+            paths = self.tracked_paths(obj)
+            ce = filecacheentry(paths, False)
+            obj._filecache[self.name] = ce
+        else:
+            ce = obj._filecache[self.name]
+
+        ce.obj = value  # update cached copy
+        obj.__dict__[self.sname] = value  # update copy returned by obj.x
+
+
+def extdatasource(repo, source):
+    """Gather a map of rev -> value dict from the specified source
+
+    A source spec is treated as a URL, with a special case shell: type
+    for parsing the output from a shell command.
+
+    The data is parsed as a series of newline-separated records where
+    each record is a revision specifier optionally followed by a space
+    and a freeform string value. If the revision is known locally, it
+    is converted to a rev, otherwise the record is skipped.
+
+    Note that both key and value are treated as UTF-8 and converted to
+    the local encoding. This allows uniformity between local and
+    remote data sources.
+    """
+
+    spec = repo.ui.config(b"extdata", source)
+    if not spec:
+        raise error.Abort(_(b"unknown extdata source '%s'") % source)
+
+    data = {}
+    src = proc = None
+    try:
+        if spec.startswith(b"shell:"):
+            # external commands should be run relative to the repo root
+            cmd = spec[6:]
+            proc = subprocess.Popen(
+                procutil.tonativestr(cmd),
+                shell=True,
+                bufsize=-1,
+                close_fds=procutil.closefds,
+                stdout=subprocess.PIPE,
+                cwd=procutil.tonativestr(repo.root),
+            )
+            src = proc.stdout
+        else:
+            # treat as a URL or file
+            src = url.open(repo.ui, spec)
+        for l in src:
+            if b" " in l:
+                k, v = l.strip().split(b" ", 1)
+            else:
+                k, v = l.strip(), b""
+
+            k = encoding.tolocal(k)
+            try:
+                data[revsingle(repo, k).rev()] = encoding.tolocal(v)
+            except (error.LookupError, error.RepoLookupError, error.InputError):
+                pass  # we ignore data for nodes that don't exist locally
+    finally:
+        if proc:
+            try:
+                proc.communicate()
+            except ValueError:
+                # This happens if we started iterating src and then
+                # get a parse error on a line. It should be safe to ignore.
+                pass
+        if src:
+            src.close()
+    if proc and proc.returncode != 0:
+        raise error.Abort(
+            _(b"extdata command '%s' failed: %s")
+            % (cmd, procutil.explainexit(proc.returncode))
+        )
+
+    return data
+
+
+class progress:
+    def __init__(self, ui, updatebar, topic, unit=b"", total=None):
+        self.ui = ui
+        self.pos = 0
+        self.topic = topic
+        self.unit = unit
+        self.total = total
+        self.debug = ui.configbool(b'progress', b'debug')
+        self._updatebar = updatebar
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, exc_tb):
+        self.complete()
+
+    def update(self, pos, item=b"", total=None):
+        assert pos is not None
+        if total:
+            self.total = total
+        self.pos = pos
+        self._updatebar(self.topic, self.pos, item, self.unit, self.total)
+        if self.debug:
+            self._printdebug(item)
+
+    def increment(self, step=1, item=b"", total=None):
+        self.update(self.pos + step, item, total)
+
+    def complete(self):
+        self.pos = None
+        self.unit = b""
+        self.total = None
+        self._updatebar(self.topic, self.pos, b"", self.unit, self.total)
+
+    def _printdebug(self, item):
+        unit = b''
+        if self.unit:
+            unit = b' ' + self.unit
+        if item:
+            item = b' ' + item
+
+        if self.total:
+            pct = 100.0 * self.pos / self.total
+            self.ui.debug(
+                b'%s:%s %d/%d%s (%4.2f%%)\n'
+                % (self.topic, item, self.pos, self.total, unit, pct)
+            )
+        else:
+            self.ui.debug(b'%s:%s %d%s\n' % (self.topic, item, self.pos, unit))
+
+
+def gdinitconfig(ui):
+    """helper function to know if a repo should be created as general delta"""
+    # experimental config: format.generaldelta
+    return ui.configbool(b'format', b'generaldelta') or ui.configbool(
+        b'format', b'usegeneraldelta'
+    )
+
+
+def gddeltaconfig(ui):
+    """helper function to know if incoming delta should be optimised"""
+    # experimental config: format.generaldelta
+    return ui.configbool(b'format', b'generaldelta')
+
+
+class simplekeyvaluefile:
+    """A simple file with key=value lines
+
+    Keys must be alphanumerics and start with a letter, values must not
+    contain '\n' characters"""
+
+    firstlinekey = b'__firstline'
+
+    def __init__(self, vfs, path, keys=None):
+        self.vfs = vfs
+        self.path = path
+
+    def read(self, firstlinenonkeyval=False):
+        """Read the contents of a simple key-value file
+
+        'firstlinenonkeyval' indicates whether the first line of file should
+        be treated as a key-value pair or reuturned fully under the
+        __firstline key."""
+        lines = self.vfs.readlines(self.path)
+        d = {}
+        if firstlinenonkeyval:
+            if not lines:
+                e = _(b"empty simplekeyvalue file")
+                raise error.CorruptedState(e)
+            # we don't want to include '\n' in the __firstline
+            d[self.firstlinekey] = lines[0][:-1]
+            del lines[0]
+
+        try:
+            # the 'if line.strip()' part prevents us from failing on empty
+            # lines which only contain '\n' therefore are not skipped
+            # by 'if line'
+            updatedict = dict(
+                line[:-1].split(b'=', 1) for line in lines if line.strip()
+            )
+            if self.firstlinekey in updatedict:
+                e = _(b"%r can't be used as a key")
+                raise error.CorruptedState(e % self.firstlinekey)
+            d.update(updatedict)
+        except ValueError as e:
+            raise error.CorruptedState(stringutil.forcebytestr(e))
+        return d
+
+    def write(self, data, firstline=None):
+        """Write key=>value mapping to a file
+        data is a dict. Keys must be alphanumerical and start with a letter.
+        Values must not contain newline characters.
+
+        If 'firstline' is not None, it is written to file before
+        everything else, as it is, not in a key=value form"""
+        lines = []
+        if firstline is not None:
+            lines.append(b'%s\n' % firstline)
+
+        for k, v in data.items():
+            if k == self.firstlinekey:
+                e = b"key name '%s' is reserved" % self.firstlinekey
+                raise error.ProgrammingError(e)
+            if not k[0:1].isalpha():
+                e = b"keys must start with a letter in a key-value file"
+                raise error.ProgrammingError(e)
+            if not k.isalnum():
+                e = b"invalid key name in a simple key-value file"
+                raise error.ProgrammingError(e)
+            if b'\n' in v:
+                e = b"invalid value in a simple key-value file"
+                raise error.ProgrammingError(e)
+            lines.append(b"%s=%s\n" % (k, v))
+        with self.vfs(self.path, mode=b'wb', atomictemp=True) as fp:
+            fp.write(b''.join(lines))
+
+
+_reportobsoletedsource = [
+    b'debugobsolete',
+    b'pull',
+    b'push',
+    b'serve',
+    b'unbundle',
+]
+
+_reportnewcssource = [
+    b'pull',
+    b'unbundle',
+]
+
+
+def prefetchfiles(repo, revmatches):
+    """Invokes the registered file prefetch functions, allowing extensions to
+    ensure the corresponding files are available locally, before the command
+    uses them.
+
+    Args:
+      revmatches: a list of (revision, match) tuples to indicate the files to
+      fetch at each revision. If any of the match elements is None, it matches
+      all files.
+    """
+
+    def _matcher(m):
+        if m:
+            assert isinstance(m, matchmod.basematcher)
+            # The command itself will complain about files that don't exist, so
+            # don't duplicate the message.
+            return matchmod.badmatch(m, lambda fn, msg: None)
+        else:
+            return matchall(repo)
+
+    revbadmatches = [(rev, _matcher(match)) for (rev, match) in revmatches]
+
+    fileprefetchhooks(repo, revbadmatches)
+
+
+# a list of (repo, revs, match) prefetch functions
+fileprefetchhooks = util.hooks()
+
+# A marker that tells the evolve extension to suppress its own reporting
+_reportstroubledchangesets = True
+
+
+def registersummarycallback(repo, otr, txnname=b'', as_validator=False):
+    """register a callback to issue a summary after the transaction is closed
+
+    If as_validator is true, then the callbacks are registered as transaction
+    validators instead
+    """
+
+    def txmatch(sources):
+        return any(txnname.startswith(source) for source in sources)
+
+    categories = []
+
+    def reportsummary(func):
+        """decorator for report callbacks."""
+        # The repoview life cycle is shorter than the one of the actual
+        # underlying repository. So the filtered object can die before the
+        # weakref is used leading to troubles. We keep a reference to the
+        # unfiltered object and restore the filtering when retrieving the
+        # repository through the weakref.
+        filtername = repo.filtername
+        reporef = weakref.ref(repo.unfiltered())
+
+        def wrapped(tr):
+            repo = reporef()
+            if filtername:
+                assert repo is not None  # help pytype
+                repo = repo.filtered(filtername)
+            func(repo, tr)
+
+        newcat = b'%02i-txnreport' % len(categories)
+        if as_validator:
+            otr.addvalidator(newcat, wrapped)
+        else:
+            otr.addpostclose(newcat, wrapped)
+        categories.append(newcat)
+        return wrapped
+
+    @reportsummary
+    def reportchangegroup(repo, tr):
+        cgchangesets = tr.changes.get(b'changegroup-count-changesets', 0)
+        cgrevisions = tr.changes.get(b'changegroup-count-revisions', 0)
+        cgfiles = tr.changes.get(b'changegroup-count-files', 0)
+        cgheads = tr.changes.get(b'changegroup-count-heads', 0)
+        if cgchangesets or cgrevisions or cgfiles:
+            htext = b""
+            if cgheads:
+                htext = _(b" (%+d heads)") % cgheads
+            msg = _(b"added %d changesets with %d changes to %d files%s\n")
+            if as_validator:
+                msg = _(b"adding %d changesets with %d changes to %d files%s\n")
+            assert repo is not None  # help pytype
+            repo.ui.status(msg % (cgchangesets, cgrevisions, cgfiles, htext))
+
+    if txmatch(_reportobsoletedsource):
+
+        @reportsummary
+        def reportobsoleted(repo, tr):
+            obsoleted = obsutil.getobsoleted(repo, tr)
+            newmarkers = len(tr.changes.get(b'obsmarkers', ()))
+            if newmarkers:
+                repo.ui.status(_(b'%i new obsolescence markers\n') % newmarkers)
+            if obsoleted:
+                msg = _(b'obsoleted %i changesets\n')
+                if as_validator:
+                    msg = _(b'obsoleting %i changesets\n')
+                repo.ui.status(msg % len(obsoleted))
+
+    if obsolete.isenabled(
+        repo, obsolete.createmarkersopt
+    ) and repo.ui.configbool(
+        b'experimental', b'evolution.report-instabilities'
+    ):
+        instabilitytypes = [
+            (b'orphan', b'orphan'),
+            (b'phase-divergent', b'phasedivergent'),
+            (b'content-divergent', b'contentdivergent'),
+        ]
+
+        def getinstabilitycounts(repo):
+            filtered = repo.changelog.filteredrevs
+            counts = {}
+            for instability, revset in instabilitytypes:
+                counts[instability] = len(
+                    set(obsolete.getrevs(repo, revset)) - filtered
+                )
+            return counts
+
+        oldinstabilitycounts = getinstabilitycounts(repo)
+
+        @reportsummary
+        def reportnewinstabilities(repo, tr):
+            newinstabilitycounts = getinstabilitycounts(repo)
+            for instability, revset in instabilitytypes:
+                delta = (
+                    newinstabilitycounts[instability]
+                    - oldinstabilitycounts[instability]
+                )
+                msg = getinstabilitymessage(delta, instability)
+                if msg:
+                    repo.ui.warn(msg)
+
+    if txmatch(_reportnewcssource):
+
+        @reportsummary
+        def reportnewcs(repo, tr):
+            """Report the range of new revisions pulled/unbundled."""
+            origrepolen = tr.changes.get(b'origrepolen', len(repo))
+            unfi = repo.unfiltered()
+            if origrepolen >= len(unfi):
+                return
+
+            # Compute the bounds of new visible revisions' range.
+            revs = smartset.spanset(repo, start=origrepolen)
+            if revs:
+                minrev, maxrev = repo[revs.min()], repo[revs.max()]
+
+                if minrev == maxrev:
+                    revrange = minrev
+                else:
+                    revrange = b'%s:%s' % (minrev, maxrev)
+                draft = len(repo.revs(b'%ld and draft()', revs))
+                secret = len(repo.revs(b'%ld and secret()', revs))
+                if not (draft or secret):
+                    msg = _(b'new changesets %s\n') % revrange
+                elif draft and secret:
+                    msg = _(b'new changesets %s (%d drafts, %d secrets)\n')
+                    msg %= (revrange, draft, secret)
+                elif draft:
+                    msg = _(b'new changesets %s (%d drafts)\n')
+                    msg %= (revrange, draft)
+                elif secret:
+                    msg = _(b'new changesets %s (%d secrets)\n')
+                    msg %= (revrange, secret)
+                else:
+                    errormsg = b'entered unreachable condition'
+                    raise error.ProgrammingError(errormsg)
+                repo.ui.status(msg)
+
+            # search new changesets directly pulled as obsolete
+            duplicates = tr.changes.get(b'revduplicates', ())
+            obsadded = unfi.revs(
+                b'(%d: + %ld) and obsolete()', origrepolen, duplicates
+            )
+            cl = repo.changelog
+            extinctadded = [r for r in obsadded if r not in cl]
+            if extinctadded:
+                # They are not just obsolete, but obsolete and invisible
+                # we call them "extinct" internally but the terms have not been
+                # exposed to users.
+                msg = b'(%d other changesets obsolete on arrival)\n'
+                repo.ui.status(msg % len(extinctadded))
+
+        @reportsummary
+        def reportphasechanges(repo, tr):
+            """Report statistics of phase changes for changesets pre-existing
+            pull/unbundle.
+            """
+            origrepolen = tr.changes.get(b'origrepolen', len(repo))
+            published = []
+            for revs, (old, new) in tr.changes.get(b'phases', []):
+                if new != phases.public:
+                    continue
+                published.extend(rev for rev in revs if rev < origrepolen)
+            if not published:
+                return
+            msg = _(b'%d local changesets published\n')
+            if as_validator:
+                msg = _(b'%d local changesets will be published\n')
+            repo.ui.status(msg % len(published))
+
+
+def getinstabilitymessage(delta, instability):
+    """function to return the message to show warning about new instabilities
+
+    exists as a separate function so that extension can wrap to show more
+    information like how to fix instabilities"""
+    if delta > 0:
+        return _(b'%i new %s changesets\n') % (delta, instability)
+
+
+def nodesummaries(repo, nodes, maxnumnodes=4):
+    if len(nodes) <= maxnumnodes or repo.ui.verbose:
+        return b' '.join(short(h) for h in nodes)
+    first = b' '.join(short(h) for h in nodes[:maxnumnodes])
+    return _(b"%s and %d others") % (first, len(nodes) - maxnumnodes)
+
+
+def enforcesinglehead(repo, tr, desc, accountclosed, filtername):
+    """check that no named branch has multiple heads"""
+    if desc in (b'strip', b'repair'):
+        # skip the logic during strip
+        return
+    visible = repo.filtered(filtername)
+    # possible improvement: we could restrict the check to affected branch
+    bm = visible.branchmap()
+    for name in bm:
+        heads = bm.branchheads(name, closed=accountclosed)
+        if len(heads) > 1:
+            msg = _(b'rejecting multiple heads on branch "%s"')
+            msg %= name
+            hint = _(b'%d heads: %s')
+            hint %= (len(heads), nodesummaries(repo, heads))
+            raise error.Abort(msg, hint=hint)
+
+
+def wrapconvertsink(sink):
+    """Allow extensions to wrap the sink returned by convcmd.convertsink()
+    before it is used, whether or not the convert extension was formally loaded.
+    """
+    return sink
+
+
+def unhidehashlikerevs(repo, specs, hiddentype):
+    """parse the user specs and unhide changesets whose hash or revision number
+    is passed.
+
+    hiddentype can be: 1) 'warn': warn while unhiding changesets
+                       2) 'nowarn': don't warn while unhiding changesets
+
+    returns a repo object with the required changesets unhidden
+    """
+    if not specs:
+        return repo
+
+    if not repo.filtername or not repo.ui.configbool(
+        b'experimental', b'directaccess'
+    ):
+        return repo
+
+    if repo.filtername not in (b'visible', b'visible-hidden'):
+        return repo
+
+    symbols = set()
+    for spec in specs:
+        try:
+            tree = revsetlang.parse(spec)
+        except error.ParseError:  # will be reported by scmutil.revrange()
+            continue
+
+        symbols.update(revsetlang.gethashlikesymbols(tree))
+
+    if not symbols:
+        return repo
+
+    revs = _getrevsfromsymbols(repo, symbols)
+
+    if not revs:
+        return repo
+
+    if hiddentype == b'warn':
+        unfi = repo.unfiltered()
+        revstr = b", ".join([pycompat.bytestr(unfi[l]) for l in revs])
+        repo.ui.warn(
+            _(
+                b"warning: accessing hidden changesets for write "
+                b"operation: %s\n"
+            )
+            % revstr
+        )
+
+    # we have to use new filtername to separate branch/tags cache until we can
+    # disbale these cache when revisions are dynamically pinned.
+    return repo.filtered(b'visible-hidden', revs)
+
+
+def _getrevsfromsymbols(repo, symbols):
+    """parse the list of symbols and returns a set of revision numbers of hidden
+    changesets present in symbols"""
+    revs = set()
+    unfi = repo.unfiltered()
+    unficl = unfi.changelog
+    cl = repo.changelog
+    tiprev = len(unficl)
+    allowrevnums = repo.ui.configbool(b'experimental', b'directaccess.revnums')
+    for s in symbols:
+        try:
+            n = int(s)
+            if n <= tiprev:
+                if not allowrevnums:
+                    continue
+                else:
+                    if n not in cl:
+                        revs.add(n)
+                    continue
+        except ValueError:
+            pass
+
+        try:
+            s = resolvehexnodeidprefix(unfi, s)
+        except (error.LookupError, error.WdirUnsupported):
+            s = None
+
+        if s is not None:
+            rev = unficl.rev(s)
+            if rev not in cl:
+                revs.add(rev)
+
+    return revs
+
+
+def bookmarkrevs(repo, mark):
+    """Select revisions reachable by a given bookmark
+
+    If the bookmarked revision isn't a head, an empty set will be returned.
+    """
+    return repo.revs(format_bookmark_revspec(mark))
+
+
+def format_bookmark_revspec(mark):
+    """Build a revset expression to select revisions reachable by a given
+    bookmark"""
+    mark = b'literal:' + mark
+    return revsetlang.formatspec(
+        b"ancestors(bookmark(%s)) - "
+        b"ancestors(head() and not bookmark(%s)) - "
+        b"ancestors(bookmark() and not bookmark(%s))",
+        mark,
+        mark,
+        mark,
+    )
+                                                                                                                                                                                                                                                                     usr/lib/python3/dist-packages/mercurial/scmwindows.py                                               0000644 0000000 0000000 00000006651 14355257011 021513  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        import os
+
+from . import (
+    encoding,
+    pycompat,
+    util,
+    win32,
+)
+
+try:
+    import _winreg as winreg  # pytype: disable=import-error
+
+    winreg.CloseKey
+except ImportError:
+    # py2 only
+    import winreg  # pytype: disable=import-error
+
+# MS-DOS 'more' is the only pager available by default on Windows.
+fallbackpager = b'more'
+
+
+def systemrcpath():
+    '''return default os-specific hgrc search path'''
+    rcpath = []
+    filename = win32.executablepath()
+    # Use mercurial.ini found in directory with hg.exe
+    progrc = os.path.join(os.path.dirname(filename), b'mercurial.ini')
+    rcpath.append(progrc)
+
+    def _processdir(progrcd):
+        if os.path.isdir(progrcd):
+            for f, kind in sorted(util.listdir(progrcd)):
+                if f.endswith(b'.rc'):
+                    rcpath.append(os.path.join(progrcd, f))
+
+    # Use hgrc.d found in directory with hg.exe
+    _processdir(os.path.join(os.path.dirname(filename), b'hgrc.d'))
+
+    # treat a PROGRAMDATA directory as equivalent to /etc/mercurial
+    programdata = encoding.environ.get(b'PROGRAMDATA')
+    if programdata:
+        programdata = os.path.join(programdata, b'Mercurial')
+        _processdir(os.path.join(programdata, b'hgrc.d'))
+
+        ini = os.path.join(programdata, b'mercurial.ini')
+        if os.path.isfile(ini):
+            rcpath.append(ini)
+
+        ini = os.path.join(programdata, b'hgrc')
+        if os.path.isfile(ini):
+            rcpath.append(ini)
+
+    # next look for a system rcpath in the registry
+    value = util.lookupreg(
+        # pytype: disable=module-attr
+        b'SOFTWARE\\Mercurial',
+        None,
+        winreg.HKEY_LOCAL_MACHINE
+        # pytype: enable=module-attr
+    )
+    if value and isinstance(value, bytes):
+        value = util.localpath(value)
+        for p in value.split(pycompat.ospathsep):
+            if p.lower().endswith(b'mercurial.ini'):
+                rcpath.append(p)
+            else:
+                _processdir(p)
+    return rcpath
+
+
+def userrcpath():
+    '''return os-specific hgrc search path to the user dir'''
+    home = _legacy_expanduser(b'~')
+    path = [os.path.join(home, b'mercurial.ini'), os.path.join(home, b'.hgrc')]
+    userprofile = encoding.environ.get(b'USERPROFILE')
+    if userprofile and userprofile != home:
+        path.append(os.path.join(userprofile, b'mercurial.ini'))
+        path.append(os.path.join(userprofile, b'.hgrc'))
+    return path
+
+
+def _legacy_expanduser(path):
+    """Expand ~ and ~user constructs in the pre 3.8 style"""
+
+    # Python 3.8+ changed the expansion of '~' from HOME to USERPROFILE.  See
+    # https://bugs.python.org/issue36264.  It also seems to capitalize the drive
+    # letter, as though it was processed through os.path.realpath().
+    if not path.startswith(b'~'):
+        return path
+
+    i, n = 1, len(path)
+    while i < n and path[i] not in b'\\/':
+        i += 1
+
+    if b'HOME' in encoding.environ:
+        userhome = encoding.environ[b'HOME']
+    elif b'USERPROFILE' in encoding.environ:
+        userhome = encoding.environ[b'USERPROFILE']
+    elif b'HOMEPATH' not in encoding.environ:
+        return path
+    else:
+        try:
+            drive = encoding.environ[b'HOMEDRIVE']
+        except KeyError:
+            drive = b''
+        userhome = os.path.join(drive, encoding.environ[b'HOMEPATH'])
+
+    if i != 1:  # ~user
+        userhome = os.path.join(os.path.dirname(userhome), path[1:i])
+
+    return userhome + path[i:]
+
+
+def termsize(ui):
+    return win32.termsize()
+                                                                                       usr/lib/python3/dist-packages/mercurial/server.py                                                   0000644 0000000 0000000 00000015777 14355257011 020635  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        # server.py - utility and factory of server
+#
+# Copyright 2005-2007 Olivia Mackall <olivia@selenic.com>
+#
+# This software may be used and distributed according to the terms of the
+# GNU General Public License version 2 or any later version.
+
+
+import os
+
+from .i18n import _
+from .pycompat import open
+
+from . import (
+    chgserver,
+    cmdutil,
+    commandserver,
+    error,
+    hgweb,
+    pycompat,
+    util,
+)
+
+from .utils import (
+    procutil,
+    urlutil,
+)
+
+
+def runservice(
+    opts,
+    parentfn=None,
+    initfn=None,
+    runfn=None,
+    logfile=None,
+    runargs=None,
+    appendpid=False,
+):
+    '''Run a command as a service.'''
+
+    postexecargs = {}
+
+    if opts[b'daemon_postexec']:
+        for inst in opts[b'daemon_postexec']:
+            if inst.startswith(b'unlink:'):
+                postexecargs[b'unlink'] = inst[7:]
+            elif inst.startswith(b'chdir:'):
+                postexecargs[b'chdir'] = inst[6:]
+            elif inst != b'none':
+                raise error.Abort(
+                    _(b'invalid value for --daemon-postexec: %s') % inst
+                )
+
+    # When daemonized on Windows, redirect stdout/stderr to the lockfile (which
+    # gets cleaned up after the child is up and running), so that the parent can
+    # read and print the error if this child dies early.  See 594dd384803c.  On
+    # other platforms, the child can write to the parent's stdio directly, until
+    # it is redirected prior to runfn().
+    if pycompat.iswindows and opts[b'daemon_postexec']:
+        if b'unlink' in postexecargs and os.path.exists(
+            postexecargs[b'unlink']
+        ):
+            procutil.stdout.flush()
+            procutil.stderr.flush()
+
+            fd = os.open(
+                postexecargs[b'unlink'], os.O_WRONLY | os.O_APPEND | os.O_BINARY
+            )
+            try:
+                os.dup2(fd, procutil.stdout.fileno())
+                os.dup2(fd, procutil.stderr.fileno())
+            finally:
+                os.close(fd)
+
+    def writepid(pid):
+        if opts[b'pid_file']:
+            if appendpid:
+                mode = b'ab'
+            else:
+                mode = b'wb'
+            fp = open(opts[b'pid_file'], mode)
+            fp.write(b'%d\n' % pid)
+            fp.close()
+
+    if opts[b'daemon'] and not opts[b'daemon_postexec']:
+        # Signal child process startup with file removal
+        lockfd, lockpath = pycompat.mkstemp(prefix=b'hg-service-')
+        os.close(lockfd)
+        try:
+            if not runargs:
+                runargs = procutil.hgcmd() + pycompat.sysargv[1:]
+            runargs.append(b'--daemon-postexec=unlink:%s' % lockpath)
+            # Don't pass --cwd to the child process, because we've already
+            # changed directory.
+            for i in range(1, len(runargs)):
+                if runargs[i].startswith(b'--cwd='):
+                    del runargs[i]
+                    break
+                elif runargs[i].startswith(b'--cwd'):
+                    del runargs[i : i + 2]
+                    break
+
+            def condfn():
+                return not os.path.exists(lockpath)
+
+            pid = procutil.rundetached(runargs, condfn)
+            if pid < 0:
+                # If the daemonized process managed to write out an error msg,
+                # report it.
+                if pycompat.iswindows and os.path.exists(lockpath):
+                    with open(lockpath, b'rb') as log:
+                        for line in log:
+                            procutil.stderr.write(line)
+                raise error.Abort(_(b'child process failed to start'))
+            writepid(pid)
+        finally:
+            util.tryunlink(lockpath)
+        if parentfn:
+            return parentfn(pid)
+        else:
+            return
+
+    if initfn:
+        initfn()
+
+    if not opts[b'daemon']:
+        writepid(procutil.getpid())
+
+    if opts[b'daemon_postexec']:
+        try:
+            os.setsid()
+        except AttributeError:
+            pass
+
+        if b'chdir' in postexecargs:
+            os.chdir(postexecargs[b'chdir'])
+        procutil.hidewindow()
+        procutil.stdout.flush()
+        procutil.stderr.flush()
+
+        nullfd = os.open(os.devnull, os.O_RDWR)
+        logfilefd = nullfd
+        if logfile:
+            logfilefd = os.open(
+                logfile, os.O_RDWR | os.O_CREAT | os.O_APPEND, 0o666
+            )
+        os.dup2(nullfd, procutil.stdin.fileno())
+        os.dup2(logfilefd, procutil.stdout.fileno())
+        os.dup2(logfilefd, procutil.stderr.fileno())
+        stdio = (
+            procutil.stdin.fileno(),
+            procutil.stdout.fileno(),
+            procutil.stderr.fileno(),
+        )
+        if nullfd not in stdio:
+            os.close(nullfd)
+        if logfile and logfilefd not in stdio:
+            os.close(logfilefd)
+
+        # Only unlink after redirecting stdout/stderr, so Windows doesn't
+        # complain about a sharing violation.
+        if b'unlink' in postexecargs:
+            os.unlink(postexecargs[b'unlink'])
+
+    if runfn:
+        return runfn()
+
+
+_cmdservicemap = {
+    b'chgunix': chgserver.chgunixservice,
+    b'pipe': commandserver.pipeservice,
+    b'unix': commandserver.unixforkingservice,
+}
+
+
+def _createcmdservice(ui, repo, opts):
+    mode = opts[b'cmdserver']
+    try:
+        servicefn = _cmdservicemap[mode]
+    except KeyError:
+        raise error.Abort(_(b'unknown mode %s') % mode)
+    commandserver.setuplogging(ui, repo)
+    return servicefn(ui, repo, opts)
+
+
+def _createhgwebservice(ui, repo, opts):
+    # this way we can check if something was given in the command-line
+    if opts.get(b'port'):
+        opts[b'port'] = urlutil.getport(opts.get(b'port'))
+
+    alluis = {ui}
+    if repo:
+        baseui = repo.baseui
+        alluis.update([repo.baseui, repo.ui])
+    else:
+        baseui = ui
+    webconf = opts.get(b'web_conf') or opts.get(b'webdir_conf')
+    if webconf:
+        if opts.get(b'subrepos'):
+            raise error.Abort(_(b'--web-conf cannot be used with --subrepos'))
+
+        # load server settings (e.g. web.port) to "copied" ui, which allows
+        # hgwebdir to reload webconf cleanly
+        servui = ui.copy()
+        servui.readconfig(webconf, sections=[b'web'])
+        alluis.add(servui)
+    elif opts.get(b'subrepos'):
+        servui = ui
+
+        # If repo is None, hgweb.createapp() already raises a proper abort
+        # message as long as webconf is None.
+        if repo:
+            webconf = dict()
+            cmdutil.addwebdirpath(repo, b"", webconf)
+    else:
+        servui = ui
+
+    optlist = (
+        b"name templates style address port prefix ipv6"
+        b" accesslog errorlog certificate encoding"
+    )
+    for o in optlist.split():
+        val = opts.get(o, b'')
+        if val in (None, b''):  # should check against default options instead
+            continue
+        for u in alluis:
+            u.setconfig(b"web", o, val, b'serve')
+
+    app = hgweb.createapp(baseui, repo, webconf)
+    return hgweb.httpservice(servui, app, opts)
+
+
+def createservice(ui, repo, opts):
+    if opts[b"cmdserver"]:
+        return _createcmdservice(ui, repo, opts)
+    else:
+        return _createhgwebservice(ui, repo, opts)
+ usr/lib/python3/dist-packages/mercurial/setdiscovery.py                                             0000644 0000000 0000000 00000044306 14355257011 022040  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        # setdiscovery.py - improved discovery of common nodeset for mercurial
+#
+# Copyright 2010 Benoit Boissinot <bboissin@gmail.com>
+# and Peter Arrenbrecht <peter@arrenbrecht.ch>
+#
+# This software may be used and distributed according to the terms of the
+# GNU General Public License version 2 or any later version.
+"""
+Algorithm works in the following way. You have two repository: local and
+remote. They both contains a DAG of changelists.
+
+The goal of the discovery protocol is to find one set of node *common*,
+the set of nodes shared by local and remote.
+
+One of the issue with the original protocol was latency, it could
+potentially require lots of roundtrips to discover that the local repo was a
+subset of remote (which is a very common case, you usually have few changes
+compared to upstream, while upstream probably had lots of development).
+
+The new protocol only requires one interface for the remote repo: `known()`,
+which given a set of changelists tells you if they are present in the DAG.
+
+The algorithm then works as follow:
+
+ - We will be using three sets, `common`, `missing`, `unknown`. Originally
+ all nodes are in `unknown`.
+ - Take a sample from `unknown`, call `remote.known(sample)`
+   - For each node that remote knows, move it and all its ancestors to `common`
+   - For each node that remote doesn't know, move it and all its descendants
+   to `missing`
+ - Iterate until `unknown` is empty
+
+There are a couple optimizations, first is instead of starting with a random
+sample of missing, start by sending all heads, in the case where the local
+repo is a subset, you computed the answer in one round trip.
+
+Then you can do something similar to the bisecting strategy used when
+finding faulty changesets. Instead of random samples, you can try picking

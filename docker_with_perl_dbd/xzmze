@@ -1,0 +1,1000 @@
+  }
+  
+  sub verify_archive {
+      my($self, $file, $uri, $dist) = @_;
+  
+      unless ($dist->{cpanid}) {
+          $self->chat("Archive '$file' does not seem to be from PAUSE. Skip verification.\n");
+          return 1;
+      }
+  
+      (my $mirror = $uri) =~ s!/authors/id.*$!!;
+  
+      (my $chksum_uri = $uri) =~ s!/[^/]*$!/CHECKSUMS!;
+      my $chk_file = $self->source_for($mirror) . "/$dist->{cpanid}.CHECKSUMS";
+      $self->mask_output( diag_progress => "Fetching $chksum_uri" );
+      $self->mirror($chksum_uri, $chk_file);
+  
+      unless (-e $chk_file) {
+          $self->diag_fail("Fetching $chksum_uri failed.\n");
+          return;
+      }
+  
+      $self->diag_ok;
+      $self->verify_checksum($file, $chk_file);
+  }
+  
+  sub verify_checksum {
+      my($self, $file, $chk_file) = @_;
+  
+      $self->chat("Verifying the SHA1 for $file\n");
+  
+      open my $fh, "<$chk_file" or die "$chk_file: $!";
+      my $data = join '', <$fh>;
+      $data =~ s/\015?\012/\n/g;
+  
+      require Safe; # no fatpack
+      my $chksum = Safe->new->reval($data);
+  
+      if (!ref $chksum or ref $chksum ne 'HASH') {
+          $self->diag_fail("! Checksum file downloaded from $chk_file is broken.\n");
+          return;
+      }
+  
+      if (my $sha = $chksum->{$file}{sha256}) {
+          my $hex = $self->sha1_for($file);
+          if ($hex eq $sha) {
+              $self->chat("Checksum for $file: Verified!\n");
+          } else {
+              $self->diag_fail("Checksum mismatch for $file\n");
+              return;
+          }
+      } else {
+          $self->chat("Checksum for $file not found in CHECKSUMS.\n");
+          return;
+      }
+  }
+  
+  sub sha1_for {
+      my($self, $file) = @_;
+  
+      require Digest::SHA; # no fatpack
+  
+      open my $fh, "<", $file or die "$file: $!";
+      my $dg = Digest::SHA->new(256);
+      my($data);
+      while (read($fh, $data, 4096)) {
+          $dg->add($data);
+      }
+  
+      return $dg->hexdigest;
+  }
+  
+  sub verify_signature {
+      my($self, $dist) = @_;
+  
+      $self->diag_progress("Verifying the SIGNATURE file");
+      my $out = `$self->{cpansign} -v --skip 2>&1`;
+      $self->log($out);
+  
+      if ($out =~ /Signature verified OK/) {
+          $self->diag_ok("Verified OK");
+          return 1;
+      } else {
+          $self->diag_fail("SIGNATURE verification for $dist->{filename} failed\n");
+          return;
+      }
+  }
+  
+  sub resolve_name {
+      my($self, $module, $version) = @_;
+  
+      # Git
+      if ($module =~ /(?:^git:|\.git(?:@.+)?$)/) {
+          return $self->git_uri($module);
+      }
+  
+      # URL
+      if ($module =~ /^(ftp|https?|file):/) {
+          if ($module =~ m!authors/id/(.*)!) {
+              return $self->cpan_dist($1, $module);
+          } else {
+              return { uris => [ $module ] };
+          }
+      }
+  
+      # Directory
+      if ($module =~ m!^[\./]! && -d $module) {
+          return {
+              source => 'local',
+              dir => Cwd::abs_path($module),
+          };
+      }
+  
+      # File
+      if (-f $module) {
+          return {
+              source => 'local',
+              uris => [ "file://" . Cwd::abs_path($module) ],
+          };
+      }
+  
+      # cpan URI
+      if ($module =~ s!^cpan:///distfile/!!) {
+          return $self->cpan_dist($module);
+      }
+  
+      # PAUSEID/foo
+      # P/PA/PAUSEID/foo
+      if ($module =~ m!^(?:[A-Z]/[A-Z]{2}/)?([A-Z]{2}[\-A-Z0-9]*/.*)$!) {
+          return $self->cpan_dist($1);
+      }
+  
+      # Module name
+      return $self->search_module($module, $version);
+  }
+  
+  sub cpan_module {
+      my($self, $module, $dist_file, $version) = @_;
+  
+      my $dist = $self->cpan_dist($dist_file);
+      $dist->{module} = $module;
+      $dist->{module_version} = $version if $version && $version ne 'undef';
+  
+      return $dist;
+  }
+  
+  sub cpan_dist {
+      my($self, $dist, $url) = @_;
+  
+      $dist =~ s!^([A-Z]{2})!substr($1,0,1)."/".substr($1,0,2)."/".$1!e;
+  
+      require CPAN::DistnameInfo;
+      my $d = CPAN::DistnameInfo->new($dist);
+  
+      if ($url) {
+          $url = [ $url ] unless ref $url eq 'ARRAY';
+      } else {
+          my $id = $d->cpanid;
+          my $fn = substr($id, 0, 1) . "/" . substr($id, 0, 2) . "/" . $id . "/" . $d->filename;
+  
+          my @mirrors = @{$self->{mirrors}};
+          my @urls    = map "$_/authors/id/$fn", @mirrors;
+  
+          $url = \@urls,
+      }
+  
+      return {
+          $d->properties,
+          source  => 'cpan',
+          uris    => $url,
+      };
+  }
+  
+  sub git_uri {
+      my ($self, $uri) = @_;
+  
+      # similar to http://www.pip-installer.org/en/latest/logic.html#vcs-support
+      # git URL has to end with .git when you need to use pin @ commit/tag/branch
+  
+      ($uri, my $commitish) = split /(?<=\.git)@/i, $uri, 2;
+  
+      my $dir = File::Temp::tempdir(CLEANUP => 1);
+  
+      $self->mask_output( diag_progress => "Cloning $uri" );
+      $self->run([ 'git', 'clone', $uri, $dir ]);
+  
+      unless (-e "$dir/.git") {
+          $self->diag_fail("Failed cloning git repository $uri", 1);
+          return;
+      }
+  
+      if ($commitish) {
+          require File::pushd;
+          my $dir = File::pushd::pushd($dir);
+  
+          unless ($self->run([ 'git', 'checkout', $commitish ])) {
+              $self->diag_fail("Failed to checkout '$commitish' in git repository $uri\n");
+              return;
+          }
+      }
+  
+      $self->diag_ok;
+  
+      return {
+          source => 'local',
+          dir    => $dir,
+      };
+  }
+  
+  sub setup_module_build_patch {
+      my $self = shift;
+  
+      open my $out, ">$self->{base}/ModuleBuildSkipMan.pm" or die $!;
+      print $out <<EOF;
+  package ModuleBuildSkipMan;
+  CHECK {
+    if (%Module::Build::) {
+      no warnings 'redefine';
+      *Module::Build::Base::ACTION_manpages = sub {};
+      *Module::Build::Base::ACTION_docs     = sub {};
+    }
+  }
+  1;
+  EOF
+  }
+  
+  sub core_version_for {
+      my($self, $module) = @_;
+  
+      require Module::CoreList; # no fatpack
+      unless (exists $Module::CoreList::version{$]+0}) {
+          die sprintf("Module::CoreList %s (loaded from %s) doesn't seem to have entries for perl $]. " .
+                      "You're strongly recommended to upgrade Module::CoreList from CPAN.\n",
+                      $Module::CoreList::VERSION, $INC{"Module/CoreList.pm"});
+      }
+  
+      unless (exists $Module::CoreList::version{$]+0}{$module}) {
+          return -1;
+      }
+  
+      return $Module::CoreList::version{$]+0}{$module};
+  }
+  
+  sub search_inc {
+      my $self = shift;
+      $self->{search_inc} ||= do {
+          # strip lib/ and fatlib/ from search path when booted from dev
+          if (defined $::Bin) {
+              [grep !/^\Q$::Bin\E\/..\/(?:fat)?lib$/, @INC]
+          } else {
+              [@INC]
+          }
+      };
+  }
+  
+  sub check_module {
+      my($self, $mod, $want_ver) = @_;
+  
+      require Module::Metadata;
+      my $meta = Module::Metadata->new_from_module($mod, inc => $self->search_inc)
+          or return 0, undef;
+  
+      my $version = $meta->version;
+  
+      # When -L is in use, the version loaded from 'perl' library path
+      # might be newer than (or actually wasn't core at) the version
+      # that is shipped with the current perl
+      if ($self->{self_contained} && $self->loaded_from_perl_lib($meta)) {
+          $version = $self->core_version_for($mod);
+          return 0, undef if $version && $version == -1;
+      }
+  
+      $self->{local_versions}{$mod} = $version;
+  
+      if ($self->is_deprecated($meta)){
+          return 0, $version;
+      } elsif ($self->satisfy_version($mod, $version, $want_ver)) {
+          return 1, ($version || 'undef');
+      } else {
+          return 0, $version;
+      }
+  }
+  
+  sub satisfy_version {
+      my($self, $mod, $version, $want_ver) = @_;
+  
+      $want_ver = '0' unless defined($want_ver) && length($want_ver);
+  
+      require CPAN::Meta::Requirements;
+      my $requirements = CPAN::Meta::Requirements->new;
+      $requirements->add_string_requirement($mod, $want_ver);
+      $requirements->accepts_module($mod, $version);
+  }
+  
+  sub unsatisfy_how {
+      my($self, $ver, $want_ver) = @_;
+  
+      if ($want_ver =~ /^[v0-9\.\_]+$/) {
+          return "$ver < $want_ver";
+      } else {
+          return "$ver doesn't satisfy $want_ver";
+      }
+  }
+  
+  sub is_deprecated {
+      my($self, $meta) = @_;
+  
+      my $deprecated = eval {
+          require Module::CoreList; # no fatpack
+          Module::CoreList::is_deprecated($meta->{module});
+      };
+  
+      return $deprecated && $self->loaded_from_perl_lib($meta);
+  }
+  
+  sub loaded_from_perl_lib {
+      my($self, $meta) = @_;
+  
+      require Config;
+      my @dirs = qw(archlibexp privlibexp);
+      if ($self->{self_contained} && ! $self->{exclude_vendor} && $Config{vendorarch}) {
+          unshift @dirs, qw(vendorarch vendorlibexp);
+      }
+      for my $dir (@dirs) {
+          my $confdir = $Config{$dir};
+          if ($confdir eq substr($meta->filename, 0, length($confdir))) {
+              return 1;
+          }
+      }
+  
+      return;
+  }
+  
+  sub should_install {
+      my($self, $mod, $ver) = @_;
+  
+      $self->chat("Checking if you have $mod $ver ... ");
+      my($ok, $local) = $self->check_module($mod, $ver);
+  
+      if ($ok)       { $self->chat("Yes ($local)\n") }
+      elsif ($local) { $self->chat("No (" . $self->unsatisfy_how($local, $ver) . ")\n") }
+      else           { $self->chat("No\n") }
+  
+      return $mod unless $ok;
+      return;
+  }
+  
+  sub check_perl_version {
+      my($self, $version) = @_;
+      require CPAN::Meta::Requirements;
+      my $req = CPAN::Meta::Requirements->from_string_hash({ perl => $version });
+      $req->accepts_module(perl => $]);
+  }
+  
+  sub install_deps {
+      my($self, $dir, $depth, @deps) = @_;
+  
+      my(@install, %seen, @fail);
+      for my $dep (@deps) {
+          next if $seen{$dep->module};
+          if ($dep->module eq 'perl') {
+              if ($dep->is_requirement && !$self->check_perl_version($dep->version)) {
+                  $self->diag("Needs perl @{[$dep->version]}, you have $]\n");
+                  push @fail, 'perl';
+              }
+          } elsif ($self->should_install($dep->module, $dep->version)) {
+              push @install, $dep;
+              $seen{$dep->module} = 1;
+          }
+      }
+  
+      if (@install) {
+          $self->diag("==> Found dependencies: " . join(", ",  map $_->module, @install) . "\n");
+      }
+  
+      for my $dep (@install) {
+          $self->install_module($dep->module, $depth + 1, $dep->version);
+      }
+  
+      $self->chdir($self->{base});
+      $self->chdir($dir) if $dir;
+  
+      if ($self->{scandeps}) {
+          return 1; # Don't check if dependencies are installed, since with --scandeps they aren't
+      }
+      my @not_ok = $self->unsatisfied_deps(@deps);
+      if (@not_ok) {
+          return 0, \@not_ok;
+      } else {
+          return 1;
+      }
+  }
+  
+  sub unsatisfied_deps {
+      my($self, @deps) = @_;
+  
+      require CPAN::Meta::Check;
+      require CPAN::Meta::Requirements;
+  
+      my $reqs = CPAN::Meta::Requirements->new;
+      for my $dep (grep $_->is_requirement, @deps) {
+          $reqs->add_string_requirement($dep->module => $dep->requires_version || '0');
+      }
+  
+      my $ret = CPAN::Meta::Check::check_requirements($reqs, 'requires', $self->{search_inc});
+      grep defined, values %$ret;
+  }
+  
+  sub install_deps_bailout {
+      my($self, $target, $dir, $depth, @deps) = @_;
+  
+      my($ok, $fail) = $self->install_deps($dir, $depth, @deps);
+      if (!$ok) {
+          $self->diag_fail("Installing the dependencies failed: " . join(", ", @$fail), 1);
+          unless ($self->prompt_bool("Do you want to continue building $target anyway?", "n")) {
+              $self->diag_fail("Bailing out the installation for $target.", 1);
+              return;
+          }
+      }
+  
+      return 1;
+  }
+  
+  sub build_stuff {
+      my($self, $stuff, $dist, $depth) = @_;
+  
+      if ($self->{verify} && -e 'SIGNATURE') {
+          $self->verify_signature($dist) or return;
+      }
+  
+      require CPAN::Meta;
+  
+      my($meta_file) = grep -f, qw(META.json META.yml);
+      if ($meta_file) {
+          $self->chat("Checking configure dependencies from $meta_file\n");
+          $dist->{cpanmeta} = eval { CPAN::Meta->load_file($meta_file) };
+      } elsif ($dist->{dist} && $dist->{version}) {
+          $self->chat("META.yml/json not found. Creating skeleton for it.\n");
+          $dist->{cpanmeta} = CPAN::Meta->new({ name => $dist->{dist}, version => $dist->{version} });
+      }
+  
+      $dist->{meta} = $dist->{cpanmeta} ? $dist->{cpanmeta}->as_struct : {};
+  
+      my @config_deps;
+  
+      if ($dist->{cpanmeta}) {
+          push @config_deps, App::cpanminus::Dependency->from_prereqs(
+              $dist->{cpanmeta}->effective_prereqs, ['configure'], $self->{install_types},
+          );
+      }
+  
+      if (-e 'Build.PL' && !$self->should_use_mm($dist->{dist}) && !@config_deps) {
+          push @config_deps, App::cpanminus::Dependency->from_versions(
+              { 'Module::Build' => '0.38' }, 'configure',
+          );
+      }
+  
+      $self->merge_with_cpanfile($dist, \@config_deps);
+  
+      $self->upgrade_toolchain(\@config_deps);
+  
+      my $target = $dist->{meta}{name} ? "$dist->{meta}{name}-$dist->{meta}{version}" : $dist->{dir};
+      {
+          $self->install_deps_bailout($target, $dist->{dir}, $depth, @config_deps)
+            or return;
+      }
+  
+      $self->diag_progress("Configuring $target");
+  
+      my $configure_state = $self->configure_this($dist, $depth);
+      $self->diag_ok($configure_state->{configured_ok} ? "OK" : "N/A");
+  
+      if ($dist->{cpanmeta} && $dist->{source} eq 'cpan') {
+          $dist->{provides} = $dist->{cpanmeta}{provides} || $self->extract_packages($dist->{cpanmeta}, ".");
+      }
+  
+      # install direct 'test' dependencies for --installdeps, even with --notest
+      my $root_target = (($self->{installdeps} or $self->{showdeps}) and $depth == 0);
+      $dist->{want_phases} = $self->{notest} && !$root_target
+                           ? [qw( build runtime )] : [qw( build test runtime )];
+  
+      push @{$dist->{want_phases}}, 'develop' if $self->{with_develop} && $depth == 0;
+      push @{$dist->{want_phases}}, 'configure' if $self->{with_configure} && $depth == 0;
+  
+      my @deps = $self->find_prereqs($dist);
+      my $module_name = $self->find_module_name($configure_state) || $dist->{meta}{name};
+      $module_name =~ s/-/::/g;
+  
+      if ($self->{showdeps}) {
+          for my $dep (@config_deps, @deps) {
+              print $dep->module, ($dep->version ? ("~".$dep->version) : ""), "\n";
+          }
+          return 1;
+      }
+  
+      my $distname = $dist->{meta}{name} ? "$dist->{meta}{name}-$dist->{meta}{version}" : $stuff;
+  
+      my $walkup;
+      if ($self->{scandeps}) {
+          $walkup = $self->scandeps_append_child($dist);
+      }
+  
+      $self->install_deps_bailout($distname, $dist->{dir}, $depth, @deps)
+          or return;
+  
+      if ($self->{scandeps}) {
+          unless ($configure_state->{configured_ok}) {
+              my $diag = <<DIAG;
+  ! Configuring $distname failed. See $self->{log} for details.
+  ! You might have to install the following modules first to get --scandeps working correctly.
+  DIAG
+              if (@config_deps) {
+                  my @tree = @{$self->{scandeps_tree}};
+                  $diag .= "!\n" . join("", map "! * $_->[0]{module}\n", @tree[0..$#tree-1]) if @tree;
+              }
+              $self->diag("!\n$diag!\n", 1);
+          }
+          $walkup->();
+          return 1;
+      }
+  
+      if ($self->{installdeps} && $depth == 0) {
+          if ($configure_state->{configured_ok}) {
+              $self->diag("<== Installed dependencies for $stuff. Finishing.\n");
+              return 1;
+          } else {
+              $self->diag("! Configuring $distname failed. See $self->{log} for details.\n", 1);
+              return;
+          }
+      }
+  
+      my $installed;
+      if ($configure_state->{use_module_build} && -e 'Build' && -f _) {
+          $self->diag_progress("Building " . ($self->{notest} ? "" : "and testing ") . $distname);
+          $self->build([ $self->{perl}, "./Build" ], $distname, $depth) &&
+          $self->test([ $self->{perl}, "./Build", "test" ], $distname, $depth) &&
+          $self->install([ $self->{perl}, "./Build", "install" ], [ "--uninst", 1 ], $depth) &&
+          $installed++;
+      } elsif ($self->{make} && -e 'Makefile') {
+          $self->diag_progress("Building " . ($self->{notest} ? "" : "and testing ") . $distname);
+          $self->build([ $self->{make} ], $distname, $depth) &&
+          $self->test([ $self->{make}, "test" ], $distname, $depth) &&
+          $self->install([ $self->{make}, "install" ], [ "UNINST=1" ], $depth) &&
+          $installed++;
+      } else {
+          my $why;
+          my $configure_failed = $configure_state->{configured} && !$configure_state->{configured_ok};
+          if ($configure_failed) { $why = "Configure failed for $distname." }
+          elsif ($self->{make})  { $why = "The distribution doesn't have a proper Makefile.PL/Build.PL" }
+          else                   { $why = "Can't configure the distribution. You probably need to have 'make'." }
+  
+          $self->diag_fail("$why See $self->{log} for details.", 1);
+          return;
+      }
+  
+      if ($installed && $self->{test_only}) {
+          $self->diag_ok;
+          $self->diag("Successfully tested $distname\n", 1);
+      } elsif ($installed) {
+          my $local   = $self->{local_versions}{$dist->{module} || ''};
+          my $version = $dist->{module_version} || $dist->{meta}{version} || $dist->{version};
+          my $reinstall = $local && ($local eq $version);
+          my $action  = $local && !$reinstall
+                      ? $self->numify_ver($version) < $self->numify_ver($local)
+                          ? "downgraded"
+                          : "upgraded"
+                      : undef;
+  
+          my $how = $reinstall ? "reinstalled $distname"
+                  : $local     ? "installed $distname ($action from $local)"
+                               : "installed $distname" ;
+          my $msg = "Successfully $how";
+          $self->diag_ok;
+          $self->diag("$msg\n", 1);
+          $self->{installed_dists}++;
+          $self->save_meta($stuff, $dist, $module_name, \@config_deps, \@deps);
+          return 1;
+      } else {
+          my $what = $self->{test_only} ? "Testing" : "Installing";
+          $self->diag_fail("$what $stuff failed. See $self->{log} for details. Retry with --force to force install it.", 1);
+          return;
+      }
+  }
+  
+  sub perl_requirements {
+      my($self, @requires) = @_;
+  
+      my @perl;
+      for my $requires (grep defined, @requires) {
+          if (exists $requires->{perl}) {
+              push @perl, App::cpanminus::Dependency->new(perl => $requires->{perl});
+          }
+      }
+  
+      return @perl;
+  }
+  
+  sub should_use_mm {
+      my($self, $dist) = @_;
+  
+      # Module::Build deps should use MakeMaker because that causes circular deps and fail
+      # Otherwise we should prefer Build.PL
+      my %should_use_mm = map { $_ => 1 } qw( version ExtUtils-ParseXS ExtUtils-Install ExtUtils-Manifest );
+  
+      $should_use_mm{$dist};
+  }
+  
+  sub configure_this {
+      my($self, $dist, $depth) = @_;
+  
+      # Short-circuit `cpanm --installdeps .` because it doesn't need to build the current dir
+      if (-e $self->{cpanfile_path} && $self->{installdeps} && $depth == 0) {
+          require Module::CPANfile;
+          $dist->{cpanfile} = eval { Module::CPANfile->load($self->{cpanfile_path}) };
+          $self->diag_fail($@, 1) if $@;
+          return {
+              configured       => 1,
+              configured_ok    => !!$dist->{cpanfile},
+              use_module_build => 0,
+          };
+      }
+  
+      if ($self->{skip_configure}) {
+          my $eumm = -e 'Makefile';
+          my $mb   = -e 'Build' && -f _;
+          return {
+              configured => 1,
+              configured_ok => $eumm || $mb,
+              use_module_build => $mb,
+          };
+      }
+  
+      my $state = {};
+  
+      my $try_eumm = sub {
+          if (-e 'Makefile.PL') {
+              $self->chat("Running Makefile.PL\n");
+  
+              # NOTE: according to Devel::CheckLib, most XS modules exit
+              # with 0 even if header files are missing, to avoid receiving
+              # tons of FAIL reports in such cases. So exit code can't be
+              # trusted if it went well.
+              if ($self->configure([ $self->{perl}, "Makefile.PL" ], $depth)) {
+                  $state->{configured_ok} = -e 'Makefile';
+              }
+              $state->{configured}++;
+          }
+      };
+  
+      my $try_mb = sub {
+          if (-e 'Build.PL') {
+              $self->chat("Running Build.PL\n");
+              if ($self->configure([ $self->{perl}, "Build.PL" ], $depth)) {
+                  $state->{configured_ok} = -e 'Build' && -f _;
+              }
+              $state->{use_module_build}++;
+              $state->{configured}++;
+          }
+      };
+  
+      my @try;
+      if ($dist->{dist} && $self->should_use_mm($dist->{dist})) {
+          @try = ($try_eumm, $try_mb);
+      } else {
+          @try = ($try_mb, $try_eumm);
+      }
+  
+      for my $try (@try) {
+          $try->();
+          last if $state->{configured_ok};
+      }
+  
+      unless ($state->{configured_ok}) {
+          while (1) {
+              my $ans = lc $self->prompt("Configuring $dist->{dist} failed.\nYou can s)kip, r)etry, e)xamine build log, or l)ook ?", "s");
+              last                                        if $ans eq 's';
+              return $self->configure_this($dist, $depth) if $ans eq 'r';
+              $self->show_build_log                       if $ans eq 'e';
+              $self->look                                 if $ans eq 'l';
+          }
+      }
+  
+      return $state;
+  }
+  
+  sub find_module_name {
+      my($self, $state) = @_;
+  
+      return unless $state->{configured_ok};
+  
+      if ($state->{use_module_build} &&
+          -e "_build/build_params") {
+          my $params = do { open my $in, "_build/build_params"; $self->safe_eval(join "", <$in>) };
+          return eval { $params->[2]{module_name} } || undef;
+      } elsif (-e "Makefile") {
+          open my $mf, "Makefile";
+          while (<$mf>) {
+              if (/^\#\s+NAME\s+=>\s+(.*)/) {
+                  return $self->safe_eval($1);
+              }
+          }
+      }
+  
+      return;
+  }
+  
+  sub list_files {
+      my $self = shift;
+  
+      if (-e 'MANIFEST') {
+          require ExtUtils::Manifest;
+          my $manifest = eval { ExtUtils::Manifest::manifind() } || {};
+          return sort { lc $a cmp lc $b } keys %$manifest;
+      } else {
+          require File::Find;
+          my @files;
+          my $finder = sub {
+              my $name = $File::Find::name;
+              $name =~ s!\.[/\\]!!;
+              push @files, $name;
+          };
+          File::Find::find($finder, ".");
+          return sort { lc $a cmp lc $b } @files;
+      }
+  }
+  
+  sub extract_packages {
+      my($self, $meta, $dir) = @_;
+  
+      my $try = sub {
+          my $file = shift;
+          return 0 if $file =~ m!^(?:x?t|inc|local|perl5|fatlib|_build)/!;
+          return 1 unless $meta->{no_index};
+          return 0 if grep { $file =~ m!^$_/! } @{$meta->{no_index}{directory} || []};
+          return 0 if grep { $file eq $_ } @{$meta->{no_index}{file} || []};
+          return 1;
+      };
+  
+      require Parse::PMFile;
+  
+      my @files = grep { /\.pm(?:\.PL)?$/ && $try->($_) } $self->list_files;
+  
+      my $provides = { };
+  
+      for my $file (@files) {
+          my $parser = Parse::PMFile->new($meta, { UNSAFE => 1, ALLOW_DEV_VERSION => 1 });
+          my $packages = $parser->parse($file);
+  
+          while (my($package, $meta) = each %$packages) {
+              $provides->{$package} ||= {
+                  file => $meta->{infile},
+                  ($meta->{version} eq 'undef') ? () : (version => $meta->{version}),
+              };
+          }
+      }
+  
+      return $provides;
+  }
+  
+  sub save_meta {
+      my($self, $module, $dist, $module_name, $config_deps, $build_deps) = @_;
+  
+      return unless $dist->{distvname} && $dist->{source} eq 'cpan';
+  
+      my $base = ($ENV{PERL_MM_OPT} || '') =~ /INSTALL_BASE=/
+          ? ($self->install_base($ENV{PERL_MM_OPT}) . "/lib/perl5") : $Config{sitelibexp};
+  
+      my $provides = $dist->{provides};
+  
+      File::Path::mkpath("blib/meta", 0, 0777);
+  
+      my $local = {
+          name => $module_name,
+          target => $module,
+          version => exists $provides->{$module_name}
+              ? ($provides->{$module_name}{version} || $dist->{version}) : $dist->{version},
+          dist => $dist->{distvname},
+          pathname => $dist->{pathname},
+          provides => $provides,
+      };
+  
+      require JSON::PP;
+      open my $fh, ">", "blib/meta/install.json" or die $!;
+      print $fh JSON::PP::encode_json($local);
+  
+      # Existence of MYMETA.* Depends on EUMM/M::B versions and CPAN::Meta
+      if (-e "MYMETA.json") {
+          File::Copy::copy("MYMETA.json", "blib/meta/MYMETA.json");
+      }
+  
+      my @cmd = (
+          ($self->{sudo} ? 'sudo' : ()),
+          $^X,
+          '-MExtUtils::Install=install',
+          '-e',
+          qq[install({ 'blib/meta' => '$base/$Config{archname}/.meta/$dist->{distvname}' })],
+      );
+      $self->run(\@cmd);
+  }
+  
+  sub _merge_hashref {
+      my($self, @hashrefs) = @_;
+  
+      my %hash;
+      for my $h (@hashrefs) {
+          %hash = (%hash, %$h);
+      }
+  
+      return \%hash;
+  }
+  
+  sub install_base {
+      my($self, $mm_opt) = @_;
+      $mm_opt =~ /INSTALL_BASE=(\S+)/ and return $1;
+      die "Your PERL_MM_OPT doesn't contain INSTALL_BASE";
+  }
+  
+  sub safe_eval {
+      my($self, $code) = @_;
+      eval $code;
+  }
+  
+  sub configure_features {
+      my($self, $dist, @features) = @_;
+      map $_->identifier, grep { $self->effective_feature($dist, $_) } @features;
+  }
+  
+  sub effective_feature {
+      my($self, $dist, $feature) = @_;
+  
+      if ($dist->{depth} == 0) {
+          my $value = $self->{features}{$feature->identifier};
+          return $value if defined $value;
+          return 1 if $self->{features}{__all};
+      }
+  
+      if ($self->{interactive}) {
+          require CPAN::Meta::Requirements;
+  
+          $self->diag("[@{[ $feature->description ]}]\n", 1);
+  
+          my $req = CPAN::Meta::Requirements->new;
+          for my $phase (@{$dist->{want_phases}}) {
+              for my $type (@{$self->{install_types}}) {
+                  $req->add_requirements($feature->prereqs->requirements_for($phase, $type));
+              }
+          }
+  
+          my $reqs = $req->as_string_hash;
+          my @missing;
+          for my $module (keys %$reqs) {
+              if ($self->should_install($module, $req->{$module})) {
+                  push @missing, $module;
+              }
+          }
+  
+          if (@missing) {
+              my $howmany = @missing;
+              $self->diag("==> Found missing dependencies: " . join(", ", @missing) . "\n", 1);
+              local $self->{prompt} = 1;
+              return $self->prompt_bool("Install the $howmany optional module(s)?", "y");
+          }
+      }
+  
+      return;
+  }
+  
+  sub find_prereqs {
+      my($self, $dist) = @_;
+  
+      my @deps = $self->extract_meta_prereqs($dist);
+  
+      if ($dist->{module} =~ /^Bundle::/i) {
+          push @deps, $self->bundle_deps($dist);
+      }
+  
+      $self->merge_with_cpanfile($dist, \@deps);
+  
+      return @deps;
+  }
+  
+  sub merge_with_cpanfile {
+      my($self, $dist, $deps) = @_;
+  
+      if ($self->{cpanfile_requirements} && !$dist->{cpanfile}) {
+          for my $dep (@$deps) {
+              $dep->merge_with($self->{cpanfile_requirements});
+          }
+      }
+  }
+  
+  sub extract_meta_prereqs {
+      my($self, $dist) = @_;
+  
+      if ($dist->{cpanfile}) {
+          my @features = $self->configure_features($dist, $dist->{cpanfile}->features);
+          my $prereqs = $dist->{cpanfile}->prereqs_with(@features);
+          # TODO: creating requirements is useful even without cpanfile to detect conflicting prereqs
+          $self->{cpanfile_requirements} = $prereqs->merged_requirements($dist->{want_phases}, ['requires']);
+          return App::cpanminus::Dependency->from_prereqs($prereqs, $dist->{want_phases}, $self->{install_types});
+      }
+  
+      require CPAN::Meta;
+  
+      my @deps;
+      my($meta_file) = grep -f, qw(MYMETA.json MYMETA.yml);
+      if ($meta_file) {
+          $self->chat("Checking dependencies from $meta_file ...\n");
+          my $mymeta = eval { CPAN::Meta->load_file($meta_file, { lazy_validation => 1 }) };
+          if ($mymeta) {
+              $dist->{meta}{name}    = $mymeta->name;
+              $dist->{meta}{version} = $mymeta->version;
+              return $self->extract_prereqs($mymeta, $dist);
+          }
+      }
+  
+      if (-e '_build/prereqs') {
+          $self->chat("Checking dependencies from _build/prereqs ...\n");
+          my $prereqs = do { open my $in, "_build/prereqs"; $self->safe_eval(join "", <$in>) };
+          my $meta = CPAN::Meta->new(
+              { name => $dist->{meta}{name}, version => $dist->{meta}{version}, %$prereqs },
+              { lazy_validation => 1 },
+          );
+          @deps = $self->extract_prereqs($meta, $dist);
+      } elsif (-e 'Makefile') {
+          $self->chat("Finding PREREQ from Makefile ...\n");
+          open my $mf, "Makefile";
+          while (<$mf>) {
+              if (/^\#\s+PREREQ_PM => \{\s*(.*?)\s*\}/) {
+                  my @all;
+                  my @pairs = split ', ', $1;
+                  for (@pairs) {
+                      my ($pkg, $v) = split '=>', $_;
+                      push @all, [ $pkg, $v ];
+                  }
+                  my $list = join ", ", map { "'$_->[0]' => $_->[1]" } @all;
+                  my $prereq = $self->safe_eval("no strict; +{ $list }");
+                  push @deps, App::cpanminus::Dependency->from_versions($prereq) if $prereq;
+                  last;
+              }
+          }
+      }
+  
+      return @deps;
+  }
+  
+  sub bundle_deps {
+      my($self, $dist) = @_;
+  
+      my $match;
+      if ($dist->{module}) {
+          $match = sub {
+              my $meta = Module::Metadata->new_from_file($_[0]);
+              $meta && ($meta->name eq $dist->{module});
+          };
+      } else {
+          $match = sub { 1 };
+      }
+  
+      my @files;
+      File::Find::find({
+          wanted => sub {
+              push @files, File::Spec->rel2abs($_) if /\.pm$/i && $match->($_);
+          },
+          no_chdir => 1,
+      }, '.');
+  
+      my @deps;
+  
+      for my $file (@files) {
+          open my $pod, "<", $file or next;
+          my $in_contents;
+          while (<$pod>) {
+              if (/^=head\d\s+CONTENTS/) {
+                  $in_contents = 1;
+              } elsif (/^=/) {
+                  $in_contents = 0;
+              } elsif ($in_contents) {
+                  /^(\S+)\s*(\S+)?/
+                      and push @deps, App::cpanminus::Dependency->new($1, $self->maybe_version($2));
+              }
+          }
+      }
+  
+      return @deps;
+  }
+  
+  sub maybe_version {
+      my($self, $string) = @_;
+      return $string && $string =~ /^\.?\d/ ? $string : undef;
+  }
+  
+  sub extract_prereqs {
+      my($self, $meta, $dist) = @_;
+  
+      my @features = $self->configure_features($dist, $meta->features);
+      my $prereqs  = $self->soften_makemaker_prereqs($meta->effective_prereqs(\@features)->clone);
+  
+      return App::cpanminus::Dependency->from_prereqs($prereqs, $dist->{want_phases}, $self->{install_types});
+  }

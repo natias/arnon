@@ -1,0 +1,1000 @@
+            if ($exception_class =~ /[^\w:']/) {
+                confess "Bad exception class '$exception_class'.\nThe '$class->exception_class' method wants to use $exception_class\nfor exceptions, but it contains characters which are not word-characters or colons.";
+            }
+
+            # Alas, Perl does turn barewords into modules unless they're
+            # actually barewords.  As such, we're left doing a string eval
+            # to make sure we load our file correctly.
+
+            my $E;
+
+            {
+                local $@;   # We can't clobber $@, it's wrong!
+                my $pm_file = $exception_class . ".pm";
+                $pm_file =~ s{ (?: :: | ' ) }{/}gx;
+                eval { require $pm_file };
+                $E = $@;    # Save $E despite ending our local.
+            }
+
+            # We need quotes around $@ to make sure it's stringified
+            # while still in scope.  Without them, we run the risk of
+            # $@ having been cleared by us exiting the local() block.
+
+            confess "Failed to load '$exception_class'.\nThis may be a typo in the '$class->exception_class' method,\nor the '$exception_class' module may not exist.\n\n $E" if $E;
+
+            $class_loaded{$exception_class}++;
+
+        }
+
+        return $exception_class->new(@args);
+    }
+}
+
+# Creates and returns a leak guard (with prototype if needed).
+sub _make_leak_guard {
+    my ($class, $filename, $wrapped_sub, $orig_sub, $call, $pkg, $proto) = @_;
+
+    # The leak guard is rather lengthly (in fact it makes up the most
+    # of _make_leak_guard).  It is possible to split it into a large
+    # "generic" part and a small wrapper with call-specific
+    # information.  This was done in v2.19 and profiling suggested
+    # that we ended up using a substantial amount of runtime in "goto"
+    # between the leak guard(s) and the final sub.  Therefore, the two
+    # parts were merged into one to reduce the runtime overhead.
+
+    my $leak_guard = sub {
+        my $caller_level = 0;
+        my $caller;
+
+        while ( ($caller = (caller $caller_level)[1]) =~ m{^\(eval \d+\)$} ) {
+
+            # If our filename is actually an eval, and we
+            # reach it, then go to our autodying code immediatately.
+
+            last if ($caller eq $filename);
+            $caller_level++;
+        }
+
+        # We're now out of the eval stack.
+
+        if ($caller eq $filename) {
+            # No leak, call the wrapper.  NB: In this case, it doesn't
+            # matter if it is a CORE sub or not.
+            if (!defined($wrapped_sub)) {
+                # CORE sub that we were too lazy to compile when we
+                # created this leak guard.
+                die "$call is not CORE::<something>"
+                    if substr($call, 0, 6) ne 'CORE::';
+
+                my $name = substr($call, 6);
+                my $sub = $name;
+                my $lexical = 1;
+                my $wrapper_pkg = $pkg;
+                my $code;
+                if (exists($reusable_builtins{$call})) {
+                    $code = $reusable_builtins{$call}{$lexical};
+                    $wrapper_pkg = undef;
+                }
+                if (!defined($code)) {
+                    $code = $class->_compile_wrapper($wrapper_pkg,
+                                                     1, # core
+                                                     $call,
+                                                     $name,
+                                                     0, # void
+                                                     $lexical,
+                                                     $sub,
+                                                     undef, # subref (not used for core)
+                                                     undef, # hints (not used for core)
+                                                     $proto);
+
+                    if (!defined($wrapper_pkg)) {
+                        # cache it so we don't recompile this part again
+                        $reusable_builtins{$call}{$lexical} = $code;
+                    }
+                }
+                # As $wrapped_sub is "closed over", updating its value will
+                # be "remembered" for the next call.
+                $wrapped_sub = $code;
+            }
+            goto $wrapped_sub;
+        }
+
+        # We leaked, time to call the original function.
+        # - for non-core functions that will be $orig_sub
+        # - for CORE functions, $orig_sub may be a trampoline
+        goto $orig_sub if defined($orig_sub);
+
+        # We are wrapping a CORE sub and we do not have a trampoline
+        # yet.
+        #
+        # If we've cached a trampoline, then use it.  Usually only
+        # resuable subs will have cache hits, but non-reusuably ones
+        # can get it as well in (very) rare cases.  It is mostly in
+        # cases where a package uses autodie multiple times and leaks
+        # from multiple places.  Possibly something like:
+        #
+        #  package Pkg::With::LeakyCode;
+        #  sub a {
+        #      use autodie;
+        #      code_that_leaks();
+        #  }
+        #
+        #  sub b {
+        #      use autodie;
+        #      more_leaky_code();
+        #  }
+        #
+        # Note that we use "Fatal" as package name for reusable subs
+        # because A) that allows us to trivially re-use the
+        # trampolines as well and B) because the reusable sub is
+        # compiled into "package Fatal" as well.
+
+        $pkg = 'Fatal' if exists $reusable_builtins{$call};
+        $orig_sub = $Trampoline_cache{$pkg}{$call};
+
+        if (not $orig_sub) {
+            # If we don't have a trampoline, we need to build it.
+            #
+            # We only generate trampolines when we need them, and
+            # we can cache them by subroutine + package.
+            #
+            # As $orig_sub is "closed over", updating its value will
+            # be "remembered" for the next call.
+
+            $orig_sub = make_core_trampoline($call, $pkg, $proto);
+
+            # We still cache it despite remembering it in $orig_sub as
+            # well.  In particularly, we rely on this to avoid
+            # re-compiling the reusable trampolines.
+            $Trampoline_cache{$pkg}{$call} = $orig_sub;
+        }
+
+        # Bounce to our trampoline, which takes us to our core sub.
+        goto $orig_sub;
+    };  # <-- end of leak guard
+
+    # If there is a prototype on the original sub, copy it to the leak
+    # guard.
+    if (defined $proto) {
+        # The "\&" may appear to be redundant but set_prototype
+        # croaks when it is removed.
+        set_prototype(\&$leak_guard, $proto);
+    }
+
+    return $leak_guard;
+}
+
+sub _compile_wrapper {
+    my ($class, $wrapper_pkg, $core, $call, $name, $void, $lexical, $sub, $sref, $hints, $proto) = @_;
+    my $real_proto = '';
+    my @protos;
+    my $code;
+    if (defined $proto) {
+        $real_proto = " ($proto)";
+    } else {
+        $proto = '@';
+    }
+
+    @protos = fill_protos($proto);
+    $code = qq[
+        sub$real_proto {
+    ];
+
+    if (!$lexical) {
+        $code .= q[
+           local($", $!) = (', ', 0);
+        ];
+    }
+
+    # Don't have perl whine if exec fails, since we'll be handling
+    # the exception now.
+    $code .= "no warnings qw(exec);\n" if $call eq "CORE::exec";
+
+    $code .= $class->_write_invocation($core, $call, $name, $void, $lexical,
+                                       $sub, $sref, @protos);
+    $code .= "}\n";
+    warn $code if $Debug;
+
+    # I thought that changing package was a monumental waste of
+    # time for CORE subs, since they'll always be the same.  However
+    # that's not the case, since they may refer to package-based
+    # filehandles (eg, with open).
+    #
+    # The %reusable_builtins hash defines ones we can aggressively
+    # cache as they never depend upon package-based symbols.
+
+    my $E;
+
+    {
+        no strict 'refs'; ## no critic # to avoid: Can't use string (...) as a symbol ref ...
+        local $@;
+        if (defined($wrapper_pkg)) {
+            $code = eval("package $wrapper_pkg; require Carp; $code");  ## no critic
+        } else {
+            $code = eval("require Carp; $code");  ## no critic
+
+        }
+        $E = $@;
+    }
+
+    if (not $code) {
+        my $true_name = $core ? $call : $sub;
+        croak("Internal error in autodie/Fatal processing $true_name: $E");
+    }
+    return $code;
+}
+
+# For some reason, dying while replacing our subs doesn't
+# kill our calling program.  It simply stops the loading of
+# autodie and keeps going with everything else.  The _autocroak
+# sub allows us to die with a vengeance.  It should *only* ever be
+# used for serious internal errors, since the results of it can't
+# be captured.
+
+sub _autocroak {
+    warn Carp::longmess(@_);
+    exit(255);  # Ugh!
+}
+
+1;
+
+__END__
+
+=head1 NAME
+
+Fatal - Replace functions with equivalents which succeed or die
+
+=head1 SYNOPSIS
+
+    use Fatal qw(open close);
+
+    open(my $fh, "<", $filename);  # No need to check errors!
+
+    use File::Copy qw(move);
+    use Fatal qw(move);
+
+    move($file1, $file2); # No need to check errors!
+
+    sub juggle { . . . }
+    Fatal->import('juggle');
+
+=head1 BEST PRACTICE
+
+B<Fatal has been obsoleted by the new L<autodie> pragma.> Please use
+L<autodie> in preference to C<Fatal>.  L<autodie> supports lexical scoping,
+throws real exception objects, and provides much nicer error messages.
+
+The use of C<:void> with Fatal is discouraged.
+
+=head1 DESCRIPTION
+
+C<Fatal> provides a way to conveniently replace
+functions which normally return a false value when they fail with
+equivalents which raise exceptions if they are not successful.  This
+lets you use these functions without having to test their return
+values explicitly on each call.  Exceptions can be caught using
+C<eval{}>.  See L<perlfunc> and L<perlvar> for details.
+
+The do-or-die equivalents are set up simply by calling Fatal's
+C<import> routine, passing it the names of the functions to be
+replaced.  You may wrap both user-defined functions and overridable
+CORE operators (except C<exec>, C<system>, C<print>, or any other
+built-in that cannot be expressed via prototypes) in this way.
+
+If the symbol C<:void> appears in the import list, then functions
+named later in that import list raise an exception only when
+these are called in void context--that is, when their return
+values are ignored.  For example
+
+    use Fatal qw/:void open close/;
+
+    # properly checked, so no exception raised on error
+    if (not open(my $fh, '<', '/bogotic') {
+        warn "Can't open /bogotic: $!";
+    }
+
+    # not checked, so error raises an exception
+    close FH;
+
+The use of C<:void> is discouraged, as it can result in exceptions
+not being thrown if you I<accidentally> call a method without
+void context.  Use L<autodie> instead if you need to be able to
+disable autodying/Fatal behaviour for a small block of code.
+
+=head1 DIAGNOSTICS
+
+=over 4
+
+=item Bad subroutine name for Fatal: %s
+
+You've called C<Fatal> with an argument that doesn't look like
+a subroutine name, nor a switch that this version of Fatal
+understands.
+
+=item %s is not a Perl subroutine
+
+You've asked C<Fatal> to try and replace a subroutine which does not
+exist, or has not yet been defined.
+
+=item %s is neither a builtin, nor a Perl subroutine
+
+You've asked C<Fatal> to replace a subroutine, but it's not a Perl
+built-in, and C<Fatal> couldn't find it as a regular subroutine.
+It either doesn't exist or has not yet been defined.
+
+=item Cannot make the non-overridable %s fatal
+
+You've tried to use C<Fatal> on a Perl built-in that can't be
+overridden, such as C<print> or C<system>, which means that
+C<Fatal> can't help you, although some other modules might.
+See the L</"SEE ALSO"> section of this documentation.
+
+=item Internal error: %s
+
+You've found a bug in C<Fatal>.  Please report it using
+the C<perlbug> command.
+
+=back
+
+=head1 BUGS
+
+C<Fatal> clobbers the context in which a function is called and always
+makes it a scalar context, except when the C<:void> tag is used.
+This problem does not exist in L<autodie>.
+
+"Used only once" warnings can be generated when C<autodie> or C<Fatal>
+is used with package filehandles (eg, C<FILE>).  It's strongly recommended
+you use scalar filehandles instead.
+
+=head1 AUTHOR
+
+Original module by Lionel Cons (CERN).
+
+Prototype updates by Ilya Zakharevich <ilya@math.ohio-state.edu>.
+
+L<autodie> support, bugfixes, extended diagnostics, C<system>
+support, and major overhauling by Paul Fenwick <pjf@perltraining.com.au>
+
+=head1 LICENSE
+
+This module is free software, you may distribute it under the
+same terms as Perl itself.
+
+=head1 SEE ALSO
+
+L<autodie> for a nicer way to use lexical Fatal.
+
+L<IPC::System::Simple> for a similar idea for calls to C<system()>
+and backticks.
+
+=for Pod::Coverage exception_class fill_protos one_invocation throw write_invocation ERROR_NO_IPC_SYS_SIMPLE LEXICAL_TAG
+
+=cut
+                                                                                                                                                                                                                                                                                                                   usr/share/perl/5.36.0/File/                                                                         0000755 0000000 0000000 00000000000 14714551115 013535  5                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        usr/share/perl/5.36.0/File/Basename.pm                                                              0000644 0000000 0000000 00000025672 14530460112 015612  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        =head1 NAME
+
+File::Basename - Parse file paths into directory, filename and suffix.
+
+=head1 SYNOPSIS
+
+    use File::Basename;
+
+    ($name,$path,$suffix) = fileparse($fullname,@suffixlist);
+    $name = fileparse($fullname,@suffixlist);
+
+    $basename = basename($fullname,@suffixlist);
+    $dirname  = dirname($fullname);
+
+
+=head1 DESCRIPTION
+
+These routines allow you to parse file paths into their directory, filename
+and suffix.
+
+B<NOTE>: C<dirname()> and C<basename()> emulate the behaviours, and
+quirks, of the shell and C functions of the same name.  See each
+function's documentation for details.  If your concern is just parsing
+paths it is safer to use L<File::Spec>'s C<splitpath()> and
+C<splitdir()> methods.
+
+It is guaranteed that
+
+    # Where $path_separator is / for Unix, \ for Windows, etc...
+    dirname($path) . $path_separator . basename($path);
+
+is equivalent to the original path for all systems but VMS.
+
+
+=cut
+
+
+package File::Basename;
+
+# File::Basename is used during the Perl build, when the re extension may
+# not be available, but we only actually need it if running under tainting.
+BEGIN {
+  if (${^TAINT}) {
+    require re;
+    re->import('taint');
+  }
+}
+
+
+use strict;
+use 5.006;
+use warnings;
+our(@ISA, @EXPORT, $VERSION, $Fileparse_fstype, $Fileparse_igncase);
+require Exporter;
+@ISA = qw(Exporter);
+@EXPORT = qw(fileparse fileparse_set_fstype basename dirname);
+$VERSION = "2.85";
+
+fileparse_set_fstype($^O);
+
+
+=over 4
+
+=item C<fileparse>
+X<fileparse>
+
+    my($filename, $dirs, $suffix) = fileparse($path);
+    my($filename, $dirs, $suffix) = fileparse($path, @suffixes);
+    my $filename                  = fileparse($path, @suffixes);
+
+The C<fileparse()> routine divides a file path into its $dirs, $filename
+and (optionally) the filename $suffix.
+
+$dirs contains everything up to and including the last
+directory separator in the $path including the volume (if applicable).
+The remainder of the $path is the $filename.
+
+     # On Unix returns ("baz", "/foo/bar/", "")
+     fileparse("/foo/bar/baz");
+
+     # On Windows returns ("baz", 'C:\foo\bar\', "")
+     fileparse('C:\foo\bar\baz');
+
+     # On Unix returns ("", "/foo/bar/baz/", "")
+     fileparse("/foo/bar/baz/");
+
+If @suffixes are given each element is a pattern (either a string or a
+C<qr//>) matched against the end of the $filename.  The matching
+portion is removed and becomes the $suffix.
+
+     # On Unix returns ("baz", "/foo/bar/", ".txt")
+     fileparse("/foo/bar/baz.txt", qr/\.[^.]*/);
+
+If type is non-Unix (see L</fileparse_set_fstype>) then the pattern
+matching for suffix removal is performed case-insensitively, since
+those systems are not case-sensitive when opening existing files.
+
+You are guaranteed that C<$dirs . $filename . $suffix> will
+denote the same location as the original $path.
+
+=cut
+
+
+sub fileparse {
+  my($fullname,@suffices) = @_;
+
+  unless (defined $fullname) {
+      require Carp;
+      Carp::croak("fileparse(): need a valid pathname");
+  }
+
+  my $orig_type = '';
+  my($type,$igncase) = ($Fileparse_fstype, $Fileparse_igncase);
+
+  my($taint) = substr($fullname,0,0);  # Is $fullname tainted?
+
+  if ($type eq "VMS" and $fullname =~ m{/} ) {
+    # We're doing Unix emulation
+    $orig_type = $type;
+    $type = 'Unix';
+  }
+
+  my($dirpath, $basename);
+
+  if (grep { $type eq $_ } qw(MSDOS DOS MSWin32 Epoc)) {
+    ($dirpath,$basename) = ($fullname =~ /^((?:.*[:\\\/])?)(.*)/s);
+    $dirpath .= '.\\' unless $dirpath =~ /[\\\/]\z/;
+  }
+  elsif ($type eq "OS2") {
+    ($dirpath,$basename) = ($fullname =~ m#^((?:.*[:\\/])?)(.*)#s);
+    $dirpath = './' unless $dirpath;	# Can't be 0
+    $dirpath .= '/' unless $dirpath =~ m#[\\/]\z#;
+  }
+  elsif ($type eq "MacOS") {
+    ($dirpath,$basename) = ($fullname =~ /^(.*:)?(.*)/s);
+    $dirpath = ':' unless $dirpath;
+  }
+  elsif ($type eq "AmigaOS") {
+    ($dirpath,$basename) = ($fullname =~ /(.*[:\/])?(.*)/s);
+    $dirpath = './' unless $dirpath;
+  }
+  elsif ($type eq 'VMS' ) {
+    ($dirpath,$basename) = ($fullname =~ /^(.*[:>\]])?(.*)/s);
+    $dirpath ||= '';  # should always be defined
+  }
+  else { # Default to Unix semantics.
+    ($dirpath,$basename) = ($fullname =~ m{^(.*/)?(.*)}s);
+    if ($orig_type eq 'VMS' and $fullname =~ m{^(/[^/]+/000000(/|$))(.*)}) {
+      # dev:[000000] is top of VMS tree, similar to Unix '/'
+      # so strip it off and treat the rest as "normal"
+      my $devspec  = $1;
+      my $remainder = $3;
+      ($dirpath,$basename) = ($remainder =~ m{^(.*/)?(.*)}s);
+      $dirpath ||= '';  # should always be defined
+      $dirpath = $devspec.$dirpath;
+    }
+    $dirpath = './' unless $dirpath;
+  }
+      
+
+  my $tail   = '';
+  my $suffix = '';
+  if (@suffices) {
+    foreach $suffix (@suffices) {
+      my $pat = ($igncase ? '(?i)' : '') . "($suffix)\$";
+      if ($basename =~ s/$pat//s) {
+        $taint .= substr($suffix,0,0);
+        $tail = $1 . $tail;
+      }
+    }
+  }
+
+  # Ensure taint is propagated from the path to its pieces.
+  $tail .= $taint;
+  wantarray ? ($basename .= $taint, $dirpath .= $taint, $tail)
+            : ($basename .= $taint);
+}
+
+
+
+=item C<basename>
+X<basename> X<filename>
+
+    my $filename = basename($path);
+    my $filename = basename($path, @suffixes);
+
+This function is provided for compatibility with the Unix shell command
+C<basename(1)>.  It does B<NOT> always return the file name portion of a
+path as you might expect.  To be safe, if you want the file name portion of
+a path use C<fileparse()>.
+
+C<basename()> returns the last level of a filepath even if the last
+level is clearly directory.  In effect, it is acting like C<pop()> for
+paths.  This differs from C<fileparse()>'s behaviour.
+
+    # Both return "bar"
+    basename("/foo/bar");
+    basename("/foo/bar/");
+
+@suffixes work as in C<fileparse()> except all regex metacharacters are
+quoted.
+
+    # These two function calls are equivalent.
+    my $filename = basename("/foo/bar/baz.txt",  ".txt");
+    my $filename = fileparse("/foo/bar/baz.txt", qr/\Q.txt\E/);
+
+Also note that in order to be compatible with the shell command,
+C<basename()> does not strip off a suffix if it is identical to the
+remaining characters in the filename.
+
+=cut
+
+
+sub basename {
+  my($path) = shift;
+
+  # From BSD basename(1)
+  # The basename utility deletes any prefix ending with the last slash '/'
+  # character present in string (after first stripping trailing slashes)
+  _strip_trailing_sep($path);
+
+  my($basename, $dirname, $suffix) = fileparse( $path, map("\Q$_\E",@_) );
+
+  # From BSD basename(1)
+  # The suffix is not stripped if it is identical to the remaining 
+  # characters in string.
+  if( length $suffix and !length $basename ) {
+      $basename = $suffix;
+  }
+  
+  # Ensure that basename '/' == '/'
+  if( !length $basename ) {
+      $basename = $dirname;
+  }
+
+  return $basename;
+}
+
+
+
+=item C<dirname>
+X<dirname>
+
+This function is provided for compatibility with the Unix shell
+command C<dirname(1)> and has inherited some of its quirks.  In spite of
+its name it does B<NOT> always return the directory name as you might
+expect.  To be safe, if you want the directory name of a path use
+C<fileparse()>.
+
+Only on VMS (where there is no ambiguity between the file and directory
+portions of a path) and AmigaOS (possibly due to an implementation quirk in
+this module) does C<dirname()> work like C<fileparse($path)>, returning just the
+$dirs.
+
+    # On VMS and AmigaOS
+    my $dirs = dirname($path);
+
+When using Unix or MSDOS syntax this emulates the C<dirname(1)> shell function
+which is subtly different from how C<fileparse()> works.  It returns all but
+the last level of a file path even if the last level is clearly a directory.
+In effect, it is not returning the directory portion but simply the path one
+level up acting like C<chop()> for file paths.
+
+Also unlike C<fileparse()>, C<dirname()> does not include a trailing slash on
+its returned path.
+
+    # returns /foo/bar.  fileparse() would return /foo/bar/
+    dirname("/foo/bar/baz");
+
+    # also returns /foo/bar despite the fact that baz is clearly a 
+    # directory.  fileparse() would return /foo/bar/baz/
+    dirname("/foo/bar/baz/");
+
+    # returns '.'.  fileparse() would return 'foo/'
+    dirname("foo/");
+
+Under VMS, if there is no directory information in the $path, then the
+current default device and directory is used.
+
+=cut
+
+
+sub dirname {
+    my $path = shift;
+
+    my($type) = $Fileparse_fstype;
+
+    if( $type eq 'VMS' and $path =~ m{/} ) {
+        # Parse as Unix
+        local($File::Basename::Fileparse_fstype) = '';
+        return dirname($path);
+    }
+
+    my($basename, $dirname) = fileparse($path);
+
+    if ($type eq 'VMS') { 
+        $dirname ||= $ENV{DEFAULT};
+    }
+    elsif ($type eq 'MacOS') {
+	if( !length($basename) && $dirname !~ /^[^:]+:\z/) {
+            _strip_trailing_sep($dirname);
+	    ($basename,$dirname) = fileparse $dirname;
+	}
+	$dirname .= ":" unless $dirname =~ /:\z/;
+    }
+    elsif (grep { $type eq $_ } qw(MSDOS DOS MSWin32 OS2)) { 
+        _strip_trailing_sep($dirname);
+        unless( length($basename) ) {
+	    ($basename,$dirname) = fileparse $dirname;
+	    _strip_trailing_sep($dirname);
+	}
+    }
+    elsif ($type eq 'AmigaOS') {
+        if ( $dirname =~ /:\z/) { return $dirname }
+        chop $dirname;
+        $dirname =~ s{[^:/]+\z}{} unless length($basename);
+    }
+    else {
+        _strip_trailing_sep($dirname);
+        unless( length($basename) ) {
+	    ($basename,$dirname) = fileparse $dirname;
+	    _strip_trailing_sep($dirname);
+	}
+    }
+
+    $dirname;
+}
+
+
+# Strip the trailing path separator.
+sub _strip_trailing_sep  {
+    my $type = $Fileparse_fstype;
+
+    if ($type eq 'MacOS') {
+        $_[0] =~ s/([^:]):\z/$1/s;
+    }
+    elsif (grep { $type eq $_ } qw(MSDOS DOS MSWin32 OS2)) { 
+        $_[0] =~ s/([^:])[\\\/]*\z/$1/;
+    }
+    else {
+        $_[0] =~ s{(.)/*\z}{$1}s;
+    }
+}
+
+
+=item C<fileparse_set_fstype>
+X<filesystem>
+
+  my $type = fileparse_set_fstype();
+  my $previous_type = fileparse_set_fstype($type);
+
+Normally File::Basename will assume a file path type native to your current
+operating system (ie. /foo/bar style on Unix, \foo\bar on Windows, etc...).
+With this function you can override that assumption.
+
+Valid $types are "MacOS", "VMS", "AmigaOS", "OS2", "RISCOS",
+"MSWin32", "DOS" (also "MSDOS" for backwards bug compatibility),
+"Epoc" and "Unix" (all case-insensitive).  If an unrecognized $type is
+given "Unix" will be assumed.
+
+If you've selected VMS syntax, and the file specification you pass to
+one of these routines contains a "/", they assume you are using Unix
+emulation and apply the Unix syntax rules instead, for that function
+call only.
+
+=back
+
+=cut
+
+
+BEGIN {
+
+my @Ignore_Case = qw(MacOS VMS AmigaOS OS2 RISCOS MSWin32 MSDOS DOS Epoc);
+my @Types = (@Ignore_Case, qw(Unix));
+
+sub fileparse_set_fstype {
+    my $old = $Fileparse_fstype;
+
+    if (@_) {
+        my $new_type = shift;
+
+        $Fileparse_fstype = 'Unix';  # default
+        foreach my $type (@Types) {
+            $Fileparse_fstype = $type if $new_type =~ /^$type/i;
+        }
+
+        $Fileparse_igncase = 
+          (grep $Fileparse_fstype eq $_, @Ignore_Case) ? 1 : 0;
+    }
+
+    return $old;
+}
+
+}
+
+
+1;
+
+
+=head1 SEE ALSO
+
+L<dirname(1)>, L<basename(1)>, L<File::Spec>
+                                                                      usr/share/perl/5.36.0/File/Compare.pm                                                               0000644 0000000 0000000 00000010166 14530460112 015455  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        package File::Compare 1.1007;
+
+use v5.12;
+use warnings;
+
+use Exporter 'import';
+
+our @EXPORT = qw(compare);
+our @EXPORT_OK = qw(cmp compare_text);
+
+our $Too_Big = 1024 * 1024 * 2;
+
+sub croak {
+    require Carp;
+    goto &Carp::croak;
+}
+
+sub compare {
+    croak("Usage: compare( file1, file2 [, buffersize]) ")
+      unless(@_ == 2 || @_ == 3);
+
+    my ($from,$to,$size) = @_;
+    my $text_mode = defined($size) && (ref($size) eq 'CODE' || $size < 0);
+
+    my ($fromsize,$closefrom,$closeto);
+    local (*FROM, *TO);
+
+    croak("from undefined") unless (defined $from);
+    croak("to undefined") unless (defined $to);
+
+    if (ref($from) && 
+        (UNIVERSAL::isa($from,'GLOB') || UNIVERSAL::isa($from,'IO::Handle'))) {
+	*FROM = *$from;
+    } elsif (ref(\$from) eq 'GLOB') {
+	*FROM = $from;
+    } else {
+	open(FROM,"<",$from) or goto fail_open1;
+	unless ($text_mode) {
+	    binmode FROM;
+	    $fromsize = -s FROM;
+	}
+	$closefrom = 1;
+    }
+
+    if (ref($to) &&
+        (UNIVERSAL::isa($to,'GLOB') || UNIVERSAL::isa($to,'IO::Handle'))) {
+	*TO = *$to;
+    } elsif (ref(\$to) eq 'GLOB') {
+	*TO = $to;
+    } else {
+	open(TO,"<",$to) or goto fail_open2;
+	binmode TO unless $text_mode;
+	$closeto = 1;
+    }
+
+    if (!$text_mode && $closefrom && $closeto) {
+	# If both are opened files we know they differ if their size differ
+	goto fail_inner if $fromsize != -s TO;
+    }
+
+    if ($text_mode) {
+	local $/ = "\n";
+	my ($fline,$tline);
+	while (defined($fline = <FROM>)) {
+	    goto fail_inner unless defined($tline = <TO>);
+	    if (ref $size) {
+		# $size contains ref to comparison function
+		goto fail_inner if &$size($fline, $tline);
+	    } else {
+		goto fail_inner if $fline ne $tline;
+	    }
+	}
+	goto fail_inner if defined($tline = <TO>);
+    }
+    else {
+	unless (defined($size) && $size > 0) {
+	    $size = $fromsize || -s TO || 0;
+	    $size = 1024 if $size < 512;
+	    $size = $Too_Big if $size > $Too_Big;
+	}
+
+	my ($fr,$tr,$fbuf,$tbuf);
+	$fbuf = $tbuf = '';
+	while(defined($fr = read(FROM,$fbuf,$size)) && $fr > 0) {
+	    unless (defined($tr = read(TO,$tbuf,$fr)) && $tbuf eq $fbuf) {
+		goto fail_inner;
+	    }
+	}
+	goto fail_inner if defined($tr = read(TO,$tbuf,$size)) && $tr > 0;
+    }
+
+    close(TO) || goto fail_open2 if $closeto;
+    close(FROM) || goto fail_open1 if $closefrom;
+
+    return 0;
+    
+  # All of these contortions try to preserve error messages...
+  fail_inner:
+    close(TO) || goto fail_open2 if $closeto;
+    close(FROM) || goto fail_open1 if $closefrom;
+
+    return 1;
+
+  fail_open2:
+    if ($closefrom) {
+	my $status = $!;
+	$! = 0;
+	close FROM;
+	$! = $status unless $!;
+    }
+  fail_open1:
+    return -1;
+}
+
+sub cmp;
+*cmp = \&compare;
+
+sub compare_text {
+    my ($from,$to,$cmp) = @_;
+    croak("Usage: compare_text( file1, file2 [, cmp-function])")
+	unless @_ == 2 || @_ == 3;
+    croak("Third arg to compare_text() function must be a code reference")
+	if @_ == 3 && ref($cmp) ne 'CODE';
+
+    # Using a negative buffer size puts compare into text_mode too
+    compare($from, $to, $cmp // -1);
+}
+
+1;
+
+__END__
+
+=head1 NAME
+
+File::Compare - Compare files or filehandles
+
+=head1 SYNOPSIS
+
+  	use File::Compare;
+
+	if (compare("file1","file2") == 0) {
+	    print "They're equal\n";
+	}
+
+=head1 DESCRIPTION
+
+The File::Compare::compare function compares the contents of two
+sources, each of which can be a file or a file handle.  It is exported
+from File::Compare by default.
+
+File::Compare::cmp is a synonym for File::Compare::compare.  It is
+exported from File::Compare only by request.
+
+File::Compare::compare_text does a line by line comparison of the two
+files. It stops as soon as a difference is detected. compare_text()
+accepts an optional third argument: This must be a CODE reference to
+a line comparison function, which returns 0 when both lines are considered
+equal. For example:
+
+    compare_text($file1, $file2)
+
+is basically equivalent to
+
+    compare_text($file1, $file2, sub {$_[0] ne $_[1]} )
+
+=head1 RETURN
+
+File::Compare::compare and its sibling functions return 0 if the files
+are equal, 1 if the files are unequal, or -1 if an error was encountered.
+
+=head1 AUTHOR
+
+File::Compare was written by Nick Ing-Simmons.
+Its original documentation was written by Chip Salzenberg.
+                                                                                                                                                                                                                                                                                                                                                                                                          usr/share/perl/5.36.0/File/Copy.pm                                                                  0000644 0000000 0000000 00000037136 14530460112 015007  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        # File/Copy.pm. Written in 1994 by Aaron Sherman <ajs@ajs.com>. This
+# source code has been placed in the public domain by the author.
+# Please be kind and preserve the documentation.
+#
+# Additions copyright 1996 by Charles Bailey.  Permission is granted
+# to distribute the revised code under the same terms as Perl itself.
+
+package File::Copy;
+
+use 5.035007;
+use strict;
+use warnings; no warnings 'newline';
+no warnings 'experimental::builtin';
+use builtin 'blessed';
+use overload;
+use File::Spec;
+use Config;
+# We want HiRes stat and utime if available
+BEGIN { eval q{ use Time::HiRes qw( stat utime ) } };
+our(@ISA, @EXPORT, @EXPORT_OK, $VERSION, $Too_Big, $Syscopy_is_copy);
+sub copy;
+sub syscopy;
+sub cp;
+sub mv;
+
+$VERSION = '2.39';
+
+require Exporter;
+@ISA = qw(Exporter);
+@EXPORT = qw(copy move);
+@EXPORT_OK = qw(cp mv);
+
+$Too_Big = 1024 * 1024 * 2;
+
+sub croak {
+    require Carp;
+    goto &Carp::croak;
+}
+
+sub carp {
+    require Carp;
+    goto &Carp::carp;
+}
+
+sub _catname {
+    my($from, $to) = @_;
+    if (not defined &basename) {
+        require File::Basename;
+        File::Basename->import( 'basename' );
+    }
+
+    return File::Spec->catfile($to, basename($from));

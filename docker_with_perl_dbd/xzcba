@@ -1,0 +1,1000 @@
+  @_ == 2 or croak 'usage: $pop3->delete($msgnum)';
+  my $me = shift;
+  return 0 unless $me->_DELE(@_);
+  ${*$me}{'net_pop3_deleted'} = 1;
+}
+
+
+sub uidl {
+  @_ == 1 || @_ == 2 or croak 'usage: $pop3->uidl([$msgnum])';
+  my $me = shift;
+  my $uidl;
+
+  $me->_UIDL(@_)
+    or return;
+  if (@_) {
+    $uidl = ($me->message =~ /\d+\s+([\041-\176]+)/)[0];
+  }
+  else {
+    my $ref = $me->read_until_dot
+      or return;
+    $uidl = {};
+    foreach my $ln (@$ref) {
+      my ($msg, $uid) = $ln =~ /^\s*(\d+)\s+([\041-\176]+)/;
+      $uidl->{$msg} = $uid;
+    }
+  }
+  return $uidl;
+}
+
+
+sub ping {
+  @_ == 2 or croak 'usage: $pop3->ping($user)';
+  my $me = shift;
+
+  return () unless $me->_PING(@_) && $me->message =~ /(\d+)\D+(\d+)/;
+
+  ($1 || 0, $2 || 0);
+}
+
+
+sub _lookup_credentials {
+  my ($me, $user) = @_;
+
+  require Net::Netrc;
+
+       $user ||= eval { local $SIG{__DIE__}; (getpwuid($>))[0] }
+    || $ENV{NAME}
+    || $ENV{USER}
+    || $ENV{LOGNAME};
+
+  my $m = Net::Netrc->lookup(${*$me}{'net_pop3_host'}, $user);
+  $m ||= Net::Netrc->lookup(${*$me}{'net_pop3_host'});
+
+  my $pass = $m
+    ? $m->password || ""
+    : "";
+
+  ($user, $pass);
+}
+
+
+sub _get_mailbox_count {
+  my ($me) = @_;
+  my $ret = ${*$me}{'net_pop3_count'} =
+    ($me->message =~ /(\d+)\s+message/io) ? $1 : ($me->popstat)[0];
+
+  $ret ? $ret : "0E0";
+}
+
+
+sub _STAT { shift->command('STAT'       )->response() == CMD_OK }
+sub _LIST { shift->command('LIST',    @_)->response() == CMD_OK }
+sub _RETR { shift->command('RETR', $_[0])->response() == CMD_OK }
+sub _DELE { shift->command('DELE', $_[0])->response() == CMD_OK }
+sub _NOOP { shift->command('NOOP'       )->response() == CMD_OK }
+sub _RSET { shift->command('RSET'       )->response() == CMD_OK }
+sub _QUIT { shift->command('QUIT'       )->response() == CMD_OK }
+sub _TOP  { shift->command( 'TOP',    @_)->response() == CMD_OK }
+sub _UIDL { shift->command('UIDL',    @_)->response() == CMD_OK }
+sub _USER { shift->command('USER', $_[0])->response() == CMD_OK }
+sub _PASS { shift->command('PASS', $_[0])->response() == CMD_OK }
+sub _APOP { shift->command('APOP',    @_)->response() == CMD_OK }
+sub _PING { shift->command('PING', $_[0])->response() == CMD_OK }
+sub _RPOP { shift->command('RPOP', $_[0])->response() == CMD_OK }
+sub _LAST { shift->command('LAST'       )->response() == CMD_OK }
+sub _CAPA { shift->command('CAPA'       )->response() == CMD_OK }
+sub _STLS { shift->command("STLS",     )->response() == CMD_OK }
+
+
+sub quit {
+  my $me = shift;
+
+  $me->_QUIT;
+  $me->close;
+}
+
+
+sub DESTROY {
+  my $me = shift;
+
+  if (defined fileno($me) and ${*$me}{'net_pop3_deleted'}) {
+    $me->reset;
+    $me->quit;
+  }
+}
+
+##
+## POP3 has weird responses, so we emulate them to look the same :-)
+##
+
+
+sub response {
+  my $cmd  = shift;
+  my $str  = $cmd->getline() or return;
+  my $code = "500";
+
+  $cmd->debug_print(0, $str)
+    if ($cmd->debug);
+
+  if ($str =~ s/^\+OK\s*//io) {
+    $code = "200";
+  }
+  elsif ($str =~ s/^\+\s*//io) {
+    $code = "300";
+  }
+  else {
+    $str =~ s/^-ERR\s*//io;
+  }
+
+  ${*$cmd}{'net_cmd_resp'} = [$str];
+  ${*$cmd}{'net_cmd_code'} = $code;
+
+  substr($code, 0, 1);
+}
+
+
+sub capa {
+  my $this = shift;
+  my ($capa, %capabilities);
+
+  # Fake a capability here
+  $capabilities{APOP} = '' if ($this->banner() =~ /<.*>/);
+
+  if ($this->_CAPA()) {
+    $capabilities{CAPA} = 1;
+    $capa = $this->read_until_dot();
+    %capabilities = (%capabilities, map {/^\s*(\S+)\s*(.*)/} @$capa);
+  }
+  else {
+
+    # Check AUTH for SASL capabilities
+    if ($this->command('AUTH')->response() == CMD_OK) {
+      my $mechanism = $this->read_until_dot();
+      $capabilities{SASL} = join " ", map {m/([A-Z0-9_-]+)/} @{$mechanism};
+    }
+  }
+
+  return ${*$this}{'net_pop3e_capabilities'} = \%capabilities;
+}
+
+
+sub capabilities {
+  my $this = shift;
+
+  ${*$this}{'net_pop3e_capabilities'} || $this->capa;
+}
+
+
+sub auth {
+  my ($self, $username, $password) = @_;
+
+  eval {
+    require MIME::Base64;
+    require Authen::SASL;
+  } or $self->set_status(500, ["Need MIME::Base64 and Authen::SASL todo auth"]), return 0;
+
+  my $capa       = $self->capa;
+  my $mechanisms = $capa->{SASL} || 'CRAM-MD5';
+
+  my $sasl;
+
+  if (ref($username) and UNIVERSAL::isa($username, 'Authen::SASL')) {
+    $sasl = $username;
+    my $user_mech = $sasl->mechanism || '';
+    my @user_mech = split(/\s+/, $user_mech);
+    my %user_mech;
+    @user_mech{@user_mech} = ();
+
+    my @server_mech = split(/\s+/, $mechanisms);
+    my @mech = @user_mech
+      ? grep { exists $user_mech{$_} } @server_mech
+      : @server_mech;
+    unless (@mech) {
+      $self->set_status(
+        500,
+        [ 'Client SASL mechanisms (',
+          join(', ', @user_mech),
+          ') do not match the SASL mechnism the server announces (',
+          join(', ', @server_mech), ')',
+        ]
+      );
+      return 0;
+    }
+
+    $sasl->mechanism(join(" ", @mech));
+  }
+  else {
+    die "auth(username, password)" if not length $username;
+    $sasl = Authen::SASL->new(
+      mechanism => $mechanisms,
+      callback  => {
+        user     => $username,
+        pass     => $password,
+        authname => $username,
+      }
+    );
+  }
+
+  # We should probably allow the user to pass the host, but I don't
+  # currently know and SASL mechanisms that are used by smtp that need it
+  my ($hostname) = split /:/, ${*$self}{'net_pop3_host'};
+  my $client = eval { $sasl->client_new('pop', $hostname, 0) };
+
+  unless ($client) {
+    my $mech = $sasl->mechanism;
+    $self->set_status(
+      500,
+      [ " Authen::SASL failure: $@",
+        '(please check if your local Authen::SASL installation',
+        "supports mechanism '$mech'"
+      ]
+    );
+    return 0;
+  }
+
+  my ($token) = $client->client_start
+    or do {
+    my $mech = $client->mechanism;
+    $self->set_status(
+      500,
+      [ ' Authen::SASL failure:  $client->client_start ',
+        "mechanism '$mech' hostname #$hostname#",
+        $client->error
+      ]
+    );
+    return 0;
+    };
+
+  # We don't support sasl mechanisms that encrypt the socket traffic.
+  # todo that we would really need to change the ISA hierarchy
+  # so we don't inherit from IO::Socket, but instead hold it in an attribute
+
+  my @cmd = ("AUTH", $client->mechanism);
+  my $code;
+
+  push @cmd, MIME::Base64::encode_base64($token, '')
+    if defined $token and length $token;
+
+  while (($code = $self->command(@cmd)->response()) == CMD_MORE) {
+
+    my ($token) = $client->client_step(MIME::Base64::decode_base64(($self->message)[0])) or do {
+      $self->set_status(
+        500,
+        [ ' Authen::SASL failure:  $client->client_step ',
+          "mechanism '", $client->mechanism, " hostname #$hostname#, ",
+          $client->error
+        ]
+      );
+      return 0;
+    };
+
+    @cmd = (MIME::Base64::encode_base64(defined $token ? $token : '', ''));
+  }
+
+  $code == CMD_OK;
+}
+
+
+sub banner {
+  my $this = shift;
+
+  return ${*$this}{'net_pop3_banner'};
+}
+
+{
+  package Net::POP3::_SSL;
+  our @ISA = ( $ssl_class ? ($ssl_class):(), 'Net::POP3' );
+  sub starttls { die "POP3 connection is already in SSL mode" }
+  sub start_SSL {
+    my ($class,$pop3,%arg) = @_;
+    delete @arg{ grep { !m{^SSL_} } keys %arg };
+    ( $arg{SSL_verifycn_name} ||= $pop3->host )
+        =~s{(?<!:):[\w()]+$}{}; # strip port
+    $arg{SSL_hostname} = $arg{SSL_verifycn_name}
+        if ! defined $arg{SSL_hostname} && $class->can_client_sni;
+    $arg{SSL_verifycn_scheme} ||= 'pop3';
+    my $ok = $class->SUPER::start_SSL($pop3,%arg);
+    $@ = $ssl_class->errstr if !$ok;
+    return $ok;
+  }
+}
+
+
+
+1;
+
+__END__
+
+=head1 NAME
+
+Net::POP3 - Post Office Protocol 3 Client class (RFC1939)
+
+=head1 SYNOPSIS
+
+    use Net::POP3;
+
+    # Constructors
+    $pop = Net::POP3->new('pop3host');
+    $pop = Net::POP3->new('pop3host', Timeout => 60);
+    $pop = Net::POP3->new('pop3host', SSL => 1, Timeout => 60);
+
+    if ($pop->login($username, $password) > 0) {
+      my $msgnums = $pop->list; # hashref of msgnum => size
+      foreach my $msgnum (keys %$msgnums) {
+        my $msg = $pop->get($msgnum);
+        print @$msg;
+        $pop->delete($msgnum);
+      }
+    }
+
+    $pop->quit;
+
+=head1 DESCRIPTION
+
+This module implements a client interface to the POP3 protocol, enabling
+a perl5 application to talk to POP3 servers. This documentation assumes
+that you are familiar with the POP3 protocol described in RFC1939.
+With L<IO::Socket::SSL> installed it also provides support for implicit and
+explicit TLS encryption, i.e. POP3S or POP3+STARTTLS.
+
+A new Net::POP3 object must be created with the I<new> method. Once
+this has been done, all POP3 commands are accessed via method calls
+on the object.
+
+The Net::POP3 class is a subclass of Net::Cmd and (depending on avaibility) of
+IO::Socket::IP, IO::Socket::INET6 or IO::Socket::INET.
+
+=head2 Class Methods
+
+=over 4
+
+=item C<new([$host][, %options])>
+
+This is the constructor for a new Net::POP3 object. C<$host> is the
+name of the remote host to which an POP3 connection is required.
+
+C<$host> is optional. If C<$host> is not given then it may instead be
+passed as the C<Host> option described below. If neither is given then
+the C<POP3_Hosts> specified in C<Net::Config> will be used.
+
+C<%options> are passed in a hash like fashion, using key and value pairs.
+Possible options are:
+
+B<Host> - POP3 host to connect to. It may be a single scalar, as defined for
+the C<PeerAddr> option in L<IO::Socket::INET>, or a reference to
+an array with hosts to try in turn. The L</host> method will return the value
+which was used to connect to the host.
+
+B<Port> - port to connect to.
+Default - 110 for plain POP3 and 995 for POP3s (direct SSL).
+
+B<SSL> - If the connection should be done from start with SSL, contrary to later
+upgrade with C<starttls>.
+You can use SSL arguments as documented in L<IO::Socket::SSL>, but it will
+usually use the right arguments already.
+
+B<LocalAddr> and B<LocalPort> - These parameters are passed directly
+to IO::Socket to allow binding the socket to a specific local address and port.
+For compatibility with older versions B<ResvPort> can be used instead of
+B<LocalPort>.
+
+B<Domain> - This parameter is passed directly to IO::Socket and makes it
+possible to enforce IPv4 connections even if L<IO::Socket::IP> is used as super
+class. Alternatively B<Family> can be used.
+
+B<Timeout> - Maximum time, in seconds, to wait for a response from the
+POP3 server (default: 120)
+
+B<Debug> - Enable debugging information
+
+=back
+
+=head2 Object Methods
+
+Unless otherwise stated all methods return either a I<true> or I<false>
+value, with I<true> meaning that the operation was a success. When a method
+states that it returns a value, failure will be returned as I<undef> or an
+empty list.
+
+C<Net::POP3> inherits from C<Net::Cmd> so methods defined in C<Net::Cmd> may
+be used to send commands to the remote POP3 server in addition to the methods
+documented here.
+
+=over 4
+
+=item C<host()>
+
+Returns the value used by the constructor, and passed to IO::Socket::INET,
+to connect to the host.
+
+=item C<auth($username, $password)>
+
+Attempt SASL authentication.
+
+=item C<user($user)>
+
+Send the USER command.
+
+=item C<pass($pass)>
+
+Send the PASS command. Returns the number of messages in the mailbox.
+
+=item C<login([$user[, $pass]])>
+
+Send both the USER and PASS commands. If C<$pass> is not given the
+C<Net::POP3> uses C<Net::Netrc> to lookup the password using the host
+and username. If the username is not specified then the current user name
+will be used.
+
+Returns the number of messages in the mailbox. However if there are no
+messages on the server the string C<"0E0"> will be returned. This is
+will give a true value in a boolean context, but zero in a numeric context.
+
+If there was an error authenticating the user then I<undef> will be returned.
+
+=item C<starttls(%sslargs)>
+
+Upgrade existing plain connection to SSL.
+You can use SSL arguments as documented in L<IO::Socket::SSL>, but it will
+usually use the right arguments already.
+
+=item C<apop([$user[, $pass]])>
+
+Authenticate with the server identifying as C<$user> with password C<$pass>.
+Similar to L</login>, but the password is not sent in clear text.
+
+To use this method you must have the Digest::MD5 or the MD5 module installed,
+otherwise this method will return I<undef>.
+
+=item C<banner()>
+
+Return the sever's connection banner
+
+=item C<capa()>
+
+Return a reference to a hash of the capabilities of the server.  APOP
+is added as a pseudo capability.  Note that I've been unable to
+find a list of the standard capability values, and some appear to
+be multi-word and some are not.  We make an attempt at intelligently
+parsing them, but it may not be correct.
+
+=item C<capabilities()>
+
+Just like capa, but only uses a cache from the last time we asked
+the server, so as to avoid asking more than once.
+
+=item C<top($msgnum[, $numlines])>
+
+Get the header and the first C<$numlines> of the body for the message
+C<$msgnum>. Returns a reference to an array which contains the lines of text
+read from the server.
+
+=item C<list([$msgnum])>
+
+If called with an argument the C<list> returns the size of the message
+in octets.
+
+If called without arguments a reference to a hash is returned. The
+keys will be the C<$msgnum>'s of all undeleted messages and the values will
+be their size in octets.
+
+=item C<get($msgnum[, $fh])>
+
+Get the message C<$msgnum> from the remote mailbox. If C<$fh> is not given
+then get returns a reference to an array which contains the lines of
+text read from the server. If C<$fh> is given then the lines returned
+from the server are printed to the filehandle C<$fh>.
+
+=item C<getfh($msgnum)>
+
+As per get(), but returns a tied filehandle.  Reading from this
+filehandle returns the requested message.  The filehandle will return
+EOF at the end of the message and should not be reused.
+
+=item C<last()>
+
+Returns the highest C<$msgnum> of all the messages accessed.
+
+=item C<popstat()>
+
+Returns a list of two elements. These are the number of undeleted
+elements and the size of the mbox in octets.
+
+=item C<ping($user)>
+
+Returns a list of two elements. These are the number of new messages
+and the total number of messages for C<$user>.
+
+=item C<uidl([$msgnum])>
+
+Returns a unique identifier for C<$msgnum> if given. If C<$msgnum> is not
+given C<uidl> returns a reference to a hash where the keys are the
+message numbers and the values are the unique identifiers.
+
+=item C<delete($msgnum)>
+
+Mark message C<$msgnum> to be deleted from the remote mailbox. All messages
+that are marked to be deleted will be removed from the remote mailbox
+when the server connection closed.
+
+=item C<reset()>
+
+Reset the status of the remote POP3 server. This includes resetting the
+status of all messages to not be deleted.
+
+=item C<quit()>
+
+Quit and close the connection to the remote POP3 server. Any messages marked
+as deleted will be deleted from the remote mailbox.
+
+=item C<can_inet6()>
+
+Returns whether we can use IPv6.
+
+=item C<can_ssl()>
+
+Returns whether we can use SSL.
+
+=back
+
+=head2 Notes
+
+If a C<Net::POP3> object goes out of scope before C<quit> method is called
+then the C<reset> method will called before the connection is closed. This
+means that any messages marked to be deleted will not be.
+
+=head1 EXPORTS
+
+I<None>.
+
+=head1 KNOWN BUGS
+
+See L<https://rt.cpan.org/Dist/Display.html?Status=Active&Queue=libnet>.
+
+=head1 SEE ALSO
+
+L<Net::Netrc>,
+L<Net::Cmd>,
+L<IO::Socket::SSL>.
+
+=head1 AUTHOR
+
+Graham Barr E<lt>L<gbarr@pobox.com|mailto:gbarr@pobox.com>E<gt>.
+
+Steve Hay E<lt>L<shay@cpan.org|mailto:shay@cpan.org>E<gt> is now maintaining
+libnet as of version 1.22_02.
+
+=head1 COPYRIGHT
+
+Copyright (C) 1995-2004 Graham Barr.  All rights reserved.
+
+Copyright (C) 2013-2016, 2020 Steve Hay.  All rights reserved.
+
+=head1 LICENCE
+
+This module is free software; you can redistribute it and/or modify it under the
+same terms as Perl itself, i.e. under the terms of either the GNU General Public
+License or the Artistic License, as specified in the F<LICENCE> file.
+
+=head1 VERSION
+
+Version 3.14
+
+=head1 DATE
+
+23 Dec 2020
+
+=head1 HISTORY
+
+See the F<Changes> file.
+
+=cut
+                                                                                                                                                                                                                                                                                                                                                                                                                                          usr/share/perl/5.36.0/Net/Ping.pm                                                                   0000644 0000000 0000000 00000244004 14530460112 014633  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        package Net::Ping;
+
+require 5.002;
+require Exporter;
+
+use strict;
+use vars qw(@ISA @EXPORT @EXPORT_OK $VERSION
+            $def_timeout $def_proto $def_factor $def_family
+            $max_datasize $pingstring $hires $source_verify $syn_forking);
+use Fcntl qw( F_GETFL F_SETFL O_NONBLOCK );
+use Socket 2.007;
+use Socket qw( SOCK_DGRAM SOCK_STREAM SOCK_RAW AF_INET PF_INET IPPROTO_TCP
+	       SOL_SOCKET SO_ERROR SO_BROADCAST
+               IPPROTO_IP IP_TOS IP_TTL
+               inet_ntoa inet_aton getnameinfo sockaddr_in );
+use POSIX qw( ENOTCONN ECONNREFUSED ECONNRESET EINPROGRESS EWOULDBLOCK EAGAIN
+	      WNOHANG );
+use FileHandle;
+use Carp;
+use Time::HiRes;
+
+@ISA = qw(Exporter);
+@EXPORT = qw(pingecho);
+@EXPORT_OK = qw(wakeonlan);
+$VERSION = "2.74";
+
+# Globals
+
+$def_timeout = 5;           # Default timeout to wait for a reply
+$def_proto = "tcp";         # Default protocol to use for pinging
+$def_factor = 1.2;          # Default exponential backoff rate.
+$def_family = AF_INET;      # Default family.
+$max_datasize = 65535;      # Maximum data bytes. recommended: 1472 (Ethernet MTU: 1500)
+# The data we exchange with the server for the stream protocol
+$pingstring = "pingschwingping!\n";
+$source_verify = 1;         # Default is to verify source endpoint
+$syn_forking = 0;
+
+# Constants
+
+my $AF_INET6  = eval { Socket::AF_INET6() } || 30;
+my $AF_UNSPEC = eval { Socket::AF_UNSPEC() };
+my $AI_NUMERICHOST = eval { Socket::AI_NUMERICHOST() } || 4;
+my $NI_NUMERICHOST = eval { Socket::NI_NUMERICHOST() } || 2;
+my $IPPROTO_IPV6   = eval { Socket::IPPROTO_IPV6() }   || 41;
+my $NIx_NOSERV = eval { Socket::NIx_NOSERV() } || 2;
+#my $IPV6_HOPLIMIT  = eval { Socket::IPV6_HOPLIMIT() };  # ping6 -h 0-255
+my $qr_family = qr/^(?:(?:(:?ip)?v?(?:4|6))|${\AF_INET}|$AF_INET6)$/;
+my $qr_family4 = qr/^(?:(?:(:?ip)?v?4)|${\AF_INET})$/;
+my $Socket_VERSION = eval $Socket::VERSION;
+
+if ($^O =~ /Win32/i) {
+  # Hack to avoid this Win32 spewage:
+  # Your vendor has not defined POSIX macro ECONNREFUSED
+  my @pairs = (ECONNREFUSED => 10061, # "Unknown Error" Special Win32 Response?
+	       ENOTCONN     => 10057,
+	       ECONNRESET   => 10054,
+	       EINPROGRESS  => 10036,
+	       EWOULDBLOCK  => 10035,
+	  );
+  while (my $name = shift @pairs) {
+    my $value = shift @pairs;
+    # When defined, these all are non-zero
+    unless (eval $name) {
+      no strict 'refs';
+      *{$name} = defined prototype \&{$name} ? sub () {$value} : sub {$value};
+    }
+  }
+#  $syn_forking = 1;    # XXX possibly useful in < Win2K ?
+};
+
+# Description:  The pingecho() subroutine is provided for backward
+# compatibility with the original Net::Ping.  It accepts a host
+# name/IP and an optional timeout in seconds.  Create a tcp ping
+# object and try pinging the host.  The result of the ping is returned.
+
+sub pingecho
+{
+  my ($host,              # Name or IP number of host to ping
+      $timeout            # Optional timeout in seconds
+      ) = @_;
+  my ($p);                # A ping object
+
+  $p = Net::Ping->new("tcp", $timeout);
+  $p->ping($host);        # Going out of scope closes the connection
+}
+
+# Description:  The new() method creates a new ping object.  Optional
+# parameters may be specified for the protocol to use, the timeout in
+# seconds and the size in bytes of additional data which should be
+# included in the packet.
+#   After the optional parameters are checked, the data is constructed
+# and a socket is opened if appropriate.  The object is returned.
+
+sub new
+{
+  my ($this,
+      $proto,             # Optional protocol to use for pinging
+      $timeout,           # Optional timeout in seconds
+      $data_size,         # Optional additional bytes of data
+      $device,            # Optional device to use
+      $tos,               # Optional ToS to set
+      $ttl,               # Optional TTL to set
+      $family,            # Optional address family (AF_INET)
+      ) = @_;
+  my  $class = ref($this) || $this;
+  my  $self = {};
+  my ($cnt,               # Count through data bytes
+      $min_datasize       # Minimum data bytes required
+      );
+
+  bless($self, $class);
+  if (ref $proto eq 'HASH') { # support named args
+    for my $k (qw(proto timeout data_size device tos ttl family
+                  gateway host port bind retrans pingstring source_verify
+                  econnrefused dontfrag
+                  IPV6_USE_MIN_MTU IPV6_RECVPATHMTU IPV6_HOPLIMIT))
+    {
+      if (exists $proto->{$k}) {
+        $self->{$k} = $proto->{$k};
+        # some are still globals
+        if ($k eq 'pingstring') { $pingstring = $proto->{$k} }
+        if ($k eq 'source_verify') { $source_verify = $proto->{$k} }
+        # and some are local
+        $timeout = $proto->{$k}   if ($k eq 'timeout');
+        $data_size = $proto->{$k} if ($k eq 'data_size');
+        $device = $proto->{$k}    if ($k eq 'device');
+        $tos = $proto->{$k}       if ($k eq 'tos');
+        $ttl = $proto->{$k}       if ($k eq 'ttl');
+        $family = $proto->{$k}    if ($k eq 'family');
+        delete $proto->{$k};
+      }
+    }
+    if (%$proto) {
+      croak("Invalid named argument: ",join(" ",keys (%$proto)));
+    }
+    $proto = $self->{'proto'};
+  }
+
+  $proto = $def_proto unless $proto;          # Determine the protocol
+  croak('Protocol for ping must be "icmp", "icmpv6", "udp", "tcp", "syn", "stream" or "external"')
+    unless $proto =~ m/^(icmp|icmpv6|udp|tcp|syn|stream|external)$/;
+  $self->{proto} = $proto;
+
+  $timeout = $def_timeout unless defined $timeout;    # Determine the timeout
+  croak("Default timeout for ping must be greater than 0 seconds")
+    if $timeout <= 0;
+  $self->{timeout} = $timeout;
+
+  $self->{device} = $device;
+
+  $self->{tos} = $tos;
+
+  if ($self->{'host'}) {
+    my $host = $self->{'host'};
+    my $ip = $self->_resolv($host) or
+      carp("could not resolve host $host");
+    $self->{host} = $ip;
+    $self->{family} = $ip->{family};
+  }
+
+  if ($self->{bind}) {
+    my $addr = $self->{bind};
+    my $ip = $self->_resolv($addr)
+      or carp("could not resolve local addr $addr");
+    $self->{local_addr} = $ip;
+  } else {
+    $self->{local_addr} = undef;              # Don't bind by default
+  }
+
+  if ($self->{proto} eq 'icmp') {
+    croak('TTL must be from 0 to 255')
+      if ($ttl && ($ttl < 0 || $ttl > 255));
+    $self->{ttl} = $ttl;
+  }
+
+  if ($family) {
+    if ($family =~ $qr_family) {
+      if ($family =~ $qr_family4) {
+        $self->{family} = AF_INET;
+      } else {
+        $self->{family} = $AF_INET6;
+      }
+    } else {
+      croak('Family must be "ipv4" or "ipv6"')
+    }
+  } else {
+    if ($self->{proto} eq 'icmpv6') {
+      $self->{family} = $AF_INET6;
+    } else {
+      $self->{family} = $def_family;
+    }
+  }
+
+  $min_datasize = ($proto eq "udp") ? 1 : 0;  # Determine data size
+  $data_size = $min_datasize unless defined($data_size) && $proto ne "tcp";
+  # allow for fragmented packets if data_size>1472 (MTU 1500)
+  croak("Data for ping must be from $min_datasize to $max_datasize bytes")
+    if ($data_size < $min_datasize) || ($data_size > $max_datasize);
+  $data_size-- if $self->{proto} eq "udp";  # We provide the first byte
+  $self->{data_size} = $data_size;
+
+  $self->{data} = "";                       # Construct data bytes
+  for ($cnt = 0; $cnt < $self->{data_size}; $cnt++)
+  {
+    $self->{data} .= chr($cnt % 256);
+  }
+
+  # Default exponential backoff rate
+  $self->{retrans} = $def_factor unless exists $self->{retrans};
+  # Default Connection refused behavior
+  $self->{econnrefused} = undef unless exists $self->{econnrefused};
+
+  $self->{seq} = 0;                         # For counting packets
+  if ($self->{proto} eq "udp")              # Open a socket
+  {
+    $self->{proto_num} = eval { (getprotobyname('udp'))[2] } ||
+      croak("Can't udp protocol by name");
+    $self->{port_num} = $self->{port}
+      || (getservbyname('echo', 'udp'))[2]
+      || croak("Can't get udp echo port by name");
+    $self->{fh} = FileHandle->new();
+    socket($self->{fh}, PF_INET, SOCK_DGRAM,
+           $self->{proto_num}) ||
+             croak("udp socket error - $!");
+    $self->_setopts();
+  }
+  elsif ($self->{proto} eq "icmp")
+  {
+    croak("icmp ping requires root privilege") if !_isroot();
+    $self->{proto_num} = eval { (getprotobyname('icmp'))[2] } ||
+      croak("Can't get icmp protocol by name");
+    $self->{pid} = $$ & 0xffff;           # Save lower 16 bits of pid
+    $self->{fh} = FileHandle->new();
+    socket($self->{fh}, PF_INET, SOCK_RAW, $self->{proto_num}) ||
+      croak("icmp socket error - $!");
+    $self->_setopts();
+    if ($self->{'ttl'}) {
+      setsockopt($self->{fh}, IPPROTO_IP, IP_TTL, pack("I*", $self->{'ttl'}))
+        or croak "error configuring ttl to $self->{'ttl'} $!";
+    }
+  }
+  elsif ($self->{proto} eq "icmpv6")
+  {
+    #croak("icmpv6 ping requires root privilege") if !_isroot();
+    croak("Wrong family $self->{family} for icmpv6 protocol")
+      if $self->{family} and $self->{family} != $AF_INET6;
+    $self->{family} = $AF_INET6;
+    $self->{proto_num} = eval { (getprotobyname('ipv6-icmp'))[2] } ||
+      croak("Can't get ipv6-icmp protocol by name"); # 58
+    $self->{pid} = $$ & 0xffff;           # Save lower 16 bits of pid
+    $self->{fh} = FileHandle->new();
+    socket($self->{fh}, $AF_INET6, SOCK_RAW, $self->{proto_num}) ||
+      croak("icmp socket error - $!");
+    $self->_setopts();
+    if ($self->{'gateway'}) {
+      my $g = $self->{gateway};
+      my $ip = $self->_resolv($g)
+        or croak("nonexistent gateway $g");
+      $self->{family} eq $AF_INET6
+        or croak("gateway requires the AF_INET6 family");
+      $ip->{family} eq $AF_INET6
+        or croak("gateway address needs to be IPv6");
+      my $IPV6_NEXTHOP = eval { Socket::IPV6_NEXTHOP() } || 48; # IPV6_3542NEXTHOP, or 21
+      setsockopt($self->{fh}, $IPPROTO_IPV6, $IPV6_NEXTHOP, _pack_sockaddr_in($ip))
+        or croak "error configuring gateway to $g NEXTHOP $!";
+    }
+    if (exists $self->{IPV6_USE_MIN_MTU}) {
+      my $IPV6_USE_MIN_MTU = eval { Socket::IPV6_USE_MIN_MTU() } || 42;
+      setsockopt($self->{fh}, $IPPROTO_IPV6, $IPV6_USE_MIN_MTU,
+                 pack("I*", $self->{'IPV6_USE_MIN_MT'}))
+        or croak "error configuring IPV6_USE_MIN_MT} $!";
+    }
+    if (exists $self->{IPV6_RECVPATHMTU}) {
+      my $IPV6_RECVPATHMTU = eval { Socket::IPV6_RECVPATHMTU() } || 43;
+      setsockopt($self->{fh}, $IPPROTO_IPV6, $IPV6_RECVPATHMTU,
+                 pack("I*", $self->{'RECVPATHMTU'}))
+        or croak "error configuring IPV6_RECVPATHMTU $!";
+    }
+    if ($self->{'tos'}) {
+      my $proto = $self->{family} == AF_INET ? IPPROTO_IP : $IPPROTO_IPV6;
+      setsockopt($self->{fh}, $proto, IP_TOS, pack("I*", $self->{'tos'}))
+        or croak "error configuring tos to $self->{'tos'} $!";
+    }
+    if ($self->{'ttl'}) {
+      my $proto = $self->{family} == AF_INET ? IPPROTO_IP : $IPPROTO_IPV6;
+      setsockopt($self->{fh}, $proto, IP_TTL, pack("I*", $self->{'ttl'}))
+        or croak "error configuring ttl to $self->{'ttl'} $!";
+    }
+  }
+  elsif ($self->{proto} eq "tcp" || $self->{proto} eq "stream")
+  {
+    $self->{proto_num} = eval { (getprotobyname('tcp'))[2] } ||
+      croak("Can't get tcp protocol by name");
+    $self->{port_num} = $self->{port}
+      || (getservbyname('echo', 'tcp'))[2]
+      ||  croak("Can't get tcp echo port by name");
+    $self->{fh} = FileHandle->new();
+  }
+  elsif ($self->{proto} eq "syn")
+  {
+    $self->{proto_num} = eval { (getprotobyname('tcp'))[2] } ||
+      croak("Can't get tcp protocol by name");
+    $self->{port_num} = (getservbyname('echo', 'tcp'))[2] ||
+      croak("Can't get tcp echo port by name");
+    if ($syn_forking) {
+      $self->{fork_rd} = FileHandle->new();
+      $self->{fork_wr} = FileHandle->new();
+      pipe($self->{fork_rd}, $self->{fork_wr});
+      $self->{fh} = FileHandle->new();
+      $self->{good} = {};
+      $self->{bad} = {};
+    } else {
+      $self->{wbits} = "";
+      $self->{bad} = {};
+    }
+    $self->{syn} = {};
+    $self->{stop_time} = 0;
+  }
+
+  return($self);
+}
+
+# Description: Set the local IP address from which pings will be sent.
+# For ICMP, UDP and TCP pings, just saves the address to be used when 
+# the socket is opened.  Returns non-zero if successful; croaks on error.
+sub bind
+{
+  my ($self,
+      $local_addr         # Name or IP number of local interface
+      ) = @_;
+  my ($ip,                # Hash of addr (string), addr_in (packed), family
+      $h		  # resolved hash
+      );
+
+  croak("Usage: \$p->bind(\$local_addr)") unless @_ == 2;
+  croak("already bound") if defined($self->{local_addr}) &&
+    ($self->{proto} eq "udp" || $self->{proto} eq "icmp");
+
+  $ip = $self->_resolv($local_addr);
+  carp("nonexistent local address $local_addr") unless defined($ip);
+  $self->{local_addr} = $ip;
+
+  if (($self->{proto} ne "udp") && 
+      ($self->{proto} ne "icmp") && 
+      ($self->{proto} ne "tcp") && 
+      ($self->{proto} ne "syn"))
+  {
+    croak("Unknown protocol \"$self->{proto}\" in bind()");
+  }
+
+  return 1;
+}
+
+# Description: A select() wrapper that compensates for platform
+# peculiarities.
+sub mselect
+{
+    if ($_[3] > 0 and $^O eq 'MSWin32') {
+	# On windows, select() doesn't process the message loop,
+	# but sleep() will, allowing alarm() to interrupt the latter.
+	# So we chop up the timeout into smaller pieces and interleave
+	# select() and sleep() calls.
+	my $t = $_[3];
+	my $gran = 0.5;  # polling granularity in seconds
+	my @args = @_;
+	while (1) {
+	    $gran = $t if $gran > $t;
+	    my $nfound = select($_[0], $_[1], $_[2], $gran);
+	    undef $nfound if $nfound == -1;
+	    $t -= $gran;
+	    return $nfound if $nfound or !defined($nfound) or $t <= 0;
+
+	    sleep(0);
+	    ($_[0], $_[1], $_[2]) = @args;
+	}
+    }
+    else {
+	my $nfound = select($_[0], $_[1], $_[2], $_[3]);
+	undef $nfound if $nfound == -1;
+	return $nfound;
+    }
+}
+
+# Description: Allow UDP source endpoint comparison to be
+#              skipped for those remote interfaces that do
+#              not response from the same endpoint.
+
+sub source_verify
+{
+  my $self = shift;
+  $source_verify = 1 unless defined
+    ($source_verify = ((defined $self) && (ref $self)) ? shift() : $self);
+}
+
+# Description: Set whether or not the connect
+# behavior should enforce remote service
+# availability as well as reachability.
+
+sub service_check
+{
+  my $self = shift;
+  $self->{econnrefused} = 1 unless defined
+    ($self->{econnrefused} = shift());
+}
+
+sub tcp_service_check
+{

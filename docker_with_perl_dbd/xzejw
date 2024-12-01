@@ -1,0 +1,1000 @@
+# insert might return 'mas' which means the caller said the test
+# required Multiple Active Statements and the driver appeared to not
+# support MAS.
+#
+# ref is a hash ref:
+#   error (0|1) whether we expect an error
+#   raise (0|1) means set RaiseError to this
+#   commit (0|1) do the inserts in a txn
+#   tuple arrayref of what we expect in the tuple status
+#      e.g., [1,1,1,1,[]]
+#      where the empty [] signifies we expect an error for this row
+#      where 1 signifies we the expect row count for this row
+#   affected - the total number of rows affected for insert/update
+#
+sub insert
+{
+    my ($self, $dbh, $sth, $ref) = @_;
+
+    die "need hashref arg" if (!$ref || (ref($ref) ne 'HASH'));
+    note("insert " . join(", ", map {"$_ = ". DBI::neat($ref->{$_})} keys %$ref ));
+    # DBD::Oracle supports MAS don't compensate for it not
+    if ($ref->{requires_mas} && $dbh->{Driver}->{Name} eq 'Oracle') {
+        delete $ref->{requires_mas};
+    }
+    @captured_error = ();
+
+    if ($ref->{raise}) {
+        $sth->{RaiseError} = 1;
+    } else {
+        $sth->{RaiseError} = 0;
+    }
+
+    my (@tuple_status, $sts, $total_affected);
+    my $tuple_status_arg = {};
+    $tuple_status_arg->{ArrayTupleStatus} = \@tuple_status unless $ref->{notuplestatus};
+
+    $sts = 999999;              # to ensure it is overwritten
+    $total_affected = 999998;
+    if ($ref->{array_context}) {
+        eval {
+            if ($ref->{params}) {
+                ($sts, $total_affected) =
+                    $sth->execute_array($tuple_status_arg,
+                                        @{$ref->{params}});
+            } elsif ($ref->{fetch}) {
+                ($sts, $total_affected) =
+                    $sth->execute_array(
+                        {%{$tuple_status_arg},
+                         ArrayTupleFetch => $ref->{fetch}});
+            } else {
+                ($sts, $total_affected) =
+                    $sth->execute_array($tuple_status_arg);
+            }
+        };
+    } else {
+        eval {
+            if ($ref->{params}) {
+                $sts =
+                    $sth->execute_array($tuple_status_arg,
+                                        @{$ref->{params}});
+            } else {
+                $sts =
+                    $sth->execute_array($tuple_status_arg);
+            }
+        };
+    }
+    if ($ref->{error} && $ref->{raise}) {
+        ok($@, 'error in execute_array eval');
+    } else {
+        if ($ref->{requires_mas} && $@) {
+            diag("\nThis test died with $@");
+            diag("It requires multiple active statement support in the driver and I cannot easily determine if your driver supports MAS. Ignoring the rest of this test.");
+            foreach (@tuple_status) {
+                if (ref($_)) {
+                    diag(join(",", @$_));
+                }
+            }
+            return 'mas';
+        }
+        ok(!$@, 'no error in execute_array eval') or note($@);
+    }
+    $dbh->commit if $ref->{commit};
+
+    if (!$ref->{raise} || ($ref->{error} == 0)) {
+        if (exists($ref->{sts})) {
+            is($sts, $ref->{sts},
+               "execute_array returned " . DBI::neat($sts) . " rows executed");
+        }
+        if (exists($ref->{affected}) && $ref->{array_context}) {
+            is($total_affected, $ref->{affected},
+               "total affected " . DBI::neat($total_affected))
+        }
+    }
+    if ($ref->{raise}) {
+        if ($ref->{error}) {
+            ok(scalar(@captured_error) > 0, "error captured");
+        } else {
+            is(scalar(@captured_error), 0, "no error captured");
+        }
+    }
+    if ($ref->{sts}) {
+        is(scalar(@tuple_status), (($ref->{sts} eq '0E0') ? 0 : $ref->{sts}),
+           "$ref->{sts} rows in tuple_status");
+    }
+    if ($ref->{tuple} && !exists($ref->{notuplestatus})) {
+        $self->check_tuple_status(\@tuple_status, $ref->{tuple});
+    }
+    return;
+}
+# simple test on ensure execute_array with no errors:
+# o checks returned status and affected is correct
+# o checks ArrayTupleStatus is correct
+# o checks no error is raised
+# o checks rows are inserted
+# o run twice with AutoCommit on/off
+# o checks if less values are specified for one parameter the right number
+#   of rows are still inserted and NULLs are placed in the missing rows
+# checks binding via bind_param_array and adding params to execute_array
+# checks binding no parameters at all
+sub simple
+{
+    my ($self, $dbh, $ref) = @_;
+
+    note('simple tests ' . join(", ", map {"$_ = $ref->{$_}"} keys %$ref ));
+
+    note("  all param arrays the same size");
+    foreach my $commit (1,0) {
+        note("    Autocommit: $commit");
+        clear_table($dbh, $table);
+        $dbh->begin_work if !$commit;
+
+        my $sth = $dbh->prepare(qq/insert into $table values(?,?)/);
+        $sth->bind_param_array(1, \@p1);
+        $sth->bind_param_array(2, \@p2);
+        $self->insert($dbh, $sth,
+                      { commit => !$commit, error => 0, sts => 5, affected => 5,
+                        tuple => [1, 1, 1, 1, 1], %$ref});
+        check_data($dbh, \@p1, \@p2);
+    }
+
+    note "  Not all param arrays the same size";
+    clear_table($dbh, $table);
+    my $sth = $dbh->prepare(qq/insert into $table values(?,?)/);
+
+    $sth->bind_param_array(1, \@p1);
+    $sth->bind_param_array(2, [qw(one)]);
+    $self->insert($dbh, $sth, {commit => 0, error => 0,
+                               raise => 1, sts => 5, affected => 5,
+                               tuple => [1, 1, 1, 1, 1], %$ref});
+    check_data($dbh, \@p1, ['one', undef, undef, undef, undef]);
+
+    note "  Not all param arrays the same size with bind on execute_array";
+    clear_table($dbh, $table);
+    $sth = $dbh->prepare(qq/insert into $table values(?,?)/);
+
+    $self->insert($dbh, $sth, {commit => 0, error => 0,
+                               raise => 1, sts => 5, affected => 5,
+                               tuple => [1, 1, 1, 1, 1], %$ref,
+                               params => [\@p1, [qw(one)]]});
+    check_data($dbh, \@p1, ['one', undef, undef, undef, undef]);
+
+    note "  no parameters";
+    clear_table($dbh, $table);
+    $sth = $dbh->prepare(qq/insert into $table values(?,?)/);
+
+    $self->insert($dbh, $sth, {commit => 0, error => 0,
+                               raise => 1, sts => '0E0', affected => 0,
+                               tuple => [], %$ref,
+                               params => [[], []]});
+    check_data($dbh, \@p1, ['one', undef, undef, undef, undef]);
+}
+
+# error test to ensure correct behavior for execute_array when it errors:
+# o execute_array of 5 inserts with last one failing
+#  o check it raises an error
+#  o check caught error is passed on from handler for eval
+#  o check returned status and affected rows
+#  o check ArrayTupleStatus
+#  o check valid inserts are inserted
+#  o execute_array of 5 inserts with 2nd last one failing
+#  o check it raises an error
+#  o check caught error is passed on from handler for eval
+#  o check returned status and affected rows
+#  o check ArrayTupleStatus
+#  o check valid inserts are inserted
+sub error
+{
+    my ($self, $dbh, $ref) = @_;
+
+    die "need hashref arg" if (!$ref || (ref($ref) ne 'HASH'));
+
+    note('error tests ' . join(", ", map {"$_ = $ref->{$_}"} keys %$ref ));
+    {
+        note("Last row in error");
+
+        clear_table($dbh, $table);
+        my $sth = $dbh->prepare(qq/insert into $table values(?,?)/);
+        my @pe1 = @p1;
+        $pe1[-1] = 1;
+        $sth->bind_param_array(1, \@pe1);
+        $sth->bind_param_array(2, \@p2);
+        $self->insert($dbh, $sth, {commit => 0, error => 1, sts => undef,
+                                   affected => undef, tuple => [1, 1, 1, 1, []],
+                                   %$ref});
+        check_data($dbh, [@pe1[0..4]], [@p2[0..4]]);
+    }
+
+    {
+        note("2nd last row in error");
+        clear_table($dbh, $table);
+        my $sth = $dbh->prepare(qq/insert into $table values(?,?)/);
+        my @pe1 = @p1;
+        $pe1[-2] = 1;
+        $sth->bind_param_array(1, \@pe1);
+        $sth->bind_param_array(2, \@p2);
+        $self->insert($dbh, $sth, {commit => 0, error => 1, sts => undef,
+                                   affected => undef, tuple => [1, 1, 1, [], 1], %$ref});
+        check_data($dbh, [@pe1[0..2],$pe1[4]], [@p2[0..2], $p2[4]]);
+    }
+}
+
+sub fetch_sub
+{
+    note("fetch_sub $fetch_row");
+    if ($fetch_row == @p1) {
+        note('returning undef');
+        $fetch_row = 0;
+        return;
+    }
+
+    return [$p1[$fetch_row], $p2[$fetch_row++]];
+}
+
+# test insertion via execute_array and ArrayTupleFetch
+sub row_wise
+{
+    my ($self, $dbh, $ref) = @_;
+
+    note("row_size via execute_for_fetch");
+
+    # Populate the first table via a ArrayTupleFetch which points to a sub
+    # returning rows
+    $fetch_row = 0;             # reset fetch_sub to start with first row
+    clear_table($dbh, $table);
+    my $sth = $dbh->prepare(qq/insert into $table values(?,?)/);
+    $self->insert($dbh, $sth,
+                  {commit => 0, error => 0, sts => 5, affected => 5,
+                   tuple => [1, 1, 1, 1, 1], %$ref,
+                   fetch => \&fetch_sub});
+
+    # NOTE: The following test requires Multiple Active Statements. Although
+    # I can find ODBC drivers which do this it is not easy (if at all possible)
+    # to know if an ODBC driver can handle MAS or not. If it errors the
+    # driver probably does not have MAS so the error is ignored and a
+    # diagnostic is output. Exceptions are DBD::Oracle which definitely does
+    # support MAS.
+    # The data pushed into the first table is retrieved via ArrayTupleFetch
+    # from the second table by passing an executed select statement handle into
+    # execute_array.
+    note("row_size via select");
+    clear_table($dbh, $table);
+    $sth = $dbh->prepare(qq/insert into $table values(?,?)/);
+    my $sth2 = $dbh->prepare(qq/select * from $table2/);
+    # some drivers issue warnings when mas fails and this causes
+    # Test::NoWarnings to output something when we already found
+    # the test failed and captured it.
+    # e.g., some ODBC drivers cannot do MAS and this test is then expected to
+    # fail but we ignore the failure. Unfortunately in failing DBD::ODBC will
+    # issue a warning in addition to the fail
+    $sth->{Warn} = 0;
+    $sth->{Warn} = 0;
+    ok($sth2->execute, 'execute on second table') or diag($sth2->errstr);
+    ok($sth2->{Executed}, 'second statement is in executed state');
+    my $res = $self->insert($dbh, $sth,
+           {commit => 0, error => 0, sts => 5, affected => 5,
+            tuple => [1, 1, 1, 1, 1], %$ref,
+            fetch => $sth2, requires_mas => 1});
+    return if $res && $res eq 'mas'; # aborted , does not seem to support MAS
+    check_data($dbh, \@p1, \@p2);
+}
+
+# test updates
+# updates are special as you can update more rows than there are parameter rows
+sub update
+{
+    my ($self, $dbh, $ref) = @_;
+
+    note("update test");
+
+    # populate the first table with the default 5 rows using a ArrayTupleFetch
+    $fetch_row = 0;
+    clear_table($dbh, $table);
+    my $sth = $dbh->prepare(qq/insert into $table values(?,?)/);
+    $self->insert($dbh, $sth,
+                  {commit => 0, error => 0, sts => 5, affected => 5,
+                   tuple => [1, 1, 1, 1, 1], %$ref,
+                   fetch => \&fetch_sub});
+    check_data($dbh, \@p1, \@p2);
+
+    # update all rows b column to 'fred' checking rows affected is 5
+    $sth = $dbh->prepare(qq/update $table set b = ? where a = ?/);
+    # NOTE, this also checks you can pass a scalar to bind_param_array
+    $sth->bind_param_array(1, 'fred');
+    $sth->bind_param_array(2, \@p1);
+    $self->insert($dbh, $sth,
+                  {commit => 0, error => 0, sts => 5, affected => 5,
+                   tuple => [1, 1, 1, 1, 1], %$ref});
+    check_data($dbh, \@p1, [qw(fred fred fred fred fred)]);
+
+    # update 4 rows column b to 'dave' checking rows affected is 4
+    $sth = $dbh->prepare(qq/update $table set b = ? where a = ?/);
+    # NOTE, this also checks you can pass a scalar to bind_param_array
+    $sth->bind_param_array(1, 'dave');
+    my @pe1 = @p1;
+    $pe1[-1] = 10;              # non-existent row
+    $sth->bind_param_array(2, \@pe1);
+    $self->insert($dbh, $sth,
+                  {commit => 0, error => 0, sts => 5, affected => 4,
+                   tuple => [1, 1, 1, 1, '0E0'], %$ref});
+    check_data($dbh, \@p1, [qw(dave dave dave dave fred)]);
+
+    # now change all rows b column to 'pete' - this will change all 5
+    # rows even though we have 2 rows of parameters so we can see if
+    # the rows affected is > parameter rows
+    $sth = $dbh->prepare(qq/update $table set b = ? where b like ?/);
+    # NOTE, this also checks you can pass a scalar to bind_param_array
+    $sth->bind_param_array(1, 'pete');
+    $sth->bind_param_array(2, ['dave%', 'fred%']);
+    $self->insert($dbh, $sth,
+                  {commit => 0, error => 0, sts => 2, affected => 5,
+                   tuple => [4, 1], %$ref});
+    check_data($dbh, \@p1, [qw(pete pete pete pete pete)]);
+}
+
+sub enable_mars {
+    my $dbh = shift;
+
+    # this test uses multiple active statements
+    # if we recognise the driver and it supports MAS enable it
+    my $driver_name = $dbh->get_info(6) || '';
+    if (($driver_name eq 'libessqlsrv.so') ||
+            ($driver_name =~ /libsqlncli/)) {
+        my $dsn = $ENV{DBI_DSN};
+        if ($dsn !~ /^dbi:ODBC:DSN=/ && $dsn !~ /DRIVER=/i) {
+            my @a = split(q/:/, $ENV{DBI_DSN});
+            $dsn = join(q/:/, @a[0..($#a - 1)]) . ":DSN=" . $a[-1];
+        }
+        $dsn .= ";MARS_Connection=yes";
+        $dbh->disconnect;
+        $dbh = DBI->connect($dsn, $ENV{DBI_USER}, $ENV{DBI_PASS});
+    }
+    return $dbh;
+}
+
+1;
+                                                                                                                                                                          root/.cpan/build/DBD-Oracle-1.90-2/t/rt13865.t                                                      0000644 0001750 0001750 00000006203 14616324562 016375  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        #!perl
+
+use strict;
+use warnings;
+
+use lib 't/lib';
+use DBDOracleTestLib qw/ db_handle table drop_table force_drop_table /;
+
+use DBI;
+use DBD::Oracle;
+
+use Test::More;
+
+my $dbh = db_handle()
+  or plan skip_all => q|Can't connect to database|;
+
+my %priv = map { $_ => 1 } get_privs($dbh);
+
+unless ( $priv{'CREATE TABLE'} ) {
+    plan skip_all => q{requires permissions 'CREATE TABLE'};
+}
+
+my $table = table('rt13865__drop_me');
+force_drop_table($dbh, $table);
+
+my $create_sql = <<"END_SQL";
+CREATE TABLE $table(
+    COL_INTEGER INTEGER,
+    COL_NUMBER NUMBER,
+    COL_NUMBER_37 NUMBER(37),
+    COL_DECIMAL NUMBER(9,2),
+    COL_FLOAT FLOAT(126),
+    COL_VC2   VARCHAR2(67),
+    COL_VC2_69CHAR  VARCHAR2(69 CHAR),
+    COL_NVC2  NVARCHAR2(69),
+    COL_NC    NCHAR(69),
+    COL_CHAR  CHAR(67),
+    COL_CHAR_69CHAR  CHAR(69 CHAR)
+)
+END_SQL
+
+my @tests = (
+    {
+        col  => 'COL_INTEGER',
+        size => 38,
+        cmp  => '==',
+        name => 'INTEGER is alias for NUMBER(38)'
+    },
+    {
+        col  => 'COL_NUMBER_37',
+        size => 37,
+        cmp  => '==',
+        name => 'NUMBER(37)'
+    },
+    {
+        col  => 'COL_NUMBER',
+        size => 0,
+        cmp  => '>',
+        name => 'NUMBER'
+    },
+    {
+        col  => 'COL_VC2',
+        size => 67,
+        cmp  => '==',
+        name => 'VARCHAR2(67)'
+    },
+    {
+        col  => 'COL_VC2_69CHAR',
+        size => 69,
+        cmp  => '==',
+        name => 'VARCHAR2(69)'
+    },
+    {
+        col  => 'COL_NVC2',
+        size => 69,
+        cmp  => '==',
+        name => 'NVARCHAR2(69)'
+    },
+    {
+        col  => 'COL_NC',
+        size => 69,
+        cmp  => '==',
+        name => 'NCHAR(69)'
+    },
+    {
+        col  => 'COL_CHAR',
+        size => 67,
+        cmp  => '==',
+        name => 'CHAR(67)'
+    },
+    {
+        col  => 'COL_CHAR_69CHAR',
+        size => 69,
+        cmp  => '==',
+        name => 'CHAR(69)'
+    },
+);    # @tests
+
+ok( $dbh->do($create_sql), "Create database: $table" )
+  or die $dbh->errstr;
+
+for my $test (@tests) {
+
+    my $col_h = $dbh->column_info( undef, undef, uc($table), $test->{col} );
+
+    # if column_info() returns undef, then the driver doesnt support column_info. DBD::Oracle should support it.
+    ok(
+        $col_h,
+        sprintf(
+            'column_info() returns something for test: %s', $test->{name}
+        )
+    ) or next;
+    cmp_ok( ref $col_h, 'eq', 'DBI::st',
+        sprintf( 'returned object is correct for test: %s', $test->{name} ) );
+
+# if there is no row, then the table/column couldnt be found... this should not happen either
+    my $row = $col_h->fetchrow_hashref;
+    cmp_ok(
+        ref $row,
+        'eq', 'HASH',
+        sprintf(
+'column/table now found - fetchrow_hashref returned a hash for test: %s',
+            $test->{name} )
+    ) or next;
+
+    # this is the actual test, everything above it sanity checking / pre-diagnosis
+    cmp_ok( $row->{COLUMN_SIZE}, $test->{cmp}, $test->{size}, $test->{name} );
+
+}
+
+drop_table($dbh, $table);
+
+# utility functions
+
+sub get_privs {
+    my $dbh = shift;
+
+    my $sth = $dbh->prepare('SELECT PRIVILEGE from session_privs');
+    $sth->execute;
+
+    return map { $_->[0] } @{ $sth->fetchall_arrayref };
+}
+
+done_testing();
+                                                                                                                                                                                                                                                                                                                                                                                             root/.cpan/build/DBD-Oracle-1.90-2/t/rt74753-utf8-encoded.t                                         0000644 0001750 0001750 00000003100 14616324562 020654  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        #!perl
+
+use strict;
+use warnings;
+
+use lib 't/lib';
+use DBDOracleTestLib qw/ oracle_test_dsn db_ochar_is_utf db_handle /;
+
+use Test::More;
+
+use DBI;
+use Encode;
+
+$ENV{NLS_LANG}  = 'AMERICAN_AMERICA.UTF8';
+$ENV{NLS_NCHAR} = 'UTF8';
+
+my $dbh = db_handle(
+    {
+        PrintError => 0,
+        AutoCommit => 0
+    }
+);
+
+plan skip_all => 'Unable to connect to Oracle database' if not $dbh;
+plan skip_all => 'Database character set is not Unicode'
+  unless db_ochar_is_utf($dbh);
+
+plan tests => 3;
+
+$dbh->do(q(alter session set nls_territory = 'GERMANY'));
+
+my $sth = $dbh->prepare(<<'END_SQL');
+    SELECT ltrim(rtrim(to_char(0, 'L'))) FROM dual
+END_SQL
+
+$sth->execute;
+
+my ($val);
+$sth->bind_columns( \($val) );
+
+$sth->fetch;
+
+is Encode::is_utf8($val) => 1, 'utf8 encoded';
+
+$sth->finish;
+
+$val = undef;
+
+$sth = $dbh->prepare(<<'END_SQL');
+declare
+    l_ret       varchar2(10);
+begin
+    select  ltrim(rtrim(to_char(0, 'L')))
+    into    l_ret
+    from    dual;
+    --
+    :ret := l_ret;
+end;
+END_SQL
+
+$sth->bind_param_inout( ':ret', \$val, 100 );
+$sth->execute;
+
+is Encode::is_utf8($val) => 1, 'utf8 encoded';
+
+$sth = $dbh->prepare(<<'END_SQL');
+declare
+    l_ret       varchar2(10);
+begin
+    select ltrim(rtrim(to_char(0, 'L')))
+        || ltrim(rtrim(to_char(0, 'L')))
+        || ltrim(rtrim(to_char(0, 'L')))
+    into    l_ret
+    from    dual;
+    --
+    :ret := l_ret;
+end;
+END_SQL
+
+$val = undef;
+
+# WARNING: does *not* truncate. DBD::Oracle doesn't heed the 3rd parameter
+$sth->bind_param_inout( ':ret', \$val, 1 );
+$sth->execute;
+
+is Encode::is_utf8($val) => 1, 'truncated, yet utf8 encoded';
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                root/.cpan/build/DBD-Oracle-1.90-2/t/rt85886.t                                                      0000755 0001750 0001750 00000001772 14616324562 016422  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        #!perl
+
+use strict;
+use warnings;
+
+use lib 't/lib';
+use DBDOracleTestLib qw/ oracle_test_dsn db_handle /;
+
+use Test::More;
+
+use DBI qw(:sql_types);
+use Devel::Peek;
+use B qw( svref_2object SVf_IOK SVf_NOK SVf_POK );
+
+sub is_iv {
+    my $sv = svref_2object( my $ref = \$_[0] );
+    my $flags = $sv->FLAGS;
+
+    # See http://www.perlmonks.org/?node_id=971411
+    my $x = $sv->can('PV') ? $sv->PV : undef;
+
+    if (wantarray) {
+        return ( $flags & SVf_IOK, $x );
+    }
+    else {
+        return $flags & SVf_IOK;
+    }
+}
+
+my $dbh = db_handle(
+    {
+        PrintError       => 0,
+        FetchHashKeyName => 'NAME_lc'
+    }
+);
+
+plan skip_all => 'Unable to connect to Oracle database' if not $dbh;
+
+plan tests => 2;
+
+my $s = $dbh->prepare(q/select 1 as one from dual/);
+$s->execute;
+
+$s->bind_col( 1, undef, { TYPE => SQL_INTEGER, DiscardString => 1 } );
+
+my $list = $s->fetchall_arrayref( {} );
+
+is( $list->[0]{one}, 1, 'correct value returned' );
+ok( is_iv( $list->[0]{one} ), 'ivok' ) or Dump( $list->[0]{one} );
+      root/.cpan/build/DBD-Oracle-1.90-2/typemap                                                          0000644 0001750 0001750 00000000067 14616324562 016315  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        OCILobLocator *         T_PTROBJ
+OCIXMLType *		T_PTROBJ                                                                                                                                                                                                                                                                                                                                                                                                                                                                         root/.cpan/build/DBI-1.645-0/                                                                       0000755 0000000 0000000 00000000000 14723046352 013541  5                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        root/.cpan/build/DBI-1.645-0/Changes                                                                0000644 0000313 0000144 00000364365 14665537651 015111  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        1.645 - 2024-09-03, H.Merijn Brand
+
+    * Move developer tests to xt/
+    * Make Changes match CPAN::Changes::Spec and regen DBI::Changes from that
+    * Fixes for modern gcc i.c.w. recent perl (Daniël)
+    * Small code & doc cleanups for recent perl
+    * See TODO in `perldoc DBI` to see where you can help with documentation!
+
+1.644 - 2024-08-23, DBI-Team
+
+    Update Devel::PPPort,
+        thanks to H.Merijn Brand
+    Fix CVE-2014-10401 and CVE-2014-10402 - f_dir might not exist in DBD::File connections
+	thanks to Jens Rehsack & H.Merijn Brand
+    Do not check gccversion on clang
+        thanks to Daniël van Eeden
+    Upgrade GIMME to GIMME_V
+        thanks to Daniël van Eeden
+    Do not check with JSON::XS with perl-5.022 and later
+        thanks to H.Merijn Brand
+    Makefile.PL allows gcc-10 and up now
+        thanks to H.Merijn Brand (noted by XSven)
+    Do not leak $_ after callback execution (rt#144526, PR#117)
+	thanks to Mauke
+    Switch from Dynaloader to XSLoader (PR#94)
+	thanks to Todd
+    Tim handed the project to the team
+    Merge Pull Requests, resolve RT tickets, & resolve GH issues
+	thanks to many! Please check gitlog
+
+1.643 - 2020-01-31, Tim Bunce
+
+    Fix memory corruption in XS functions when Perl stack is reallocated
+        thanks to Pali
+    Fix calling dbd_db_do6 API function
+        thanks to Pali
+    Fix potentially calling newSV(0) in malloc_using_sv()
+        thanks to Pali
+    Fix order of XS preparse() ps_accept and ps_return argument names
+        thanks to Petr Písař
+    Fix a potential NULL profile dereference in dbi_profile()
+        thanks to Petr Písař
+    Fix a buffer overflow on an overlong DBD class name
+        thanks to Petr Písař
+
+    Remove remnants of support for perl <= v5.8.0
+        thanks to Pali and H.Merijn Brand
+    Update Devel::PPPort and remove redundant compatibility macros
+        thanks to Pali and H.Merijn Brand
+
+    Correct minor typo in documentation
+        thanks to Mohammad Anwar
+    Correct documentation introducing $dbh->selectall_array()
+        thanks to Pali
+    Introduce select and do wrappers earlier in the documentation
+        thanks to Dan Book
+    Mark as deprecated old API functions which overflow or are affected by
+        Unicode issues, thanks to Pali
+
+    Add new attribute RaiseWarn, similar to RaiseError,
+        thanks to Pali
+
+1.642 - 2018-10-28, Tim Bunce
+
+    Fix '.' in @INC for proxy test under parallel load
+        thanks to H.Merijn Brand.
+    Fix driver-related croak() in DBI->connect to report the original DSN
+        thanks to maxatome #67
+
+    Introduce a new statement DBI method $sth->last_insert_id()
+        thanks to pali #64
+    Allow to call $dbh->last_insert_id() method without arguments
+        thanks to pali #64
+    Added a new XS API function variant dbd_db_do6()
+        thanks to Pali #61
+
+    Fix misprints in doc of selectall_hashref
+        thanks to Perlover #69
+    Remove outdated links to DBI related training resources. RT#125999
+
+1.641 - 2018-03-19, Tim Bunce
+
+    Remove dependency on Storable 2.16 introduced in DBI 1.639
+        thanks to Ribasushi #60
+    Avoid compiler warnings in Driver.xst #59
+        thanks to pali #59
+
+1.640 - 2018-01-28, Tim Bunce
+
+    Fix test t/91_store_warning.t for perl 5.10.0
+        thanks to pali #57
+
+    Add Perl 5.10.0 and 5.8.1 specific versions to Travis testing
+        thanks to pali #57
+    Add registration of mariadb_ prefix for new DBD::MariaDB driver
+        thanks to pali #56
+
+1.639 - 2017-12-28, Tim Bunce
+
+    Fix UTF-8 support for warn/croak calls within DBI internals,
+        thanks to pali #53
+    Fix dependency on Storable for perl older than 5.8.9,
+        thanks to H.Merijn Brand.
+
+    Add DBD::Mem driver, a pure-perl in-memory driver using DBI::DBD::SqlEngine,
+        thanks to Jens Rehsack #42
+
+    Corrected missing semicolon in example in documentation,
+        thanks to pali #55
+
+1.637 - 2017-08-16, Tim Bunce
+
+    Fix use of externally controlled format string (CWE-134) thanks to pali #44
+        This could cause a crash if, for example, a db error contained a %.
+        https://cwe.mitre.org/data/definitions/134.html
+    Fix extension detection for DBD::File related drivers
+    Fix tests for perl without dot in @INC RT#120443
+    Fix loss of error message on parent handle, thanks to charsbar #34
+    Fix disappearing $_ inside callbacks, thanks to robschaber #47
+    Fix dependency on Storable for perl older than 5.8.9
+
+    Allow objects to be used as passwords without throwing an error, thanks to demerphq #40
+    Allow $sth NAME_* attributes to be set from Perl code, re #45
+    Added support for DBD::XMLSimple thanks to nigelhorne #38
+
+    Documentation updates:
+    Improve examples using eval to be more correct, thanks to pali #39
+    Add cautionary note to prepare_cached docs re refs in %attr #46
+    Small POD changes (Getting Help -> Online) thanks to openstrike #33
+    Adds links to more module names and fix typo, thanks to oalders #43
+    Typo fix thanks to bor #37
+
+1.636 - 2016-04-24, Tim Bunce
+
+    Fix compilation for threaded perl <= 5.12 broken in 1.635 RT#113955
+    Revert change to DBI::PurePerl DESTROY in 1.635
+    Change t/16destroy.t to avoid race hazard RT#113951
+    Output perl version and archname in t/01basics.t
+    Add perl 5.22 and 5.22-extras to travis-ci config
+
+1.635 - 2016-04-24, Tim Bunce
+
+    Fixed RaiseError/PrintError for UTF-8 errors/warnings. RT#102404
+    Fixed cases where ShowErrorStatement might show incorrect Statement RT#97434
+    Fixed DBD::Gofer for UTF-8-enabled STDIN/STDOUT
+        thanks to mauke PR#32
+    Fixed fetchall_arrayref({}) behavior with no columns
+        thanks to Dan McGee PR#31
+    Fixed tied CachedKids ref leak in attribute cache by weakening
+        thanks to Michael Conrad RT#113852
+    Fixed "panic: attempt to copy freed scalar" upon commit() or rollback()
+        thanks to fbriere for detailed bug report RT#102791
+    Ceased to ignore DESTROY of outer handle in DBI::PurePerl
+    Treat undef in DBI::Profile Path as string "undef"
+        thanks to fREW Schmidt RT#113298
+    Fix SQL::Nano parser to ignore trailing semicolon
+        thanks to H.Merijn Brand.
+
+    Added @ary = $dbh->selectall_array(...) method
+        thanks to Ed Avis RT#106411
+    Added appveyor support (Travis like CI for windows)
+        thanks to mbeijen PR#30
+
+    Corrected spelling errors in pod
+        thanks to Gregor Herrmann RT#107838
+    Corrected and/or removed broken links to SQL standards
+        thanks to David Pottage RT#111437
+    Corrected doc example to use dbi: instead of DBI: in DSN
+        thanks to Michael R. Davis RT#101181
+    Removed/updated broken links in docs
+        thanks to mbeijen PR#29
+    Clarified docs for DBI::hash($string)
+    Removed the ancient DBI::FAQ module RT#102714
+    Fixed t/pod.t to require Test::Pod >= 1.41 RT#101769
+
+This release was developed at the Perl QA Hackathon 2016
+L<http://act.qa-hackathon.org/qa2016/>
+which was made possible by the generosity of many sponsors:
+
+L<https://www.fastmail.com> FastMail,
+L<https://www.ziprecruiter.com> ZipRecruiter,
+L<http://www.activestate.com> ActiveState,
+L<http://www.opusvl.com> OpusVL,
+L<https://www.strato.com> Strato,
+L<http://www.surevoip.co.uk> SureVoIP,
+L<http://www.cv-library.co.uk> CV-Library,
+L<https://www.iinteractive.com/> Infinity,
+L<https://opensource.careers/perl-careers/> Perl Careers,
+L<https://www.mongodb.com> MongoDB,
+L<https://www.thinkproject.com> thinkproject!,
+L<https://www.dreamhost.com/> Dreamhost,
+L<http://www.perl6.org/> Perl 6,
+L<http://www.perl-services.de/> Perl Services,
+L<https://www.evozon.com/> Evozon,
+L<http://www.booking.com> Booking,
+L<http://eligo.co.uk> Eligo,
+L<http://www.oetiker.ch/> Oetiker+Partner,
+L<http://capside.com/en/> CAPSiDE,
+L<https://www.procura.nl/> Procura,
+L<https://constructor.io/> Constructor.io,
+L<https://metacpan.org/author/BABF> Robbie Bow,
+L<https://metacpan.org/author/RSAVAGE> Ron Savage,
+L<https://metacpan.org/author/ITCHARLIE> Charlie Gonzalez,
+L<https://twitter.com/jscook2345> Justin Cook.
+
+1.634 - 2015-08-03, Tim Bunce
+
+    Enabled strictures on all modules (Jose Luis Perez Diez) #22
+        Note that this might cause new exceptions in existing code.
+        Please take time for extra testing before deploying to production.
+    Improved handling of row counts for compiled drivers and enable them to
+        return larger row counts (IV type) by defining new *_iv macros.
+    Fixed quote_identifier that was adding a trailing separator when there
+        was only a catalog (Martin J. Evans)
+
+    Removed redundant keys() call in fetchall_arrayref with hash slice (ilmari) #24
+    Corrected pod xref to Placeholders section (Matthew D. Fuller)
+    Corrected pod grammar (Nick Tonkin) #25
+
+    Added support for tables('', '', '', '%') special case (Martin J. Evans)
+    Added support for DBD prefixes with numbers (Jens Rehsack) #19
+    Added extra initializer for DBI::DBD::SqlEngine based DBD's (Jens Rehsack)
+    Added Memory Leaks section to the DBI docs (Tim)
+    Added Artistic v1 & GPL v1 LICENSE file (Jose Luis Perez Diez) #21
+
+1.633 - 2015-01-11, Tim Bunce
+
+    Fixed selectrow_*ref to return undef on error in list context
+        instead if an empty list.
+    Changed t/42prof_data.t more informative
+    Changed $sth->{TYPE} to be NUMERIC in DBD::File drivers as per the
+        DBI docs. Note TYPE_NAME is now also available. [H.Merijn Brand]
+    Fixed compilation error on bleadperl due DEFSV no longer being an lvalue
+        [Dagfinn Ilmari Mannsåker]
+
+    Added docs for escaping placeholders using a backslash.
+    Added docs for get_info(9000) indicating ability to escape placeholders.
+    Added multi_ prefix for DBD::Multi (Dan Wright) and ad2_ prefix for
+        DBD::AnyData2
+
+1.632 - 2014-11-09, Tim Bunce
+
+    Fixed risk of memory corruption with many arguments to methods
+        originally reported by OSCHWALD for Callbacks but may apply
+        to other functionality in DBI method dispatch RT#86744.
+    Fixed DBD::PurePerl to not set $sth->{Active} true by default
+        drivers are expected to set it true as needed.
+    Fixed DBI::DBD::SqlEngine to complain loudly when prerequite
+        driver_prefix is not fulfilled (RT#93204) [Jens Rehsack]
+    Fixed redundant sprintf argument warning RT#97062 [Reini Urban]
+    Fixed security issue where DBD::File drivers would open files
+        from folders other than specifically passed using the
+        f_dir attribute RT#99508 [H.Merijn Brand]
+
+    Changed delete $h->{$key} to work for keys with 'private_' prefix
+        per request in RT#83156. local $h->{$key} works as before.
+
+    Added security notice to DBD::Proxy and DBI::ProxyServer because they
+        use Storable which is insecure. Thanks to ppisar@redhat.com RT#90475
+    Added note to AutoInactiveDestroy docs strongly recommending that it
+        is enabled in all new code.
+
+1.631 - 2014-01-20, Tim Bunce
+
+NOTE: This release changes the handle passed to Callbacks from being an 'inner'
+handle to being an 'outer' handle. If you have code that makes use of Callbacks,
+ensure that you understand what this change means and review your callback code.
+
+    Fixed err_hash handling of integer err RT#92172 [Dagfinn Ilmari]
+    Fixed use of \Q vs \E in t/70callbacks.t
+
+    Changed the handle passed to Callbacks from being an 'inner'
+        handle to being an 'outer' handle.
+
+    Improved reliability of concurrent testing
+        PR#8 [Peter Rabbitson]
+    Changed optional dependencies to "suggest"
+        PR#9 [Karen Etheridge]
+    Changed to avoid mg_get in neatsvpv during global destruction
+        PR#10 [Matt Phillips]
+
+1.630 - 2013-10-28, Tim Bunce
+
+NOTE: This release enables PrintWarn by default regardless of $^W.
+Your applications may generate more log messages than before.
+
+    Fixed err for new drh to be undef not to 0 [Martin J. Evans]
+    Fixed RT#83132 - moved DBIstcf* constants to util
+        export tag [Martin J. Evans]
+    PrintWarn is now triggered by warnings recorded in methods like STORE
+        that don't clear err RT#89015 [Tim Bunce]
+
+    Changed tracing to no longer show quote and quote_identifier calls
+        at trace level 1.
+    Changed DBD::Gofer ping while disconnected set_err from warn to info.
+    Clarified wording of log message when err is cleared.
+    Changed bootstrap to use $XS_VERSION RT#89618 [Andreas Koenig]
+
+    Added connect_cached.connected Callback PR#3 [David E. Wheeler]
+
+    Clarified effect of refs in connect_cached attributes [David E. Wheeler]
+    Extended ReadOnly attribute docs for when the driver cannot
+      ensure read only [Martin J. Evans]
+    Corrected SQL_BIGINT docs to say ODBC value is used PR#5 [ilmari]
+
+There was no DBI 1.629 release.
+
+1.628 - 2013-07-22, Tim Bunce
+
+    Fixed missing fields on partial insert via DBI::DBD::SqlEngine
+        engines (DBD::CSV, DBD::DBM etc.) [H.Merijn Brand, Jens Rehsack]
+    Fixed stack corruption on callbacks RT#85562 RT#84974 [Aaron Schweiger]
+    Fixed DBI::SQL::Nano_::Statement handling of "0" [Jens Rehsack]
+    Fixed exit op precedence in test RT#87029 [Reni Urban]
+
+    Added support for finding tables in multiple directories
+        via new DBD::File f_dir_search attribute [H.Merijn Brand]
+    Enable compiling by C++ RT#84285 [Kurt Jaeger]
+
+    Typo fixes in pod and comment [David Steinbrunner]
+    Change DBI's docs to refer to git not svn [H.Merijn Brand]
+    Clarify bind_col TYPE attribute is sticky [Martin J. Evans]
+    Fixed reference to $sth in selectall_arrayref docs RT#84873
+    Spelling fixes [Ville Skyttä]
+    Changed $VERSIONs to hardcoded strings [H.Merijn Brand]
+
+1.627 - 2013-05-16, Tim Bunce
+
+    Fixed VERSION regression in DBI::SQL::Nano [Tim Bunce]
+
+1.626 - 2013-05-15, Tim Bunce
+
+    Fixed pod text/link was reversed in a few cases RT#85168
+        [H.Merijn Brand]
+
+    Handle aliasing of STORE'd attributes in DBI::DBD::SqlEngine
+        [Jens Rehsack]
+
+    Updated repository URI to git [Jens Rehsack]
+
+    Fixed skip() count arg in t/48dbi_dbd_sqlengine.t [Tim Bunce]
+
+1.625 - 2013-03-28, Tim Bunce (svn r15595)
+
+  Fixed heap-use-after-free during global destruction RT#75614
+    thanks to Reini Urban.
+  Fixed ignoring RootClass attribute during connect() by
+    DBI::DBD::SqlEngine reported in RT#84260 by Michael Schout
+
+1.624 - 2013-03-22, Tim Bunce (svn r15576)
+
+  Fixed Gofer for hash randomization in perl 5.17.10+ RT#84146
+
+  Clarify docs for can() re RT#83207
+
+1.623 - 2013-01-02, Tim Bunce (svn r15547)
+
+  Fixed RT#64330 - ping wipes out errstr (Martin J. Evans).
+  Fixed RT#75868 - DBD::Proxy shouldn't call connected() on the server.
+  Fixed RT#80474 - segfault in DESTROY with threads.
+  Fixed RT#81516 - Test failures due to hash randomisation in perl 5.17.6
+    thanks to Jens Rehsack and H.Merijn Brand and feedback on IRC
+  Fixed RT#81724 - Handle copy-on-write scalars (sprout)
+  Fixed unused variable / self-assignment compiler warnings.
+  Fixed default table_info in DBI::DBD::SqlEngine which passed NAMES

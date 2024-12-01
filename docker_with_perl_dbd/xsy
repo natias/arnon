@@ -1,0 +1,1000 @@
+            finally:
+                self._writinghandles = None
+                self._segmentfile.writing_handle = None
+                self._segmentfile_sidedata.writing_handle = None
+                if dfh is not None:
+                    dfh.close()
+                if sdfh is not None:
+                    sdfh.close()
+                # closing the index file last to avoid exposing referent to
+                # potential unflushed data content.
+                if ifh is not None:
+                    ifh.close()
+
+    def _write_docket(self, transaction):
+        """write the current docket on disk
+
+        Exist as a method to help changelog to implement transaction logic
+
+        We could also imagine using the same transaction logic for all revlog
+        since docket are cheap."""
+        self._docket.write(transaction)
+
+    def addrevision(
+        self,
+        text,
+        transaction,
+        link,
+        p1,
+        p2,
+        cachedelta=None,
+        node=None,
+        flags=REVIDX_DEFAULT_FLAGS,
+        deltacomputer=None,
+        sidedata=None,
+    ):
+        """add a revision to the log
+
+        text - the revision data to add
+        transaction - the transaction object used for rollback
+        link - the linkrev data to add
+        p1, p2 - the parent nodeids of the revision
+        cachedelta - an optional precomputed delta
+        node - nodeid of revision; typically node is not specified, and it is
+            computed by default as hash(text, p1, p2), however subclasses might
+            use different hashing method (and override checkhash() in such case)
+        flags - the known flags to set on the revision
+        deltacomputer - an optional deltacomputer instance shared between
+            multiple calls
+        """
+        if link == nullrev:
+            raise error.RevlogError(
+                _(b"attempted to add linkrev -1 to %s") % self.display_id
+            )
+
+        if sidedata is None:
+            sidedata = {}
+        elif sidedata and not self.hassidedata:
+            raise error.ProgrammingError(
+                _(b"trying to add sidedata to a revlog who don't support them")
+            )
+
+        if flags:
+            node = node or self.hash(text, p1, p2)
+
+        rawtext, validatehash = flagutil.processflagswrite(self, text, flags)
+
+        # If the flag processor modifies the revision data, ignore any provided
+        # cachedelta.
+        if rawtext != text:
+            cachedelta = None
+
+        if len(rawtext) > _maxentrysize:
+            raise error.RevlogError(
+                _(
+                    b"%s: size of %d bytes exceeds maximum revlog storage of 2GiB"
+                )
+                % (self.display_id, len(rawtext))
+            )
+
+        node = node or self.hash(rawtext, p1, p2)
+        rev = self.index.get_rev(node)
+        if rev is not None:
+            return rev
+
+        if validatehash:
+            self.checkhash(rawtext, node, p1=p1, p2=p2)
+
+        return self.addrawrevision(
+            rawtext,
+            transaction,
+            link,
+            p1,
+            p2,
+            node,
+            flags,
+            cachedelta=cachedelta,
+            deltacomputer=deltacomputer,
+            sidedata=sidedata,
+        )
+
+    def addrawrevision(
+        self,
+        rawtext,
+        transaction,
+        link,
+        p1,
+        p2,
+        node,
+        flags,
+        cachedelta=None,
+        deltacomputer=None,
+        sidedata=None,
+    ):
+        """add a raw revision with known flags, node and parents
+        useful when reusing a revision not stored in this revlog (ex: received
+        over wire, or read from an external bundle).
+        """
+        with self._writing(transaction):
+            return self._addrevision(
+                node,
+                rawtext,
+                transaction,
+                link,
+                p1,
+                p2,
+                flags,
+                cachedelta,
+                deltacomputer=deltacomputer,
+                sidedata=sidedata,
+            )
+
+    def compress(self, data):
+        """Generate a possibly-compressed representation of data."""
+        if not data:
+            return b'', data
+
+        compressed = self._compressor.compress(data)
+
+        if compressed:
+            # The revlog compressor added the header in the returned data.
+            return b'', compressed
+
+        if data[0:1] == b'\0':
+            return b'', data
+        return b'u', data
+
+    def decompress(self, data):
+        """Decompress a revlog chunk.
+
+        The chunk is expected to begin with a header identifying the
+        format type so it can be routed to an appropriate decompressor.
+        """
+        if not data:
+            return data
+
+        # Revlogs are read much more frequently than they are written and many
+        # chunks only take microseconds to decompress, so performance is
+        # important here.
+        #
+        # We can make a few assumptions about revlogs:
+        #
+        # 1) the majority of chunks will be compressed (as opposed to inline
+        #    raw data).
+        # 2) decompressing *any* data will likely by at least 10x slower than
+        #    returning raw inline data.
+        # 3) we want to prioritize common and officially supported compression
+        #    engines
+        #
+        # It follows that we want to optimize for "decompress compressed data
+        # when encoded with common and officially supported compression engines"
+        # case over "raw data" and "data encoded by less common or non-official
+        # compression engines." That is why we have the inline lookup first
+        # followed by the compengines lookup.
+        #
+        # According to `hg perfrevlogchunks`, this is ~0.5% faster for zlib
+        # compressed chunks. And this matters for changelog and manifest reads.
+        t = data[0:1]
+
+        if t == b'x':
+            try:
+                return _zlibdecompress(data)
+            except zlib.error as e:
+                raise error.RevlogError(
+                    _(b'revlog decompress error: %s')
+                    % stringutil.forcebytestr(e)
+                )
+        # '\0' is more common than 'u' so it goes first.
+        elif t == b'\0':
+            return data
+        elif t == b'u':
+            return util.buffer(data, 1)
+
+        compressor = self._get_decompressor(t)
+
+        return compressor.decompress(data)
+
+    def _addrevision(
+        self,
+        node,
+        rawtext,
+        transaction,
+        link,
+        p1,
+        p2,
+        flags,
+        cachedelta,
+        alwayscache=False,
+        deltacomputer=None,
+        sidedata=None,
+    ):
+        """internal function to add revisions to the log
+
+        see addrevision for argument descriptions.
+
+        note: "addrevision" takes non-raw text, "_addrevision" takes raw text.
+
+        if "deltacomputer" is not provided or None, a defaultdeltacomputer will
+        be used.
+
+        invariants:
+        - rawtext is optional (can be None); if not set, cachedelta must be set.
+          if both are set, they must correspond to each other.
+        """
+        if node == self.nullid:
+            raise error.RevlogError(
+                _(b"%s: attempt to add null revision") % self.display_id
+            )
+        if (
+            node == self.nodeconstants.wdirid
+            or node in self.nodeconstants.wdirfilenodeids
+        ):
+            raise error.RevlogError(
+                _(b"%s: attempt to add wdir revision") % self.display_id
+            )
+        if self._writinghandles is None:
+            msg = b'adding revision outside `revlog._writing` context'
+            raise error.ProgrammingError(msg)
+
+        if self._inline:
+            fh = self._writinghandles[0]
+        else:
+            fh = self._writinghandles[1]
+
+        btext = [rawtext]
+
+        curr = len(self)
+        prev = curr - 1
+
+        offset = self._get_data_offset(prev)
+
+        if self._concurrencychecker:
+            ifh, dfh, sdfh = self._writinghandles
+            # XXX no checking for the sidedata file
+            if self._inline:
+                # offset is "as if" it were in the .d file, so we need to add on
+                # the size of the entry metadata.
+                self._concurrencychecker(
+                    ifh, self._indexfile, offset + curr * self.index.entry_size
+                )
+            else:
+                # Entries in the .i are a consistent size.
+                self._concurrencychecker(
+                    ifh, self._indexfile, curr * self.index.entry_size
+                )
+                self._concurrencychecker(dfh, self._datafile, offset)
+
+        p1r, p2r = self.rev(p1), self.rev(p2)
+
+        # full versions are inserted when the needed deltas
+        # become comparable to the uncompressed text
+        if rawtext is None:
+            # need rawtext size, before changed by flag processors, which is
+            # the non-raw size. use revlog explicitly to avoid filelog's extra
+            # logic that might remove metadata size.
+            textlen = mdiff.patchedsize(
+                revlog.size(self, cachedelta[0]), cachedelta[1]
+            )
+        else:
+            textlen = len(rawtext)
+
+        if deltacomputer is None:
+            write_debug = None
+            if self._debug_delta:
+                write_debug = transaction._report
+            deltacomputer = deltautil.deltacomputer(
+                self, write_debug=write_debug
+            )
+
+        revinfo = revlogutils.revisioninfo(
+            node,
+            p1,
+            p2,
+            btext,
+            textlen,
+            cachedelta,
+            flags,
+        )
+
+        deltainfo = deltacomputer.finddeltainfo(revinfo, fh)
+
+        compression_mode = COMP_MODE_INLINE
+        if self._docket is not None:
+            default_comp = self._docket.default_compression_header
+            r = deltautil.delta_compression(default_comp, deltainfo)
+            compression_mode, deltainfo = r
+
+        sidedata_compression_mode = COMP_MODE_INLINE
+        if sidedata and self.hassidedata:
+            sidedata_compression_mode = COMP_MODE_PLAIN
+            serialized_sidedata = sidedatautil.serialize_sidedata(sidedata)
+            sidedata_offset = self._docket.sidedata_end
+            h, comp_sidedata = self.compress(serialized_sidedata)
+            if (
+                h != b'u'
+                and comp_sidedata[0:1] != b'\0'
+                and len(comp_sidedata) < len(serialized_sidedata)
+            ):
+                assert not h
+                if (
+                    comp_sidedata[0:1]
+                    == self._docket.default_compression_header
+                ):
+                    sidedata_compression_mode = COMP_MODE_DEFAULT
+                    serialized_sidedata = comp_sidedata
+                else:
+                    sidedata_compression_mode = COMP_MODE_INLINE
+                    serialized_sidedata = comp_sidedata
+        else:
+            serialized_sidedata = b""
+            # Don't store the offset if the sidedata is empty, that way
+            # we can easily detect empty sidedata and they will be no different
+            # than ones we manually add.
+            sidedata_offset = 0
+
+        rank = RANK_UNKNOWN
+        if self._format_version == CHANGELOGV2:
+            if (p1r, p2r) == (nullrev, nullrev):
+                rank = 1
+            elif p1r != nullrev and p2r == nullrev:
+                rank = 1 + self.fast_rank(p1r)
+            elif p1r == nullrev and p2r != nullrev:
+                rank = 1 + self.fast_rank(p2r)
+            else:  # merge node
+                if rustdagop is not None and self.index.rust_ext_compat:
+                    rank = rustdagop.rank(self.index, p1r, p2r)
+                else:
+                    pmin, pmax = sorted((p1r, p2r))
+                    rank = 1 + self.fast_rank(pmax)
+                    rank += sum(1 for _ in self.findmissingrevs([pmax], [pmin]))
+
+        e = revlogutils.entry(
+            flags=flags,
+            data_offset=offset,
+            data_compressed_length=deltainfo.deltalen,
+            data_uncompressed_length=textlen,
+            data_compression_mode=compression_mode,
+            data_delta_base=deltainfo.base,
+            link_rev=link,
+            parent_rev_1=p1r,
+            parent_rev_2=p2r,
+            node_id=node,
+            sidedata_offset=sidedata_offset,
+            sidedata_compressed_length=len(serialized_sidedata),
+            sidedata_compression_mode=sidedata_compression_mode,
+            rank=rank,
+        )
+
+        self.index.append(e)
+        entry = self.index.entry_binary(curr)
+        if curr == 0 and self._docket is None:
+            header = self._format_flags | self._format_version
+            header = self.index.pack_header(header)
+            entry = header + entry
+        self._writeentry(
+            transaction,
+            entry,
+            deltainfo.data,
+            link,
+            offset,
+            serialized_sidedata,
+            sidedata_offset,
+        )
+
+        rawtext = btext[0]
+
+        if alwayscache and rawtext is None:
+            rawtext = deltacomputer.buildtext(revinfo, fh)
+
+        if type(rawtext) == bytes:  # only accept immutable objects
+            self._revisioncache = (node, curr, rawtext)
+        self._chainbasecache[curr] = deltainfo.chainbase
+        return curr
+
+    def _get_data_offset(self, prev):
+        """Returns the current offset in the (in-transaction) data file.
+        Versions < 2 of the revlog can get this 0(1), revlog v2 needs a docket
+        file to store that information: since sidedata can be rewritten to the
+        end of the data file within a transaction, you can have cases where, for
+        example, rev `n` does not have sidedata while rev `n - 1` does, leading
+        to `n - 1`'s sidedata being written after `n`'s data.
+
+        TODO cache this in a docket file before getting out of experimental."""
+        if self._docket is None:
+            return self.end(prev)
+        else:
+            return self._docket.data_end
+
+    def _writeentry(
+        self, transaction, entry, data, link, offset, sidedata, sidedata_offset
+    ):
+        # Files opened in a+ mode have inconsistent behavior on various
+        # platforms. Windows requires that a file positioning call be made
+        # when the file handle transitions between reads and writes. See
+        # 3686fa2b8eee and the mixedfilemodewrapper in windows.py. On other
+        # platforms, Python or the platform itself can be buggy. Some versions
+        # of Solaris have been observed to not append at the end of the file
+        # if the file was seeked to before the end. See issue4943 for more.
+        #
+        # We work around this issue by inserting a seek() before writing.
+        # Note: This is likely not necessary on Python 3. However, because
+        # the file handle is reused for reads and may be seeked there, we need
+        # to be careful before changing this.
+        if self._writinghandles is None:
+            msg = b'adding revision outside `revlog._writing` context'
+            raise error.ProgrammingError(msg)
+        ifh, dfh, sdfh = self._writinghandles
+        if self._docket is None:
+            ifh.seek(0, os.SEEK_END)
+        else:
+            ifh.seek(self._docket.index_end, os.SEEK_SET)
+        if dfh:
+            if self._docket is None:
+                dfh.seek(0, os.SEEK_END)
+            else:
+                dfh.seek(self._docket.data_end, os.SEEK_SET)
+        if sdfh:
+            sdfh.seek(self._docket.sidedata_end, os.SEEK_SET)
+
+        curr = len(self) - 1
+        if not self._inline:
+            transaction.add(self._datafile, offset)
+            if self._sidedatafile:
+                transaction.add(self._sidedatafile, sidedata_offset)
+            transaction.add(self._indexfile, curr * len(entry))
+            if data[0]:
+                dfh.write(data[0])
+            dfh.write(data[1])
+            if sidedata:
+                sdfh.write(sidedata)
+            ifh.write(entry)
+        else:
+            offset += curr * self.index.entry_size
+            transaction.add(self._indexfile, offset)
+            ifh.write(entry)
+            ifh.write(data[0])
+            ifh.write(data[1])
+            assert not sidedata
+            self._enforceinlinesize(transaction)
+        if self._docket is not None:
+            # revlog-v2 always has 3 writing handles, help Pytype
+            wh1 = self._writinghandles[0]
+            wh2 = self._writinghandles[1]
+            wh3 = self._writinghandles[2]
+            assert wh1 is not None
+            assert wh2 is not None
+            assert wh3 is not None
+            self._docket.index_end = wh1.tell()
+            self._docket.data_end = wh2.tell()
+            self._docket.sidedata_end = wh3.tell()
+
+        nodemaputil.setup_persistent_nodemap(transaction, self)
+
+    def addgroup(
+        self,
+        deltas,
+        linkmapper,
+        transaction,
+        alwayscache=False,
+        addrevisioncb=None,
+        duplicaterevisioncb=None,
+    ):
+        """
+        add a delta group
+
+        given a set of deltas, add them to the revision log. the
+        first delta is against its parent, which should be in our
+        log, the rest are against the previous delta.
+
+        If ``addrevisioncb`` is defined, it will be called with arguments of
+        this revlog and the node that was added.
+        """
+
+        if self._adding_group:
+            raise error.ProgrammingError(b'cannot nest addgroup() calls')
+
+        self._adding_group = True
+        empty = True
+        try:
+            with self._writing(transaction):
+                write_debug = None
+                if self._debug_delta:
+                    write_debug = transaction._report
+                deltacomputer = deltautil.deltacomputer(
+                    self,
+                    write_debug=write_debug,
+                )
+                # loop through our set of deltas
+                for data in deltas:
+                    (
+                        node,
+                        p1,
+                        p2,
+                        linknode,
+                        deltabase,
+                        delta,
+                        flags,
+                        sidedata,
+                    ) = data
+                    link = linkmapper(linknode)
+                    flags = flags or REVIDX_DEFAULT_FLAGS
+
+                    rev = self.index.get_rev(node)
+                    if rev is not None:
+                        # this can happen if two branches make the same change
+                        self._nodeduplicatecallback(transaction, rev)
+                        if duplicaterevisioncb:
+                            duplicaterevisioncb(self, rev)
+                        empty = False
+                        continue
+
+                    for p in (p1, p2):
+                        if not self.index.has_node(p):
+                            raise error.LookupError(
+                                p, self.radix, _(b'unknown parent')
+                            )
+
+                    if not self.index.has_node(deltabase):
+                        raise error.LookupError(
+                            deltabase, self.display_id, _(b'unknown delta base')
+                        )
+
+                    baserev = self.rev(deltabase)
+
+                    if baserev != nullrev and self.iscensored(baserev):
+                        # if base is censored, delta must be full replacement in a
+                        # single patch operation
+                        hlen = struct.calcsize(b">lll")
+                        oldlen = self.rawsize(baserev)
+                        newlen = len(delta) - hlen
+                        if delta[:hlen] != mdiff.replacediffheader(
+                            oldlen, newlen
+                        ):
+                            raise error.CensoredBaseError(
+                                self.display_id, self.node(baserev)
+                            )
+
+                    if not flags and self._peek_iscensored(baserev, delta):
+                        flags |= REVIDX_ISCENSORED
+
+                    # We assume consumers of addrevisioncb will want to retrieve
+                    # the added revision, which will require a call to
+                    # revision(). revision() will fast path if there is a cache
+                    # hit. So, we tell _addrevision() to always cache in this case.
+                    # We're only using addgroup() in the context of changegroup
+                    # generation so the revision data can always be handled as raw
+                    # by the flagprocessor.
+                    rev = self._addrevision(
+                        node,
+                        None,
+                        transaction,
+                        link,
+                        p1,
+                        p2,
+                        flags,
+                        (baserev, delta),
+                        alwayscache=alwayscache,
+                        deltacomputer=deltacomputer,
+                        sidedata=sidedata,
+                    )
+
+                    if addrevisioncb:
+                        addrevisioncb(self, rev)
+                    empty = False
+        finally:
+            self._adding_group = False
+        return not empty
+
+    def iscensored(self, rev):
+        """Check if a file revision is censored."""
+        if not self._censorable:
+            return False
+
+        return self.flags(rev) & REVIDX_ISCENSORED
+
+    def _peek_iscensored(self, baserev, delta):
+        """Quickly check if a delta produces a censored revision."""
+        if not self._censorable:
+            return False
+
+        return storageutil.deltaiscensored(delta, baserev, self.rawsize)
+
+    def getstrippoint(self, minlink):
+        """find the minimum rev that must be stripped to strip the linkrev
+
+        Returns a tuple containing the minimum rev and a set of all revs that
+        have linkrevs that will be broken by this strip.
+        """
+        return storageutil.resolvestripinfo(
+            minlink,
+            len(self) - 1,
+            self.headrevs(),
+            self.linkrev,
+            self.parentrevs,
+        )
+
+    def strip(self, minlink, transaction):
+        """truncate the revlog on the first revision with a linkrev >= minlink
+
+        This function is called when we're stripping revision minlink and
+        its descendants from the repository.
+
+        We have to remove all revisions with linkrev >= minlink, because
+        the equivalent changelog revisions will be renumbered after the
+        strip.
+
+        So we truncate the revlog on the first of these revisions, and
+        trust that the caller has saved the revisions that shouldn't be
+        removed and that it'll re-add them after this truncation.
+        """
+        if len(self) == 0:
+            return
+
+        rev, _ = self.getstrippoint(minlink)
+        if rev == len(self):
+            return
+
+        # first truncate the files on disk
+        data_end = self.start(rev)
+        if not self._inline:
+            transaction.add(self._datafile, data_end)
+            end = rev * self.index.entry_size
+        else:
+            end = data_end + (rev * self.index.entry_size)
+
+        if self._sidedatafile:
+            sidedata_end = self.sidedata_cut_off(rev)
+            transaction.add(self._sidedatafile, sidedata_end)
+
+        transaction.add(self._indexfile, end)
+        if self._docket is not None:
+            # XXX we could, leverage the docket while stripping. However it is
+            # not powerfull enough at the time of this comment
+            self._docket.index_end = end
+            self._docket.data_end = data_end
+            self._docket.sidedata_end = sidedata_end
+            self._docket.write(transaction, stripping=True)
+
+        # then reset internal state in memory to forget those revisions
+        self._revisioncache = None
+        self._chaininfocache = util.lrucachedict(500)
+        self._segmentfile.clear_cache()
+        self._segmentfile_sidedata.clear_cache()
+
+        del self.index[rev:-1]
+
+    def checksize(self):
+        """Check size of index and data files
+
+        return a (dd, di) tuple.
+        - dd: extra bytes for the "data" file
+        - di: extra bytes for the "index" file
+
+        A healthy revlog will return (0, 0).
+        """
+        expected = 0
+        if len(self):
+            expected = max(0, self.end(len(self) - 1))
+
+        try:
+            with self._datafp() as f:
+                f.seek(0, io.SEEK_END)
+                actual = f.tell()
+            dd = actual - expected
+        except FileNotFoundError:
+            dd = 0
+
+        try:
+            f = self.opener(self._indexfile)
+            f.seek(0, io.SEEK_END)
+            actual = f.tell()
+            f.close()
+            s = self.index.entry_size
+            i = max(0, actual // s)
+            di = actual - (i * s)
+            if self._inline:
+                databytes = 0
+                for r in self:
+                    databytes += max(0, self.length(r))
+                dd = 0
+                di = actual - len(self) * s - databytes
+        except FileNotFoundError:
+            di = 0
+
+        return (dd, di)
+
+    def files(self):
+        res = [self._indexfile]
+        if self._docket_file is None:
+            if not self._inline:
+                res.append(self._datafile)
+        else:
+            res.append(self._docket_file)
+            res.extend(self._docket.old_index_filepaths(include_empty=False))
+            if self._docket.data_end:
+                res.append(self._datafile)
+            res.extend(self._docket.old_data_filepaths(include_empty=False))
+            if self._docket.sidedata_end:
+                res.append(self._sidedatafile)
+            res.extend(self._docket.old_sidedata_filepaths(include_empty=False))
+        return res
+
+    def emitrevisions(
+        self,
+        nodes,
+        nodesorder=None,
+        revisiondata=False,
+        assumehaveparentrevisions=False,
+        deltamode=repository.CG_DELTAMODE_STD,
+        sidedata_helpers=None,
+    ):
+        if nodesorder not in (b'nodes', b'storage', b'linear', None):
+            raise error.ProgrammingError(
+                b'unhandled value for nodesorder: %s' % nodesorder
+            )
+
+        if nodesorder is None and not self._generaldelta:
+            nodesorder = b'storage'
+
+        if (
+            not self._storedeltachains
+            and deltamode != repository.CG_DELTAMODE_PREV
+        ):
+            deltamode = repository.CG_DELTAMODE_FULL
+
+        return storageutil.emitrevisions(
+            self,
+            nodes,
+            nodesorder,
+            revlogrevisiondelta,
+            deltaparentfn=self.deltaparent,
+            candeltafn=self.candelta,
+            rawsizefn=self.rawsize,
+            revdifffn=self.revdiff,
+            flagsfn=self.flags,
+            deltamode=deltamode,
+            revisiondata=revisiondata,
+            assumehaveparentrevisions=assumehaveparentrevisions,
+            sidedata_helpers=sidedata_helpers,
+        )
+
+    DELTAREUSEALWAYS = b'always'
+    DELTAREUSESAMEREVS = b'samerevs'
+    DELTAREUSENEVER = b'never'
+
+    DELTAREUSEFULLADD = b'fulladd'
+
+    DELTAREUSEALL = {b'always', b'samerevs', b'never', b'fulladd'}
+
+    def clone(
+        self,
+        tr,
+        destrevlog,
+        addrevisioncb=None,
+        deltareuse=DELTAREUSESAMEREVS,
+        forcedeltabothparents=None,
+        sidedata_helpers=None,
+    ):
+        """Copy this revlog to another, possibly with format changes.
+
+        The destination revlog will contain the same revisions and nodes.
+        However, it may not be bit-for-bit identical due to e.g. delta encoding
+        differences.
+
+        The ``deltareuse`` argument control how deltas from the existing revlog
+        are preserved in the destination revlog. The argument can have the
+        following values:
+
+        DELTAREUSEALWAYS
+           Deltas will always be reused (if possible), even if the destination
+           revlog would not select the same revisions for the delta. This is the
+           fastest mode of operation.
+        DELTAREUSESAMEREVS
+           Deltas will be reused if the destination revlog would pick the same
+           revisions for the delta. This mode strikes a balance between speed
+           and optimization.
+        DELTAREUSENEVER
+           Deltas will never be reused. This is the slowest mode of execution.
+           This mode can be used to recompute deltas (e.g. if the diff/delta
+           algorithm changes).
+        DELTAREUSEFULLADD
+           Revision will be re-added as if their were new content. This is
+           slower than DELTAREUSEALWAYS but allow more mechanism to kicks in.
+           eg: large file detection and handling.
+
+        Delta computation can be slow, so the choice of delta reuse policy can
+        significantly affect run time.
+
+        The default policy (``DELTAREUSESAMEREVS``) strikes a balance between
+        two extremes. Deltas will be reused if they are appropriate. But if the
+        delta could choose a better revision, it will do so. This means if you
+        are converting a non-generaldelta revlog to a generaldelta revlog,
+        deltas will be recomputed if the delta's parent isn't a parent of the
+        revision.
+
+        In addition to the delta policy, the ``forcedeltabothparents``
+        argument controls whether to force compute deltas against both parents
+        for merges. By default, the current default is used.
+
+        See `revlogutil.sidedata.get_sidedata_helpers` for the doc on
+        `sidedata_helpers`.
+        """
+        if deltareuse not in self.DELTAREUSEALL:
+            raise ValueError(
+                _(b'value for deltareuse invalid: %s') % deltareuse
+            )
+
+        if len(destrevlog):
+            raise ValueError(_(b'destination revlog is not empty'))
+
+        if getattr(self, 'filteredrevs', None):
+            raise ValueError(_(b'source revlog has filtered revisions'))
+        if getattr(destrevlog, 'filteredrevs', None):
+            raise ValueError(_(b'destination revlog has filtered revisions'))
+
+        # lazydelta and lazydeltabase controls whether to reuse a cached delta,
+        # if possible.
+        oldlazydelta = destrevlog._lazydelta
+        oldlazydeltabase = destrevlog._lazydeltabase
+        oldamd = destrevlog._deltabothparents
+
+        try:
+            if deltareuse == self.DELTAREUSEALWAYS:
+                destrevlog._lazydeltabase = True
+                destrevlog._lazydelta = True
+            elif deltareuse == self.DELTAREUSESAMEREVS:
+                destrevlog._lazydeltabase = False
+                destrevlog._lazydelta = True
+            elif deltareuse == self.DELTAREUSENEVER:
+                destrevlog._lazydeltabase = False
+                destrevlog._lazydelta = False
+
+            destrevlog._deltabothparents = forcedeltabothparents or oldamd
+
+            self._clone(
+                tr,
+                destrevlog,
+                addrevisioncb,
+                deltareuse,
+                forcedeltabothparents,
+                sidedata_helpers,
+            )
+
+        finally:
+            destrevlog._lazydelta = oldlazydelta
+            destrevlog._lazydeltabase = oldlazydeltabase
+            destrevlog._deltabothparents = oldamd
+
+    def _clone(
+        self,
+        tr,
+        destrevlog,
+        addrevisioncb,
+        deltareuse,
+        forcedeltabothparents,
+        sidedata_helpers,
+    ):
+        """perform the core duty of `revlog.clone` after parameter processing"""
+        write_debug = None
+        if self._debug_delta:
+            write_debug = tr._report
+        deltacomputer = deltautil.deltacomputer(
+            destrevlog,
+            write_debug=write_debug,
+        )
+        index = self.index
+        for rev in self:
+            entry = index[rev]
+
+            # Some classes override linkrev to take filtered revs into
+            # account. Use raw entry from index.
+            flags = entry[0] & 0xFFFF
+            linkrev = entry[4]
+            p1 = index[entry[5]][7]
+            p2 = index[entry[6]][7]
+            node = entry[7]
+
+            # (Possibly) reuse the delta from the revlog if allowed and
+            # the revlog chunk is a delta.
+            cachedelta = None
+            rawtext = None
+            if deltareuse == self.DELTAREUSEFULLADD:
+                text = self._revisiondata(rev)
+                sidedata = self.sidedata(rev)
+
+                if sidedata_helpers is not None:
+                    (sidedata, new_flags) = sidedatautil.run_sidedata_helpers(
+                        self, sidedata_helpers, sidedata, rev
+                    )
+                    flags = flags | new_flags[0] & ~new_flags[1]
+
+                destrevlog.addrevision(
+                    text,
+                    tr,
+                    linkrev,
+                    p1,
+                    p2,
+                    cachedelta=cachedelta,
+                    node=node,
+                    flags=flags,
+                    deltacomputer=deltacomputer,
+                    sidedata=sidedata,
+                )
+            else:
+                if destrevlog._lazydelta:
+                    dp = self.deltaparent(rev)
+                    if dp != nullrev:
+                        cachedelta = (dp, bytes(self._chunk(rev)))
+
+                sidedata = None
+                if not cachedelta:
+                    rawtext = self._revisiondata(rev)
+                    sidedata = self.sidedata(rev)
+                if sidedata is None:
+                    sidedata = self.sidedata(rev)
+
+                if sidedata_helpers is not None:
+                    (sidedata, new_flags) = sidedatautil.run_sidedata_helpers(
+                        self, sidedata_helpers, sidedata, rev
+                    )
+                    flags = flags | new_flags[0] & ~new_flags[1]
+
+                with destrevlog._writing(tr):
+                    destrevlog._addrevision(
+                        node,
+                        rawtext,
+                        tr,
+                        linkrev,
+                        p1,
+                        p2,
+                        flags,
+                        cachedelta,
+                        deltacomputer=deltacomputer,
+                        sidedata=sidedata,
+                    )
+
+            if addrevisioncb:
+                addrevisioncb(self, rev, node)
+
+    def censorrevision(self, tr, censornode, tombstone=b''):
+        if self._format_version == REVLOGV0:
+            raise error.RevlogError(
+                _(b'cannot censor with version %d revlogs')
+                % self._format_version
+            )
+        elif self._format_version == REVLOGV1:
+            rewrite.v1_censor(self, tr, censornode, tombstone)
+        else:
+            rewrite.v2_censor(self, tr, censornode, tombstone)
+
+    def verifyintegrity(self, state):
+        """Verifies the integrity of the revlog.
+
+        Yields ``revlogproblem`` instances describing problems that are
+        found.
+        """
+        dd, di = self.checksize()
+        if dd:
+            yield revlogproblem(error=_(b'data length off by %d bytes') % dd)
+        if di:
+            yield revlogproblem(error=_(b'index contains %d extra bytes') % di)
+
+        version = self._format_version
+
+        # The verifier tells us what version revlog we should be.
+        if version != state[b'expectedversion']:
+            yield revlogproblem(
+                warning=_(b"warning: '%s' uses revlog format %d; expected %d")
+                % (self.display_id, version, state[b'expectedversion'])
+            )
+
+        state[b'skipread'] = set()
+        state[b'safe_renamed'] = set()
+
+        for rev in self:
+            node = self.node(rev)
+
+            # Verify contents. 4 cases to care about:
+            #
+            #   common: the most common case
+            #   rename: with a rename

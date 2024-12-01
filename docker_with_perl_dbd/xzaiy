@@ -1,0 +1,1000 @@
+            # just before Popen.wait() set returncode.
+            pass
+        except OSError as exc:
+            print_warning(f"Failed to kill {what}: {exc!r}")
+
+    def stop(self) -> None:
+        # Method called from a different thread to stop this thread
+        self._stopped = True
+        self._kill()
+
+    def mp_result_error(
+        self,
+        test_result: TestResult,
+        stdout: str = '',
+        err_msg=None
+    ) -> MultiprocessResult:
+        test_result.duration_sec = time.monotonic() - self.start_time
+        return MultiprocessResult(test_result, stdout, err_msg)
+
+    def _run_process(self, test_name: str, stdout_fh: TextIO) -> int:
+        self.start_time = time.monotonic()
+
+        self.current_test_name = test_name
+        try:
+            popen = run_test_in_subprocess(test_name, self.ns, stdout_fh)
+
+            self._killed = False
+            self._popen = popen
+        except:
+            self.current_test_name = None
+            raise
+
+        try:
+            if self._stopped:
+                # If kill() has been called before self._popen is set,
+                # self._popen is still running. Call again kill()
+                # to ensure that the process is killed.
+                self._kill()
+                raise ExitThread
+
+            try:
+                # gh-94026: stdout+stderr are written to tempfile
+                retcode = popen.wait(timeout=self.timeout)
+                assert retcode is not None
+                return retcode
+            except subprocess.TimeoutExpired:
+                if self._stopped:
+                    # kill() has been called: communicate() fails on reading
+                    # closed stdout
+                    raise ExitThread
+
+                # On timeout, kill the process
+                self._kill()
+
+                # None means TIMEOUT for the caller
+                retcode = None
+                # bpo-38207: Don't attempt to call communicate() again: on it
+                # can hang until all child processes using stdout
+                # pipes completes.
+            except OSError:
+                if self._stopped:
+                    # kill() has been called: communicate() fails
+                    # on reading closed stdout
+                    raise ExitThread
+                raise
+        except:
+            self._kill()
+            raise
+        finally:
+            self._wait_completed()
+            self._popen = None
+            self.current_test_name = None
+
+    def _runtest(self, test_name: str) -> MultiprocessResult:
+        if sys.platform == 'win32':
+            # gh-95027: When stdout is not a TTY, Python uses the ANSI code
+            # page for the sys.stdout encoding. If the main process runs in a
+            # terminal, sys.stdout uses WindowsConsoleIO with UTF-8 encoding.
+            encoding = locale.getencoding()
+        else:
+            encoding = sys.stdout.encoding
+        # gh-94026: Write stdout+stderr to a tempfile as workaround for
+        # non-blocking pipes on Emscripten with NodeJS.
+        with tempfile.TemporaryFile('w+', encoding=encoding) as stdout_fh:
+            # gh-93353: Check for leaked temporary files in the parent process,
+            # since the deletion of temporary files can happen late during
+            # Python finalization: too late for libregrtest.
+            retcode = self._run_process(test_name, stdout_fh)
+            stdout_fh.seek(0)
+            stdout = stdout_fh.read().strip()
+
+        if retcode is None:
+            return self.mp_result_error(Timeout(test_name), stdout)
+
+        err_msg = None
+        if retcode != 0:
+            err_msg = "Exit code %s" % retcode
+        else:
+            stdout, _, result = stdout.rpartition("\n")
+            stdout = stdout.rstrip()
+            if not result:
+                err_msg = "Failed to parse worker stdout"
+            else:
+                try:
+                    # deserialize run_tests_worker() output
+                    result = json.loads(result, object_hook=decode_test_result)
+                except Exception as exc:
+                    err_msg = "Failed to parse worker JSON: %s" % exc
+
+        if err_msg is not None:
+            return self.mp_result_error(ChildError(test_name), stdout, err_msg)
+
+        return MultiprocessResult(result, stdout, err_msg)
+
+    def run(self) -> None:
+        while not self._stopped:
+            try:
+                try:
+                    test_name = next(self.pending)
+                except StopIteration:
+                    break
+
+                mp_result = self._runtest(test_name)
+                self.output.put((False, mp_result))
+
+                if must_stop(mp_result.result, self.ns):
+                    break
+            except ExitThread:
+                break
+            except BaseException:
+                self.output.put((True, traceback.format_exc()))
+                break
+
+    def _wait_completed(self) -> None:
+        popen = self._popen
+
+        try:
+            popen.wait(JOIN_TIMEOUT)
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            print_warning(f"Failed to wait for {self} completion "
+                          f"(timeout={format_duration(JOIN_TIMEOUT)}): "
+                          f"{exc!r}")
+
+    def wait_stopped(self, start_time: float) -> None:
+        # bpo-38207: MultiprocessTestRunner.stop_workers() called self.stop()
+        # which killed the process. Sometimes, killing the process from the
+        # main thread does not interrupt popen.communicate() in
+        # TestWorkerProcess thread. This loop with a timeout is a workaround
+        # for that.
+        #
+        # Moreover, if this method fails to join the thread, it is likely
+        # that Python will hang at exit while calling threading._shutdown()
+        # which tries again to join the blocked thread. Regrtest.main()
+        # uses EXIT_TIMEOUT to workaround this second bug.
+        while True:
+            # Write a message every second
+            self.join(1.0)
+            if not self.is_alive():
+                break
+            dt = time.monotonic() - start_time
+            self.regrtest.log(f"Waiting for {self} thread "
+                              f"for {format_duration(dt)}")
+            if dt > JOIN_TIMEOUT:
+                print_warning(f"Failed to join {self} in {format_duration(dt)}")
+                break
+
+
+def get_running(workers: list[TestWorkerProcess]) -> list[TestWorkerProcess]:
+    running = []
+    for worker in workers:
+        current_test_name = worker.current_test_name
+        if not current_test_name:
+            continue
+        dt = time.monotonic() - worker.start_time
+        if dt >= PROGRESS_MIN_TIME:
+            text = '%s (%s)' % (current_test_name, format_duration(dt))
+            running.append(text)
+    return running
+
+
+class MultiprocessTestRunner:
+    def __init__(self, regrtest: Regrtest) -> None:
+        self.regrtest = regrtest
+        self.log = self.regrtest.log
+        self.ns = regrtest.ns
+        self.output: queue.Queue[QueueOutput] = queue.Queue()
+        self.pending = MultiprocessIterator(self.regrtest.tests)
+        if self.ns.timeout is not None:
+            # Rely on faulthandler to kill a worker process. This timouet is
+            # when faulthandler fails to kill a worker process. Give a maximum
+            # of 5 minutes to faulthandler to kill the worker.
+            self.worker_timeout = min(self.ns.timeout * 1.5,
+                                      self.ns.timeout + 5 * 60)
+        else:
+            self.worker_timeout = None
+        self.workers = None
+
+    def start_workers(self) -> None:
+        self.workers = [TestWorkerProcess(index, self)
+                        for index in range(1, self.ns.use_mp + 1)]
+        msg = f"Run tests in parallel using {len(self.workers)} child processes"
+        if self.ns.timeout:
+            msg += (" (timeout: %s, worker timeout: %s)"
+                    % (format_duration(self.ns.timeout),
+                       format_duration(self.worker_timeout)))
+        self.log(msg)
+        for worker in self.workers:
+            worker.start()
+
+    def stop_workers(self) -> None:
+        start_time = time.monotonic()
+        for worker in self.workers:
+            worker.stop()
+        for worker in self.workers:
+            worker.wait_stopped(start_time)
+
+    def _get_result(self) -> QueueOutput | None:
+        use_faulthandler = (self.ns.timeout is not None)
+        timeout = PROGRESS_UPDATE
+
+        # bpo-46205: check the status of workers every iteration to avoid
+        # waiting forever on an empty queue.
+        while any(worker.is_alive() for worker in self.workers):
+            if use_faulthandler:
+                faulthandler.dump_traceback_later(MAIN_PROCESS_TIMEOUT,
+                                                  exit=True)
+
+            # wait for a thread
+            try:
+                return self.output.get(timeout=timeout)
+            except queue.Empty:
+                pass
+
+            # display progress
+            running = get_running(self.workers)
+            if running and not self.ns.pgo:
+                self.log('running: %s' % ', '.join(running))
+
+        # all worker threads are done: consume pending results
+        try:
+            return self.output.get(timeout=0)
+        except queue.Empty:
+            return None
+
+    def display_result(self, mp_result: MultiprocessResult) -> None:
+        result = mp_result.result
+
+        text = str(result)
+        if mp_result.error_msg is not None:
+            # CHILD_ERROR
+            text += ' (%s)' % mp_result.error_msg
+        elif (result.duration_sec >= PROGRESS_MIN_TIME and not self.ns.pgo):
+            text += ' (%s)' % format_duration(result.duration_sec)
+        running = get_running(self.workers)
+        if running and not self.ns.pgo:
+            text += ' -- running: %s' % ', '.join(running)
+        self.regrtest.display_progress(self.test_index, text)
+
+    def _process_result(self, item: QueueOutput) -> bool:
+        """Returns True if test runner must stop."""
+        if item[0]:
+            # Thread got an exception
+            format_exc = item[1]
+            print_warning(f"regrtest worker thread failed: {format_exc}")
+            return True
+
+        self.test_index += 1
+        mp_result = item[1]
+        self.regrtest.accumulate_result(mp_result.result)
+        self.display_result(mp_result)
+
+        if mp_result.stdout:
+            print(mp_result.stdout, flush=True)
+
+        if must_stop(mp_result.result, self.ns):
+            return True
+
+        return False
+
+    def run_tests(self) -> None:
+        self.start_workers()
+
+        self.test_index = 0
+        try:
+            while True:
+                item = self._get_result()
+                if item is None:
+                    break
+
+                stop = self._process_result(item)
+                if stop:
+                    break
+        except KeyboardInterrupt:
+            print()
+            self.regrtest.interrupted = True
+        finally:
+            if self.ns.timeout is not None:
+                faulthandler.cancel_dump_traceback_later()
+
+            # Always ensure that all worker processes are no longer
+            # worker when we exit this function
+            self.pending.stop()
+            self.stop_workers()
+
+
+def run_tests_multiprocess(regrtest: Regrtest) -> None:
+    MultiprocessTestRunner(regrtest).run_tests()
+
+
+class EncodeTestResult(json.JSONEncoder):
+    """Encode a TestResult (sub)class object into a JSON dict."""
+
+    def default(self, o: Any) -> dict[str, Any]:
+        if isinstance(o, TestResult):
+            result = vars(o)
+            result["__test_result__"] = o.__class__.__name__
+            return result
+
+        return super().default(o)
+
+
+def decode_test_result(d: dict[str, Any]) -> TestResult | dict[str, Any]:
+    """Decode a TestResult (sub)class object from a JSON dict."""
+
+    if "__test_result__" not in d:
+        return d
+
+    cls_name = d.pop("__test_result__")
+    for cls in get_all_test_result_classes():
+        if cls.__name__ == cls_name:
+            return cls(**d)
+
+
+def get_all_test_result_classes() -> set[type[TestResult]]:
+    prev_count = 0
+    classes = {TestResult}
+    while len(classes) > prev_count:
+        prev_count = len(classes)
+        to_add = []
+        for cls in classes:
+            to_add.extend(cls.__subclasses__())
+        classes.update(to_add)
+    return classes
+                                                                                                                                                                                                                                                                                                                                                                                                                             usr/lib/python3.11/test/libregrtest/save_env.py                                                     0000644 0000000 0000000 00000031214 14671176116 020147  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        import builtins
+import locale
+import os
+import sys
+import threading
+from test import support
+from test.support import os_helper
+from test.libregrtest.utils import print_warning
+
+
+class SkipTestEnvironment(Exception):
+    pass
+
+
+# Unit tests are supposed to leave the execution environment unchanged
+# once they complete.  But sometimes tests have bugs, especially when
+# tests fail, and the changes to environment go on to mess up other
+# tests.  This can cause issues with buildbot stability, since tests
+# are run in random order and so problems may appear to come and go.
+# There are a few things we can save and restore to mitigate this, and
+# the following context manager handles this task.
+
+class saved_test_environment:
+    """Save bits of the test environment and restore them at block exit.
+
+        with saved_test_environment(testname, verbose, quiet):
+            #stuff
+
+    Unless quiet is True, a warning is printed to stderr if any of
+    the saved items was changed by the test. The support.environment_altered
+    attribute is set to True if a change is detected.
+
+    If verbose is more than 1, the before and after state of changed
+    items is also printed.
+    """
+
+    def __init__(self, testname, verbose=0, quiet=False, *, pgo=False):
+        self.testname = testname
+        self.verbose = verbose
+        self.quiet = quiet
+        self.pgo = pgo
+
+    # To add things to save and restore, add a name XXX to the resources list
+    # and add corresponding get_XXX/restore_XXX functions.  get_XXX should
+    # return the value to be saved and compared against a second call to the
+    # get function when test execution completes.  restore_XXX should accept
+    # the saved value and restore the resource using it.  It will be called if
+    # and only if a change in the value is detected.
+    #
+    # Note: XXX will have any '.' replaced with '_' characters when determining
+    # the corresponding method names.
+
+    resources = ('sys.argv', 'cwd', 'sys.stdin', 'sys.stdout', 'sys.stderr',
+                 'os.environ', 'sys.path', 'sys.path_hooks', '__import__',
+                 'warnings.filters', 'asyncore.socket_map',
+                 'logging._handlers', 'logging._handlerList', 'sys.gettrace',
+                 'sys.warnoptions',
+                 # multiprocessing.process._cleanup() may release ref
+                 # to a thread, so check processes first.
+                 'multiprocessing.process._dangling', 'threading._dangling',
+                 'sysconfig._CONFIG_VARS', 'sysconfig._INSTALL_SCHEMES',
+                 'files', 'locale', 'warnings.showwarning',
+                 'shutil_archive_formats', 'shutil_unpack_formats',
+                 'asyncio.events._event_loop_policy',
+                 'urllib.requests._url_tempfiles', 'urllib.requests._opener',
+                )
+
+    def get_module(self, name):
+        # function for restore() methods
+        return sys.modules[name]
+
+    def try_get_module(self, name):
+        # function for get() methods
+        try:
+            return self.get_module(name)
+        except KeyError:
+            raise SkipTestEnvironment
+
+    def get_urllib_requests__url_tempfiles(self):
+        urllib_request = self.try_get_module('urllib.request')
+        return list(urllib_request._url_tempfiles)
+    def restore_urllib_requests__url_tempfiles(self, tempfiles):
+        for filename in tempfiles:
+            os_helper.unlink(filename)
+
+    def get_urllib_requests__opener(self):
+        urllib_request = self.try_get_module('urllib.request')
+        return urllib_request._opener
+    def restore_urllib_requests__opener(self, opener):
+        urllib_request = self.get_module('urllib.request')
+        urllib_request._opener = opener
+
+    def get_asyncio_events__event_loop_policy(self):
+        self.try_get_module('asyncio')
+        return support.maybe_get_event_loop_policy()
+    def restore_asyncio_events__event_loop_policy(self, policy):
+        asyncio = self.get_module('asyncio')
+        asyncio.set_event_loop_policy(policy)
+
+    def get_sys_argv(self):
+        return id(sys.argv), sys.argv, sys.argv[:]
+    def restore_sys_argv(self, saved_argv):
+        sys.argv = saved_argv[1]
+        sys.argv[:] = saved_argv[2]
+
+    def get_cwd(self):
+        return os.getcwd()
+    def restore_cwd(self, saved_cwd):
+        os.chdir(saved_cwd)
+
+    def get_sys_stdout(self):
+        return sys.stdout
+    def restore_sys_stdout(self, saved_stdout):
+        sys.stdout = saved_stdout
+
+    def get_sys_stderr(self):
+        return sys.stderr
+    def restore_sys_stderr(self, saved_stderr):
+        sys.stderr = saved_stderr
+
+    def get_sys_stdin(self):
+        return sys.stdin
+    def restore_sys_stdin(self, saved_stdin):
+        sys.stdin = saved_stdin
+
+    def get_os_environ(self):
+        return id(os.environ), os.environ, dict(os.environ)
+    def restore_os_environ(self, saved_environ):
+        os.environ = saved_environ[1]
+        os.environ.clear()
+        os.environ.update(saved_environ[2])
+
+    def get_sys_path(self):
+        return id(sys.path), sys.path, sys.path[:]
+    def restore_sys_path(self, saved_path):
+        sys.path = saved_path[1]
+        sys.path[:] = saved_path[2]
+
+    def get_sys_path_hooks(self):
+        return id(sys.path_hooks), sys.path_hooks, sys.path_hooks[:]
+    def restore_sys_path_hooks(self, saved_hooks):
+        sys.path_hooks = saved_hooks[1]
+        sys.path_hooks[:] = saved_hooks[2]
+
+    def get_sys_gettrace(self):
+        return sys.gettrace()
+    def restore_sys_gettrace(self, trace_fxn):
+        sys.settrace(trace_fxn)
+
+    def get___import__(self):
+        return builtins.__import__
+    def restore___import__(self, import_):
+        builtins.__import__ = import_
+
+    def get_warnings_filters(self):
+        warnings = self.try_get_module('warnings')
+        return id(warnings.filters), warnings.filters, warnings.filters[:]
+    def restore_warnings_filters(self, saved_filters):
+        warnings = self.get_module('warnings')
+        warnings.filters = saved_filters[1]
+        warnings.filters[:] = saved_filters[2]
+
+    def get_asyncore_socket_map(self):
+        asyncore = sys.modules.get('asyncore')
+        # XXX Making a copy keeps objects alive until __exit__ gets called.
+        return asyncore and asyncore.socket_map.copy() or {}
+    def restore_asyncore_socket_map(self, saved_map):
+        asyncore = sys.modules.get('asyncore')
+        if asyncore is not None:
+            asyncore.close_all(ignore_all=True)
+            asyncore.socket_map.update(saved_map)
+
+    def get_shutil_archive_formats(self):
+        shutil = self.try_get_module('shutil')
+        # we could call get_archives_formats() but that only returns the
+        # registry keys; we want to check the values too (the functions that
+        # are registered)
+        return shutil._ARCHIVE_FORMATS, shutil._ARCHIVE_FORMATS.copy()
+    def restore_shutil_archive_formats(self, saved):
+        shutil = self.get_module('shutil')
+        shutil._ARCHIVE_FORMATS = saved[0]
+        shutil._ARCHIVE_FORMATS.clear()
+        shutil._ARCHIVE_FORMATS.update(saved[1])
+
+    def get_shutil_unpack_formats(self):
+        shutil = self.try_get_module('shutil')
+        return shutil._UNPACK_FORMATS, shutil._UNPACK_FORMATS.copy()
+    def restore_shutil_unpack_formats(self, saved):
+        shutil = self.get_module('shutil')
+        shutil._UNPACK_FORMATS = saved[0]
+        shutil._UNPACK_FORMATS.clear()
+        shutil._UNPACK_FORMATS.update(saved[1])
+
+    def get_logging__handlers(self):
+        logging = self.try_get_module('logging')
+        # _handlers is a WeakValueDictionary
+        return id(logging._handlers), logging._handlers, logging._handlers.copy()
+    def restore_logging__handlers(self, saved_handlers):
+        # Can't easily revert the logging state
+        pass
+
+    def get_logging__handlerList(self):
+        logging = self.try_get_module('logging')
+        # _handlerList is a list of weakrefs to handlers
+        return id(logging._handlerList), logging._handlerList, logging._handlerList[:]
+    def restore_logging__handlerList(self, saved_handlerList):
+        # Can't easily revert the logging state
+        pass
+
+    def get_sys_warnoptions(self):
+        return id(sys.warnoptions), sys.warnoptions, sys.warnoptions[:]
+    def restore_sys_warnoptions(self, saved_options):
+        sys.warnoptions = saved_options[1]
+        sys.warnoptions[:] = saved_options[2]
+
+    # Controlling dangling references to Thread objects can make it easier
+    # to track reference leaks.
+    def get_threading__dangling(self):
+        # This copies the weakrefs without making any strong reference
+        return threading._dangling.copy()
+    def restore_threading__dangling(self, saved):
+        threading._dangling.clear()
+        threading._dangling.update(saved)
+
+    # Same for Process objects
+    def get_multiprocessing_process__dangling(self):
+        multiprocessing_process = self.try_get_module('multiprocessing.process')
+        # Unjoined process objects can survive after process exits
+        multiprocessing_process._cleanup()
+        # This copies the weakrefs without making any strong reference
+        return multiprocessing_process._dangling.copy()
+    def restore_multiprocessing_process__dangling(self, saved):
+        multiprocessing_process = self.get_module('multiprocessing.process')
+        multiprocessing_process._dangling.clear()
+        multiprocessing_process._dangling.update(saved)
+
+    def get_sysconfig__CONFIG_VARS(self):
+        # make sure the dict is initialized
+        sysconfig = self.try_get_module('sysconfig')
+        sysconfig.get_config_var('prefix')
+        return (id(sysconfig._CONFIG_VARS), sysconfig._CONFIG_VARS,
+                dict(sysconfig._CONFIG_VARS))
+    def restore_sysconfig__CONFIG_VARS(self, saved):
+        sysconfig = self.get_module('sysconfig')
+        sysconfig._CONFIG_VARS = saved[1]
+        sysconfig._CONFIG_VARS.clear()
+        sysconfig._CONFIG_VARS.update(saved[2])
+
+    def get_sysconfig__INSTALL_SCHEMES(self):
+        sysconfig = self.try_get_module('sysconfig')
+        return (id(sysconfig._INSTALL_SCHEMES), sysconfig._INSTALL_SCHEMES,
+                sysconfig._INSTALL_SCHEMES.copy())
+    def restore_sysconfig__INSTALL_SCHEMES(self, saved):
+        sysconfig = self.get_module('sysconfig')
+        sysconfig._INSTALL_SCHEMES = saved[1]
+        sysconfig._INSTALL_SCHEMES.clear()
+        sysconfig._INSTALL_SCHEMES.update(saved[2])
+
+    def get_files(self):
+        return sorted(fn + ('/' if os.path.isdir(fn) else '')
+                      for fn in os.listdir())
+    def restore_files(self, saved_value):
+        fn = os_helper.TESTFN
+        if fn not in saved_value and (fn + '/') not in saved_value:
+            if os.path.isfile(fn):
+                os_helper.unlink(fn)
+            elif os.path.isdir(fn):
+                os_helper.rmtree(fn)
+
+    _lc = [getattr(locale, lc) for lc in dir(locale)
+           if lc.startswith('LC_')]
+    def get_locale(self):
+        pairings = []
+        for lc in self._lc:
+            try:
+                pairings.append((lc, locale.setlocale(lc, None)))
+            except (TypeError, ValueError):
+                continue
+        return pairings
+    def restore_locale(self, saved):
+        for lc, setting in saved:
+            locale.setlocale(lc, setting)
+
+    def get_warnings_showwarning(self):
+        warnings = self.try_get_module('warnings')
+        return warnings.showwarning
+    def restore_warnings_showwarning(self, fxn):
+        warnings = self.get_module('warnings')
+        warnings.showwarning = fxn
+
+    def resource_info(self):
+        for name in self.resources:
+            method_suffix = name.replace('.', '_')
+            get_name = 'get_' + method_suffix
+            restore_name = 'restore_' + method_suffix
+            yield name, getattr(self, get_name), getattr(self, restore_name)
+
+    def __enter__(self):
+        self.saved_values = []
+        for name, get, restore in self.resource_info():
+            try:
+                original = get()
+            except SkipTestEnvironment:
+                continue
+
+            self.saved_values.append((name, get, restore, original))
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        saved_values = self.saved_values
+        self.saved_values = None
+
+        # Some resources use weak references
+        support.gc_collect()
+
+        for name, get, restore, original in saved_values:
+            current = get()
+            # Check for changes to the resource's value
+            if current != original:
+                support.environment_altered = True
+                restore(original)
+                if not self.quiet and not self.pgo:
+                    print_warning(
+                        f"{name} was modified by {self.testname}\n"
+                        f"  Before: {original}\n"
+                        f"  After:  {current} ")
+        return False
+                                                                                                                                                                                                                                                                                                                                                                                    usr/lib/python3.11/test/libregrtest/setup.py                                                        0000644 0000000 0000000 00000013620 14671176116 017502  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        import atexit
+import faulthandler
+import os
+import signal
+import sys
+import unittest
+from test import support
+from test.support.os_helper import TESTFN_UNDECODABLE, FS_NONASCII
+try:
+    import gc
+except ImportError:
+    gc = None
+
+from test.libregrtest.utils import (setup_unraisable_hook,
+                                    setup_threading_excepthook)
+
+
+UNICODE_GUARD_ENV = "PYTHONREGRTEST_UNICODE_GUARD"
+
+
+def setup_tests(ns):
+    try:
+        stderr_fd = sys.__stderr__.fileno()
+    except (ValueError, AttributeError):
+        # Catch ValueError to catch io.UnsupportedOperation on TextIOBase
+        # and ValueError on a closed stream.
+        #
+        # Catch AttributeError for stderr being None.
+        stderr_fd = None
+    else:
+        # Display the Python traceback on fatal errors (e.g. segfault)
+        faulthandler.enable(all_threads=True, file=stderr_fd)
+
+        # Display the Python traceback on SIGALRM or SIGUSR1 signal
+        signals = []
+        if hasattr(signal, 'SIGALRM'):
+            signals.append(signal.SIGALRM)
+        if hasattr(signal, 'SIGUSR1'):
+            signals.append(signal.SIGUSR1)
+        for signum in signals:
+            faulthandler.register(signum, chain=True, file=stderr_fd)
+
+    _adjust_resource_limits()
+    replace_stdout()
+    support.record_original_stdout(sys.stdout)
+
+    if ns.testdir:
+        # Prepend test directory to sys.path, so runtest() will be able
+        # to locate tests
+        sys.path.insert(0, os.path.abspath(ns.testdir))
+
+    # Some times __path__ and __file__ are not absolute (e.g. while running from
+    # Lib/) and, if we change the CWD to run the tests in a temporary dir, some
+    # imports might fail.  This affects only the modules imported before os.chdir().
+    # These modules are searched first in sys.path[0] (so '' -- the CWD) and if
+    # they are found in the CWD their __file__ and __path__ will be relative (this
+    # happens before the chdir).  All the modules imported after the chdir, are
+    # not found in the CWD, and since the other paths in sys.path[1:] are absolute
+    # (site.py absolutize them), the __file__ and __path__ will be absolute too.
+    # Therefore it is necessary to absolutize manually the __file__ and __path__ of
+    # the packages to prevent later imports to fail when the CWD is different.
+    for module in sys.modules.values():
+        if hasattr(module, '__path__'):
+            for index, path in enumerate(module.__path__):
+                module.__path__[index] = os.path.abspath(path)
+        if getattr(module, '__file__', None):
+            module.__file__ = os.path.abspath(module.__file__)
+
+    if ns.huntrleaks:
+        unittest.BaseTestSuite._cleanup = False
+
+    if ns.memlimit is not None:
+        support.set_memlimit(ns.memlimit)
+
+    if ns.threshold is not None:
+        gc.set_threshold(ns.threshold)
+
+    support.suppress_msvcrt_asserts(ns.verbose and ns.verbose >= 2)
+
+    support.use_resources = ns.use_resources
+
+    if hasattr(sys, 'addaudithook'):
+        # Add an auditing hook for all tests to ensure PySys_Audit is tested
+        def _test_audit_hook(name, args):
+            pass
+        sys.addaudithook(_test_audit_hook)
+
+    setup_unraisable_hook()
+    setup_threading_excepthook()
+
+    if ns.timeout is not None:
+        # For a slow buildbot worker, increase SHORT_TIMEOUT and LONG_TIMEOUT
+        support.SHORT_TIMEOUT = max(support.SHORT_TIMEOUT, ns.timeout / 40)
+        support.LONG_TIMEOUT = max(support.LONG_TIMEOUT, ns.timeout / 4)
+
+        # If --timeout is short: reduce timeouts
+        support.LOOPBACK_TIMEOUT = min(support.LOOPBACK_TIMEOUT, ns.timeout)
+        support.INTERNET_TIMEOUT = min(support.INTERNET_TIMEOUT, ns.timeout)
+        support.SHORT_TIMEOUT = min(support.SHORT_TIMEOUT, ns.timeout)
+        support.LONG_TIMEOUT = min(support.LONG_TIMEOUT, ns.timeout)
+
+    if ns.xmlpath:
+        from test.support.testresult import RegressionTestResult
+        RegressionTestResult.USE_XML = True
+
+    # Ensure there's a non-ASCII character in env vars at all times to force
+    # tests consider this case. See BPO-44647 for details.
+    if TESTFN_UNDECODABLE and os.supports_bytes_environ:
+        os.environb.setdefault(UNICODE_GUARD_ENV.encode(), TESTFN_UNDECODABLE)
+    elif FS_NONASCII:
+        os.environ.setdefault(UNICODE_GUARD_ENV, FS_NONASCII)
+
+
+def replace_stdout():
+    """Set stdout encoder error handler to backslashreplace (as stderr error
+    handler) to avoid UnicodeEncodeError when printing a traceback"""
+    stdout = sys.stdout
+    try:
+        fd = stdout.fileno()
+    except ValueError:
+        # On IDLE, sys.stdout has no file descriptor and is not a TextIOWrapper
+        # object. Leaving sys.stdout unchanged.
+        #
+        # Catch ValueError to catch io.UnsupportedOperation on TextIOBase
+        # and ValueError on a closed stream.
+        return
+
+    sys.stdout = open(fd, 'w',
+        encoding=stdout.encoding,
+        errors="backslashreplace",
+        closefd=False,
+        newline='\n')
+
+    def restore_stdout():
+        sys.stdout.close()
+        sys.stdout = stdout
+    atexit.register(restore_stdout)
+
+
+def _adjust_resource_limits():
+    """Adjust the system resource limits (ulimit) if needed."""
+    try:
+        import resource
+        from resource import RLIMIT_NOFILE, RLIM_INFINITY
+    except ImportError:
+        return
+    fd_limit, max_fds = resource.getrlimit(RLIMIT_NOFILE)
+    # On macOS the default fd limit is sometimes too low (256) for our
+    # test suite to succeed.  Raise it to something more reasonable.
+    # 1024 is a common Linux default.
+    desired_fds = 1024
+    if fd_limit < desired_fds and fd_limit < max_fds:
+        new_fd_limit = min(desired_fds, max_fds)
+        try:
+            resource.setrlimit(RLIMIT_NOFILE, (new_fd_limit, max_fds))
+            print(f"Raised RLIMIT_NOFILE: {fd_limit} -> {new_fd_limit}")
+        except (ValueError, OSError) as err:
+            print(f"Unable to raise RLIMIT_NOFILE from {fd_limit} to "
+                  f"{new_fd_limit}: {err}.")
+                                                                                                                usr/lib/python3.11/test/libregrtest/utils.py                                                        0000644 0000000 0000000 00000011666 14671176116 017512  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        import math
+import os.path
+import sys
+import textwrap
+from test import support
+
+
+def format_duration(seconds):
+    ms = math.ceil(seconds * 1e3)
+    seconds, ms = divmod(ms, 1000)
+    minutes, seconds = divmod(seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+
+    parts = []
+    if hours:
+        parts.append('%s hour' % hours)
+    if minutes:
+        parts.append('%s min' % minutes)
+    if seconds:
+        if parts:
+            # 2 min 1 sec
+            parts.append('%s sec' % seconds)
+        else:
+            # 1.0 sec
+            parts.append('%.1f sec' % (seconds + ms / 1000))
+    if not parts:
+        return '%s ms' % ms
+
+    parts = parts[:2]
+    return ' '.join(parts)
+
+
+def removepy(names):
+    if not names:
+        return
+    for idx, name in enumerate(names):
+        basename, ext = os.path.splitext(name)
+        if ext == '.py':
+            names[idx] = basename
+
+
+def count(n, word):
+    if n == 1:
+        return "%d %s" % (n, word)
+    else:
+        return "%d %ss" % (n, word)
+
+
+def printlist(x, width=70, indent=4, file=None):
+    """Print the elements of iterable x to stdout.
+
+    Optional arg width (default 70) is the maximum line length.
+    Optional arg indent (default 4) is the number of blanks with which to
+    begin each line.
+    """
+
+    blanks = ' ' * indent
+    # Print the sorted list: 'x' may be a '--random' list or a set()
+    print(textwrap.fill(' '.join(str(elt) for elt in sorted(x)), width,
+                        initial_indent=blanks, subsequent_indent=blanks),
+          file=file)
+
+
+def print_warning(msg):
+    support.print_warning(msg)
+
+
+orig_unraisablehook = None
+
+
+def regrtest_unraisable_hook(unraisable):
+    global orig_unraisablehook
+    support.environment_altered = True
+    support.print_warning("Unraisable exception")
+    old_stderr = sys.stderr
+    try:
+        support.flush_std_streams()
+        sys.stderr = support.print_warning.orig_stderr
+        orig_unraisablehook(unraisable)
+        sys.stderr.flush()
+    finally:
+        sys.stderr = old_stderr
+
+
+def setup_unraisable_hook():
+    global orig_unraisablehook
+    orig_unraisablehook = sys.unraisablehook
+    sys.unraisablehook = regrtest_unraisable_hook
+
+
+orig_threading_excepthook = None
+
+
+def regrtest_threading_excepthook(args):
+    global orig_threading_excepthook
+    support.environment_altered = True
+    support.print_warning(f"Uncaught thread exception: {args.exc_type.__name__}")
+    old_stderr = sys.stderr
+    try:
+        support.flush_std_streams()
+        sys.stderr = support.print_warning.orig_stderr
+        orig_threading_excepthook(args)
+        sys.stderr.flush()
+    finally:
+        sys.stderr = old_stderr
+
+
+def setup_threading_excepthook():
+    global orig_threading_excepthook
+    import threading
+    orig_threading_excepthook = threading.excepthook
+    threading.excepthook = regrtest_threading_excepthook
+
+
+def clear_caches():
+    # Clear the warnings registry, so they can be displayed again
+    for mod in sys.modules.values():
+        if hasattr(mod, '__warningregistry__'):
+            del mod.__warningregistry__
+
+    # Flush standard output, so that buffered data is sent to the OS and
+    # associated Python objects are reclaimed.
+    for stream in (sys.stdout, sys.stderr, sys.__stdout__, sys.__stderr__):
+        if stream is not None:
+            stream.flush()
+
+    # Clear assorted module caches.
+    # Don't worry about resetting the cache if the module is not loaded
+    try:
+        distutils_dir_util = sys.modules['distutils.dir_util']
+    except KeyError:
+        pass
+    else:
+        distutils_dir_util._path_created.clear()
+
+    try:
+        re = sys.modules['re']
+    except KeyError:
+        pass
+    else:
+        re.purge()
+
+    try:
+        _strptime = sys.modules['_strptime']
+    except KeyError:
+        pass
+    else:
+        _strptime._regex_cache.clear()
+
+    try:
+        urllib_parse = sys.modules['urllib.parse']
+    except KeyError:
+        pass
+    else:
+        urllib_parse.clear_cache()
+
+    try:
+        urllib_request = sys.modules['urllib.request']
+    except KeyError:
+        pass
+    else:
+        urllib_request.urlcleanup()
+
+    try:
+        linecache = sys.modules['linecache']
+    except KeyError:
+        pass
+    else:
+        linecache.clearcache()
+
+    try:

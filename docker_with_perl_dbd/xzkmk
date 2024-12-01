@@ -1,0 +1,1000 @@
+}
+
+# generally, this should be called without arguments so that the currently
+# loaded config file is where changes are committed.
+sub commit {
+    my($self,@args) = @_;
+    CPAN->debug("args[@args]") if $CPAN::DEBUG;
+    if ($CPAN::RUN_DEGRADED) {
+        $CPAN::Frontend->mydie(
+            "'o conf commit' disabled in ".
+            "degraded mode. Maybe try\n".
+            " !undef \$CPAN::RUN_DEGRADED\n"
+        );
+    }
+    my ($configpm, $must_reload);
+
+    # XXX does anything do this? can it be simplified? -- dagolden, 2011-01-19
+    if (@args) {
+      if ($args[0] eq "args") {
+        # we have not signed that contract
+      } else {
+        $configpm = $args[0];
+      }
+    }
+
+    # use provided name or the current config or create a new MyConfig
+    $configpm ||= require_myconfig_or_config() || make_new_config();
+
+    # commit to MyConfig if we can't write to Config
+    if ( ! -w $configpm && $configpm =~ m{CPAN/Config\.pm} ) {
+        my $myconfig = _new_config_name();
+        $CPAN::Frontend->mywarn(
+            "Your $configpm file\n".
+            "is not writable. I will attempt to write your configuration to\n" .
+            "$myconfig instead.\n\n"
+        );
+        $configpm = make_new_config();
+        $must_reload++; # so it gets loaded as $INC{'CPAN/MyConfig.pm'}
+    }
+
+    # XXX why not just "-w $configpm"? -- dagolden, 2011-01-19
+    my($mode);
+    if (-f $configpm) {
+        $mode = (stat $configpm)[2];
+        if ($mode && ! -w _) {
+            _die_cant_write_config($configpm);
+        }
+    }
+
+    $self->_write_config_file($configpm);
+    require_myconfig_or_config() if $must_reload;
+
+    #$mode = 0444 | ( $mode & 0111 ? 0111 : 0 );
+    #chmod $mode, $configpm;
+###why was that so?    $self->defaults;
+    $CPAN::Frontend->myprint("commit: wrote '$configpm'\n");
+    $CPAN::CONFIG_DIRTY = 0;
+    1;
+}
+
+sub _write_config_file {
+    my ($self, $configpm) = @_;
+    my $msg;
+    $msg = <<EOF if $configpm =~ m{CPAN/Config\.pm};
+
+# This is CPAN.pm's systemwide configuration file. This file provides
+# defaults for users, and the values can be changed in a per-user
+# configuration file.
+
+EOF
+    $msg ||= "\n";
+    my($fh) = FileHandle->new;
+    rename $configpm, "$configpm~" if -f $configpm;
+    open $fh, ">$configpm" or
+        $CPAN::Frontend->mydie("Couldn't open >$configpm: $!");
+    $fh->print(qq[$msg\$CPAN::Config = \{\n]);
+    foreach (sort keys %$CPAN::Config) {
+        unless (exists $keys{$_}) {
+            # do not drop them: forward compatibility!
+            $CPAN::Frontend->mywarn("Unknown config variable '$_'\n");
+            next;
+        }
+        $fh->print(
+            "  '$_' => ",
+            $self->neatvalue($CPAN::Config->{$_}),
+            ",\n"
+        );
+    }
+    $fh->print("};\n1;\n__END__\n");
+    close $fh;
+
+    return;
+}
+
+
+# stolen from MakeMaker; not taking the original because it is buggy;
+# bugreport will have to say: keys of hashes remain unquoted and can
+# produce syntax errors
+sub neatvalue {
+    my($self, $v) = @_;
+    return "undef" unless defined $v;
+    my($t) = ref $v;
+    unless ($t) {
+        $v =~ s/\\/\\\\/g;
+        return "q[$v]";
+    }
+    if ($t eq 'ARRAY') {
+        my(@m, @neat);
+        push @m, "[";
+        foreach my $elem (@$v) {
+            push @neat, "q[$elem]";
+        }
+        push @m, join ", ", @neat;
+        push @m, "]";
+        return join "", @m;
+    }
+    return "$v" unless $t eq 'HASH';
+    my @m;
+    foreach my $key (sort keys %$v) {
+        my $val = $v->{$key};
+        push(@m,"q[$key]=>".$self->neatvalue($val)) ;
+    }
+    return "{ ".join(', ',@m)." }";
+}
+
+sub defaults {
+    my($self) = @_;
+    if ($CPAN::RUN_DEGRADED) {
+                             $CPAN::Frontend->mydie(
+                                                    "'o conf defaults' disabled in ".
+                                                    "degraded mode. Maybe try\n".
+                                                    " !undef \$CPAN::RUN_DEGRADED\n"
+                                                   );
+    }
+    my $done;
+    for my $config (qw(CPAN/MyConfig.pm CPAN/Config.pm)) {
+        if ($INC{$config}) {
+            CPAN->debug("INC{'$config'}[$INC{$config}]") if $CPAN::DEBUG;
+            CPAN::Shell->_reload_this($config,{reloforce => 1});
+            $CPAN::Frontend->myprint("'$INC{$config}' reread\n");
+            last;
+        }
+    }
+    $CPAN::CONFIG_DIRTY = 0;
+    1;
+}
+
+=head2 C<< CLASS->safe_quote ITEM >>
+
+Quotes an item to become safe against spaces
+in shell interpolation. An item is enclosed
+in double quotes if:
+
+  - the item contains spaces in the middle
+  - the item does not start with a quote
+
+This happens to avoid shell interpolation
+problems when whitespace is present in
+directory names.
+
+This method uses C<commands_quote> to determine
+the correct quote. If C<commands_quote> is
+a space, no quoting will take place.
+
+
+if it starts and ends with the same quote character: leave it as it is
+
+if it contains no whitespace: leave it as it is
+
+if it contains whitespace, then
+
+if it contains quotes: better leave it as it is
+
+else: quote it with the correct quote type for the box we're on
+
+=cut
+
+{
+    # Instead of patching the guess, set commands_quote
+    # to the right value
+    my ($quotes,$use_quote)
+        = $^O eq 'MSWin32'
+            ? ('"', '"')
+                : (q{"'}, "'")
+                    ;
+
+    sub safe_quote {
+        my ($self, $command) = @_;
+        # Set up quote/default quote
+        my $quote = $CPAN::Config->{commands_quote} || $quotes;
+
+        if ($quote ne ' '
+            and defined($command )
+            and $command =~ /\s/
+            and $command !~ /[$quote]/) {
+            return qq<$use_quote$command$use_quote>
+        }
+        return $command;
+    }
+}
+
+sub init {
+    my($self,@args) = @_;
+    CPAN->debug("self[$self]args[".join(",",@args)."]");
+    $self->load(do_init => 1, @args);
+    1;
+}
+
+# Loads CPAN::MyConfig or fall-back to CPAN::Config. Will not reload a file
+# if already loaded. Returns the path to the file %INC or else the empty string
+#
+# Note -- if CPAN::Config were loaded and CPAN::MyConfig subsequently
+# created, calling this again will leave *both* in %INC
+
+sub require_myconfig_or_config () {
+    if (   $INC{"CPAN/MyConfig.pm"} || _try_loading("CPAN::MyConfig", cpan_home())) {
+        return $INC{"CPAN/MyConfig.pm"};
+    }
+    elsif ( $INC{"CPAN/Config.pm"} || _try_loading("CPAN::Config") ) {
+        return $INC{"CPAN/Config.pm"};
+    }
+    else {
+        return q{};
+    }
+}
+
+# Load a module, but ignore "can't locate..." errors
+# Optionally take a list of directories to add to @INC for the load
+sub _try_loading {
+    my ($module, @dirs) = @_;
+    (my $file = $module) =~ s{::}{/}g;
+    $file .= ".pm";
+
+    local @INC = @INC;
+    for my $dir ( @dirs ) {
+        if ( -f File::Spec->catfile($dir, $file) ) {
+            unshift @INC, $dir;
+            last;
+        }
+    }
+
+    eval { require $file };
+    my $err_myconfig = $@;
+    if ($err_myconfig and $err_myconfig !~ m#locate \Q$file\E#) {
+        die "Error while requiring ${module}:\n$err_myconfig";
+    }
+    return $INC{$file};
+}
+
+# prioritized list of possible places for finding "CPAN/MyConfig.pm"
+sub cpan_home_dir_candidates {
+    my @dirs;
+    my $old_v = $CPAN::Config->{load_module_verbosity};
+    $CPAN::Config->{load_module_verbosity} = q[none];
+    if ($CPAN::META->has_usable('File::HomeDir')) {
+        if ($^O ne 'darwin') {
+            push @dirs, File::HomeDir->my_data;
+            # my_data is ~/Library/Application Support on darwin,
+            # which causes issues in the toolchain.
+        }
+        push @dirs, File::HomeDir->my_home;
+    }
+    # Windows might not have HOME, so check it first
+    push @dirs, $ENV{HOME} if $ENV{HOME};
+    # Windows might have these instead
+    push( @dirs, File::Spec->catpath($ENV{HOMEDRIVE}, $ENV{HOMEPATH}, '') )
+      if $ENV{HOMEDRIVE} && $ENV{HOMEPATH};
+    push @dirs, $ENV{USERPROFILE} if $ENV{USERPROFILE};
+
+    $CPAN::Config->{load_module_verbosity} = $old_v;
+    my $dotcpan = $^O eq 'VMS' ? '_cpan' : '.cpan';
+    @dirs = map { File::Spec->catdir($_, $dotcpan) } grep { defined } @dirs;
+    return wantarray ? @dirs : $dirs[0];
+}
+
+sub load {
+    my($self, %args) = @_;
+    $CPAN::Be_Silent+=0; # protect against 'used only once'
+    $CPAN::Be_Silent++ if $args{be_silent}; # do not use; planned to be removed in 2011
+    my $do_init = delete $args{do_init} || 0;
+    my $make_myconfig = delete $args{make_myconfig};
+    $loading = 0 unless defined $loading;
+
+    my $configpm = require_myconfig_or_config;
+    my @miss = $self->missing_config_data;
+    CPAN->debug("do_init[$do_init]loading[$loading]miss[@miss]") if $CPAN::DEBUG;
+    return unless $do_init || @miss;
+    if (@miss==1 and $miss[0] eq "pushy_https" && !$do_init) {
+        $CPAN::Frontend->myprint(<<'END');
+
+Starting with version 2.29 of the cpan shell, a new download mechanism
+is the default which exclusively uses cpan.org as the host to download
+from. The configuration variable pushy_https can be used to (de)select
+the new mechanism. Please read more about it and make your choice
+between the old and the new mechanism by running
+
+    o conf init pushy_https
+
+Once you have done that and stored the config variable this dialog
+will disappear.
+END
+
+        return;
+    }
+
+    # I'm not how we'd ever wind up in a recursive loop, but I'm leaving
+    # this here for safety's sake -- dagolden, 2011-01-19
+    return if $loading;
+    local $loading = ($loading||0) + 1;
+
+    # Warn if we have a config file, but things were found missing
+    if ($configpm && @miss && !$do_init) {
+        if ($make_myconfig || ( ! -w $configpm && $configpm =~ m{CPAN/Config\.pm})) {
+            $configpm = make_new_config();
+            $CPAN::Frontend->myprint(<<END);
+The system CPAN configuration file has provided some default values,
+but you need to complete the configuration dialog for CPAN.pm.
+Configuration will be written to
+ <<$configpm>>
+END
+        }
+        else {
+            $CPAN::Frontend->myprint(<<END);
+Sorry, we have to rerun the configuration dialog for CPAN.pm due to
+some missing parameters. Configuration will be written to
+ <<$configpm>>
+
+END
+        }
+    }
+
+    require CPAN::FirstTime;
+    return CPAN::FirstTime::init($configpm || make_new_config(), %args);
+}
+
+# Creates a new, empty config file at the preferred location
+# Any existing will be renamed with a ".bak" suffix if possible
+# If the file cannot be created, an exception is thrown
+sub make_new_config {
+    my $configpm = _new_config_name();
+    my $configpmdir = File::Basename::dirname( $configpm );
+    File::Path::mkpath($configpmdir) unless -d $configpmdir;
+
+    if ( -w $configpmdir ) {
+        #_#_# following code dumped core on me with 5.003_11, a.k.
+        if( -f $configpm ) {
+            my $configpm_bak = "$configpm.bak";
+            unlink $configpm_bak if -f $configpm_bak;
+            if( rename $configpm, $configpm_bak ) {
+                $CPAN::Frontend->mywarn(<<END);
+Old configuration file $configpm
+    moved to $configpm_bak
+END
+            }
+        }
+        my $fh = FileHandle->new;
+        if ($fh->open(">$configpm")) {
+            $fh->print("1;\n");
+            return $configpm;
+        }
+    }
+    _die_cant_write_config($configpm);
+}
+
+sub _die_cant_write_config {
+    my ($configpm) = @_;
+    $CPAN::Frontend->mydie(<<"END");
+WARNING: CPAN.pm is unable to write a configuration file.  You
+must be able to create and write to '$configpm'.
+
+Aborting configuration.
+END
+
+}
+
+# From candidate directories, we would like (in descending preference order):
+#   * the one that contains a MyConfig file
+#   * one that exists (even without MyConfig)
+#   * the first one on the list
+sub cpan_home {
+    my @dirs = cpan_home_dir_candidates();
+    for my $d (@dirs) {
+        return $d if -f "$d/CPAN/MyConfig.pm";
+    }
+    for my $d (@dirs) {
+        return $d if -d $d;
+    }
+    return $dirs[0];
+}
+
+sub _new_config_name {
+    return File::Spec->catfile(cpan_home(), 'CPAN', 'MyConfig.pm');
+}
+
+# returns mandatory but missing entries in the Config
+sub missing_config_data {
+    my(@miss);
+    for (
+         "auto_commit",
+         "build_cache",
+         "build_dir",
+         "cache_metadata",
+         "cpan_home",
+         "ftp_proxy",
+         #"gzip",
+         "http_proxy",
+         "index_expire",
+         #"inhibit_startup_message",
+         "keep_source_where",
+         #"make",
+         "make_arg",
+         "make_install_arg",
+         "makepl_arg",
+         "mbuild_arg",
+         "mbuild_install_arg",
+         ($^O eq "MSWin32" ? "" : "mbuild_install_build_command"),
+         "mbuildpl_arg",
+         "no_proxy",
+         #"pager",
+         "prerequisites_policy",
+         "pushy_https",
+         "scan_cache",
+         #"tar",
+         #"unzip",
+         "urllist",
+        ) {
+        next unless exists $keys{$_};
+        push @miss, $_ unless defined $CPAN::Config->{$_};
+    }
+    return @miss;
+}
+
+sub help {
+    $CPAN::Frontend->myprint(q[
+Known options:
+  commit    commit session changes to disk
+  defaults  reload default config values from disk
+  help      this help
+  init      enter a dialog to set all or a set of parameters
+
+Edit key values as in the following (the "o" is a literal letter o):
+  o conf build_cache 15
+  o conf build_dir "/foo/bar"
+  o conf urllist shift
+  o conf urllist unshift ftp://ftp.foo.bar/
+  o conf inhibit_startup_message 1
+
+]);
+    1; #don't reprint CPAN::Config
+}
+
+sub cpl {
+    my($word,$line,$pos) = @_;
+    $word ||= "";
+    CPAN->debug("word[$word] line[$line] pos[$pos]") if $CPAN::DEBUG;
+    my(@words) = split " ", substr($line,0,$pos+1);
+    if (
+        defined($words[2])
+        and
+        $words[2] =~ /list$/
+        and
+        (
+        @words == 3
+        ||
+        @words == 4 && length($word)
+        )
+       ) {
+        return grep /^\Q$word\E/, qw(splice shift unshift pop push);
+    } elsif (defined($words[2])
+             and
+             $words[2] eq "init"
+             and
+            (
+             @words == 3
+             ||
+             @words >= 4 && length($word)
+            )) {
+        return sort grep /^\Q$word\E/, keys %keys;
+    } elsif (@words >= 4) {
+        return ();
+    }
+    my %seen;
+    my(@o_conf) =  sort grep { !$seen{$_}++ }
+        keys %can,
+            keys %$CPAN::Config,
+                keys %keys;
+    return grep /^\Q$word\E/, @o_conf;
+}
+
+sub prefs_lookup {
+    my($self,$distro,$what) = @_;
+
+    if ($prefssupport{$what}) {
+        return $CPAN::Config->{$what} unless
+            $distro
+                and $distro->prefs
+                    and $distro->prefs->{cpanconfig}
+                        and defined $distro->prefs->{cpanconfig}{$what};
+        return $distro->prefs->{cpanconfig}{$what};
+    } else {
+        $CPAN::Frontend->mywarn("Warning: $what not yet officially ".
+                                "supported for distroprefs, doing a normal lookup\n");
+        return $CPAN::Config->{$what};
+    }
+}
+
+
+{
+    package
+        CPAN::Config; ####::###### #hide from indexer
+    # note: J. Nick Koston wrote me that they are using
+    # CPAN::Config->commit although undocumented. I suggested
+    # CPAN::Shell->o("conf","commit") even when ugly it is at least
+    # documented
+
+    # that's why I added the CPAN::Config class with autoload and
+    # deprecated warning
+
+    use strict;
+    use vars qw($AUTOLOAD $VERSION);
+    $VERSION = "5.5012";
+
+    # formerly CPAN::HandleConfig was known as CPAN::Config
+    sub AUTOLOAD { ## no critic
+        my $class = shift; # e.g. in dh-make-perl: CPAN::Config
+        my($l) = $AUTOLOAD;
+        $CPAN::Frontend->mywarn("Dispatching deprecated method '$l' to CPAN::HandleConfig\n");
+        $l =~ s/.*:://;
+        CPAN::HandleConfig->$l(@_);
+    }
+}
+
+1;
+
+__END__
+
+=head1 LICENSE
+
+This program is free software; you can redistribute it and/or
+modify it under the same terms as Perl itself.
+
+=cut
+
+# Local Variables:
+# mode: cperl
+# cperl-indent-level: 4
+# End:
+# vim: ts=4 sts=4 sw=4:
+                                                                                                                                                                                                                                                                                                                                                                                                         usr/local/lib/perl5/5.40.0/CPAN/Index.pm                                                            0000444 0000000 0000000 00000053334 14714567415 015642  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        package CPAN::Index;
+use strict;
+use vars qw($LAST_TIME $DATE_OF_02 $DATE_OF_03 $HAVE_REANIMATED $VERSION);
+$VERSION = "2.29";
+@CPAN::Index::ISA = qw(CPAN::Debug);
+$LAST_TIME ||= 0;
+$DATE_OF_03 ||= 0;
+# use constant PROTOCOL => "2.0"; # commented out to avoid warning on upgrade from 1.57
+sub PROTOCOL { 2.0 }
+
+#-> sub CPAN::Index::force_reload ;
+sub force_reload {
+    my($class) = @_;
+    $CPAN::Index::LAST_TIME = 0;
+    $class->reload(1);
+}
+
+my @indexbundle =
+    (
+     {
+      reader => "rd_authindex",
+      dir => "authors",
+      remotefile => '01mailrc.txt.gz',
+      shortlocalfile => '01mailrc.gz',
+     },
+     {
+      reader => "rd_modpacks",
+      dir => "modules",
+      remotefile => '02packages.details.txt.gz',
+      shortlocalfile => '02packag.gz',
+     },
+     {
+      reader => "rd_modlist",
+      dir => "modules",
+      remotefile => '03modlist.data.gz',
+      shortlocalfile => '03mlist.gz',
+     },
+    );
+
+#-> sub CPAN::Index::reload ;
+sub reload {
+    my($self,$force) = @_;
+    my $time = time;
+
+    # XXX check if a newer one is available. (We currently read it
+    # from time to time)
+    for ($CPAN::Config->{index_expire}) {
+        $_ = 0.001 unless $_ && $_ > 0.001;
+    }
+    unless (1 || $CPAN::Have_warned->{readmetadatacache}++) {
+        # debug here when CPAN doesn't seem to read the Metadata
+        require Carp;
+        Carp::cluck("META-PROTOCOL[$CPAN::META->{PROTOCOL}]");
+    }
+    unless ($CPAN::META->{PROTOCOL}) {
+        $self->read_metadata_cache;
+        $CPAN::META->{PROTOCOL} ||= "1.0";
+    }
+    if ( $CPAN::META->{PROTOCOL} < PROTOCOL  ) {
+        # warn "Setting last_time to 0";
+        $LAST_TIME = 0; # No warning necessary
+    }
+    if ($LAST_TIME + $CPAN::Config->{index_expire}*86400 > $time
+        and ! $force) {
+        # called too often
+        # CPAN->debug("LAST_TIME[$LAST_TIME]index_expire[$CPAN::Config->{index_expire}]time[$time]");
+    } elsif (0) {
+        # IFF we are developing, it helps to wipe out the memory
+        # between reloads, otherwise it is not what a user expects.
+        undef $CPAN::META; # Neue Gruendlichkeit since v1.52(r1.274)
+        $CPAN::META = CPAN->new;
+    } else {
+        my($debug,$t2);
+        local $LAST_TIME = $time;
+        local $CPAN::META->{PROTOCOL} = PROTOCOL;
+
+        my $needshort = $^O eq "dos";
+
+    INX: for my $indexbundle (@indexbundle) {
+            my $reader = $indexbundle->{reader};
+            my $localfile = $needshort ? $indexbundle->{shortlocalfile} : $indexbundle->{remotefile};
+            my $localpath = File::Spec->catfile($indexbundle->{dir}, $localfile);
+            my $remote = join "/", $indexbundle->{dir}, $indexbundle->{remotefile};
+            my $localized = $self->reload_x($remote, $localpath, $force);
+            $self->$reader($localized); # may die but we let the shell catch it
+            if ($CPAN::DEBUG){
+                $t2 = time;
+                $debug = "timing reading 01[".($t2 - $time)."]";
+                $time = $t2;
+            }
+            return if $CPAN::Signal; # this is sometimes lengthy
+        }
+        $self->write_metadata_cache;
+        if ($CPAN::DEBUG){
+            $t2 = time;
+            $debug .= "03[".($t2 - $time)."]";
+            $time = $t2;
+        }
+        CPAN->debug($debug) if $CPAN::DEBUG;
+    }
+    if ($CPAN::Config->{build_dir_reuse}) {
+        $self->reanimate_build_dir;
+    }
+    if (CPAN::_sqlite_running()) {
+        $CPAN::SQLite->reload(time => $time, force => $force)
+            if not $LAST_TIME;
+    }
+    $LAST_TIME = $time;
+    $CPAN::META->{PROTOCOL} = PROTOCOL;
+}
+
+#-> sub CPAN::Index::reanimate_build_dir ;
+sub reanimate_build_dir {
+    my($self) = @_;
+    unless ($CPAN::META->has_inst($CPAN::Config->{yaml_module}||"YAML")) {
+        return;
+    }
+    return if $HAVE_REANIMATED++;
+    my $d = $CPAN::Config->{build_dir};
+    my $dh = DirHandle->new;
+    opendir $dh, $d or return; # does not exist
+    my $dirent;
+    my $i = 0;
+    my $painted = 0;
+    my $restored = 0;
+    my $start = CPAN::FTP::_mytime();
+    my @candidates = map { $_->[0] }
+        sort { $b->[1] <=> $a->[1] }
+            map { [ $_, -M File::Spec->catfile($d,$_) ] }
+                grep {/(.+)\.yml$/ && -d File::Spec->catfile($d,$1)} readdir $dh;
+    if ( @candidates ) {
+        $CPAN::Frontend->myprint
+            (sprintf("Reading %d yaml file%s from %s/\n",
+                    scalar @candidates,
+                    @candidates==1 ? "" : "s",
+                    $CPAN::Config->{build_dir}
+                    ));
+      DISTRO: for $i (0..$#candidates) {
+            my $dirent = $candidates[$i];
+            my $y = eval {CPAN->_yaml_loadfile(File::Spec->catfile($d,$dirent), {loadblessed => 1})};
+            if ($@) {
+                warn "Error while parsing file '$dirent'; error: '$@'";
+                next DISTRO;
+            }
+            my $c = $y->[0];
+            if ($c && $c->{perl} && $c->{distribution} && CPAN->_perl_fingerprint($c->{perl})) {
+                my $key = $c->{distribution}{ID};
+                for my $k (keys %{$c->{distribution}}) {
+                    if ($c->{distribution}{$k}
+                        && ref $c->{distribution}{$k}
+                        && UNIVERSAL::isa($c->{distribution}{$k},"CPAN::Distrostatus")) {
+                        $c->{distribution}{$k}{COMMANDID} = $i - @candidates;
+                    }
+                }
+
+                #we tried to restore only if element already
+                #exists; but then we do not work with metadata
+                #turned off.
+                my $do
+                    = $CPAN::META->{readwrite}{'CPAN::Distribution'}{$key}
+                        = $c->{distribution};
+                for my $skipper (qw(
+                                    badtestcnt
+                                    configure_requires_later
+                                    configure_requires_later_for
+                                    force_update
+                                    later
+                                    later_for
+                                    notest
+                                    should_report
+                                    sponsored_mods
+                                    prefs
+                                    negative_prefs_cache
+                                  )) {
+                    delete $do->{$skipper};
+                }
+                if ($do->can("tested_ok_but_not_installed")) {
+                    if ($do->tested_ok_but_not_installed) {
+                        $CPAN::META->is_tested($do->{build_dir},$do->{make_test}{TIME});
+                    } else {
+                        next DISTRO;
+                    }
+                }
+                $restored++;
+            }
+            $i++;
+            while (($painted/76) < ($i/@candidates)) {
+                $CPAN::Frontend->myprint(".");
+                $painted++;
+            }
+        }
+    }
+    else {
+        $CPAN::Frontend->myprint("Build_dir empty, nothing to restore\n");
+    }
+    my $took = CPAN::FTP::_mytime() - $start;
+    $CPAN::Frontend->myprint(sprintf(
+                                     "DONE\nRestored the state of %s (in %.4f secs)\n",
+                                     $restored || "none",
+                                     $took,
+                                    ));
+}
+
+
+#-> sub CPAN::Index::reload_x ;
+sub reload_x {
+    my($cl,$wanted,$localname,$force) = @_;
+    $force |= 2; # means we're dealing with an index here
+    CPAN::HandleConfig->load; # we should guarantee loading wherever
+                              # we rely on Config XXX
+    $localname ||= $wanted;
+    my $abs_wanted = File::Spec->catfile($CPAN::Config->{'keep_source_where'},
+                                         $localname);
+    if (
+        -f $abs_wanted &&
+        -M $abs_wanted < $CPAN::Config->{'index_expire'} &&
+        !($force & 1)
+       ) {
+        my $s = $CPAN::Config->{'index_expire'} == 1 ? "" : "s";
+        $cl->debug(qq{$abs_wanted younger than $CPAN::Config->{'index_expire'} }.
+                   qq{day$s. I\'ll use that.});
+        return $abs_wanted;
+    } else {
+        $force |= 1; # means we're quite serious about it.
+    }
+    return CPAN::FTP->localize($wanted,$abs_wanted,$force);
+}
+
+#-> sub CPAN::Index::rd_authindex ;
+sub rd_authindex {
+    my($cl, $index_target) = @_;
+    return unless defined $index_target;
+    return if CPAN::_sqlite_running();
+    my @lines;
+    $CPAN::Frontend->myprint("Reading '$index_target'\n");
+    local(*FH);
+    tie *FH, 'CPAN::Tarzip', $index_target;
+    local($/) = "\n";
+    local($_);
+    push @lines, split /\012/ while <FH>;
+    my $i = 0;
+    my $painted = 0;
+    foreach (@lines) {
+        my($userid,$fullname,$email) =
+            m/alias\s+(\S+)\s+\"([^\"\<]*)\s+\<(.*)\>\"/;
+        $fullname ||= $email;
+        if ($userid && $fullname && $email) {
+            my $userobj = $CPAN::META->instance('CPAN::Author',$userid);
+            $userobj->set('FULLNAME' => $fullname, 'EMAIL' => $email);
+        } else {
+            CPAN->debug(sprintf "line[%s]", $_) if $CPAN::DEBUG;
+        }
+        $i++;
+        while (($painted/76) < ($i/@lines)) {
+            $CPAN::Frontend->myprint(".");
+            $painted++;
+        }
+        return if $CPAN::Signal;
+    }
+    $CPAN::Frontend->myprint("DONE\n");
+}
+
+sub userid {
+  my($self,$dist) = @_;
+  $dist = $self->{'id'} unless defined $dist;
+  my($ret) = $dist =~ m|(?:\w/\w\w/)?([^/]+)/|;
+  $ret;
+}
+
+#-> sub CPAN::Index::rd_modpacks ;
+sub rd_modpacks {
+    my($self, $index_target) = @_;
+    return unless defined $index_target;
+    return if CPAN::_sqlite_running();
+    $CPAN::Frontend->myprint("Reading '$index_target'\n");
+    my $fh = CPAN::Tarzip->TIEHANDLE($index_target);
+    local $_;
+    CPAN->debug(sprintf "start[%d]", time) if $CPAN::DEBUG;
+    my $slurp = "";
+    my $chunk;
+    while (my $bytes = $fh->READ(\$chunk,8192)) {
+        $slurp.=$chunk;
+    }
+    my @lines = split /\012/, $slurp;
+    CPAN->debug(sprintf "end[%d]", time) if $CPAN::DEBUG;
+    undef $fh;
+    # read header
+    my($line_count,$last_updated);
+    while (@lines) {
+        my $shift = shift(@lines);
+        last if $shift =~ /^\s*$/;
+        $shift =~ /^Line-Count:\s+(\d+)/ and $line_count = $1;
+        $shift =~ /^Last-Updated:\s+(.+)/ and $last_updated = $1;
+    }
+    CPAN->debug("line_count[$line_count]last_updated[$last_updated]") if $CPAN::DEBUG;
+    my $errors = 0;
+    if (not defined $line_count) {
+
+        $CPAN::Frontend->mywarn(qq{Warning: Your $index_target does not contain a Line-Count header.
+Please check the validity of the index file by comparing it to more
+than one CPAN mirror. I'll continue but problems seem likely to
+happen.\a
+});
+        $errors++;
+        $CPAN::Frontend->mysleep(5);
+    } elsif ($line_count != scalar @lines) {
+
+        $CPAN::Frontend->mywarn(sprintf qq{Warning: Your %s
+contains a Line-Count header of %d but I see %d lines there. Please
+check the validity of the index file by comparing it to more than one
+CPAN mirror. I'll continue but problems seem likely to happen.\a\n},
+$index_target, $line_count, scalar(@lines));
+
+    }
+    if (not defined $last_updated) {
+
+        $CPAN::Frontend->mywarn(qq{Warning: Your $index_target does not contain a Last-Updated header.
+Please check the validity of the index file by comparing it to more
+than one CPAN mirror. I'll continue but problems seem likely to
+happen.\a
+});
+        $errors++;
+        $CPAN::Frontend->mysleep(5);
+    } else {
+
+        $CPAN::Frontend
+            ->myprint(sprintf qq{  Database was generated on %s\n},
+                      $last_updated);
+        $DATE_OF_02 = $last_updated;
+
+        my $age = time;
+        if ($CPAN::META->has_inst('HTTP::Date')) {
+            require HTTP::Date;
+            $age -= HTTP::Date::str2time($last_updated);
+        } else {
+            $CPAN::Frontend->mywarn("  HTTP::Date not available\n");
+            require Time::Local;
+            my(@d) = $last_updated =~ / (\d+) (\w+) (\d+) (\d+):(\d+):(\d+) /;
+            $d[1] = index("Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec", $d[1])/4;
+            $age -= $d[1]>=0 ? Time::Local::timegm(@d[5,4,3,0,1,2]) : 0;
+        }
+        $age /= 3600*24;
+        if ($age > 30) {
+
+            $CPAN::Frontend
+                ->mywarn(sprintf
+                         qq{Warning: This index file is %d days old.
+  Please check the host you chose as your CPAN mirror for staleness.
+  I'll continue but problems seem likely to happen.\a\n},
+                         $age);
+
+        } elsif ($age < -1) {
+
+            $CPAN::Frontend
+                ->mywarn(sprintf
+                         qq{Warning: Your system date is %d days behind this index file!
+  System time:          %s
+  Timestamp index file: %s
+  Please fix your system time, problems with the make command expected.\n},
+                         -$age,
+                         scalar gmtime,
+                         $DATE_OF_02,
+                        );
+
+        }
+    }
+
+
+    # A necessity since we have metadata_cache: delete what isn't
+    # there anymore
+    my $secondtime = $CPAN::META->exists("CPAN::Module","CPAN");
+    CPAN->debug("secondtime[$secondtime]") if $CPAN::DEBUG;
+    my(%exists);
+    my $i = 0;
+    my $painted = 0;
+ LINE: foreach (@lines) {
+        # before 1.56 we split into 3 and discarded the rest. From
+        # 1.57 we assign remaining text to $comment thus allowing to
+        # influence isa_perl
+        my($mod,$version,$dist,$comment) = split " ", $_, 4;
+        unless ($mod && defined $version && $dist) {
+            require Dumpvalue;
+            my $dv = Dumpvalue->new(tick => '"');
+            $CPAN::Frontend->mywarn(sprintf "Could not split line[%s]\n", $dv->stringify($_));
+            if ($errors++ >= 5){
+                $CPAN::Frontend->mydie("Giving up parsing your $index_target, too many errors");
+            }
+            next LINE;
+        }
+        my($bundle,$id,$userid);
+
+        if ($mod eq 'CPAN' &&
+            ! (
+            CPAN::Queue->exists('Bundle::CPAN') ||
+            CPAN::Queue->exists('CPAN')
+            )
+        ) {
+            local($^W)= 0;
+            if ($version > $CPAN::VERSION) {
+                $CPAN::Frontend->mywarn(qq{
+  New CPAN.pm version (v$version) available.
+  [Currently running version is v$CPAN::VERSION]
+  You might want to try
+    install CPAN
+    reload cpan
+  to both upgrade CPAN.pm and run the new version without leaving
+  the current session.
+
+}); #});
+                $CPAN::Frontend->mysleep(2);
+                $CPAN::Frontend->myprint(qq{\n});
+            }
+            last if $CPAN::Signal;
+        } elsif ($mod =~ /^Bundle::(.*)/) {
+            $bundle = $1;
+        }
+
+        if ($bundle) {
+            $id =  $CPAN::META->instance('CPAN::Bundle',$mod);
+            # Let's make it a module too, because bundles have so much
+            # in common with modules.
+
+            # Changed in 1.57_63: seems like memory bloat now without
+            # any value, so commented out
+
+            # $CPAN::META->instance('CPAN::Module',$mod);
+
+        } else {
+
+            # instantiate a module object
+            $id = $CPAN::META->instance('CPAN::Module',$mod);
+
+        }
+
+        # Although CPAN prohibits same name with different version the
+        # indexer may have changed the version for the same distro
+        # since the last time ("Force Reindexing" feature)
+        if ($id->cpan_file ne $dist
+            ||
+            $id->cpan_version ne $version
+           ) {
+            $userid = $id->userid || $self->userid($dist);
+            $id->set(
+                     'CPAN_USERID' => $userid,
+                     'CPAN_VERSION' => $version,
+                     'CPAN_FILE' => $dist,
+                    );
+        }
+
+        # instantiate a distribution object
+        if ($CPAN::META->exists('CPAN::Distribution',$dist)) {
+        # we do not need CONTAINSMODS unless we do something with

@@ -1,0 +1,1000 @@
+        for k, v in item.items():
+            if v is None:
+                item[k] = templateutil.wrappedvalue(v)
+        self._out.write(self._t.render(ref, item))
+
+    @util.propertycache
+    def _symbolsused(self):
+        return self._t.symbolsused(self._tref)
+
+    def datahint(self):
+        '''set of field names to be referenced from the template'''
+        return self._symbolsused[0]
+
+    def end(self):
+        baseformatter.end(self)
+        self._renderitem(b'docfooter', {})
+
+
+@attr.s(frozen=True)
+class templatespec:
+    ref = attr.ib()
+    tmpl = attr.ib()
+    mapfile = attr.ib()
+    refargs = attr.ib(default=None)
+    fp = attr.ib(default=None)
+
+
+def empty_templatespec():
+    return templatespec(None, None, None)
+
+
+def reference_templatespec(ref, refargs=None):
+    return templatespec(ref, None, None, refargs)
+
+
+def literal_templatespec(tmpl):
+    assert not isinstance(tmpl, str), b'tmpl must not be a str'
+    return templatespec(b'', tmpl, None)
+
+
+def mapfile_templatespec(topic, mapfile, fp=None):
+    return templatespec(topic, None, mapfile, fp=fp)
+
+
+def lookuptemplate(ui, topic, tmpl):
+    """Find the template matching the given -T/--template spec 'tmpl'
+
+    'tmpl' can be any of the following:
+
+     - a literal template (e.g. '{rev}')
+     - a reference to built-in template (i.e. formatter)
+     - a map-file name or path (e.g. 'changelog')
+     - a reference to [templates] in config file
+     - a path to raw template file
+
+    A map file defines a stand-alone template environment. If a map file
+    selected, all templates defined in the file will be loaded, and the
+    template matching the given topic will be rendered. Aliases won't be
+    loaded from user config, but from the map file.
+
+    If no map file selected, all templates in [templates] section will be
+    available as well as aliases in [templatealias].
+    """
+
+    if not tmpl:
+        return empty_templatespec()
+
+    # looks like a literal template?
+    if b'{' in tmpl:
+        return literal_templatespec(tmpl)
+
+    # a reference to built-in (formatter) template
+    if tmpl in {b'cbor', b'json', b'pickle', b'debug'}:
+        return reference_templatespec(tmpl)
+
+    # a function-style reference to built-in template
+    func, fsep, ftail = tmpl.partition(b'(')
+    if func in {b'cbor', b'json'} and fsep and ftail.endswith(b')'):
+        templater.parseexpr(tmpl)  # make sure syntax errors are confined
+        return reference_templatespec(func, refargs=ftail[:-1])
+
+    # perhaps a stock style?
+    if not os.path.split(tmpl)[0]:
+        (mapname, fp) = templater.try_open_template(
+            b'map-cmdline.' + tmpl
+        ) or templater.try_open_template(tmpl)
+        if mapname:
+            return mapfile_templatespec(topic, mapname, fp)
+
+    # perhaps it's a reference to [templates]
+    if ui.config(b'templates', tmpl):
+        return reference_templatespec(tmpl)
+
+    if tmpl == b'list':
+        ui.write(_(b"available styles: %s\n") % templater.stylelist())
+        raise error.Abort(_(b"specify a template"))
+
+    # perhaps it's a path to a map or a template
+    if (b'/' in tmpl or b'\\' in tmpl) and os.path.isfile(tmpl):
+        # is it a mapfile for a style?
+        if os.path.basename(tmpl).startswith(b"map-"):
+            return mapfile_templatespec(topic, os.path.realpath(tmpl))
+        with util.posixfile(tmpl, b'rb') as f:
+            tmpl = f.read()
+        return literal_templatespec(tmpl)
+
+    # constant string?
+    return literal_templatespec(tmpl)
+
+
+def templatepartsmap(spec, t, partnames):
+    """Create a mapping of {part: ref}"""
+    partsmap = {spec.ref: spec.ref}  # initial ref must exist in t
+    if spec.mapfile:
+        partsmap.update((p, p) for p in partnames if p in t)
+    elif spec.ref:
+        for part in partnames:
+            ref = b'%s:%s' % (spec.ref, part)  # select config sub-section
+            if ref in t:
+                partsmap[part] = ref
+    return partsmap
+
+
+def loadtemplater(ui, spec, defaults=None, resources=None, cache=None):
+    """Create a templater from either a literal template or loading from
+    a map file"""
+    assert not (spec.tmpl and spec.mapfile)
+    if spec.mapfile:
+        return templater.templater.frommapfile(
+            spec.mapfile,
+            spec.fp,
+            defaults=defaults,
+            resources=resources,
+            cache=cache,
+        )
+    return maketemplater(
+        ui, spec.tmpl, defaults=defaults, resources=resources, cache=cache
+    )
+
+
+def maketemplater(ui, tmpl, defaults=None, resources=None, cache=None):
+    """Create a templater from a string template 'tmpl'"""
+    aliases = ui.configitems(b'templatealias')
+    t = templater.templater(
+        defaults=defaults, resources=resources, cache=cache, aliases=aliases
+    )
+    t.cache.update(
+        (k, templater.unquotestring(v)) for k, v in ui.configitems(b'templates')
+    )
+    if tmpl:
+        t.cache[b''] = tmpl
+    return t
+
+
+# marker to denote a resource to be loaded on demand based on mapping values
+# (e.g. (ctx, path) -> fctx)
+_placeholder = object()
+
+
+class templateresources(templater.resourcemapper):
+    """Resource mapper designed for the default templatekw and function"""
+
+    def __init__(self, ui, repo=None):
+        self._resmap = {
+            b'cache': {},  # for templatekw/funcs to store reusable data
+            b'repo': repo,
+            b'ui': ui,
+        }
+
+    def availablekeys(self, mapping):
+        return {
+            k for k in self.knownkeys() if self._getsome(mapping, k) is not None
+        }
+
+    def knownkeys(self):
+        return {b'cache', b'ctx', b'fctx', b'repo', b'revcache', b'ui'}
+
+    def lookup(self, mapping, key):
+        if key not in self.knownkeys():
+            return None
+        v = self._getsome(mapping, key)
+        if v is _placeholder:
+            v = mapping[key] = self._loadermap[key](self, mapping)
+        return v
+
+    def populatemap(self, context, origmapping, newmapping):
+        mapping = {}
+        if self._hasnodespec(newmapping):
+            mapping[b'revcache'] = {}  # per-ctx cache
+        if self._hasnodespec(origmapping) and self._hasnodespec(newmapping):
+            orignode = templateutil.runsymbol(context, origmapping, b'node')
+            mapping[b'originalnode'] = orignode
+        # put marker to override 'ctx'/'fctx' in mapping if any, and flag
+        # its existence to be reported by availablekeys()
+        if b'ctx' not in newmapping and self._hasliteral(newmapping, b'node'):
+            mapping[b'ctx'] = _placeholder
+        if b'fctx' not in newmapping and self._hasliteral(newmapping, b'path'):
+            mapping[b'fctx'] = _placeholder
+        return mapping
+
+    def _getsome(self, mapping, key):
+        v = mapping.get(key)
+        if v is not None:
+            return v
+        return self._resmap.get(key)
+
+    def _hasliteral(self, mapping, key):
+        """Test if a literal value is set or unset in the given mapping"""
+        return key in mapping and not callable(mapping[key])
+
+    def _getliteral(self, mapping, key):
+        """Return value of the given name if it is a literal"""
+        v = mapping.get(key)
+        if callable(v):
+            return None
+        return v
+
+    def _hasnodespec(self, mapping):
+        """Test if context revision is set or unset in the given mapping"""
+        return b'node' in mapping or b'ctx' in mapping
+
+    def _loadctx(self, mapping):
+        repo = self._getsome(mapping, b'repo')
+        node = self._getliteral(mapping, b'node')
+        if repo is None or node is None:
+            return
+        try:
+            return repo[node]
+        except error.RepoLookupError:
+            return None  # maybe hidden/non-existent node
+
+    def _loadfctx(self, mapping):
+        ctx = self._getsome(mapping, b'ctx')
+        path = self._getliteral(mapping, b'path')
+        if ctx is None or path is None:
+            return None
+        try:
+            return ctx[path]
+        except error.LookupError:
+            return None  # maybe removed file?
+
+    _loadermap = {
+        b'ctx': _loadctx,
+        b'fctx': _loadfctx,
+    }
+
+
+def _internaltemplateformatter(
+    ui,
+    out,
+    topic,
+    opts,
+    spec,
+    tmpl,
+    docheader=b'',
+    docfooter=b'',
+    separator=b'',
+):
+    """Build template formatter that handles customizable built-in templates
+    such as -Tjson(...)"""
+    templates = {spec.ref: tmpl}
+    if docheader:
+        templates[b'%s:docheader' % spec.ref] = docheader
+    if docfooter:
+        templates[b'%s:docfooter' % spec.ref] = docfooter
+    if separator:
+        templates[b'%s:separator' % spec.ref] = separator
+    return templateformatter(
+        ui, out, topic, opts, spec, overridetemplates=templates
+    )
+
+
+def formatter(ui, out, topic, opts):
+    spec = lookuptemplate(ui, topic, opts.get(b'template', b''))
+    if spec.ref == b"cbor" and spec.refargs is not None:
+        return _internaltemplateformatter(
+            ui,
+            out,
+            topic,
+            opts,
+            spec,
+            tmpl=b'{dict(%s)|cbor}' % spec.refargs,
+            docheader=cborutil.BEGIN_INDEFINITE_ARRAY,
+            docfooter=cborutil.BREAK,
+        )
+    elif spec.ref == b"cbor":
+        return cborformatter(ui, out, topic, opts)
+    elif spec.ref == b"json" and spec.refargs is not None:
+        return _internaltemplateformatter(
+            ui,
+            out,
+            topic,
+            opts,
+            spec,
+            tmpl=b'{dict(%s)|json}' % spec.refargs,
+            docheader=b'[\n ',
+            docfooter=b'\n]\n',
+            separator=b',\n ',
+        )
+    elif spec.ref == b"json":
+        return jsonformatter(ui, out, topic, opts)
+    elif spec.ref == b"pickle":
+        assert spec.refargs is None, r'function-style not supported'
+        return pickleformatter(ui, out, topic, opts)
+    elif spec.ref == b"debug":
+        assert spec.refargs is None, r'function-style not supported'
+        return debugformatter(ui, out, topic, opts)
+    elif spec.ref or spec.tmpl or spec.mapfile:
+        assert spec.refargs is None, r'function-style not supported'
+        return templateformatter(ui, out, topic, opts, spec)
+    # developer config: ui.formatdebug
+    elif ui.configbool(b'ui', b'formatdebug'):
+        return debugformatter(ui, out, topic, opts)
+    # deprecated config: ui.formatjson
+    elif ui.configbool(b'ui', b'formatjson'):
+        return jsonformatter(ui, out, topic, opts)
+    return plainformatter(ui, out, topic, opts)
+
+
+@contextlib.contextmanager
+def openformatter(ui, filename, topic, opts):
+    """Create a formatter that writes outputs to the specified file
+
+    Must be invoked using the 'with' statement.
+    """
+    with util.posixfile(filename, b'wb') as out:
+        with formatter(ui, out, topic, opts) as fm:
+            yield fm
+
+
+@contextlib.contextmanager
+def _neverending(fm):
+    yield fm
+
+
+def maybereopen(fm, filename):
+    """Create a formatter backed by file if filename specified, else return
+    the given formatter
+
+    Must be invoked using the 'with' statement. This will never call fm.end()
+    of the given formatter.
+    """
+    if filename:
+        return openformatter(fm._ui, filename, fm._topic, fm._opts)
+    else:
+        return _neverending(fm)
+                                                                                                                                                                                                                                                                                                                              usr/lib/python3/dist-packages/mercurial/graphmod.py                                                 0000644 0000000 0000000 00000041263 14355257011 021115  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        # Revision graph generator for Mercurial
+#
+# Copyright 2008 Dirkjan Ochtman <dirkjan@ochtman.nl>
+# Copyright 2007 Joel Rosdahl <joel@rosdahl.net>
+#
+# This software may be used and distributed according to the terms of the
+# GNU General Public License version 2 or any later version.
+
+"""supports walking the history as DAGs suitable for graphical output
+
+The most basic format we use is that of::
+
+  (id, type, data, [parentids])
+
+The node and parent ids are arbitrary integers which identify a node in the
+context of the graph returned. Type is a constant specifying the node type.
+Data depends on type.
+"""
+
+
+from .node import nullrev
+from .thirdparty import attr
+from . import (
+    dagop,
+    smartset,
+    util,
+)
+
+CHANGESET = b'C'
+PARENT = b'P'
+GRANDPARENT = b'G'
+MISSINGPARENT = b'M'
+# Style of line to draw. None signals a line that ends and is removed at this
+# point. A number prefix means only the last N characters of the current block
+# will use that style, the rest will use the PARENT style. Add a - sign
+# (so making N negative) and all but the first N characters use that style.
+EDGES = {PARENT: b'|', GRANDPARENT: b':', MISSINGPARENT: None}
+
+
+def dagwalker(repo, revs):
+    """cset DAG generator yielding (id, CHANGESET, ctx, [parentinfo]) tuples
+
+    This generator function walks through revisions (which should be ordered
+    from bigger to lower). It returns a tuple for each node.
+
+    Each parentinfo entry is a tuple with (edgetype, parentid), where edgetype
+    is one of PARENT, GRANDPARENT or MISSINGPARENT. The node and parent ids
+    are arbitrary integers which identify a node in the context of the graph
+    returned.
+
+    """
+    gpcache = {}
+
+    for rev in revs:
+        ctx = repo[rev]
+        # partition into parents in the rev set and missing parents, then
+        # augment the lists with markers, to inform graph drawing code about
+        # what kind of edge to draw between nodes.
+        pset = {p.rev() for p in ctx.parents() if p.rev() in revs}
+        mpars = [
+            p.rev()
+            for p in ctx.parents()
+            if p.rev() != nullrev and p.rev() not in pset
+        ]
+        parents = [(PARENT, p) for p in sorted(pset)]
+
+        for mpar in mpars:
+            gp = gpcache.get(mpar)
+            if gp is None:
+                # precompute slow query as we know reachableroots() goes
+                # through all revs (issue4782)
+                if not isinstance(revs, smartset.baseset):
+                    revs = smartset.baseset(revs)
+                gp = gpcache[mpar] = sorted(
+                    set(dagop.reachableroots(repo, revs, [mpar]))
+                )
+            if not gp:
+                parents.append((MISSINGPARENT, mpar))
+                pset.add(mpar)
+            else:
+                parents.extend((GRANDPARENT, g) for g in gp if g not in pset)
+                pset.update(gp)
+
+        yield (ctx.rev(), CHANGESET, ctx, parents)
+
+
+def nodes(repo, nodes):
+    """cset DAG generator yielding (id, CHANGESET, ctx, [parentids]) tuples
+
+    This generator function walks the given nodes. It only returns parents
+    that are in nodes, too.
+    """
+    include = set(nodes)
+    for node in nodes:
+        ctx = repo[node]
+        parents = {
+            (PARENT, p.rev()) for p in ctx.parents() if p.node() in include
+        }
+        yield (ctx.rev(), CHANGESET, ctx, sorted(parents))
+
+
+def colored(dag, repo):
+    """annotates a DAG with colored edge information
+
+    For each DAG node this function emits tuples::
+
+      (id, type, data, (col, color), [(col, nextcol, color)])
+
+    with the following new elements:
+
+      - Tuple (col, color) with column and color index for the current node
+      - A list of tuples indicating the edges between the current node and its
+        parents.
+    """
+    seen = []
+    colors = {}
+    newcolor = 1
+    config = {}
+
+    for key, val in repo.ui.configitems(b'graph'):
+        if b'.' in key:
+            branch, setting = key.rsplit(b'.', 1)
+            # Validation
+            if setting == b"width" and val.isdigit():
+                config.setdefault(branch, {})[setting] = int(val)
+            elif setting == b"color" and val.isalnum():
+                config.setdefault(branch, {})[setting] = val
+
+    if config:
+        getconf = util.lrucachefunc(
+            lambda rev: config.get(repo[rev].branch(), {})
+        )
+    else:
+        getconf = lambda rev: {}
+
+    for (cur, type, data, parents) in dag:
+
+        # Compute seen and next
+        if cur not in seen:
+            seen.append(cur)  # new head
+            colors[cur] = newcolor
+            newcolor += 1
+
+        col = seen.index(cur)
+        color = colors.pop(cur)
+        next = seen[:]
+
+        # Add parents to next
+        addparents = [p for pt, p in parents if p not in next]
+        next[col : col + 1] = addparents
+
+        # Set colors for the parents
+        for i, p in enumerate(addparents):
+            if not i:
+                colors[p] = color
+            else:
+                colors[p] = newcolor
+                newcolor += 1
+
+        # Add edges to the graph
+        edges = []
+        for ecol, eid in enumerate(seen):
+            if eid in next:
+                bconf = getconf(eid)
+                edges.append(
+                    (
+                        ecol,
+                        next.index(eid),
+                        colors[eid],
+                        bconf.get(b'width', -1),
+                        bconf.get(b'color', b''),
+                    )
+                )
+            elif eid == cur:
+                for ptype, p in parents:
+                    bconf = getconf(p)
+                    edges.append(
+                        (
+                            ecol,
+                            next.index(p),
+                            color,
+                            bconf.get(b'width', -1),
+                            bconf.get(b'color', b''),
+                        )
+                    )
+
+        # Yield and move on
+        yield (cur, type, data, (col, color), edges)
+        seen = next
+
+
+def asciiedges(type, char, state, rev, parents):
+    """adds edge info to changelog DAG walk suitable for ascii()"""
+    seen = state.seen
+    if rev not in seen:
+        seen.append(rev)
+    nodeidx = seen.index(rev)
+
+    knownparents = []
+    newparents = []
+    for ptype, parent in parents:
+        if parent == rev:
+            # self reference (should only be seen in null rev)
+            continue
+        if parent in seen:
+            knownparents.append(parent)
+        else:
+            newparents.append(parent)
+            state.edges[parent] = state.styles.get(ptype, b'|')
+
+    ncols = len(seen)
+    width = 1 + ncols * 2
+    nextseen = seen[:]
+    nextseen[nodeidx : nodeidx + 1] = newparents
+    edges = [(nodeidx, nextseen.index(p)) for p in knownparents]
+
+    seen[:] = nextseen
+    while len(newparents) > 2:
+        # ascii() only knows how to add or remove a single column between two
+        # calls. Nodes with more than two parents break this constraint so we
+        # introduce intermediate expansion lines to grow the active node list
+        # slowly.
+        edges.append((nodeidx, nodeidx))
+        edges.append((nodeidx, nodeidx + 1))
+        nmorecols = 1
+        width += 2
+        yield (type, char, width, (nodeidx, edges, ncols, nmorecols))
+        char = b'\\'
+        nodeidx += 1
+        ncols += 1
+        edges = []
+        del newparents[0]
+
+    if len(newparents) > 0:
+        edges.append((nodeidx, nodeidx))
+    if len(newparents) > 1:
+        edges.append((nodeidx, nodeidx + 1))
+    nmorecols = len(nextseen) - ncols
+    if nmorecols > 0:
+        width += 2
+    # remove current node from edge characters, no longer needed
+    state.edges.pop(rev, None)
+    yield (type, char, width, (nodeidx, edges, ncols, nmorecols))
+
+
+def _fixlongrightedges(edges):
+    for (i, (start, end)) in enumerate(edges):
+        if end > start:
+            edges[i] = (start, end + 1)
+
+
+def _getnodelineedgestail(echars, idx, pidx, ncols, coldiff, pdiff, fix_tail):
+    if fix_tail and coldiff == pdiff and coldiff != 0:
+        # Still going in the same non-vertical direction.
+        if coldiff == -1:
+            start = max(idx + 1, pidx)
+            tail = echars[idx * 2 : (start - 1) * 2]
+            tail.extend([b"/", b" "] * (ncols - start))
+            return tail
+        else:
+            return [b"\\", b" "] * (ncols - idx - 1)
+    else:
+        remainder = ncols - idx - 1
+        return echars[-(remainder * 2) :] if remainder > 0 else []
+
+
+def _drawedges(echars, edges, nodeline, interline):
+    for (start, end) in edges:
+        if start == end + 1:
+            interline[2 * end + 1] = b"/"
+        elif start == end - 1:
+            interline[2 * start + 1] = b"\\"
+        elif start == end:
+            interline[2 * start] = echars[2 * start]
+        else:
+            if 2 * end >= len(nodeline):
+                continue
+            nodeline[2 * end] = b"+"
+            if start > end:
+                (start, end) = (end, start)
+            for i in range(2 * start + 1, 2 * end):
+                if nodeline[i] != b"+":
+                    nodeline[i] = b"-"
+
+
+def _getpaddingline(echars, idx, ncols, edges):
+    # all edges up to the current node
+    line = echars[: idx * 2]
+    # an edge for the current node, if there is one
+    if (idx, idx - 1) in edges or (idx, idx) in edges:
+        # (idx, idx - 1)      (idx, idx)
+        # | | | |           | | | |
+        # +---o |           | o---+
+        # | | X |           | X | |
+        # | |/ /            | |/ /
+        # | | |             | | |
+        line.extend(echars[idx * 2 : (idx + 1) * 2])
+    else:
+        line.extend([b' ', b' '])
+    # all edges to the right of the current node
+    remainder = ncols - idx - 1
+    if remainder > 0:
+        line.extend(echars[-(remainder * 2) :])
+    return line
+
+
+def _drawendinglines(lines, extra, edgemap, seen, state):
+    """Draw ending lines for missing parent edges
+
+    None indicates an edge that ends at between this node and the next
+    Replace with a short line ending in ~ and add / lines to any edges to
+    the right.
+
+    """
+    if None not in edgemap.values():
+        return
+
+    # Check for more edges to the right of our ending edges.
+    # We need enough space to draw adjustment lines for these.
+    edgechars = extra[::2]
+    while edgechars and edgechars[-1] is None:
+        edgechars.pop()
+    shift_size = max((edgechars.count(None) * 2) - 1, 0)
+    minlines = 3 if not state.graphshorten else 2
+    while len(lines) < minlines + shift_size:
+        lines.append(extra[:])
+
+    if shift_size:
+        empties = []
+        toshift = []
+        first_empty = extra.index(None)
+        for i, c in enumerate(extra[first_empty::2], first_empty // 2):
+            if c is None:
+                empties.append(i * 2)
+            else:
+                toshift.append(i * 2)
+        targets = list(range(first_empty, first_empty + len(toshift) * 2, 2))
+        positions = toshift[:]
+        for line in lines[-shift_size:]:
+            line[first_empty:] = [b' '] * (len(line) - first_empty)
+            for i in range(len(positions)):
+                pos = positions[i] - 1
+                positions[i] = max(pos, targets[i])
+                line[pos] = b'/' if pos > targets[i] else extra[toshift[i]]
+
+    map = {1: b'|', 2: b'~'} if not state.graphshorten else {1: b'~'}
+    for i, line in enumerate(lines):
+        if None not in line:
+            continue
+        line[:] = [c or map.get(i, b' ') for c in line]
+
+    # remove edges that ended
+    remove = [p for p, c in edgemap.items() if c is None]
+    for parent in remove:
+        del edgemap[parent]
+        seen.remove(parent)
+
+
+@attr.s
+class asciistate:
+    """State of ascii() graph rendering"""
+
+    seen = attr.ib(init=False, default=attr.Factory(list))
+    edges = attr.ib(init=False, default=attr.Factory(dict))
+    lastcoldiff = attr.ib(init=False, default=0)
+    lastindex = attr.ib(init=False, default=0)
+    styles = attr.ib(init=False, default=attr.Factory(EDGES.copy))
+    graphshorten = attr.ib(init=False, default=False)
+
+
+def outputgraph(ui, graph):
+    """outputs an ASCII graph of a DAG
+
+    this is a helper function for 'ascii' below.
+
+    takes the following arguments:
+
+    - ui to write to
+    - graph data: list of { graph nodes/edges, text }
+
+    this function can be monkey-patched by extensions to alter graph display
+    without needing to mimic all of the edge-fixup logic in ascii()
+    """
+    for (ln, logstr) in graph:
+        ui.write((ln + logstr).rstrip() + b"\n")
+
+
+def ascii(ui, state, type, char, text, coldata):
+    """prints an ASCII graph of the DAG
+
+    takes the following arguments (one call per node in the graph):
+
+      - ui to write to
+      - Somewhere to keep the needed state in (init to asciistate())
+      - Column of the current node in the set of ongoing edges.
+      - Type indicator of node data, usually 'C' for changesets.
+      - Payload: (char, lines):
+        - Character to use as node's symbol.
+        - List of lines to display as the node's text.
+      - Edges; a list of (col, next_col) indicating the edges between
+        the current node and its parents.
+      - Number of columns (ongoing edges) in the current revision.
+      - The difference between the number of columns (ongoing edges)
+        in the next revision and the number of columns (ongoing edges)
+        in the current revision. That is: -1 means one column removed;
+        0 means no columns added or removed; 1 means one column added.
+    """
+    idx, edges, ncols, coldiff = coldata
+    assert -2 < coldiff < 2
+
+    edgemap, seen = state.edges, state.seen
+    # Be tolerant of history issues; make sure we have at least ncols + coldiff
+    # elements to work with. See test-glog.t for broken history test cases.
+    echars = [c for p in seen for c in (edgemap.get(p, b'|'), b' ')]
+    echars.extend((b'|', b' ') * max(ncols + coldiff - len(seen), 0))
+
+    if coldiff == -1:
+        # Transform
+        #
+        #     | | |        | | |
+        #     o | |  into  o---+
+        #     |X /         |/ /
+        #     | |          | |
+        _fixlongrightedges(edges)
+
+    # add_padding_line says whether to rewrite
+    #
+    #     | | | |        | | | |
+    #     | o---+  into  | o---+
+    #     |  / /         |   | |  # <--- padding line
+    #     o | |          |  / /
+    #                    o | |
+    add_padding_line = (
+        len(text) > 2 and coldiff == -1 and [x for (x, y) in edges if x + 1 < y]
+    )
+
+    # fix_nodeline_tail says whether to rewrite
+    #
+    #     | | o | |        | | o | |
+    #     | | |/ /         | | |/ /
+    #     | o | |    into  | o / /   # <--- fixed nodeline tail
+    #     | |/ /           | |/ /
+    #     o | |            o | |
+    fix_nodeline_tail = len(text) <= 2 and not add_padding_line
+
+    # nodeline is the line containing the node character (typically o)
+    nodeline = echars[: idx * 2]
+    nodeline.extend([char, b" "])
+
+    nodeline.extend(
+        _getnodelineedgestail(
+            echars,
+            idx,
+            state.lastindex,
+            ncols,
+            coldiff,
+            state.lastcoldiff,
+            fix_nodeline_tail,
+        )
+    )
+
+    # shift_interline is the line containing the non-vertical
+    # edges between this entry and the next
+    shift_interline = echars[: idx * 2]
+    for i in range(2 + coldiff):
+        shift_interline.append(b' ')
+    count = ncols - idx - 1
+    if coldiff == -1:
+        for i in range(count):
+            shift_interline.extend([b'/', b' '])
+    elif coldiff == 0:
+        shift_interline.extend(echars[(idx + 1) * 2 : ncols * 2])
+    else:
+        for i in range(count):
+            shift_interline.extend([b'\\', b' '])
+
+    # draw edges from the current node to its parents
+    _drawedges(echars, edges, nodeline, shift_interline)
+
+    # lines is the list of all graph lines to print
+    lines = [nodeline]
+    if add_padding_line:
+        lines.append(_getpaddingline(echars, idx, ncols, edges))
+
+    # If 'graphshorten' config, only draw shift_interline
+    # when there is any non vertical flow in graph.
+    if state.graphshorten:
+        if any(c in br'\/' for c in shift_interline if c):
+            lines.append(shift_interline)
+    # Else, no 'graphshorten' config so draw shift_interline.
+    else:
+        lines.append(shift_interline)
+
+    # make sure that there are as many graph lines as there are
+    # log strings
+    extra_interline = echars[: (ncols + coldiff) * 2]
+    if len(lines) < len(text):
+        while len(lines) < len(text):
+            lines.append(extra_interline[:])
+
+    _drawendinglines(lines, extra_interline, edgemap, seen, state)
+
+    while len(text) < len(lines):
+        text.append(b"")
+
+    # print lines
+    indentation_level = max(ncols, ncols + coldiff)
+    lines = [
+        b"%-*s " % (2 * indentation_level, b"".join(line)) for line in lines
+    ]
+    outputgraph(ui, zip(lines, text))
+
+    # ... and start over
+    state.lastcoldiff = coldiff
+    state.lastindex = idx
+                                                                                                                                                                                                                                                                                                                                             usr/lib/python3/dist-packages/mercurial/grep.py                                                     0000644 0000000 0000000 00000016163 14355257011 020252  0                                                                                                    ustar 00                                                                0000000 0000000                                                                                                                                                                        # grep.py - logic for history walk and grep
+#
+# Copyright 2005-2007 Olivia Mackall <olivia@selenic.com>
+#
+# This software may be used and distributed according to the terms of the
+# GNU General Public License version 2 or any later version.
+
+
+import difflib
+
+from .i18n import _
+
+from . import (
+    error,
+    match as matchmod,
+    pycompat,
+    scmutil,
+    util,
+)
+
+
+def matchlines(body, regexp):
+    begin = 0
+    linenum = 0
+    while begin < len(body):
+        match = regexp.search(body, begin)
+        if not match:
+            break
+        mstart, mend = match.span()
+        linenum += body.count(b'\n', begin, mstart) + 1
+        lstart = body.rfind(b'\n', begin, mstart) + 1 or begin
+        begin = body.find(b'\n', mend) + 1 or len(body) + 1
+        lend = begin - 1
+        yield linenum, mstart - lstart, mend - lstart, body[lstart:lend]
+
+
+class linestate:
+    def __init__(self, line, linenum, colstart, colend):
+        self.line = line
+        self.linenum = linenum
+        self.colstart = colstart
+        self.colend = colend
+
+    def __hash__(self):
+        return hash(self.line)
+
+    def __eq__(self, other):
+        return self.line == other.line
+
+    def findpos(self, regexp):
+        """Iterate all (start, end) indices of matches"""
+        yield self.colstart, self.colend
+        p = self.colend
+        while p < len(self.line):
+            m = regexp.search(self.line, p)
+            if not m:
+                break
+            if m.end() == p:
+                p += 1
+            else:
+                yield m.span()
+                p = m.end()
+
+
+def difflinestates(a, b):
+    sm = difflib.SequenceMatcher(None, a, b)
+    for tag, alo, ahi, blo, bhi in sm.get_opcodes():
+        if tag == 'insert':
+            for i in range(blo, bhi):
+                yield (b'+', b[i])
+        elif tag == 'delete':
+            for i in range(alo, ahi):
+                yield (b'-', a[i])
+        elif tag == 'replace':
+            for i in range(alo, ahi):
+                yield (b'-', a[i])
+            for i in range(blo, bhi):
+                yield (b'+', b[i])
+
+
+class grepsearcher:
+    """Search files and revisions for lines matching the given pattern
+
+    Options:
+    - all_files to search unchanged files at that revision.
+    - diff to search files in the parent revision so diffs can be generated.
+    - follow to skip files across copies and renames.
+    """
+
+    def __init__(
+        self, ui, repo, regexp, all_files=False, diff=False, follow=False
+    ):
+        self._ui = ui
+        self._repo = repo
+        self._regexp = regexp
+        self._all_files = all_files
+        self._diff = diff
+        self._follow = follow
+
+        self._getfile = util.lrucachefunc(repo.file)
+        self._getrenamed = scmutil.getrenamedfn(repo)
+
+        self._matches = {}
+        self._copies = {}
+        self._skip = set()
+        self._revfiles = {}
+
+    def skipfile(self, fn, rev):
+        """Exclude the given file (and the copy at the specified revision)
+        from future search"""
+        copy = self._copies.get(rev, {}).get(fn)
+        self._skip.add(fn)
+        if copy:
+            self._skip.add(copy)
+
+    def searchfiles(self, revs, makefilematcher):
+        """Walk files and revisions to yield (fn, ctx, pstates, states)
+        matches
+
+        states is a list of linestate objects. pstates may be empty unless
+        diff is True.
+        """
+        for ctx in scmutil.walkchangerevs(
+            self._repo, revs, makefilematcher, self._prep
+        ):
+            rev = ctx.rev()
+            parent = ctx.p1().rev()
+            for fn in sorted(self._revfiles.get(rev, [])):
+                states = self._matches[rev][fn]
+                copy = self._copies.get(rev, {}).get(fn)
+                if fn in self._skip:
+                    if copy:
+                        self._skip.add(copy)
+                    continue
+                pstates = self._matches.get(parent, {}).get(copy or fn, [])
+                if pstates or states:
+                    yield fn, ctx, pstates, states
+            del self._revfiles[rev]
+            # We will keep the matches dict for the duration of the window

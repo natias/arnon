@@ -1,0 +1,1000 @@
+use vars qw(%optionRequire);
+
+%optionRequire = (
+    compactDump => 'dumpvar.pl',
+    veryCompact => 'dumpvar.pl',
+    quote       => 'dumpvar.pl',
+);
+
+=pod
+
+There are a number of initialization-related variables which can be set
+by putting code to set them in a BEGIN block in the C<PERL5DB> environment
+variable. These are:
+
+=over 4
+
+=item C<$rl> - readline control XXX needs more explanation
+
+=item C<$warnLevel> - whether or not debugger takes over warning handling
+
+=item C<$dieLevel> - whether or not debugger takes over die handling
+
+=item C<$signalLevel> - whether or not debugger takes over signal handling
+
+=item C<$pre> - preprompt actions (array reference)
+
+=item C<$post> - postprompt actions (array reference)
+
+=item C<$pretype>
+
+=item C<$CreateTTY> - whether or not to create a new TTY for this debugger
+
+=item C<$CommandSet> - which command set to use (defaults to new, documented set)
+
+=back
+
+=cut
+
+# These guys may be defined in $ENV{PERL5DB} :
+$rl          = 1     unless defined $rl;
+$warnLevel   = 1     unless defined $warnLevel;
+$dieLevel    = 1     unless defined $dieLevel;
+$signalLevel = 1     unless defined $signalLevel;
+$pre         = []    unless defined $pre;
+$post        = []    unless defined $post;
+$pretype     = []    unless defined $pretype;
+$CreateTTY   = 3     unless defined $CreateTTY;
+$CommandSet  = '580' unless defined $CommandSet;
+
+share($rl);
+share($warnLevel);
+share($dieLevel);
+share($signalLevel);
+share($pre);
+share($post);
+share($pretype);
+share($CreateTTY);
+share($CommandSet);
+
+=pod
+
+The default C<die>, C<warn>, and C<signal> handlers are set up.
+
+=cut
+
+warnLevel($warnLevel);
+dieLevel($dieLevel);
+signalLevel($signalLevel);
+
+=pod
+
+The pager to be used is needed next. We try to get it from the
+environment first.  If it's not defined there, we try to find it in
+the Perl C<Config.pm>.  If it's not there, we default to C<more>. We
+then call the C<pager()> function to save the pager name.
+
+=cut
+
+# This routine makes sure $pager is set up so that '|' can use it.
+pager(
+
+    # If PAGER is defined in the environment, use it.
+    defined $ENV{PAGER}
+    ? $ENV{PAGER}
+
+      # If not, see if Config.pm defines it.
+    : eval { require Config }
+      && defined $Config::Config{pager}
+    ? $Config::Config{pager}
+
+      # If not, fall back to 'more'.
+    : 'more'
+  )
+  unless defined $pager;
+
+=pod
+
+We set up the command to be used to access the man pages, the command
+recall character (C<!> unless otherwise defined) and the shell escape
+character (C<!> unless otherwise defined). Yes, these do conflict, and
+neither works in the debugger at the moment.
+
+=cut
+
+setman();
+
+# Set up defaults for command recall and shell escape (note:
+# these currently don't work in linemode debugging).
+recallCommand("!") unless defined $prc;
+shellBang("!")     unless defined $psh;
+
+=pod
+
+We then set up the gigantic string containing the debugger help.
+We also set the limit on the number of arguments we'll display during a
+trace.
+
+=cut
+
+sethelp();
+
+# If we didn't get a default for the length of eval/stack trace args,
+# set it here.
+$maxtrace = 400 unless defined $maxtrace;
+
+=head2 SETTING UP THE DEBUGGER GREETING
+
+The debugger I<greeting> helps to inform the user how many debuggers are
+running, and whether the current debugger is the primary or a child.
+
+If we are the primary, we just hang onto our pid so we'll have it when
+or if we start a child debugger. If we are a child, we'll set things up
+so we'll have a unique greeting and so the parent will give us our own
+TTY later.
+
+We save the current contents of the C<PERLDB_PIDS> environment variable
+because we mess around with it. We'll also need to hang onto it because
+we'll need it if we restart.
+
+Child debuggers make a label out of the current PID structure recorded in
+PERLDB_PIDS plus the new PID. They also mark themselves as not having a TTY
+yet so the parent will give them one later via C<resetterm()>.
+
+=cut
+
+# Save the current contents of the environment; we're about to
+# much with it. We'll need this if we have to restart.
+use vars qw($ini_pids);
+$ini_pids = $ENV{PERLDB_PIDS};
+
+use vars qw ($pids $term_pid);
+
+if ( defined $ENV{PERLDB_PIDS} ) {
+
+    # We're a child. Make us a label out of the current PID structure
+    # recorded in PERLDB_PIDS plus our (new) PID. Mark us as not having
+    # a term yet so the parent will give us one later via resetterm().
+
+    my $env_pids = $ENV{PERLDB_PIDS};
+    $pids = "[$env_pids]";
+
+    # Unless we are on OpenVMS, all programs under the DCL shell run under
+    # the same PID.
+
+    if (($^O eq 'VMS') && ($env_pids =~ /\b$$\b/)) {
+        $term_pid         = $$;
+    }
+    else {
+        $ENV{PERLDB_PIDS} .= "->$$";
+        $term_pid = -1;
+    }
+
+} ## end if (defined $ENV{PERLDB_PIDS...
+else {
+
+    # We're the parent PID. Initialize PERLDB_PID in case we end up with a
+    # child debugger, and mark us as the parent, so we'll know to set up
+    # more TTY's is we have to.
+    $ENV{PERLDB_PIDS} = "$$";
+    $pids             = "[pid=$$]";
+    $term_pid         = $$;
+}
+
+use vars qw($pidprompt);
+$pidprompt = '';
+
+# Sets up $emacs as a synonym for $client_editor.
+our ($client_editor);
+*emacs = $client_editor if $client_editor;    # May be used in afterinit()...
+
+=head2 READING THE RC FILE
+
+The debugger will read a file of initialization options if supplied. If
+running interactively, this is C<.perldb>; if not, it's C<perldb.ini>.
+
+=cut
+
+# As noted, this test really doesn't check accurately that the debugger
+# is running at a terminal or not.
+
+use vars qw($rcfile);
+{
+    my $dev_tty = (($^O eq 'VMS') ? 'TT:' : '/dev/tty');
+    # this is the wrong metric!
+    $rcfile = ((-e $dev_tty) ? ".perldb" : "perldb.ini");
+}
+
+=pod
+
+The debugger does a safety test of the file to be read. It must be owned
+either by the current user or root, and must only be writable by the owner.
+
+=cut
+
+# This wraps a safety test around "do" to read and evaluate the init file.
+#
+# This isn't really safe, because there's a race
+# between checking and opening.  The solution is to
+# open and fstat the handle, but then you have to read and
+# eval the contents.  But then the silly thing gets
+# your lexical scope, which is unfortunate at best.
+sub safe_do {
+    my $file = shift;
+
+    # Just exactly what part of the word "CORE::" don't you understand?
+    local $SIG{__WARN__};
+    local $SIG{__DIE__};
+
+    unless ( is_safe_file($file) ) {
+        CORE::warn <<EO_GRIPE;
+perldb: Must not source insecure rcfile $file.
+        You or the superuser must be the owner, and it must not
+        be writable by anyone but its owner.
+EO_GRIPE
+        return;
+    } ## end unless (is_safe_file($file...
+
+    do $file;
+    CORE::warn("perldb: couldn't parse $file: $@") if $@;
+} ## end sub safe_do
+
+# This is the safety test itself.
+#
+# Verifies that owner is either real user or superuser and that no
+# one but owner may write to it.  This function is of limited use
+# when called on a path instead of upon a handle, because there are
+# no guarantees that filename (by dirent) whose file (by ino) is
+# eventually accessed is the same as the one tested.
+# Assumes that the file's existence is not in doubt.
+sub is_safe_file {
+    my $path = shift;
+    stat($path) || return;    # mysteriously vaporized
+    my ( $dev, $ino, $mode, $nlink, $uid, $gid ) = stat(_);
+
+    return 0 if $uid != 0 && $uid != $<;
+    return 0 if $mode & 022;
+    return 1;
+} ## end sub is_safe_file
+
+# If the rcfile (whichever one we decided was the right one to read)
+# exists, we safely do it.
+if ( -f $rcfile ) {
+    safe_do("./$rcfile");
+}
+
+# If there isn't one here, try the user's home directory.
+elsif ( defined $ENV{HOME} && -f "$ENV{HOME}/$rcfile" ) {
+    safe_do("$ENV{HOME}/$rcfile");
+}
+
+# Else try the login directory.
+elsif ( defined $ENV{LOGDIR} && -f "$ENV{LOGDIR}/$rcfile" ) {
+    safe_do("$ENV{LOGDIR}/$rcfile");
+}
+
+# If the PERLDB_OPTS variable has options in it, parse those out next.
+if ( defined $ENV{PERLDB_OPTS} ) {
+    parse_options( $ENV{PERLDB_OPTS} );
+}
+
+=pod
+
+The last thing we do during initialization is determine which subroutine is
+to be used to obtain a new terminal when a new debugger is started. Right now,
+the debugger only handles TCP sockets, X11, OS/2, amd Mac OS X
+(darwin).
+
+=cut
+
+# Set up the get_fork_TTY subroutine to be aliased to the proper routine.
+# Works if you're running an xterm or xterm-like window, or you're on
+# OS/2, or on Mac OS X. This may need some expansion.
+
+if (not defined &get_fork_TTY)       # only if no routine exists
+{
+    if ( defined $remoteport ) {
+                                                 # Expect an inetd-like server
+        *get_fork_TTY = \&socket_get_fork_TTY;   # to listen to us
+    }
+    elsif (defined $ENV{TERM}                    # If we know what kind
+                                                 # of terminal this is,
+        and $ENV{TERM} eq 'xterm'                # and it's an xterm,
+        and defined $ENV{DISPLAY}                # and what display it's on,
+      )
+    {
+        *get_fork_TTY = \&xterm_get_fork_TTY;    # use the xterm version
+    }
+    elsif ( $ENV{TMUX} ) {
+        *get_fork_TTY = \&tmux_get_fork_TTY;
+    }
+    elsif ( $^O eq 'os2' ) {                     # If this is OS/2,
+        *get_fork_TTY = \&os2_get_fork_TTY;      # use the OS/2 version
+    }
+    elsif ( $^O eq 'darwin'                      # If this is Mac OS X
+            and defined $ENV{TERM_PROGRAM}       # and we're running inside
+            and $ENV{TERM_PROGRAM}
+                eq 'Apple_Terminal'              # Terminal.app
+            )
+    {
+        *get_fork_TTY = \&macosx_get_fork_TTY;   # use the Mac OS X version
+    }
+} ## end if (not defined &get_fork_TTY...
+
+# untaint $^O, which may have been tainted by the last statement.
+# see bug [perl #24674]
+$^O =~ m/^(.*)\z/;
+$^O = $1;
+
+# Here begin the unreadable code.  It needs fixing.
+
+=head2 RESTART PROCESSING
+
+This section handles the restart command. When the C<R> command is invoked, it
+tries to capture all of the state it can into environment variables, and
+then sets C<PERLDB_RESTART>. When we start executing again, we check to see
+if C<PERLDB_RESTART> is there; if so, we reload all the information that
+the R command stuffed into the environment variables.
+
+  PERLDB_RESTART   - flag only, contains no restart data itself.
+  PERLDB_HIST      - command history, if it's available
+  PERLDB_ON_LOAD   - breakpoints set by the rc file
+  PERLDB_POSTPONE  - subs that have been loaded/not executed,
+                     and have actions
+  PERLDB_VISITED   - files that had breakpoints
+  PERLDB_FILE_...  - breakpoints for a file
+  PERLDB_OPT       - active options
+  PERLDB_INC       - the original @INC
+  PERLDB_PRETYPE   - preprompt debugger actions
+  PERLDB_PRE       - preprompt Perl code
+  PERLDB_POST      - post-prompt Perl code
+  PERLDB_TYPEAHEAD - typeahead captured by readline()
+
+We chug through all these variables and plug the values saved in them
+back into the appropriate spots in the debugger.
+
+=cut
+
+use vars qw(%postponed_file @typeahead);
+
+our (@hist, @truehist);
+
+sub _restore_shared_globals_after_restart
+{
+    @hist          = get_list('PERLDB_HIST');
+    %break_on_load = get_list("PERLDB_ON_LOAD");
+    %postponed     = get_list("PERLDB_POSTPONE");
+
+    share(@hist);
+    share(@truehist);
+    share(%break_on_load);
+    share(%postponed);
+}
+
+sub _restore_breakpoints_and_actions {
+
+    my @had_breakpoints = get_list("PERLDB_VISITED");
+
+    for my $file_idx ( 0 .. $#had_breakpoints ) {
+        my $filename = $had_breakpoints[$file_idx];
+        my %pf = get_list("PERLDB_FILE_$file_idx");
+        $postponed_file{ $filename } = \%pf if %pf;
+        my @lines = sort {$a <=> $b} keys(%pf);
+        my @enabled_statuses = get_list("PERLDB_FILE_ENABLED_$file_idx");
+        for my $line_idx (0 .. $#lines) {
+            _set_breakpoint_enabled_status(
+                $filename,
+                $lines[$line_idx],
+                ($enabled_statuses[$line_idx] ? 1 : ''),
+            );
+        }
+    }
+
+    return;
+}
+
+sub _restore_options_after_restart
+{
+    my %options_map = get_list("PERLDB_OPT");
+
+    while ( my ( $opt, $val ) = each %options_map ) {
+        $val =~ s/[\\\']/\\$1/g;
+        parse_options("$opt'$val'");
+    }
+
+    return;
+}
+
+sub _restore_globals_after_restart
+{
+    # restore original @INC
+    @INC     = get_list("PERLDB_INC");
+    @ini_INC = @INC;
+
+    # return pre/postprompt actions and typeahead buffer
+    $pretype   = [ get_list("PERLDB_PRETYPE") ];
+    $pre       = [ get_list("PERLDB_PRE") ];
+    $post      = [ get_list("PERLDB_POST") ];
+    @typeahead = get_list( "PERLDB_TYPEAHEAD", @typeahead );
+
+    return;
+}
+
+
+if ( exists $ENV{PERLDB_RESTART} ) {
+
+    # We're restarting, so we don't need the flag that says to restart anymore.
+    delete $ENV{PERLDB_RESTART};
+
+    # $restart = 1;
+    _restore_shared_globals_after_restart();
+
+    _restore_breakpoints_and_actions();
+
+    # restore options
+    _restore_options_after_restart();
+
+    _restore_globals_after_restart();
+} ## end if (exists $ENV{PERLDB_RESTART...
+
+=head2 SETTING UP THE TERMINAL
+
+Now, we'll decide how the debugger is going to interact with the user.
+If there's no TTY, we set the debugger to run non-stop; there's not going
+to be anyone there to enter commands.
+
+=cut
+
+use vars qw($notty $console $tty $LINEINFO);
+use vars qw($lineinfo $doccmd);
+
+our ($runnonstop);
+
+# Local autoflush to avoid rt#116769,
+# as calling IO::File methods causes an unresolvable loop
+# that results in debugger failure.
+sub _autoflush {
+    my $o = select($_[0]);
+    $|++;
+    select($o);
+}
+
+if ($notty) {
+    $runnonstop = 1;
+    share($runnonstop);
+}
+
+=pod
+
+If there is a TTY, we have to determine who it belongs to before we can
+proceed. If this is a client editor or graphical debugger (denoted by
+the first command-line switch being '-emacs'), we shift this off and
+set C<$rl> to 0 (XXX ostensibly to do straight reads).
+
+=cut
+
+else {
+
+    # Is Perl being run from a client editor or graphical debugger?
+    # If so, don't use readline, and set $client_editor = 1.
+    if ($client_editor = ( @main::ARGV && ( $main::ARGV[0] eq '-emacs' ) )) {
+        $rl = 0;
+        shift(@main::ARGV);
+    }
+
+    #require Term::ReadLine;
+
+=pod
+
+We then determine what the console should be on various systems:
+
+=over 4
+
+=item * Cygwin - We use C<stdin> instead of a separate device.
+
+=cut
+
+    if ( $^O eq 'cygwin' ) {
+
+        # /dev/tty is binary. use stdin for textmode
+        undef $console;
+    }
+
+=item * Windows - use C<con>.
+
+=cut
+
+    elsif ( $^O eq 'MSWin32' and -e "con" ) {
+        $console = "con";
+    }
+
+=item * AmigaOS - use C<CONSOLE:>.
+
+=cut
+
+    elsif ( $^O eq 'amigaos' ) {
+        $console = "CONSOLE:";
+    }
+
+=item * VMS - use C<sys$command>.
+
+=cut
+
+    elsif ($^O eq 'VMS') {
+        $console = 'sys$command';
+    }
+
+# Keep this penultimate, on the grounds that it satisfies a wide variety of
+# Unix-like systems that would otherwise need to be identified individually.
+
+=item * Unix - use F</dev/tty>.
+
+=cut
+
+    elsif ( -e "/dev/tty" ) {
+        $console = "/dev/tty";
+    }
+
+# Keep this last.
+
+    else {
+        _db_warn("Can't figure out your console, using stdin");
+        undef $console;
+    }
+
+=pod
+
+=back
+
+Several other systems don't use a specific console. We S<C<undef $console>>
+for those (Windows using a client editor/graphical debugger, OS/2
+with a client editor).
+
+=cut
+
+    if ( ( $^O eq 'MSWin32' ) and ( $client_editor or defined $ENV{EMACS} ) ) {
+
+        # /dev/tty is binary. use stdin for textmode
+        $console = undef;
+    }
+
+    # In OS/2, we need to use STDIN to get textmode too, even though
+    # it pretty much looks like Unix otherwise.
+    if ( defined $ENV{OS2_SHELL} and ( $client_editor or $ENV{WINDOWID} ) )
+    {    # In OS/2
+        $console = undef;
+    }
+
+=pod
+
+If there is a TTY hanging around from a parent, we use that as the console.
+
+=cut
+
+    $console = $tty if defined $tty;
+
+=head2 SOCKET HANDLING
+
+The debugger is capable of opening a socket and carrying out a debugging
+session over the socket.
+
+If C<RemotePort> was defined in the options, the debugger assumes that it
+should try to start a debugging session on that port. It builds the socket
+and then tries to connect the input and output filehandles to it.
+
+=cut
+
+    # Handle socket stuff.
+
+    if ( defined $remoteport ) {
+
+        # If RemotePort was defined in the options, connect input and output
+        # to the socket.
+        $IN = $OUT = connect_remoteport();
+    } ## end if (defined $remoteport)
+
+=pod
+
+If no C<RemotePort> was defined, and we want to create a TTY on startup,
+this is probably a situation where multiple debuggers are running (for example,
+a backticked command that starts up another debugger). We create a new IN and
+OUT filehandle, and do the necessary mojo to create a new TTY if we know how
+and if we can.
+
+=cut
+
+    # Non-socket.
+    else {
+
+        # Two debuggers running (probably a system or a backtick that invokes
+        # the debugger itself under the running one). create a new IN and OUT
+        # filehandle, and do the necessary mojo to create a new tty if we
+        # know how, and we can.
+        create_IN_OUT(4) if $CreateTTY & 4;
+        if ($console) {
+
+            # If we have a console, check to see if there are separate ins and
+            # outs to open. (They are assumed identical if not.)
+
+            my ( $i, $o ) = split /,/, $console;
+            $o = $i unless defined $o;
+
+            # read/write on in, or just read, or read on STDIN.
+                 open( IN, '+<', $i )
+              || open( IN, '<',  $i )
+              || open( IN, "<&STDIN" );
+
+            # read/write/create/clobber out, or write/create/clobber out,
+            # or merge with STDERR, or merge with STDOUT.
+                 open( OUT, '+>', $o )
+              || open( OUT, '>',  $o )
+              || open( OUT, ">&STDERR" )
+              || open( OUT, ">&STDOUT" );    # so we don't dongle stdout
+
+        } ## end if ($console)
+        elsif ( not defined $console ) {
+
+            # No console. Open STDIN.
+            open( IN, "<&STDIN" );
+
+            # merge with STDERR, or with STDOUT.
+            open( OUT,      ">&STDERR" )
+              || open( OUT, ">&STDOUT" );    # so we don't dongle stdout
+            $console = 'STDIN/OUT';
+        } ## end elsif (not defined $console)
+
+        # Keep copies of the filehandles so that when the pager runs, it
+        # can close standard input without clobbering ours.
+        if ($console or (not defined($console))) {
+            $IN = \*IN;
+            $OUT = \*OUT;
+        }
+    } ## end elsif (from if(defined $remoteport))
+
+    # Unbuffer DB::OUT. We need to see responses right away.
+    _autoflush($OUT);
+
+    # Line info goes to debugger output unless pointed elsewhere.
+    # Pointing elsewhere makes it possible for client editors to
+    # keep track of file and position. We have both a filehandle
+    # and a I/O description to keep track of.
+    $LINEINFO = $OUT     unless defined $LINEINFO;
+    $lineinfo = $console unless defined $lineinfo;
+    # share($LINEINFO); # <- unable to share globs
+    share($lineinfo);   #
+
+=pod
+
+To finish initialization, we show the debugger greeting,
+and then call the C<afterinit()> subroutine if there is one.
+
+=cut
+
+    # Show the debugger greeting.
+    $header =~ s/.Header: ([^,]+),v(\s+\S+\s+\S+).*$/$1$2/;
+    unless ($runnonstop) {
+        local $\ = '';
+        local $, = '';
+        if ( $term_pid eq '-1' ) {
+            print $OUT "\nDaughter DB session started...\n";
+        }
+        else {
+            print $OUT "\nLoading DB routines from $header\n";
+            print $OUT (
+                "Editor support ",
+                $client_editor ? "enabled" : "available", ".\n"
+            );
+            print $OUT
+"\nEnter h or 'h h' for help, or '$doccmd perldebug' for more help.\n\n";
+        } ## end else [ if ($term_pid eq '-1')
+    } ## end unless ($runnonstop)
+} ## end else [ if ($notty)
+
+# XXX This looks like a bug to me.
+# Why copy to @ARGS and then futz with @args?
+@ARGS = @ARGV;
+# for (@args) {
+    # Make sure backslashes before single quotes are stripped out, and
+    # keep args unless they are numeric (XXX why?)
+    # s/\'/\\\'/g;                      # removed while not justified understandably
+    # s/(.*)/'$1'/ unless /^-?[\d.]+$/; # ditto
+# }
+
+# If there was an afterinit() sub defined, call it. It will get
+# executed in our scope, so it can fiddle with debugger globals.
+if ( defined &afterinit ) {    # May be defined in $rcfile
+    afterinit();
+}
+
+# Inform us about "Stack dump during die enabled ..." in dieLevel().
+use vars qw($I_m_init);
+
+$I_m_init = 1;
+
+############################################################ Subroutines
+
+=head1 SUBROUTINES
+
+=head2 DB
+
+This gigantic subroutine is the heart of the debugger. Called before every
+statement, its job is to determine if a breakpoint has been reached, and
+stop if so; read commands from the user, parse them, and execute
+them, and then send execution off to the next statement.
+
+Note that the order in which the commands are processed is very important;
+some commands earlier in the loop will actually alter the C<$cmd> variable
+to create other commands to be executed later. This is all highly I<optimized>
+but can be confusing. Check the comments for each C<$cmd ... && do {}> to
+see what's happening in any given command.
+
+=cut
+
+# $cmd cannot be an our() variable unfortunately (possible perl bug?).
+
+use vars qw(
+    $action
+    $cmd
+    $file
+    $filename_ini
+    $finished
+    %had_breakpoints
+    $level
+    $max
+    $package
+    $try
+);
+
+our (
+    %alias,
+    $doret,
+    $end,
+    $fall_off_end,
+    $incr,
+    $laststep,
+    $rc,
+    $sh,
+    $stack_depth,
+    @stack,
+    @to_watch,
+    @old_watch,
+);
+
+sub _DB__determine_if_we_should_break
+{
+    # if we have something here, see if we should break.
+    # $stop is lexical and local to this block - $action on the other hand
+    # is global.
+    my $stop;
+
+    if ( $dbline{$line}
+        && _is_breakpoint_enabled($filename, $line)
+        && (( $stop, $action ) = split( /\0/, $dbline{$line} ) ) )
+    {
+
+        # Stop if the stop criterion says to just stop.
+        if ( $stop eq '1' ) {
+            $signal |= 1;
+        }
+
+        # It's a conditional stop; eval it in the user's context and
+        # see if we should stop. If so, remove the one-time sigil.
+        elsif ($stop) {
+            $evalarg = "\$DB::signal |= 1 if do {$stop}";
+            # The &-call is here to ascertain the mutability of @_.
+            &DB::eval;
+            # If the breakpoint is temporary, then delete its enabled status.
+            if ($dbline{$line} =~ s/;9($|\0)/$1/) {
+                _cancel_breakpoint_temp_enabled_status($filename, $line);
+            }
+        }
+    } ## end if ($dbline{$line} && ...
+}
+
+sub _DB__is_finished {
+    if ($finished and $level <= 1) {
+        end_report();
+        return 1;
+    }
+    else {
+        return;
+    }
+}
+
+sub _DB__read_next_cmd
+{
+    my ($tid) = @_;
+
+    # We have a terminal, or can get one ...
+    if (!$term) {
+        setterm();
+    }
+
+    # ... and it belongs to this PID or we get one for this PID ...
+    if ($term_pid != $$) {
+        resetterm(1);
+    }
+
+    # ... and we got a line of command input ...
+    $cmd = DB::readline(
+        "$pidprompt $tid DB"
+        . ( '<' x $level )
+        . ( $#hist + 1 )
+        . ( '>' x $level ) . " "
+    );
+
+    return defined($cmd);
+}
+
+sub _DB__trim_command_and_return_first_component {
+    my ($obj) = @_;
+
+    $cmd =~ s/\A\s+//s;    # trim annoying leading whitespace
+    $cmd =~ s/\s+\z//s;    # trim annoying trailing whitespace
+
+    # A single-character debugger command can be immediately followed by its
+    # argument if they aren't both alphanumeric; otherwise require space
+    # between commands and arguments:
+    my ($verb, $args) = $cmd =~ m{\A([^\.-]\b|\S*)\s*(.*)}s;
+
+    $obj->cmd_verb($verb);
+    $obj->cmd_args($args);
+
+    return;
+}
+
+sub _DB__handle_f_command {
+    my ($obj) = @_;
+
+    if ($file = $obj->cmd_args) {
+        # help for no arguments (old-style was return from sub).
+        if ( !$file ) {
+            print $OUT
+            "The old f command is now the r command.\n";    # hint
+            print $OUT "The new f command switches filenames.\n";
+            next CMD;
+        } ## end if (!$file)
+
+        # if not in magic file list, try a close match.
+        if ( !defined $main::{ '_<' . $file } ) {
+            if ( ($try) = grep( m#^_<.*$file#, keys %main:: ) ) {
+                {
+                    $try = substr( $try, 2 );
+                    print $OUT "Choosing $try matching '$file':\n";
+                    $file = $try;
+                }
+            } ## end if (($try) = grep(m#^_<.*$file#...
+        } ## end if (!defined $main::{ ...
+
+        # If not successfully switched now, we failed.
+        if ( !defined $main::{ '_<' . $file } ) {
+            print $OUT "No file matching '$file' is loaded.\n";
+            next CMD;
+        }
+
+        # We switched, so switch the debugger internals around.
+        elsif ( $file ne $filename ) {
+            *dbline   = $main::{ '_<' . $file };
+            $max      = $#dbline;
+            $filename = $file;
+            $start    = 1;
+            $cmd      = "l";
+        } ## end elsif ($file ne $filename)
+
+        # We didn't switch; say we didn't.
+        else {
+            print $OUT "Already in $file.\n";
+            next CMD;
+        }
+    }
+
+    return;
+}
+
+sub _DB__handle_dot_command {
+    my ($obj) = @_;
+
+    # . command.
+    if ($obj->_is_full('.')) {
+        $incr = -1;    # stay at current line
+
+        # Reset everything to the old location.
+        $start    = $line;
+        $filename = $filename_ini;
+        *dbline   = $main::{ '_<' . $filename };
+        $max      = $#dbline;
+
+        # Now where are we?
+        print_lineinfo($obj->position());
+        next CMD;
+    }
+
+    return;
+}
+
+sub _DB__handle_y_command {
+    my ($obj) = @_;
+
+    if (my ($match_level, $match_vars)
+        = $obj->cmd_args =~ /\A(?:(\d*)\s*(.*))?\z/) {
+
+        # See if we've got the necessary support.
+        if (!eval {
+            local @INC = @INC;
+            pop @INC if $INC[-1] eq '.';
+            require PadWalker; PadWalker->VERSION(0.08) }) {
+            my $Err = $@;
+            _db_warn(
+                $Err =~ /locate/
+                ? "PadWalker module not found - please install\n"
+                : $Err
+            );
+            next CMD;
+        }
+
+        # Load up dumpvar if we don't have it. If we can, that is.
+        do 'dumpvar.pl' || die $@ unless defined &main::dumpvar;
+        defined &main::dumpvar
+            or print $OUT "dumpvar.pl not available.\n"
+            and next CMD;
+
+        # Got all the modules we need. Find them and print them.
+        my @vars = split( ' ', $match_vars || '' );
+
+        # Find the pad.
+        my $h = eval { PadWalker::peek_my( ( $match_level || 0 ) + 2 ) };
+
+        # Oops. Can't find it.
+        if (my $Err = $@) {
+            $Err =~ s/ at .*//;
+            _db_warn($Err);
+            next CMD;
+        }
+
+        # Show the desired vars with dumplex().
+        my $savout = select($OUT);
+
+        # Have dumplex dump the lexicals.
+        foreach my $key (sort keys %$h) {
+            dumpvar::dumplex( $key, $h->{$key},
+                defined $option{dumpDepth} ? $option{dumpDepth} : -1,
+                @vars );
+        }
+        select($savout);
+        next CMD;
+    }
+}
+
+sub _DB__handle_c_command {
+    my ($obj) = @_;
+
+    my $i = $obj->cmd_args;
+
+    if ($i =~ m#\A[\w:]*\z#) {
+
+        # Hey, show's over. The debugged program finished
+        # executing already.
+        next CMD if _DB__is_finished();
+
+        # Capture the place to put a one-time break.
+        $subname = $i;
+
+        #  Probably not needed, since we finish an interactive
+        #  sub-session anyway...
+        # local $filename = $filename;
+        # local *dbline = *dbline; # XXX Would this work?!
+        #
+        # The above question wonders if localizing the alias
+        # to the magic array works or not. Since it's commented
+        # out, we'll just leave that to speculation for now.
+
+        # If the "subname" isn't all digits, we'll assume it
+        # is a subroutine name, and try to find it.
+        if ( $subname =~ /\D/ ) {    # subroutine name
+            # Qualify it to the current package unless it's
+            # already qualified.
+            $subname = $package . "::" . $subname
+            unless $subname =~ /::/;
+
+            # find_sub will return "file:line_number" corresponding
+            # to where the subroutine is defined; we call find_sub,
